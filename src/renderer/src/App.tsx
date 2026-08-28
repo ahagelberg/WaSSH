@@ -518,6 +518,7 @@ export default function App() {
                     settings={settings}
                     fontSizePx={sessionStyleFrom(t.connection).fontSizePx}
                     fontFamily={sessionStyleFrom(t.connection).fontFamily}
+                    scrollbackLines={sessionStyleFrom(t.connection).scrollbackLines}
                     bellMode={sessionStyleFrom(t.connection).bellMode}
                     cursorStyle={sessionStyleFrom(t.connection).cursorStyle}
                     cursorBlink={sessionStyleFrom(t.connection).cursorBlink}

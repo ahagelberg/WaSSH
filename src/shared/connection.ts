@@ -11,8 +11,11 @@ import {
   DEFAULT_CURSOR_STYLE,
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE_PX,
+  DEFAULT_SCROLLBACK_LINES,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
+  SCROLLBACK_LINES_MAX,
+  SCROLLBACK_LINES_MIN,
   THEME_COLOR_UNSET,
   type BellMode,
   type ConnectionParams,
@@ -29,6 +32,7 @@ export interface SessionStyle {
   bellMode: BellMode
   cursorStyle: CursorStyle
   cursorBlink: boolean
+  scrollbackLines: number
 }
 
 /** Hex values treated as theme default (empty) */
@@ -101,6 +105,19 @@ function fontSizeOrDefault(value: number | undefined): number {
   return value
 }
 
+function scrollbackLinesOrDefault(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_SCROLLBACK_LINES
+  }
+  if (value < SCROLLBACK_LINES_MIN) {
+    return SCROLLBACK_LINES_MIN
+  }
+  if (value > SCROLLBACK_LINES_MAX) {
+    return SCROLLBACK_LINES_MAX
+  }
+  return Math.floor(value)
+}
+
 export function sessionStyleFrom(
   src: Partial<SessionStyle> | null | undefined
 ): SessionStyle {
@@ -112,7 +129,8 @@ export function sessionStyleFrom(
     fontFamily: fontFamilyOrDefault(src?.fontFamily),
     bellMode: bellModeOrDefault(src?.bellMode),
     cursorStyle: cursorStyleOrDefault(src?.cursorStyle),
-    cursorBlink: typeof src?.cursorBlink === 'boolean' ? src.cursorBlink : DEFAULT_CURSOR_BLINK
+    cursorBlink: typeof src?.cursorBlink === 'boolean' ? src.cursorBlink : DEFAULT_CURSOR_BLINK,
+    scrollbackLines: scrollbackLinesOrDefault(src?.scrollbackLines)
   }
 }
 

@@ -48,13 +48,19 @@ function writeJson(file: string, value: unknown): void {
 type StoredSettings = Partial<AppSettings> & {
   fontSizePx?: number
   fontFamily?: string
+  scrollbackLines?: number
 }
 
-function storedFontFallback(): { fontSizePx?: number; fontFamily?: string } {
+function storedStyleFallback(): {
+  fontSizePx?: number
+  fontFamily?: string
+  scrollbackLines?: number
+} {
   const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
   return {
     fontSizePx: raw.fontSizePx,
-    fontFamily: raw.fontFamily
+    fontFamily: raw.fontFamily,
+    scrollbackLines: raw.scrollbackLines
   }
 }
 
@@ -70,7 +76,7 @@ function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile 
     passphraseVaultId: raw.passphraseVaultId ?? '',
     authMethod: raw.authMethod ?? 'none',
     proxyHostId: raw.proxyHostId ?? '',
-    ...sessionStyleFrom({ ...storedFontFallback(), ...raw })
+    ...sessionStyleFrom({ ...storedStyleFallback(), ...raw })
   }
 }
 
@@ -121,7 +127,7 @@ export class SessionStore {
 
 export class TabStore {
   getTabs(): TabSnapshot[] {
-    const fallback = storedFontFallback()
+    const fallback = storedStyleFallback()
     return readJson<TabSnapshot[]>(TABS_FILE, []).map((t) => ({
       ...t,
       connection: {
@@ -139,7 +145,12 @@ export class TabStore {
 export class SettingsStore {
   get(): AppSettings {
     const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
-    const { fontSizePx: _fontSizePx, fontFamily: _fontFamily, ...rest } = raw
+    const {
+      fontSizePx: _fontSizePx,
+      fontFamily: _fontFamily,
+      scrollbackLines: _scrollbackLines,
+      ...rest
+    } = raw
     const theme: AppTheme = rest.theme === 'light' ? 'light' : DEFAULT_THEME
     return { ...DEFAULT_SETTINGS, ...rest, theme }
   }

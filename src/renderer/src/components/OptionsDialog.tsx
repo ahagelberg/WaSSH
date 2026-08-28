@@ -13,7 +13,6 @@ function optionsPayload(draft: AppSettings): Partial<AppSettings> {
     reconnectOnStartup: draft.reconnectOnStartup,
     autoReconnectOnDrop: draft.autoReconnectOnDrop,
     reconnectMaxAttempts: draft.reconnectMaxAttempts,
-    scrollbackLines: draft.scrollbackLines,
     termType: draft.termType,
     theme: draft.theme
   }
@@ -118,34 +117,17 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
         id: 'terminal',
         title: 'Terminal',
         content: (
-          <>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <strong>Scrollback lines</strong>
-                <span>Primary-buffer history (PuTTY-like). Alt-screen apps manage their own view.</span>
-              </div>
-              <input
-                type="number"
-                min={100}
-                max={100000}
-                value={draft.scrollbackLines}
-                onChange={(e) =>
-                  patch({ scrollbackLines: Number(e.target.value) || 100 })
-                }
-              />
+          <div className="settings-row">
+            <div className="settings-row-label">
+              <strong>TERM</strong>
+              <span>PTY terminal type sent to the remote host. Scrollback is set per host or session.</span>
             </div>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <strong>TERM</strong>
-                <span>PTY terminal type sent to the remote host.</span>
-              </div>
-              <input
-                type="text"
-                value={draft.termType}
-                onChange={(e) => patch({ termType: e.target.value })}
-              />
-            </div>
-          </>
+            <input
+              type="text"
+              value={draft.termType}
+              onChange={(e) => patch({ termType: e.target.value })}
+            />
+          </div>
         )
       }
     ],

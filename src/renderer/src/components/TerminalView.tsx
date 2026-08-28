@@ -30,6 +30,7 @@ interface Props {
   settings: AppSettings
   fontSizePx: number
   fontFamily: string
+  scrollbackLines: number
   bellMode: BellMode
   cursorStyle: CursorStyle
   cursorBlink: boolean
@@ -72,6 +73,7 @@ export default function TerminalView({
   settings,
   fontSizePx,
   fontFamily,
+  scrollbackLines,
   bellMode,
   cursorStyle,
   cursorBlink,
@@ -105,7 +107,7 @@ export default function TerminalView({
       cursorBlink,
       cursorStyle,
       convertEol: false,
-      scrollback: settings.scrollbackLines,
+      scrollback: scrollbackLines,
       fontSize: fontSizePx,
       fontFamily: terminalFontStack(fontFamily),
       allowProposedApi: true,
@@ -241,12 +243,12 @@ export default function TerminalView({
     if (!term) {
       return
     }
-    term.options.scrollback = settings.scrollbackLines
+    term.options.scrollback = scrollbackLines
     term.options.fontSize = fontSizePx
     term.options.fontFamily = terminalFontStack(fontFamily)
     fitRef.current?.fit()
     onResize(tabId, term.cols, term.rows)
-  }, [settings.scrollbackLines, fontSizePx, fontFamily, tabId, onResize])
+  }, [scrollbackLines, fontSizePx, fontFamily, tabId, onResize])
 
   useEffect(() => {
     const term = termRef.current

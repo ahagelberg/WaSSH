@@ -10,9 +10,12 @@ import {
   DEFAULT_CURSOR_BLINK,
   DEFAULT_CURSOR_STYLE,
   DEFAULT_FONT_SIZE_PX,
+  DEFAULT_SCROLLBACK_LINES,
   DEFAULT_SSH_PORT,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
+  SCROLLBACK_LINES_MAX,
+  SCROLLBACK_LINES_MIN,
   type AuthMethod,
   type BellMode,
   type ConnectionParams,
@@ -351,6 +354,25 @@ export default function HostSessionSettingsDialog({
             value={form.fontSizePx}
             onChange={(e) =>
               patch({ fontSizePx: Number(e.target.value) || DEFAULT_FONT_SIZE_PX })
+            }
+          />
+        </div>
+        <div className="settings-row">
+          <div className="settings-row-label">
+            <strong>Scrollback lines</strong>
+            <span>
+              Primary-buffer history (PuTTY-like). {fontHint}
+            </span>
+          </div>
+          <input
+            type="number"
+            min={SCROLLBACK_LINES_MIN}
+            max={SCROLLBACK_LINES_MAX}
+            value={form.scrollbackLines}
+            onChange={(e) =>
+              patch({
+                scrollbackLines: Number(e.target.value) || DEFAULT_SCROLLBACK_LINES
+              })
             }
           />
         </div>

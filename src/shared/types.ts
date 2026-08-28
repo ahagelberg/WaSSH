@@ -8,6 +8,12 @@ export const DEFAULT_TERM_ROWS = 24
 /** Default scrollback lines */
 export const DEFAULT_SCROLLBACK_LINES = 10000
 
+/** Minimum scrollback lines */
+export const SCROLLBACK_LINES_MIN = 100
+
+/** Maximum scrollback lines */
+export const SCROLLBACK_LINES_MAX = 100000
+
 /** Default font size in px */
 export const DEFAULT_FONT_SIZE_PX = 14
 
@@ -170,6 +176,8 @@ export interface HostProfile {
   cursorStyle: CursorStyle
   /** Whether the cursor blinks */
   cursorBlink: boolean
+  /** Primary-buffer scrollback lines */
+  scrollbackLines: number
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -201,6 +209,8 @@ export interface ConnectionParams {
   cursorStyle: CursorStyle
   /** Whether the cursor blinks */
   cursorBlink: boolean
+  /** Primary-buffer scrollback lines */
+  scrollbackLines: number
   /** Session-local password not yet vaulted (ephemeral) */
   ephemeralPassword: string
   ephemeralPassphrase: string
@@ -216,7 +226,6 @@ export interface AppSettings {
   reconnectOnStartup: boolean
   autoReconnectOnDrop: boolean
   reconnectMaxAttempts: number
-  scrollbackLines: number
   termType: string
   sidebarCollapsed: boolean
   windowBounds: WindowBounds | null
@@ -227,7 +236,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   reconnectOnStartup: true,
   autoReconnectOnDrop: true,
   reconnectMaxAttempts: DEFAULT_RECONNECT_MAX_ATTEMPTS,
-  scrollbackLines: DEFAULT_SCROLLBACK_LINES,
   termType: DEFAULT_TERM_TYPE,
   sidebarCollapsed: false,
   windowBounds: null,
