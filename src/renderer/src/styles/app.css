@@ -308,12 +308,12 @@ textarea:focus {
 .tab-bar {
   display: flex;
   align-items: stretch;
+  flex-shrink: 0;
   gap: 2px;
   padding: 0 var(--gap);
-  min-height: var(--tabbar-height);
+  height: var(--tabbar-height);
   border-bottom: var(--tab-bar-edge-width) solid var(--border);
   background: var(--bg-panel-2);
-  overflow-x: auto;
 }
 
 .tab {
@@ -322,6 +322,7 @@ textarea:focus {
   gap: 6px;
   padding: 0 10px;
   position: relative;
+  min-width: 0;
   margin-bottom: calc(-1 * var(--tab-bar-edge-width));
   border: var(--tab-active-border-width) solid transparent;
   border-bottom: var(--tab-bar-edge-width) solid transparent;
