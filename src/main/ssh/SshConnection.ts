@@ -3,7 +3,7 @@ import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
 import { Client, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import { Readable } from 'stream'
-import { sessionStyleFrom, proxyLabel, resolveProxyChain } from '../../shared/connection'
+import { sessionStyleFrom, proxyLabel, resolveProxyChain, tunnelConfigFrom } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_TERM_COLS,
@@ -19,6 +19,7 @@ import {
 } from '../../shared/types'
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore } from '../store/sessionStore'
+import { TunnelManager } from './TunnelManager'
 
 /** SSH connect ready timeout ms */
 const CONNECT_READY_TIMEOUT_MS = 20000
@@ -47,6 +48,9 @@ export class SshConnection extends EventEmitter {
   private everConnected = false
   /** True after the remote shell sent an exit-status / exit-signal (logout, not a drop) */
   private remoteShellExited = false
+  private tunnels = new TunnelManager((message) => {
+    this.emit('data', `\r\n[WaSSH] ${message}\r\n`)
+  })
 
   constructor(
     readonly tabId: string,
@@ -125,7 +129,8 @@ export class SshConnection extends EventEmitter {
       passphraseVaultId: this.connection.passphraseVaultId,
       authMethod: 'password',
       proxyHostId: this.connection.proxyHostId || '',
-      ...sessionStyleFrom(this.connection)
+      ...sessionStyleFrom(this.connection),
+      ...tunnelConfigFrom(this.connection)
     })
     this.connection.hostId = id
     this.connection.name = name
@@ -505,51 +510,58 @@ export class SshConnection extends EventEmitter {
         cols: this.cols,
         rows: this.rows
       }
-      client.shell(pty, (err, stream) => {
-        if (err) {
-          this.emitStatus('failed', err.message)
-          this.scheduleReconnect()
-          resolve()
-          return
-        }
-        this.stream = stream
-        this.reconnectAttempt = 0
-        this.everConnected = true
-        this.emitStatus('connected')
+      const tunnelOpts = tunnelConfigFrom(this.connection)
+      const shellOptions = tunnelOpts.x11Forwarding ? { x11: true } : {}
 
-        if (this.usedInteractivePassword && this.interactivePassword) {
-          this.pendingSavePassword = this.interactivePassword
-          this.usedInteractivePassword = false
-          this.emit('savePasswordPrompt', {
-            tabId: this.tabId,
-            hasHostProfile: Boolean(this.connection.hostId)
-          } satisfies SavePasswordPrompt)
-        }
-
-        stream.on('data', (data: Buffer) => {
-          this.emit('data', data.toString('utf8'))
-        })
-        stream.stderr.on('data', (data: Buffer) => {
-          this.emit('data', data.toString('utf8'))
-        })
-        stream.on('exit', () => {
-          this.remoteShellExited = true
-        })
-        stream.on('close', () => {
-          this.stream = null
-          if (this.intentionalDisconnect || this.disposed) {
-            this.emitStatus('disconnected')
+      void this.tunnels.start(client, tunnelOpts.tunnels, tunnelOpts.x11Forwarding).then(() => {
+        client.shell(pty, shellOptions, (err, stream) => {
+          if (err) {
+            this.tunnels.stop()
+            this.emitStatus('failed', err.message)
+            this.scheduleReconnect()
             resolve()
             return
           }
-          if (this.remoteShellExited) {
-            this.endAfterRemoteLogout()
-            resolve()
-            return
+          this.stream = stream
+          this.reconnectAttempt = 0
+          this.everConnected = true
+          this.emitStatus('connected')
+
+          if (this.usedInteractivePassword && this.interactivePassword) {
+            this.pendingSavePassword = this.interactivePassword
+            this.usedInteractivePassword = false
+            this.emit('savePasswordPrompt', {
+              tabId: this.tabId,
+              hasHostProfile: Boolean(this.connection.hostId)
+            } satisfies SavePasswordPrompt)
           }
-          this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
-          this.scheduleReconnect()
-          resolve()
+
+          stream.on('data', (data: Buffer) => {
+            this.emit('data', data.toString('utf8'))
+          })
+          stream.stderr.on('data', (data: Buffer) => {
+            this.emit('data', data.toString('utf8'))
+          })
+          stream.on('exit', () => {
+            this.remoteShellExited = true
+          })
+          stream.on('close', () => {
+            this.stream = null
+            this.tunnels.stop()
+            if (this.intentionalDisconnect || this.disposed) {
+              this.emitStatus('disconnected')
+              resolve()
+              return
+            }
+            if (this.remoteShellExited) {
+              this.endAfterRemoteLogout()
+              resolve()
+              return
+            }
+            this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
+            this.scheduleReconnect()
+            resolve()
+          })
         })
       })
 
@@ -606,6 +618,7 @@ export class SshConnection extends EventEmitter {
   }
 
   private closeClientOnly(): void {
+    this.tunnels.stop()
     try {
       this.stream?.close()
     } catch {

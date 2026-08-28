@@ -12,7 +12,7 @@ import {
   TabSnapshot,
   type AppTheme
 } from '../../shared/types'
-import { sessionStyleFrom } from '../../shared/connection'
+import { sessionStyleFrom, tunnelConfigFrom } from '../../shared/connection'
 
 const HOSTS_FILE = 'hosts.json'
 const PREVIOUS_HOSTS_FILE = 'sessions.json'
@@ -76,7 +76,8 @@ function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile 
     passphraseVaultId: raw.passphraseVaultId ?? '',
     authMethod: raw.authMethod ?? 'none',
     proxyHostId: raw.proxyHostId ?? '',
-    ...sessionStyleFrom({ ...storedStyleFallback(), ...raw })
+    ...sessionStyleFrom({ ...storedStyleFallback(), ...raw }),
+    ...tunnelConfigFrom(raw)
   }
 }
 
@@ -132,7 +133,8 @@ export class TabStore {
       ...t,
       connection: {
         ...t.connection,
-        ...sessionStyleFrom({ ...fallback, ...t.connection })
+        ...sessionStyleFrom({ ...fallback, ...t.connection }),
+        ...tunnelConfigFrom(t.connection)
       }
     }))
   }

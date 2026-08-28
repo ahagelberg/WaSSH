@@ -12,15 +12,24 @@ import {
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE_PX,
   DEFAULT_SCROLLBACK_LINES,
+  DEFAULT_TUNNEL_LISTEN_HOST,
+  DEFAULT_X11_FORWARDING,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
   THEME_COLOR_UNSET,
+  TUNNEL_PORT_MAX,
+  TUNNEL_PORT_MIN,
+  TUNNEL_TYPE_DYNAMIC,
+  TUNNEL_TYPE_LOCAL,
+  TUNNEL_TYPE_REMOTE,
   type BellMode,
   type ConnectionParams,
   type CursorStyle,
-  type HostProfile
+  type HostProfile,
+  type SshTunnel,
+  type TunnelType
 } from './types'
 
 export interface SessionStyle {
@@ -134,6 +143,69 @@ export function sessionStyleFrom(
   }
 }
 
+function tunnelTypeOrDefault(value: string | undefined): TunnelType {
+  if (
+    value === TUNNEL_TYPE_LOCAL ||
+    value === TUNNEL_TYPE_REMOTE ||
+    value === TUNNEL_TYPE_DYNAMIC
+  ) {
+    return value
+  }
+  return TUNNEL_TYPE_LOCAL
+}
+
+function tunnelPortOrZero(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return 0
+  }
+  const port = Math.floor(value)
+  if (port < TUNNEL_PORT_MIN || port > TUNNEL_PORT_MAX) {
+    return 0
+  }
+  return port
+}
+
+function normalizeTunnel(raw: Partial<SshTunnel>, index: number): SshTunnel {
+  return {
+    id: raw.id || `tunnel-${index}`,
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+    type: tunnelTypeOrDefault(raw.type),
+    listenHost: (raw.listenHost || DEFAULT_TUNNEL_LISTEN_HOST).trim() || DEFAULT_TUNNEL_LISTEN_HOST,
+    listenPort: tunnelPortOrZero(raw.listenPort),
+    destHost: (raw.destHost || '').trim(),
+    destPort: tunnelPortOrZero(raw.destPort)
+  }
+}
+
+export interface TunnelConfig {
+  tunnels: SshTunnel[]
+  x11Forwarding: boolean
+}
+
+export function tunnelConfigFrom(
+  src: Partial<TunnelConfig> | null | undefined
+): TunnelConfig {
+  const list = Array.isArray(src?.tunnels) ? src.tunnels : []
+  return {
+    tunnels: list.map((t, i) => normalizeTunnel(t ?? {}, i)),
+    x11Forwarding:
+      typeof src?.x11Forwarding === 'boolean' ? src.x11Forwarding : DEFAULT_X11_FORWARDING
+  }
+}
+
+export function emptyTunnel(): SshTunnel {
+  const idSuffix = Math.random().toString(36).slice(2)
+  return {
+    id: `tunnel-${idSuffix}`,
+    enabled: true,
+    type: TUNNEL_TYPE_LOCAL,
+    listenHost: DEFAULT_TUNNEL_LISTEN_HOST,
+    listenPort: 0,
+    destHost: '',
+    destPort: 0
+  }
+}
+
 export function hostDisplayName(host: Pick<HostProfile, 'name' | 'host'>): string {
   const trimmed = (host.name ?? '').trim()
   if (trimmed) {
@@ -155,6 +227,7 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     authMethod: host.authMethod,
     proxyHostId: host.proxyHostId || '',
     ...sessionStyleFrom(host),
+    ...tunnelConfigFrom(host),
     ephemeralPassword: '',
     ephemeralPassphrase: ''
   }

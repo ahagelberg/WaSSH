@@ -246,10 +246,7 @@ textarea:focus {
 }
 
 .host-context-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  margin-top: 4px;
+  position: fixed;
   display: flex;
   flex-direction: column;
 }

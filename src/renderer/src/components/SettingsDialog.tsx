@@ -17,10 +17,25 @@ interface Props {
 /** Intersection ratio to consider a section active */
 const SECTION_VISIBLE_RATIO = 0.35
 
+/** Keyboard key that dismisses the dialog like Cancel */
+const DIALOG_DISMISS_KEY = 'Escape'
+
 export default function SettingsDialog({ title, sections, onClose, footer }: Props) {
   const [activeId, setActiveId] = useState(sections[0]?.id ?? '')
   const contentRef = useRef<HTMLDivElement>(null)
   const sectionRefs = useRef<Record<string, HTMLElement | null>>({})
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key !== DIALOG_DISMISS_KEY) {
+        return
+      }
+      e.preventDefault()
+      onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
 
   useEffect(() => {
     const root = contentRef.current

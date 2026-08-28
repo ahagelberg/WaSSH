@@ -153,3 +153,55 @@
   gap: 8px;
 }
 
+.settings-row-block {
+  grid-template-columns: 1fr;
+  align-items: start;
+}
+
+.settings-tunnel-list {
+  display: grid;
+  gap: var(--gap);
+  width: 100%;
+}
+
+.settings-tunnel-card {
+  display: grid;
+  grid-template-columns:
+    auto
+    minmax(7rem, 9rem)
+    minmax(5rem, 1fr)
+    4.5rem
+    minmax(5rem, 1fr)
+    4.5rem
+    auto;
+  gap: 6px;
+  align-items: center;
+  padding: 8px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.settings-tunnel-enabled {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.settings-tunnel-card input[type='number'],
+.settings-tunnel-card input[type='text'],
+.settings-tunnel-card select {
+  width: 100%;
+  min-width: 0;
+}
+
+.settings-tunnel-card input:disabled {
+  opacity: 0.45;
+}
+
+.settings-tunnel-add {
+  justify-self: start;
+}
+

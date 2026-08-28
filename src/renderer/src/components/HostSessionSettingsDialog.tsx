@@ -16,13 +16,25 @@ import {
   FONT_SIZE_MIN_PX,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
+  TUNNEL_PORT_MAX,
+  TUNNEL_PORT_MIN,
+  TUNNEL_TYPE_DYNAMIC,
+  TUNNEL_TYPE_LOCAL,
+  TUNNEL_TYPE_REMOTE,
   type AuthMethod,
   type BellMode,
   type ConnectionParams,
   type CursorStyle,
-  type HostProfile
+  type HostProfile,
+  type SshTunnel,
+  type TunnelType
 } from '@shared/types'
-import { sessionStyleFrom, hostToConnection } from '@shared/connection'
+import {
+  emptyTunnel,
+  hostToConnection,
+  sessionStyleFrom,
+  tunnelConfigFrom
+} from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 
@@ -44,7 +56,8 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
     return {
       ...initial,
       proxyHostId: initial.proxyHostId || '',
-      ...sessionStyleFrom(initial)
+      ...sessionStyleFrom(initial),
+      ...tunnelConfigFrom(initial)
     }
   }
   return hostToConnection(initial)
@@ -420,11 +433,137 @@ export default function HostSessionSettingsDialog({
       </>
     )
 
+    const tunnelHint =
+      mode === 'editHost'
+        ? 'Applied when a new session connects from this host.'
+        : 'Applied on the next connect or reconnect for this tab.'
+
+    const updateTunnel = (id: string, partial: Partial<SshTunnel>): void => {
+      patch({
+        tunnels: form.tunnels.map((t) => (t.id === id ? { ...t, ...partial } : t))
+      })
+    }
+
+    const removeTunnel = (id: string): void => {
+      patch({ tunnels: form.tunnels.filter((t) => t.id !== id) })
+    }
+
+    const tunnelRows = (
+      <>
+        <div className="settings-row">
+          <div className="settings-row-label">
+            <strong>X11 forwarding</strong>
+            <span>
+              Forward remote X11 clients to the local display (DISPLAY / port 6000+N). {tunnelHint}
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={form.x11Forwarding}
+            onChange={(e) => patch({ x11Forwarding: e.target.checked })}
+          />
+        </div>
+        <div className="settings-row settings-row-block">
+          <div className="settings-row-label">
+            <strong>Tunnels</strong>
+            <span>
+              Local (L), remote (R), and dynamic SOCKS (D) forwards. {tunnelHint}
+            </span>
+          </div>
+          <div className="settings-tunnel-list">
+            {form.tunnels.map((tunnel) => {
+              const isDynamic = tunnel.type === TUNNEL_TYPE_DYNAMIC
+              return (
+                <div key={tunnel.id} className="settings-tunnel-card">
+                  <label className="settings-tunnel-enabled">
+                    <input
+                      type="checkbox"
+                      checked={tunnel.enabled}
+                      onChange={(e) => updateTunnel(tunnel.id, { enabled: e.target.checked })}
+                    />
+                    On
+                  </label>
+                  <select
+                    aria-label="Tunnel type"
+                    value={tunnel.type}
+                    onChange={(e) =>
+                      updateTunnel(tunnel.id, { type: e.target.value as TunnelType })
+                    }
+                  >
+                    <option value={TUNNEL_TYPE_LOCAL}>Local</option>
+                    <option value={TUNNEL_TYPE_REMOTE}>Remote</option>
+                    <option value={TUNNEL_TYPE_DYNAMIC}>Dynamic (SOCKS)</option>
+                  </select>
+                  <input
+                    type="text"
+                    aria-label="Listen host"
+                    placeholder="Listen host"
+                    value={tunnel.listenHost}
+                    onChange={(e) => updateTunnel(tunnel.id, { listenHost: e.target.value })}
+                  />
+                  <input
+                    type="number"
+                    aria-label="Listen port"
+                    placeholder="Port"
+                    min={TUNNEL_PORT_MIN}
+                    max={TUNNEL_PORT_MAX}
+                    value={tunnel.listenPort || ''}
+                    onChange={(e) =>
+                      updateTunnel(tunnel.id, {
+                        listenPort: Number(e.target.value) || 0
+                      })
+                    }
+                  />
+                  <input
+                    type="text"
+                    aria-label="Destination host"
+                    placeholder="Dest host"
+                    value={tunnel.destHost}
+                    disabled={isDynamic}
+                    onChange={(e) => updateTunnel(tunnel.id, { destHost: e.target.value })}
+                  />
+                  <input
+                    type="number"
+                    aria-label="Destination port"
+                    placeholder="Dest port"
+                    min={TUNNEL_PORT_MIN}
+                    max={TUNNEL_PORT_MAX}
+                    value={isDynamic ? '' : tunnel.destPort || ''}
+                    disabled={isDynamic}
+                    onChange={(e) =>
+                      updateTunnel(tunnel.id, {
+                        destPort: Number(e.target.value) || 0
+                      })
+                    }
+                  />
+                  <button type="button" onClick={() => removeTunnel(tunnel.id)}>
+                    Remove
+                  </button>
+                </div>
+              )
+            })}
+            <button
+              type="button"
+              className="settings-tunnel-add"
+              onClick={() => patch({ tunnels: [...form.tunnels, emptyTunnel()] })}
+            >
+              Add tunnel
+            </button>
+          </div>
+        </div>
+      </>
+    )
+
     const list: SettingsSection[] = [
       {
         id: 'connection',
         title: 'Connection',
         content: connectionRows
+      },
+      {
+        id: 'tunnels',
+        title: 'Tunnels',
+        content: tunnelRows
       },
       {
         id: 'appearance',
@@ -472,7 +611,8 @@ export default function HostSessionSettingsDialog({
         passphraseVaultId: form.passphraseVaultId || (passphrase ? `pp-${id}` : ''),
         authMethod: form.authMethod,
         proxyHostId: form.proxyHostId || '',
-        ...sessionStyleFrom(form)
+        ...sessionStyleFrom(form),
+        ...tunnelConfigFrom(form)
       }
       onSaveHost(host, password, passphrase)
       onClose()
@@ -482,6 +622,7 @@ export default function HostSessionSettingsDialog({
     onSaveSession({
       ...form,
       ...sessionStyleFrom(form),
+      ...tunnelConfigFrom(form),
       ephemeralPassword: password || form.ephemeralPassword,
       ephemeralPassphrase: passphrase || form.ephemeralPassphrase
     })

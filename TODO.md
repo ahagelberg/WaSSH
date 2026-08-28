@@ -1,9 +1,9 @@
 ## Basic ##
 - sudo helper
-- Colored tabs
+- ~~Colored tabs~~
 - Tab grouping like browsers
 
 ## Advanced ##
-- Tunnels
+- ~~Tunnels~~
 
 # Nice to have ##

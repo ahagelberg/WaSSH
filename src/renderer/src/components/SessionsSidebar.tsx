@@ -12,6 +12,39 @@ interface Props {
   onNewHost: () => void
 }
 
+/** Gap between gear button and menu */
+const HOST_MENU_GAP_PX = 4
+
+/** Approximate menu height (3 items) for flip-above calculation */
+const HOST_MENU_ESTIMATED_HEIGHT_PX = 120
+
+/** Minimum menu width; keep in sync with --host-menu-min-width */
+const HOST_MENU_MIN_WIDTH_PX = 120
+
+interface HostMenuState {
+  hostId: string
+  left: number
+  top: number
+}
+
+function menuPositionForGear(gear: DOMRect): { left: number; top: number } {
+  let left = gear.right - HOST_MENU_MIN_WIDTH_PX
+  if (left < 0) {
+    left = gear.left
+  }
+  if (left + HOST_MENU_MIN_WIDTH_PX > window.innerWidth) {
+    left = Math.max(0, window.innerWidth - HOST_MENU_MIN_WIDTH_PX)
+  }
+
+  const openBelow = gear.bottom + HOST_MENU_GAP_PX
+  const openAbove = gear.top - HOST_MENU_GAP_PX - HOST_MENU_ESTIMATED_HEIGHT_PX
+  const fitsBelow =
+    openBelow + HOST_MENU_ESTIMATED_HEIGHT_PX <= window.innerHeight
+  const top = fitsBelow ? openBelow : Math.max(0, openAbove)
+
+  return { left, top }
+}
+
 export default function SessionsSidebar({
   hosts,
   collapsed,
@@ -21,10 +54,10 @@ export default function SessionsSidebar({
   onDelete,
   onNewHost
 }: Props) {
-  const [menuHostId, setMenuHostId] = useState<string | null>(null)
+  const [menu, setMenu] = useState<HostMenuState | null>(null)
 
   useEffect(() => {
-    if (!menuHostId) {
+    if (!menu) {
       return
     }
     const close = (ev: MouseEvent): void => {
@@ -32,20 +65,33 @@ export default function SessionsSidebar({
       if (!(target instanceof Element)) {
         return
       }
-      if (target.closest('.host-item-menu')) {
+      if (target.closest('.host-item-menu') || target.closest('.host-context-menu')) {
         return
       }
-      setMenuHostId(null)
+      setMenu(null)
     }
+    const closeOnScroll = (): void => setMenu(null)
     document.addEventListener('mousedown', close)
-    return () => document.removeEventListener('mousedown', close)
-  }, [menuHostId])
+    document.addEventListener('scroll', closeOnScroll, true)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('scroll', closeOnScroll, true)
+    }
+  }, [menu])
 
-  const closeMenu = (): void => setMenuHostId(null)
+  const closeMenu = (): void => setMenu(null)
 
-  const toggleMenu = (hostId: string): void => {
-    setMenuHostId((prev) => (prev === hostId ? null : hostId))
+  const toggleMenu = (hostId: string, gearEl: HTMLElement): void => {
+    setMenu((prev) => {
+      if (prev?.hostId === hostId) {
+        return null
+      }
+      const { left, top } = menuPositionForGear(gearEl.getBoundingClientRect())
+      return { hostId, left, top }
+    })
   }
+
+  const menuHost = menu ? hosts.find((h) => h.id === menu.hostId) : undefined
 
   return (
     <aside className={`sidebar${collapsed ? ' collapsed' : ''}`}>
@@ -70,7 +116,7 @@ export default function SessionsSidebar({
                 const proxy = host.proxyHostId
                   ? hosts.find((h) => h.id === host.proxyHostId)
                   : null
-                const menuOpen = menuHostId === host.id
+                const menuOpen = menu?.hostId === host.id
                 return (
                   <div key={host.id} className="host-item">
                     <div
@@ -94,46 +140,11 @@ export default function SessionsSidebar({
                         aria-haspopup="menu"
                         onClick={(e) => {
                           e.stopPropagation()
-                          toggleMenu(host.id)
+                          toggleMenu(host.id, e.currentTarget)
                         }}
                       >
                         ⚙
                       </button>
-                      {menuOpen ? (
-                        <div className="host-context-menu" role="menu">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            onClick={() => {
-                              closeMenu()
-                              onConnect(host)
-                            }}
-                          >
-                            Open
-                          </button>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            onClick={() => {
-                              closeMenu()
-                              onEdit(host)
-                            }}
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            className="danger"
-                            onClick={() => {
-                              closeMenu()
-                              onDelete(host)
-                            }}
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      ) : null}
                     </div>
                   </div>
                 )
@@ -145,6 +156,45 @@ export default function SessionsSidebar({
               New host…
             </button>
           </div>
+          {menu && menuHost ? (
+            <div
+              className="host-context-menu"
+              role="menu"
+              style={{ left: menu.left, top: menu.top }}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closeMenu()
+                  onConnect(menuHost)
+                }}
+              >
+                Open
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closeMenu()
+                  onEdit(menuHost)
+                }}
+              >
+                Edit
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="danger"
+                onClick={() => {
+                  closeMenu()
+                  onDelete(menuHost)
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          ) : null}
         </>
       ) : null}
     </aside>

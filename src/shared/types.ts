@@ -1,6 +1,49 @@
 /** Default SSH port */
 export const DEFAULT_SSH_PORT = 22
 
+/** Default local bind address for tunnels */
+export const DEFAULT_TUNNEL_LISTEN_HOST = '127.0.0.1'
+
+/** Tunnel port range */
+export const TUNNEL_PORT_MIN = 1
+export const TUNNEL_PORT_MAX = 65535
+
+/** Local port forward (listen here → remote dest) */
+export const TUNNEL_TYPE_LOCAL = 'local'
+
+/** Remote port forward (listen on server → local dest) */
+export const TUNNEL_TYPE_REMOTE = 'remote'
+
+/** Dynamic SOCKS proxy (listen here) */
+export const TUNNEL_TYPE_DYNAMIC = 'dynamic'
+
+export type TunnelType =
+  | typeof TUNNEL_TYPE_LOCAL
+  | typeof TUNNEL_TYPE_REMOTE
+  | typeof TUNNEL_TYPE_DYNAMIC
+
+/** Default X11 forwarding off */
+export const DEFAULT_X11_FORWARDING = false
+
+/** Local X server host when DISPLAY is unset */
+export const DEFAULT_X11_HOST = '127.0.0.1'
+
+/** X11 TCP base port (display N → 6000+N) */
+export const X11_TCP_BASE_PORT = 6000
+
+export interface SshTunnel {
+  id: string
+  enabled: boolean
+  type: TunnelType
+  /** Bind address for the listening side */
+  listenHost: string
+  listenPort: number
+  /** Destination host (local/remote); unused for dynamic */
+  destHost: string
+  /** Destination port (local/remote); unused for dynamic */
+  destPort: number
+}
+
 /** Default terminal columns/rows before first fit */
 export const DEFAULT_TERM_COLS = 80
 export const DEFAULT_TERM_ROWS = 24
@@ -178,6 +221,10 @@ export interface HostProfile {
   cursorBlink: boolean
   /** Primary-buffer scrollback lines */
   scrollbackLines: number
+  /** Port forwards / SOCKS tunnels for this host */
+  tunnels: SshTunnel[]
+  /** Forward remote X11 clients to the local display */
+  x11Forwarding: boolean
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -211,6 +258,10 @@ export interface ConnectionParams {
   cursorBlink: boolean
   /** Primary-buffer scrollback lines */
   scrollbackLines: number
+  /** Port forwards / SOCKS tunnels for this session */
+  tunnels: SshTunnel[]
+  /** Forward remote X11 clients to the local display */
+  x11Forwarding: boolean
   /** Session-local password not yet vaulted (ephemeral) */
   ephemeralPassword: string
   ephemeralPassphrase: string

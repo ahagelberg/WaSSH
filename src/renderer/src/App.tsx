@@ -14,7 +14,7 @@ import {
   TAB_SNAPSHOT_DEBOUNCE_MS,
   TabSnapshot
 } from '@shared/types'
-import { sessionStyleFrom, hostToConnection } from '@shared/connection'
+import { sessionStyleFrom, hostToConnection, tunnelConfigFrom } from '@shared/connection'
 import SessionsSidebar from './components/SessionsSidebar'
 import QuickConnect from './components/QuickConnect'
 import TabBar from './components/TabBar'
@@ -67,7 +67,8 @@ function emptyHost(): HostProfile {
     passphraseVaultId: '',
     authMethod: 'none',
     proxyHostId: '',
-    ...sessionStyleFrom(null)
+    ...sessionStyleFrom(null),
+    ...tunnelConfigFrom(null)
   }
 }
 
@@ -101,7 +102,7 @@ export default function App() {
 
   const refreshHosts = useCallback(async () => {
     const list = await window.wassh.listHosts()
-    setHosts(list.map((h) => ({ ...h, ...sessionStyleFrom(h) })))
+    setHosts(list.map((h) => ({ ...h, ...sessionStyleFrom(h), ...tunnelConfigFrom(h) })))
   }, [])
 
   const persistTabs = useCallback(() => {
@@ -110,6 +111,7 @@ export default function App() {
       connection: {
         ...t.connection,
         ...sessionStyleFrom(t.connection),
+        ...tunnelConfigFrom(t.connection),
         ephemeralPassword: '',
         ephemeralPassphrase: ''
       },
@@ -170,7 +172,11 @@ export default function App() {
       }
       const restored: TabState[] = snapshot.map((t) => ({
         id: t.id,
-        connection: { ...t.connection, ...sessionStyleFrom(t.connection) },
+        connection: {
+          ...t.connection,
+          ...sessionStyleFrom(t.connection),
+          ...tunnelConfigFrom(t.connection)
+        },
         status: 'connecting'
       }))
       setTabs(restored)
@@ -384,7 +390,8 @@ export default function App() {
                 passphraseVaultId: '',
                 authMethod: tab.connection.authMethod,
                 proxyHostId: tab.connection.proxyHostId || '',
-                ...sessionStyleFrom(tab.connection)
+                ...sessionStyleFrom(tab.connection),
+                ...tunnelConfigFrom(tab.connection)
               },
               connected: false,
               linkTabId: id
