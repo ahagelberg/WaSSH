@@ -3,33 +3,97 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import type { AppSettings } from '@shared/types'
+import {
+  BELL_MODE_INVERT_LINE,
+  BELL_MODE_INVERT_WINDOW,
+  BELL_MODE_SYSTEM,
+  TAB_CYCLE_KEY,
+  type AppSettings,
+  type BellMode,
+  type CursorStyle
+} from '@shared/types'
+import { terminalFontStack } from '@shared/connection'
 
 /** Debounce resize observer notifications */
 const RESIZE_DEBOUNCE_MS = 50
+
+/** Visual BEL invert duration */
+const BELL_FLASH_MS = 200
+
+/** DECSCUSR: CSI Ps SP q */
+const DECSCUSR_INTERMEDIATE = ' '
+const DECSCUSR_FINAL = 'q'
 
 interface Props {
   tabId: string
   active: boolean
   settings: AppSettings
+  fontSizePx: number
+  fontFamily: string
+  bellMode: BellMode
+  cursorStyle: CursorStyle
+  cursorBlink: boolean
+  termBackground: string
+  termForeground: string
   onData: (tabId: string, data: string) => void
   onResize: (tabId: string, cols: number, rows: number) => void
   registerWriter: (tabId: string, write: (data: string) => void) => void
   unregisterWriter: (tabId: string) => void
 }
 
+function xtermThemeFromHost(el: HTMLElement) {
+  const styles = getComputedStyle(el)
+  const selection = styles.getPropertyValue('--term-selection').trim()
+  return {
+    background: styles.backgroundColor,
+    foreground: styles.color,
+    cursor: styles.color,
+    selectionBackground: selection
+  }
+}
+
+function positionBellLine(host: HTMLElement, term: Terminal, lineEl: HTMLElement): void {
+  const screen = host.querySelector('.xterm-screen')
+  if (!(screen instanceof HTMLElement) || term.rows <= 0) {
+    return
+  }
+  const hostRect = host.getBoundingClientRect()
+  const screenRect = screen.getBoundingClientRect()
+  const cellHeight = screenRect.height / term.rows
+  lineEl.style.left = `${screenRect.left - hostRect.left}px`
+  lineEl.style.top = `${screenRect.top - hostRect.top + term.buffer.active.cursorY * cellHeight}px`
+  lineEl.style.width = `${screenRect.width}px`
+  lineEl.style.height = `${cellHeight}px`
+}
+
 export default function TerminalView({
   tabId,
   active,
   settings,
+  fontSizePx,
+  fontFamily,
+  bellMode,
+  cursorStyle,
+  cursorBlink,
+  termBackground,
+  termForeground,
   onData,
   onResize,
   registerWriter,
   unregisterWriter
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
+  const bellLineRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
+  const bellModeRef = useRef(bellMode)
+  const cursorStyleRef = useRef(cursorStyle)
+  const cursorBlinkRef = useRef(cursorBlink)
+  const bellTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  bellModeRef.current = bellMode
+  cursorStyleRef.current = cursorStyle
+  cursorBlinkRef.current = cursorBlink
 
   useEffect(() => {
     const host = hostRef.current
@@ -38,18 +102,14 @@ export default function TerminalView({
     }
 
     const term = new Terminal({
-      cursorBlink: true,
+      cursorBlink,
+      cursorStyle,
       convertEol: false,
       scrollback: settings.scrollbackLines,
-      fontSize: settings.fontSizePx,
-      fontFamily: settings.fontFamily,
+      fontSize: fontSizePx,
+      fontFamily: terminalFontStack(fontFamily),
       allowProposedApi: true,
-      theme: {
-        background: '#0c0d0f',
-        foreground: '#e8eaed',
-        cursor: '#e8eaed',
-        selectionBackground: '#3d8bfd66'
-      }
+      theme: xtermThemeFromHost(host)
     })
     const fit = new FitAddon()
     const unicode = new Unicode11Addon()
@@ -58,16 +118,71 @@ export default function TerminalView({
     term.loadAddon(new WebLinksAddon())
     term.unicode.activeVersion = '11'
     term.open(host)
+    if (bellLineRef.current) {
+      host.appendChild(bellLineRef.current)
+    }
     fit.fit()
     term.focus()
 
+    const applyCursor = (): void => {
+      term.options.cursorStyle = cursorStyleRef.current
+      term.options.cursorBlink = cursorBlinkRef.current
+    }
+
     termRef.current = term
     fitRef.current = fit
-    registerWriter(tabId, (data) => term.write(data))
+    registerWriter(tabId, (data) => {
+      term.write(data)
+      applyCursor()
+    })
 
     const dataDisp = term.onData((data) => onData(tabId, data))
+    const cursorSeqDisp = term.parser.registerCsiHandler(
+      { intermediates: DECSCUSR_INTERMEDIATE, final: DECSCUSR_FINAL },
+      () => true
+    )
+
+    const clearBellFlash = (): void => {
+      delete host.dataset.bellFlash
+      if (bellTimerRef.current) {
+        clearTimeout(bellTimerRef.current)
+        bellTimerRef.current = null
+      }
+    }
+
+    const flashBell = (kind: 'window' | 'line'): void => {
+      if (kind === 'line' && bellLineRef.current) {
+        positionBellLine(host, term, bellLineRef.current)
+      }
+      host.dataset.bellFlash = kind
+      if (bellTimerRef.current) {
+        clearTimeout(bellTimerRef.current)
+      }
+      bellTimerRef.current = setTimeout(() => {
+        delete host.dataset.bellFlash
+        bellTimerRef.current = null
+      }, BELL_FLASH_MS)
+    }
+
+    const bellDisp = term.onBell(() => {
+      const mode = bellModeRef.current
+      if (mode === BELL_MODE_SYSTEM) {
+        void window.wassh.beep()
+        return
+      }
+      if (mode === BELL_MODE_INVERT_WINDOW) {
+        flashBell('window')
+        return
+      }
+      if (mode === BELL_MODE_INVERT_LINE) {
+        flashBell('line')
+      }
+    })
 
     term.attachCustomKeyEventHandler((ev) => {
+      if (ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key === TAB_CYCLE_KEY) {
+        return false
+      }
       const mod = ev.ctrlKey && ev.shiftKey
       if (mod && ev.key.toLowerCase() === 'c') {
         const sel = term.getSelection()
@@ -106,6 +221,9 @@ export default function TerminalView({
 
     return () => {
       dataDisp.dispose()
+      cursorSeqDisp.dispose()
+      bellDisp.dispose()
+      clearBellFlash()
       ro.disconnect()
       if (resizeTimer) {
         clearTimeout(resizeTimer)
@@ -115,7 +233,6 @@ export default function TerminalView({
       termRef.current = null
       fitRef.current = null
     }
-    // mount once per tab
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId])
 
@@ -125,11 +242,29 @@ export default function TerminalView({
       return
     }
     term.options.scrollback = settings.scrollbackLines
-    term.options.fontSize = settings.fontSizePx
-    term.options.fontFamily = settings.fontFamily
+    term.options.fontSize = fontSizePx
+    term.options.fontFamily = terminalFontStack(fontFamily)
     fitRef.current?.fit()
     onResize(tabId, term.cols, term.rows)
-  }, [settings.scrollbackLines, settings.fontSizePx, settings.fontFamily, tabId, onResize])
+  }, [settings.scrollbackLines, fontSizePx, fontFamily, tabId, onResize])
+
+  useEffect(() => {
+    const term = termRef.current
+    if (!term) {
+      return
+    }
+    term.options.cursorStyle = cursorStyle
+    term.options.cursorBlink = cursorBlink
+  }, [cursorStyle, cursorBlink])
+
+  useEffect(() => {
+    const term = termRef.current
+    const host = hostRef.current
+    if (!term || !host) {
+      return
+    }
+    term.options.theme = xtermThemeFromHost(host)
+  }, [termBackground, termForeground, settings.theme])
 
   useEffect(() => {
     if (!active) {
@@ -143,5 +278,14 @@ export default function TerminalView({
     }
   }, [active, tabId, onResize])
 
-  return <div className="terminal-host" ref={hostRef} />
+  return (
+    <div
+      className="terminal-host"
+      ref={hostRef}
+      data-term-bg={termBackground || undefined}
+      data-term-fg={termForeground || undefined}
+    >
+      <div className="terminal-bell-line" ref={bellLineRef} />
+    </div>
+  )
 }

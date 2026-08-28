@@ -5,17 +5,80 @@ export const DEFAULT_SSH_PORT = 22
 export const DEFAULT_TERM_COLS = 80
 export const DEFAULT_TERM_ROWS = 24
 
-/** Default scrollback lines (PuTTY-like) */
+/** Default scrollback lines */
 export const DEFAULT_SCROLLBACK_LINES = 10000
 
 /** Default font size in px */
 export const DEFAULT_FONT_SIZE_PX = 14
 
+/** Minimum terminal font size in px */
+export const FONT_SIZE_MIN_PX = 8
+
+/** Maximum terminal font size in px */
+export const FONT_SIZE_MAX_PX = 48
+
 /** Default TERM for PTY */
 export const DEFAULT_TERM_TYPE = 'xterm-256color'
 
+/** Bundled terminal fonts (always available) */
+export const BUNDLED_FONT_FAMILIES = ['JetBrains Mono', 'IBM Plex Mono'] as const
+
 /** Default font family for terminal */
-export const DEFAULT_FONT_FAMILY = 'Cascadia Mono, Consolas, monospace'
+export const DEFAULT_FONT_FAMILY: string = BUNDLED_FONT_FAMILIES[0]
+
+/** Empty host/session color: follow the active app theme */
+export const THEME_COLOR_UNSET = ''
+
+/** BEL: play the OS default sound */
+export const BELL_MODE_SYSTEM = 'system'
+
+/** BEL: invert the whole terminal briefly */
+export const BELL_MODE_INVERT_WINDOW = 'invertWindow'
+
+/** BEL: invert the current line briefly */
+export const BELL_MODE_INVERT_LINE = 'invertLine'
+
+export type BellMode =
+  | typeof BELL_MODE_SYSTEM
+  | typeof BELL_MODE_INVERT_WINDOW
+  | typeof BELL_MODE_INVERT_LINE
+
+/** Default BEL action */
+export const DEFAULT_BELL_MODE: BellMode = BELL_MODE_SYSTEM
+
+/** Cursor: filled cell */
+export const CURSOR_STYLE_BLOCK = 'block'
+
+/** Cursor: underline */
+export const CURSOR_STYLE_UNDERLINE = 'underline'
+
+/** Cursor: vertical bar */
+export const CURSOR_STYLE_BAR = 'bar'
+
+export type CursorStyle =
+  | typeof CURSOR_STYLE_BLOCK
+  | typeof CURSOR_STYLE_UNDERLINE
+  | typeof CURSOR_STYLE_BAR
+
+/** Default cursor shape */
+export const DEFAULT_CURSOR_STYLE: CursorStyle = CURSOR_STYLE_BLOCK
+
+/** Default cursor blink */
+export const DEFAULT_CURSOR_BLINK = true
+
+export type AppTheme = 'dark' | 'light'
+
+/** Default app theme */
+export const DEFAULT_THEME: AppTheme = 'dark'
+
+/**
+ * BrowserWindow background per theme.
+ * Keep in sync with `--bg-app` in app.css.
+ */
+export const THEME_WINDOW_BACKGROUND: Record<AppTheme, string> = {
+  dark: '#1b1d21',
+  light: '#f3f4f6'
+}
 
 /** Mid-session reconnect: initial backoff ms */
 export const RECONNECT_INITIAL_BACKOFF_MS = 1000
@@ -28,6 +91,15 @@ export const DEFAULT_RECONNECT_MAX_ATTEMPTS = 10
 
 /** Tab snapshot write debounce ms */
 export const TAB_SNAPSHOT_DEBOUNCE_MS = 500
+
+/** Keyboard key for cycling session tabs */
+export const TAB_CYCLE_KEY = 'Tab'
+
+/** Ctrl+Tab moves to the next session tab */
+export const TAB_CYCLE_NEXT = 1
+
+/** Ctrl+Shift+Tab moves to the previous session tab */
+export const TAB_CYCLE_PREV = -1
 
 /** Default main window width px */
 export const DEFAULT_WINDOW_WIDTH = 1280
@@ -63,6 +135,7 @@ export type SessionStatus =
   | 'connected'
   | 'reconnecting'
   | 'disconnected'
+  | 'closed'
   | 'failed'
 
 export type AuthMethod = 'password' | 'privateKey' | 'none'
@@ -81,6 +154,22 @@ export interface HostProfile {
   authMethod: AuthMethod
   /** Saved host id used as SSH jump/proxy; empty = direct */
   proxyHostId: string
+  /** Tab accent color (hex); empty = app theme */
+  tabColor: string
+  /** Terminal background (hex); empty = app theme */
+  termBackground: string
+  /** Terminal default text color (hex); empty = app theme */
+  termForeground: string
+  /** Terminal font size in px */
+  fontSizePx: number
+  /** Terminal font family */
+  fontFamily: string
+  /** Action when the remote sends BEL */
+  bellMode: BellMode
+  /** Cursor shape */
+  cursorStyle: CursorStyle
+  /** Whether the cursor blinks */
+  cursorBlink: boolean
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -96,6 +185,22 @@ export interface ConnectionParams {
   authMethod: AuthMethod
   /** Saved host id used as SSH jump/proxy; empty = direct */
   proxyHostId: string
+  /** Tab accent color (hex); empty = app theme */
+  tabColor: string
+  /** Terminal background (hex); empty = app theme */
+  termBackground: string
+  /** Terminal default text color (hex); empty = app theme */
+  termForeground: string
+  /** Terminal font size in px */
+  fontSizePx: number
+  /** Terminal font family */
+  fontFamily: string
+  /** Action when the remote sends BEL */
+  bellMode: BellMode
+  /** Cursor shape */
+  cursorStyle: CursorStyle
+  /** Whether the cursor blinks */
+  cursorBlink: boolean
   /** Session-local password not yet vaulted (ephemeral) */
   ephemeralPassword: string
   ephemeralPassphrase: string
@@ -112,11 +217,10 @@ export interface AppSettings {
   autoReconnectOnDrop: boolean
   reconnectMaxAttempts: number
   scrollbackLines: number
-  fontSizePx: number
-  fontFamily: string
   termType: string
   sidebarCollapsed: boolean
   windowBounds: WindowBounds | null
+  theme: AppTheme
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -124,11 +228,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoReconnectOnDrop: true,
   reconnectMaxAttempts: DEFAULT_RECONNECT_MAX_ATTEMPTS,
   scrollbackLines: DEFAULT_SCROLLBACK_LINES,
-  fontSizePx: DEFAULT_FONT_SIZE_PX,
-  fontFamily: DEFAULT_FONT_FAMILY,
   termType: DEFAULT_TERM_TYPE,
   sidebarCollapsed: false,
-  windowBounds: null
+  windowBounds: null,
+  theme: DEFAULT_THEME
 }
 
 export interface KnownHostEntry {
@@ -193,8 +296,11 @@ export interface WasshApi {
     hostName?: string
   ) => Promise<void>
   pickPrivateKeyFile: () => Promise<string | null>
+  beep: () => Promise<void>
   onSessionData: (cb: (tabId: string, data: string) => void) => () => void
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void
+  onCycleTab: (cb: (delta: number) => void) => () => void
+  onOpenPreferences: (cb: () => void) => () => void
   onHostKeyPrompt: (cb: (prompt: HostKeyPrompt) => void) => () => void
   onSavePasswordPrompt: (cb: (prompt: SavePasswordPrompt) => void) => () => void
 }

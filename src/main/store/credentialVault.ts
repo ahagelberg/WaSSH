@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 const VAULT_FILE = 'vault.json'
+const JSON_INDENT = 2
 
 type VaultFile = Record<string, string>
 
@@ -32,7 +33,7 @@ export class CredentialVault {
   }
 
   private persist(): void {
-    writeFileSync(this.path, JSON.stringify(this.cache), 'utf8')
+    writeFileSync(this.path, JSON.stringify(this.cache, null, JSON_INDENT), 'utf8')
   }
 
   set(vaultId: string, plaintext: string): void {

@@ -6,10 +6,20 @@ import {
   AppSettings,
   DEFAULT_SETTINGS,
   DEFAULT_SSH_PORT,
+  DEFAULT_THEME,
   HostProfile,
   KnownHostEntry,
-  TabSnapshot
+  TabSnapshot,
+  type AppTheme
 } from '../../shared/types'
+import { sessionStyleFrom } from '../../shared/connection'
+
+const HOSTS_FILE = 'hosts.json'
+const PREVIOUS_HOSTS_FILE = 'sessions.json'
+const TABS_FILE = 'tabs.json'
+const SETTINGS_FILE = 'settings.json'
+const KNOWN_HOSTS_FILE = 'known_hosts.json'
+const JSON_INDENT = 2
 
 function dataDir(): string {
   const dir = app.getPath('userData')
@@ -32,13 +42,21 @@ function readJson<T>(file: string, fallback: T): T {
 }
 
 function writeJson(file: string, value: unknown): void {
-  writeFileSync(join(dataDir(), file), JSON.stringify(value, null, 2), 'utf8')
+  writeFileSync(join(dataDir(), file), JSON.stringify(value, null, JSON_INDENT), 'utf8')
 }
 
-const SESSIONS_FILE = 'sessions.json'
-const TABS_FILE = 'tabs.json'
-const SETTINGS_FILE = 'settings.json'
-const KNOWN_HOSTS_FILE = 'known_hosts.json'
+type StoredSettings = Partial<AppSettings> & {
+  fontSizePx?: number
+  fontFamily?: string
+}
+
+function storedFontFallback(): { fontSizePx?: number; fontFamily?: string } {
+  const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
+  return {
+    fontSizePx: raw.fontSizePx,
+    fontFamily: raw.fontFamily
+  }
+}
 
 function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile {
   return {
@@ -51,32 +69,47 @@ function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile 
     privateKeyPath: raw.privateKeyPath ?? '',
     passphraseVaultId: raw.passphraseVaultId ?? '',
     authMethod: raw.authMethod ?? 'none',
-    proxyHostId: raw.proxyHostId ?? ''
+    proxyHostId: raw.proxyHostId ?? '',
+    ...sessionStyleFrom({ ...storedFontFallback(), ...raw })
   }
+}
+
+function readHostsFile(): Partial<HostProfile>[] {
+  const dir = dataDir()
+  const current = join(dir, HOSTS_FILE)
+  if (existsSync(current)) {
+    return readJson<Partial<HostProfile>[]>(HOSTS_FILE, [])
+  }
+  const previous = join(dir, PREVIOUS_HOSTS_FILE)
+  if (!existsSync(previous)) {
+    return []
+  }
+  const hosts = readJson<Partial<HostProfile>[]>(PREVIOUS_HOSTS_FILE, [])
+  writeJson(HOSTS_FILE, hosts)
+  return hosts
 }
 
 export class SessionStore {
   listHosts(): HostProfile[] {
-    return readJson<Partial<HostProfile>[]>(SESSIONS_FILE, []).map((h) =>
-      normalizeHost({ ...h, id: h.id ?? randomUUID() })
-    )
+    return readHostsFile().map((h) => normalizeHost({ ...h, id: h.id ?? randomUUID() }))
   }
 
   saveHost(host: HostProfile): HostProfile {
+    const next = normalizeHost({ ...host, id: host.id })
     const hosts = this.listHosts()
-    const idx = hosts.findIndex((h) => h.id === host.id)
+    const idx = hosts.findIndex((h) => h.id === next.id)
     if (idx >= 0) {
-      hosts[idx] = host
+      hosts[idx] = next
     } else {
-      hosts.push(host)
+      hosts.push(next)
     }
-    writeJson(SESSIONS_FILE, hosts)
-    return host
+    writeJson(HOSTS_FILE, hosts)
+    return next
   }
 
   deleteHost(id: string): void {
     writeJson(
-      SESSIONS_FILE,
+      HOSTS_FILE,
       this.listHosts().filter((h) => h.id !== id)
     )
   }
@@ -88,7 +121,14 @@ export class SessionStore {
 
 export class TabStore {
   getTabs(): TabSnapshot[] {
-    return readJson<TabSnapshot[]>(TABS_FILE, [])
+    const fallback = storedFontFallback()
+    return readJson<TabSnapshot[]>(TABS_FILE, []).map((t) => ({
+      ...t,
+      connection: {
+        ...t.connection,
+        ...sessionStyleFrom({ ...fallback, ...t.connection })
+      }
+    }))
   }
 
   saveTabs(tabs: TabSnapshot[]): void {
@@ -98,11 +138,16 @@ export class TabStore {
 
 export class SettingsStore {
   get(): AppSettings {
-    return { ...DEFAULT_SETTINGS, ...readJson<Partial<AppSettings>>(SETTINGS_FILE, {}) }
+    const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
+    const { fontSizePx: _fontSizePx, fontFamily: _fontFamily, ...rest } = raw
+    const theme: AppTheme = rest.theme === 'light' ? 'light' : DEFAULT_THEME
+    return { ...DEFAULT_SETTINGS, ...rest, theme }
   }
 
   set(partial: Partial<AppSettings>): AppSettings {
-    const next = { ...this.get(), ...partial }
+    const merged = { ...this.get(), ...partial }
+    const theme: AppTheme = merged.theme === 'light' ? 'light' : DEFAULT_THEME
+    const next = { ...merged, theme }
     writeJson(SETTINGS_FILE, next)
     return next
   }

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { DEFAULT_SSH_PORT, type ConnectionParams } from '@shared/types'
+import { sessionStyleFrom } from '@shared/connection'
 
 interface Props {
   onConnect: (connection: ConnectionParams) => void
@@ -27,6 +28,7 @@ export default function QuickConnect({ onConnect }: Props) {
       passphraseVaultId: '',
       authMethod: password ? 'password' : 'none',
       proxyHostId: '',
+      ...sessionStyleFrom(null),
       ephemeralPassword: password,
       ephemeralPassphrase: ''
     })

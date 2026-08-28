@@ -1,11 +1,13 @@
-import { BrowserWindow, dialog, ipcMain } from 'electron'
+import { BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
 import {
   AppSettings,
+  AppTheme,
   ConnectRequest,
   HostKeyDecision,
   HostProfile,
   SavePasswordDecision,
-  TabSnapshot
+  TabSnapshot,
+  THEME_WINDOW_BACKGROUND
 } from '../../shared/types'
 import { CredentialVault } from '../store/credentialVault'
 import {
@@ -15,6 +17,13 @@ import {
   TabStore
 } from '../store/sessionStore'
 import { SessionManager } from '../ssh/SessionManager'
+
+export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): void {
+  nativeTheme.themeSource = theme
+  if (win && !win.isDestroyed()) {
+    win.setBackgroundColor(THEME_WINDOW_BACKGROUND[theme])
+  }
+}
 
 export function registerIpc(
   vault: CredentialVault,
@@ -29,6 +38,7 @@ export function registerIpc(
   ipcMain.handle('settings:set', (_e, partial: Partial<AppSettings>) => {
     const next = settingsStore.set(partial)
     sessions.updateReconnectPolicies()
+    applyChromeTheme(next.theme, getWindow())
     return next
   })
 
@@ -75,6 +85,10 @@ export function registerIpc(
       sessions.respondSavePassword(tabId, decision, hostName)
     }
   )
+
+  ipcMain.handle('app:beep', () => {
+    shell.beep()
+  })
 
   ipcMain.handle('dialog:pickPrivateKey', async () => {
     const win = getWindow()

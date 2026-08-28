@@ -1,4 +1,120 @@
-import type { ConnectionParams, HostProfile } from './types'
+import {
+  BELL_MODE_INVERT_LINE,
+  BELL_MODE_INVERT_WINDOW,
+  BELL_MODE_SYSTEM,
+  BUNDLED_FONT_FAMILIES,
+  CURSOR_STYLE_BAR,
+  CURSOR_STYLE_BLOCK,
+  CURSOR_STYLE_UNDERLINE,
+  DEFAULT_BELL_MODE,
+  DEFAULT_CURSOR_BLINK,
+  DEFAULT_CURSOR_STYLE,
+  DEFAULT_FONT_FAMILY,
+  DEFAULT_FONT_SIZE_PX,
+  FONT_SIZE_MAX_PX,
+  FONT_SIZE_MIN_PX,
+  THEME_COLOR_UNSET,
+  type BellMode,
+  type ConnectionParams,
+  type CursorStyle,
+  type HostProfile
+} from './types'
+
+export interface SessionStyle {
+  tabColor: string
+  termBackground: string
+  termForeground: string
+  fontSizePx: number
+  fontFamily: string
+  bellMode: BellMode
+  cursorStyle: CursorStyle
+  cursorBlink: boolean
+}
+
+/** Hex values treated as theme default (empty) */
+const UNSET_TAB_COLOR_HEX = '#3d8bfd'
+const UNSET_TERM_BACKGROUND_HEX = '#0c0d0f'
+const UNSET_TERM_FOREGROUND_HEX = '#e8eaed'
+
+function colorOrTheme(value: string | undefined, unsetHex: string): string {
+  if (!value || value.trim().toLowerCase() === unsetHex) {
+    return THEME_COLOR_UNSET
+  }
+  return value
+}
+
+function bellModeOrDefault(value: string | undefined): BellMode {
+  if (
+    value === BELL_MODE_SYSTEM ||
+    value === BELL_MODE_INVERT_WINDOW ||
+    value === BELL_MODE_INVERT_LINE
+  ) {
+    return value
+  }
+  return DEFAULT_BELL_MODE
+}
+
+function cursorStyleOrDefault(value: string | undefined): CursorStyle {
+  if (
+    value === CURSOR_STYLE_BLOCK ||
+    value === CURSOR_STYLE_UNDERLINE ||
+    value === CURSOR_STYLE_BAR
+  ) {
+    return value
+  }
+  return DEFAULT_CURSOR_STYLE
+}
+
+function fontFamilyOrDefault(value: string | undefined): string {
+  const first = value?.split(',')[0]?.trim().replace(/^["']|["']$/g, '')
+  return first || DEFAULT_FONT_FAMILY
+}
+
+function quoteFontFamily(name: string): string {
+  if (name === 'monospace') {
+    return name
+  }
+  return `"${name.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+export function terminalFontStack(family: string): string {
+  const names = [fontFamilyOrDefault(family), ...BUNDLED_FONT_FAMILIES, 'monospace']
+  const unique: string[] = []
+  for (const name of names) {
+    if (!unique.includes(name)) {
+      unique.push(name)
+    }
+  }
+  return unique.map(quoteFontFamily).join(', ')
+}
+
+function fontSizeOrDefault(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_FONT_SIZE_PX
+  }
+  if (value < FONT_SIZE_MIN_PX) {
+    return FONT_SIZE_MIN_PX
+  }
+  if (value > FONT_SIZE_MAX_PX) {
+    return FONT_SIZE_MAX_PX
+  }
+  return value
+}
+
+export function sessionStyleFrom(
+  src: Partial<SessionStyle> | null | undefined
+): SessionStyle {
+  return {
+    tabColor: colorOrTheme(src?.tabColor, UNSET_TAB_COLOR_HEX),
+    termBackground: colorOrTheme(src?.termBackground, UNSET_TERM_BACKGROUND_HEX),
+    termForeground: colorOrTheme(src?.termForeground, UNSET_TERM_FOREGROUND_HEX),
+    fontSizePx: fontSizeOrDefault(src?.fontSizePx),
+    fontFamily: fontFamilyOrDefault(src?.fontFamily),
+    bellMode: bellModeOrDefault(src?.bellMode),
+    cursorStyle: cursorStyleOrDefault(src?.cursorStyle),
+    cursorBlink: typeof src?.cursorBlink === 'boolean' ? src.cursorBlink : DEFAULT_CURSOR_BLINK
+  }
+}
 
 export function hostDisplayName(host: Pick<HostProfile, 'name' | 'host'>): string {
   const trimmed = (host.name ?? '').trim()
@@ -20,6 +136,7 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     passphraseVaultId: host.passphraseVaultId,
     authMethod: host.authMethod,
     proxyHostId: host.proxyHostId || '',
+    ...sessionStyleFrom(host),
     ephemeralPassword: '',
     ephemeralPassphrase: ''
   }

@@ -3,7 +3,7 @@ import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
 import { Client, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import { Readable } from 'stream'
-import { proxyLabel, resolveProxyChain } from '../../shared/connection'
+import { sessionStyleFrom, proxyLabel, resolveProxyChain } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_TERM_COLS,
@@ -22,6 +22,8 @@ import { KnownHostsStore, SessionStore } from '../store/sessionStore'
 
 /** SSH connect ready timeout ms */
 const CONNECT_READY_TIMEOUT_MS = 20000
+/** Status when the remote shell ends (logout / exit), not a network drop */
+const SESSION_CLOSED_MESSAGE = 'Session closed'
 
 export class SshConnection extends EventEmitter {
   private client: Client | null = null
@@ -43,6 +45,8 @@ export class SshConnection extends EventEmitter {
   private intentionalDisconnect = false
   private authInputActive = false
   private everConnected = false
+  /** True after the remote shell sent an exit-status / exit-signal (logout, not a drop) */
+  private remoteShellExited = false
 
   constructor(
     readonly tabId: string,
@@ -74,6 +78,7 @@ export class SshConnection extends EventEmitter {
     this.intentionalDisconnect = false
     this.reconnectAttempt = 0
     this.everConnected = false
+    this.remoteShellExited = false
     await this.open()
   }
 
@@ -119,7 +124,8 @@ export class SshConnection extends EventEmitter {
       privateKeyPath: this.connection.privateKeyPath,
       passphraseVaultId: this.connection.passphraseVaultId,
       authMethod: 'password',
-      proxyHostId: this.connection.proxyHostId || ''
+      proxyHostId: this.connection.proxyHostId || '',
+      ...sessionStyleFrom(this.connection)
     })
     this.connection.hostId = id
     this.connection.name = name
@@ -429,6 +435,7 @@ export class SshConnection extends EventEmitter {
     }
     this.clearReconnectTimer()
     this.closeClientOnly()
+    this.remoteShellExited = false
     this.emitStatus('connecting')
 
     let chain: ConnectionParams[]
@@ -525,6 +532,9 @@ export class SshConnection extends EventEmitter {
         stream.stderr.on('data', (data: Buffer) => {
           this.emit('data', data.toString('utf8'))
         })
+        stream.on('exit', () => {
+          this.remoteShellExited = true
+        })
         stream.on('close', () => {
           this.stream = null
           if (this.intentionalDisconnect || this.disposed) {
@@ -532,7 +542,12 @@ export class SshConnection extends EventEmitter {
             resolve()
             return
           }
-          this.emitStatus('disconnected', 'Session closed')
+          if (this.remoteShellExited) {
+            this.endAfterRemoteLogout()
+            resolve()
+            return
+          }
+          this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
           this.scheduleReconnect()
           resolve()
         })
@@ -549,8 +564,18 @@ export class SshConnection extends EventEmitter {
     })
   }
 
+  private endAfterRemoteLogout(): void {
+    this.intentionalDisconnect = true
+    this.clearReconnectTimer()
+    this.closeClientOnly()
+    this.emitStatus('closed', SESSION_CLOSED_MESSAGE)
+  }
+
   private scheduleReconnect(): void {
     if (!this.autoReconnect || this.intentionalDisconnect || this.disposed || !this.everConnected) {
+      return
+    }
+    if (this.reconnectTimer) {
       return
     }
     if (this.reconnectAttempt >= this.maxReconnectAttempts) {

@@ -96,7 +96,7 @@
   gap: 16px;
   align-items: center;
   padding: 10px 0;
-  border-bottom: 1px solid rgba(58, 63, 72, 0.5);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
 }
 
 .settings-row-label {
@@ -116,6 +116,28 @@
 .settings-row input[type='checkbox'] {
   width: auto;
   justify-self: start;
+}
+
+.settings-row input[type='color'] {
+  width: 48px;
+  height: 32px;
+  padding: 2px;
+  cursor: pointer;
+}
+
+.settings-color-field {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  justify-self: start;
+}
+
+.settings-theme-default {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .settings-footer {

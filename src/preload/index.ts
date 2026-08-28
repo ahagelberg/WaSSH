@@ -46,10 +46,13 @@ const api: WasshApi = {
   respondSavePassword: (tabId: string, decision: SavePasswordDecision, hostName?: string) =>
     ipcRenderer.invoke('session:respondSavePassword', tabId, decision, hostName),
   pickPrivateKeyFile: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
+  beep: () => ipcRenderer.invoke('app:beep'),
   onSessionData: (cb) =>
     on('session:data', (tabId, data) => cb(tabId as string, data as string)),
   onSessionStatus: (cb) =>
     on('session:status', (ev) => cb(ev as SessionStatusEvent)),
+  onCycleTab: (cb) => on('tabs:cycle', (delta) => cb(delta as number)),
+  onOpenPreferences: (cb) => on('app:openPreferences', () => cb()),
   onHostKeyPrompt: (cb) =>
     on('session:hostKeyPrompt', (prompt) => cb(prompt as HostKeyPrompt)),
   onSavePasswordPrompt: (cb) =>

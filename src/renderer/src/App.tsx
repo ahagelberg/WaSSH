@@ -6,6 +6,7 @@ import {
   DEFAULT_SSH_PORT,
   DEFAULT_TERM_COLS,
   DEFAULT_TERM_ROWS,
+  DEFAULT_THEME,
   HostKeyPrompt,
   HostProfile,
   SavePasswordPrompt,
@@ -13,7 +14,7 @@ import {
   TAB_SNAPSHOT_DEBOUNCE_MS,
   TabSnapshot
 } from '@shared/types'
-import { hostToConnection } from '@shared/connection'
+import { sessionStyleFrom, hostToConnection } from '@shared/connection'
 import SessionsSidebar from './components/SessionsSidebar'
 import QuickConnect from './components/QuickConnect'
 import TabBar from './components/TabBar'
@@ -42,6 +43,18 @@ function titleOf(c: ConnectionParams): string {
   return c.host
 }
 
+function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
+  return tabs.slice().sort((a, b) => {
+    if (a.id < b.id) {
+      return -1
+    }
+    if (a.id > b.id) {
+      return 1
+    }
+    return 0
+  })
+}
+
 function emptyHost(): HostProfile {
   return {
     id: crypto.randomUUID(),
@@ -53,7 +66,8 @@ function emptyHost(): HostProfile {
     privateKeyPath: '',
     passphraseVaultId: '',
     authMethod: 'none',
-    proxyHostId: ''
+    proxyHostId: '',
+    ...sessionStyleFrom(null)
   }
 }
 
@@ -67,6 +81,8 @@ export default function App() {
     mode: HostSessionMode
     initial: ConnectionParams | HostProfile
     connected: boolean
+    /** Tab to link when saving a new host from an open session */
+    linkTabId?: string
   } | null>(null)
   const [saveAsHostName, setSaveAsHostName] = useState('')
   const writers = useRef<Map<string, (data: string) => void>>(new Map())
@@ -79,8 +95,13 @@ export default function App() {
   activeRef.current = activeTabId
   settingsRef.current = settings
 
+  useEffect(() => {
+    document.documentElement.dataset.theme = settings.theme || DEFAULT_THEME
+  }, [settings.theme])
+
   const refreshHosts = useCallback(async () => {
-    setHosts(await window.wassh.listHosts())
+    const list = await window.wassh.listHosts()
+    setHosts(list.map((h) => ({ ...h, ...sessionStyleFrom(h) })))
   }, [])
 
   const persistTabs = useCallback(() => {
@@ -88,6 +109,7 @@ export default function App() {
       id: t.id,
       connection: {
         ...t.connection,
+        ...sessionStyleFrom(t.connection),
         ephemeralPassword: '',
         ephemeralPassphrase: ''
       },
@@ -148,7 +170,7 @@ export default function App() {
       }
       const restored: TabState[] = snapshot.map((t) => ({
         id: t.id,
-        connection: t.connection,
+        connection: { ...t.connection, ...sessionStyleFrom(t.connection) },
         status: 'connecting'
       }))
       setTabs(restored)
@@ -160,11 +182,50 @@ export default function App() {
     })()
   }, [refreshHosts, connectTab])
 
+  const closeTab = useCallback((id: string): void => {
+    void window.wassh.disconnect(id)
+    setTabs((prev) => {
+      const next = prev.filter((t) => t.id !== id)
+      if (activeRef.current === id) {
+        setActiveTabId(next[next.length - 1]?.id ?? null)
+      }
+      return next
+    })
+  }, [])
+
+  const reorderTabs = useCallback((fromId: string, insertIndex: number): void => {
+    setTabs((prev) => {
+      const from = prev.findIndex((t) => t.id === fromId)
+      if (from < 0 || insertIndex < 0 || insertIndex >= prev.length || from === insertIndex) {
+        return prev
+      }
+      const next = prev.slice()
+      const [item] = next.splice(from, 1)
+      next.splice(insertIndex, 0, item)
+      return next
+    })
+  }, [])
+
+  const cycleTab = useCallback((delta: number): void => {
+    const list = tabsRef.current
+    if (list.length === 0) {
+      return
+    }
+    const idx = list.findIndex((t) => t.id === activeRef.current)
+    const from = idx < 0 ? 0 : idx
+    const nextIndex = (from + delta + list.length) % list.length
+    setActiveTabId(list[nextIndex].id)
+  }, [])
+
   useEffect(() => {
     const offData = window.wassh.onSessionData((tabId, data) => {
       writers.current.get(tabId)?.(data)
     })
     const offStatus = window.wassh.onSessionStatus((ev) => {
+      if (ev.status === 'closed') {
+        closeTab(ev.tabId)
+        return
+      }
       setTabs((prev) =>
         prev.map((t) =>
           t.id === ev.tabId
@@ -190,24 +251,19 @@ export default function App() {
         setSaveAsHostName(tab ? titleOf(tab.connection) : '')
       }
     })
+    const offCycle = window.wassh.onCycleTab(cycleTab)
+    const offPrefs = window.wassh.onOpenPreferences(() => {
+      setShowOptions(true)
+    })
     return () => {
       offData()
       offStatus()
       offHostKey()
       offSavePwd()
+      offCycle()
+      offPrefs()
     }
-  }, [refreshHosts])
-
-  const closeTab = (id: string): void => {
-    void window.wassh.disconnect(id)
-    setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== id)
-      if (activeTabId === id) {
-        setActiveTabId(next[next.length - 1]?.id ?? null)
-      }
-      return next
-    })
-  }
+  }, [refreshHosts, closeTab, cycleTab])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
     void window.wassh.setSettings(partial).then(setSettings)
@@ -276,76 +332,74 @@ export default function App() {
       </div>
 
       <div className="main-pane">
-        <div className="toolbar">
-          <strong>WaSSH</strong>
-          <div className="toolbar-spacer" />
-          {activeTab ? (
-            <>
-              <button
-                type="button"
-                onClick={() =>
-                  setHostEditor({
-                    mode: 'editOpenSession',
-                    initial: activeTab.connection,
-                    connected: activeTab.status === 'connected'
-                  })
-                }
-              >
-                Session
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  void window.wassh.disconnect(activeTab.id)
-                  void connectTab(activeTab.id, activeTab.connection)
-                }}
-              >
-                Reconnect
-              </button>
-              {!activeTab.connection.hostId ? (
-                <button
-                  type="button"
-                  onClick={() =>
-                    setHostEditor({
-                      mode: 'editHost',
-                      initial: {
-                        id: crypto.randomUUID(),
-                        name: titleOf(activeTab.connection),
-                        host: activeTab.connection.host,
-                        port: activeTab.connection.port,
-                        username: activeTab.connection.username,
-                        passwordVaultId: '',
-                        privateKeyPath: activeTab.connection.privateKeyPath,
-                        passphraseVaultId: '',
-                        authMethod: activeTab.connection.authMethod,
-                        proxyHostId: activeTab.connection.proxyHostId || ''
-                      },
-                      connected: false
-                    })
-                  }
-                >
-                  Save as host…
-                </button>
-              ) : null}
-            </>
-          ) : null}
-          <button type="button" onClick={() => setShowOptions(true)}>
-            Options
-          </button>
-        </div>
-
         <TabBar
           tabs={tabs.map((t) => ({
             id: t.id,
             title: titleOf(t.connection),
             status: t.status,
-            active: t.id === activeTabId
+            active: t.id === activeTabId,
+            tabColor: sessionStyleFrom(t.connection).tabColor,
+            canSaveAsHost: !t.connection.hostId
           }))}
           onSelect={setActiveTabId}
           onClose={closeTab}
+          onReorder={reorderTabs}
+          onReconnect={(id) => {
+            const tab = tabsRef.current.find((t) => t.id === id)
+            if (!tab) {
+              return
+            }
+            void window.wassh.disconnect(id)
+            void connectTab(id, tab.connection)
+          }}
+          onConfigure={(id) => {
+            const tab = tabsRef.current.find((t) => t.id === id)
+            if (!tab) {
+              return
+            }
+            setActiveTabId(id)
+            setHostEditor({
+              mode: 'editOpenSession',
+              initial: tab.connection,
+              connected: tab.status === 'connected',
+              linkTabId: id
+            })
+          }}
+          onSaveAsHost={(id) => {
+            const tab = tabsRef.current.find((t) => t.id === id)
+            if (!tab) {
+              return
+            }
+            setActiveTabId(id)
+            setHostEditor({
+              mode: 'editHost',
+              initial: {
+                id: crypto.randomUUID(),
+                name: titleOf(tab.connection),
+                host: tab.connection.host,
+                port: tab.connection.port,
+                username: tab.connection.username,
+                passwordVaultId: '',
+                privateKeyPath: tab.connection.privateKeyPath,
+                passphraseVaultId: '',
+                authMethod: tab.connection.authMethod,
+                proxyHostId: tab.connection.proxyHostId || '',
+                ...sessionStyleFrom(tab.connection)
+              },
+              connected: false,
+              linkTabId: id
+            })
+          }}
         />
 
-        <div className="terminal-area">
+        <div
+          className="terminal-area"
+          data-term-bg={
+            activeTab
+              ? sessionStyleFrom(activeTab.connection).termBackground || undefined
+              : undefined
+          }
+        >
           {activeTab?.hostKeyPrompt ? (
             <div className="inline-banner warn">
               <div className="msg">
@@ -453,7 +507,7 @@ export default function App() {
             </div>
           ) : (
             <div className="terminal-stack">
-              {tabs.map((t) => (
+              {tabsByStablePaneOrder(tabs).map((t) => (
                 <div
                   key={t.id}
                   className={`terminal-pane${t.id === activeTabId ? ' active' : ''}`}
@@ -462,6 +516,13 @@ export default function App() {
                     tabId={t.id}
                     active={t.id === activeTabId}
                     settings={settings}
+                    fontSizePx={sessionStyleFrom(t.connection).fontSizePx}
+                    fontFamily={sessionStyleFrom(t.connection).fontFamily}
+                    bellMode={sessionStyleFrom(t.connection).bellMode}
+                    cursorStyle={sessionStyleFrom(t.connection).cursorStyle}
+                    cursorBlink={sessionStyleFrom(t.connection).cursorBlink}
+                    termBackground={sessionStyleFrom(t.connection).termBackground}
+                    termForeground={sessionStyleFrom(t.connection).termForeground}
                     onData={onTermData}
                     onResize={onTermResize}
                     registerWriter={registerWriter}
@@ -491,31 +552,35 @@ export default function App() {
           pickPrivateKey={() => window.wassh.pickPrivateKeyFile()}
           onClose={() => setHostEditor(null)}
           onSaveHost={(host, password, passphrase) => {
+            const linkTabId = hostEditor.linkTabId
             void saveHost(host, password, passphrase)
-            if (activeTab && !activeTab.connection.hostId) {
-              setTabs((prev) =>
-                prev.map((t) =>
-                  t.id === activeTab.id
-                    ? {
-                        ...t,
-                        connection: {
-                          ...t.connection,
-                          hostId: host.id,
-                          name: host.name,
-                          passwordVaultId: host.passwordVaultId
-                        }
-                      }
-                    : t
-                )
-              )
-            }
-          }}
-          onSaveSession={(connection) => {
-            if (!activeTab) {
+            if (!linkTabId) {
               return
             }
             setTabs((prev) =>
-              prev.map((t) => (t.id === activeTab.id ? { ...t, connection } : t))
+              prev.map((t) =>
+                t.id === linkTabId && !t.connection.hostId
+                  ? {
+                      ...t,
+                      connection: {
+                        ...t.connection,
+                        hostId: host.id,
+                        passwordVaultId: host.passwordVaultId || t.connection.passwordVaultId,
+                        passphraseVaultId:
+                          host.passphraseVaultId || t.connection.passphraseVaultId
+                      }
+                    }
+                  : t
+              )
+            )
+          }}
+          onSaveSession={(connection) => {
+            const tabId = hostEditor.linkTabId
+            if (!tabId) {
+              return
+            }
+            setTabs((prev) =>
+              prev.map((t) => (t.id === tabId ? { ...t, connection } : t))
             )
           }}
         />
