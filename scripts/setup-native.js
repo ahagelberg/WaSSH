@@ -9,6 +9,11 @@ const ROOT = resolve(__dirname, '..')
 const ELECTRON_DIR = join(ROOT, 'node_modules', 'electron')
 /** ssh2 package dir */
 const SSH2_DIR = join(ROOT, 'node_modules', 'ssh2')
+/** electron-rebuild CLI (Windows uses .cmd) */
+const ELECTRON_REBUILD =
+  platform() === 'win32'
+    ? join(ROOT, 'node_modules', '.bin', 'electron-rebuild.cmd')
+    : join(ROOT, 'node_modules', '.bin', 'electron-rebuild')
 /** Windows electron exe name */
 const ELECTRON_EXE = 'electron.exe'
 
@@ -107,5 +112,23 @@ function ensureSsh2() {
   runNodeScript(join(SSH2_DIR, 'install.js'))
 }
 
+function rebuildSerialport() {
+  if (!existsSync(join(ROOT, 'node_modules', 'serialport'))) {
+    return
+  }
+  if (!existsSync(ELECTRON_REBUILD)) {
+    return
+  }
+  const result = spawnSync(ELECTRON_REBUILD, ['-f', '-w', 'serialport'], {
+    cwd: ROOT,
+    stdio: 'inherit',
+    shell: platform() === 'win32'
+  })
+  if (result.status !== 0) {
+    console.warn('electron-rebuild serialport failed; serial connections may not work until rebuild succeeds')
+  }
+}
+
 ensureElectron()
 ensureSsh2()
+rebuildSerialport()

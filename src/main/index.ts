@@ -163,3 +163,4 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   sessions?.disposeAll()
 })
+

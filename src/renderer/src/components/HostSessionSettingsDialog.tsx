@@ -4,6 +4,9 @@ import {
   BELL_MODE_INVERT_WINDOW,
   BELL_MODE_SYSTEM,
   BUNDLED_FONT_FAMILIES,
+  CONNECTION_TYPE_SERIAL,
+  CONNECTION_TYPE_SSH,
+  CONNECTION_TYPE_TELNET,
   CURSOR_STYLE_BAR,
   CURSOR_STYLE_BLOCK,
   CURSOR_STYLE_UNDERLINE,
@@ -11,11 +14,28 @@ import {
   DEFAULT_CURSOR_STYLE,
   DEFAULT_FONT_SIZE_PX,
   DEFAULT_SCROLLBACK_LINES,
-  DEFAULT_SSH_PORT,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
+  SERIAL_BAUD_MAX,
+  SERIAL_BAUD_MIN,
+  SERIAL_BAUD_RATES,
+  SERIAL_DATA_BITS_5,
+  SERIAL_DATA_BITS_6,
+  SERIAL_DATA_BITS_7,
+  SERIAL_DATA_BITS_8,
+  SERIAL_FLOW_NONE,
+  SERIAL_FLOW_RTSCTS,
+  SERIAL_FLOW_XONXOFF,
+  SERIAL_PARITY_EVEN,
+  SERIAL_PARITY_MARK,
+  SERIAL_PARITY_NONE,
+  SERIAL_PARITY_ODD,
+  SERIAL_PARITY_SPACE,
+  SERIAL_STOP_BITS_1,
+  SERIAL_STOP_BITS_1_5,
+  SERIAL_STOP_BITS_2,
   TUNNEL_PORT_MAX,
   TUNNEL_PORT_MIN,
   TUNNEL_TYPE_DYNAMIC,
@@ -24,19 +44,29 @@ import {
   type AuthMethod,
   type BellMode,
   type ConnectionParams,
+  type ConnectionType,
   type CursorStyle,
   type HostProfile,
+  type SerialDataBits,
+  type SerialFlowControl,
+  type SerialParity,
+  type SerialStopBits,
   type SshTunnel,
   type TunnelType
 } from '@shared/types'
 import {
+  connectionTypeOf,
+  defaultPortForType,
   emptyTunnel,
   hostToConnection,
+  isSshConnectionType,
+  protocolConfigFrom,
   sessionStyleFrom,
   tunnelConfigFrom
 } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
+import SerialPortField from './SerialPortField'
 
 export type HostSessionMode = 'editHost' | 'editOpenSession'
 
@@ -56,6 +86,7 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
     return {
       ...initial,
       proxyHostId: initial.proxyHostId || '',
+      ...protocolConfigFrom(initial),
       ...sessionStyleFrom(initial),
       ...tunnelConfigFrom(initial)
     }
@@ -149,10 +180,32 @@ export default function HostSessionSettingsDialog({
   const identityLocked = mode === 'editOpenSession' && connected
   const editingHostId =
     mode === 'editHost' && 'id' in initial ? initial.id : form.hostId || ''
-  const proxyOptions = hosts.filter((h) => h.id !== editingHostId)
+  const connType = connectionTypeOf(form)
+  const isSsh = isSshConnectionType(connType)
+  const isSerial = connType === CONNECTION_TYPE_SERIAL
+  const proxyOptions = hosts.filter(
+    (h) => h.id !== editingHostId && isSshConnectionType(connectionTypeOf(h))
+  )
 
   const patch = (partial: Partial<ConnectionParams>): void => {
     setForm((prev) => ({ ...prev, ...partial }))
+  }
+
+  const changeType = (next: ConnectionType): void => {
+    const prevType = connectionTypeOf(form)
+    const prevDefault = defaultPortForType(prevType)
+    const nextDefault = defaultPortForType(next)
+    const port =
+      next === CONNECTION_TYPE_SERIAL
+        ? 0
+        : form.port === prevDefault || form.port === 0
+          ? nextDefault
+          : form.port
+    patch({
+      connectionType: next,
+      port,
+      proxyHostId: next === CONNECTION_TYPE_SSH ? form.proxyHostId : ''
+    })
   }
 
   useEffect(() => {
@@ -177,137 +230,269 @@ export default function HostSessionSettingsDialog({
         ) : null}
         <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
           <div className="settings-row-label">
-            <strong>Host</strong>
-            <span>Hostname or IP.</span>
-          </div>
-          <input
-            type="text"
-            value={form.host}
-            onChange={(e) => patch({ host: e.target.value })}
-            readOnly={identityLocked}
-          />
-        </div>
-        <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
-          <div className="settings-row-label">
-            <strong>Port</strong>
-            <span>SSH port.</span>
-          </div>
-          <input
-            type="number"
-            value={form.port}
-            onChange={(e) => patch({ port: Number(e.target.value) || DEFAULT_SSH_PORT })}
-            readOnly={identityLocked}
-          />
-        </div>
-        <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
-          <div className="settings-row-label">
-            <strong>Username</strong>
-            <span>Leave empty to prompt in the terminal.</span>
-          </div>
-          <input
-            type="text"
-            value={form.username}
-            onChange={(e) => patch({ username: e.target.value })}
-            readOnly={identityLocked}
-          />
-        </div>
-        <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
-          <div className="settings-row-label">
-            <strong>Auth method</strong>
-            <span>Preferred authentication.</span>
+            <strong>Type</strong>
+            <span>SSH, Telnet, or serial.</span>
           </div>
           <select
-            value={form.authMethod}
-            onChange={(e) => patch({ authMethod: e.target.value as AuthMethod })}
+            value={connType}
+            onChange={(e) => changeType(e.target.value as ConnectionType)}
             disabled={identityLocked}
           >
-            <option value="password">Password</option>
-            <option value="privateKey">Private key</option>
-            <option value="none">Prompt / none stored</option>
+            <option value={CONNECTION_TYPE_SSH}>SSH</option>
+            <option value={CONNECTION_TYPE_TELNET}>Telnet</option>
+            <option value={CONNECTION_TYPE_SERIAL}>Serial</option>
           </select>
         </div>
-        {!identityLocked ? (
-          <div className="settings-row">
-            <div className="settings-row-label">
-              <strong>Password</strong>
-              <span>
-                {mode === 'editHost'
-                  ? 'Stored in host settings (vaulted). Empty = prompt in terminal.'
-                  : 'Session-local only; does not update the saved host.'}
-              </span>
+        {isSerial ? (
+          <>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Serial port</strong>
+                <span>Detected ports are listed; you can also type any path.</span>
+              </div>
+              <SerialPortField
+                id="host-serial-port"
+                listId="host-serial-ports"
+                value={form.host}
+                disabled={identityLocked}
+                onChange={(host) => patch({ host })}
+              />
             </div>
-            <input
-              type="password"
-              value={password}
-              placeholder={form.passwordVaultId ? '(stored)' : ''}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </div>
-        ) : null}
-        <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
-          <div className="settings-row-label">
-            <strong>Private key path</strong>
-            <span>Path to OpenSSH private key file.</span>
-          </div>
-          <div className="stack">
-            <input
-              type="text"
-              value={form.privateKeyPath}
-              onChange={(e) => patch({ privateKeyPath: e.target.value })}
-              readOnly={identityLocked}
-            />
-            {!identityLocked ? (
-              <button
-                type="button"
-                onClick={() => {
-                  void pickPrivateKey().then((p) => {
-                    if (p) {
-                      patch({ privateKeyPath: p, authMethod: 'privateKey' })
-                    }
-                  })
-                }}
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Baud rate</strong>
+                <span>Common rates are suggested; any value in range is allowed.</span>
+              </div>
+              <div className="stack">
+                <input
+                  type="number"
+                  list="host-baud-rates"
+                  min={SERIAL_BAUD_MIN}
+                  max={SERIAL_BAUD_MAX}
+                  value={form.serialBaudRate}
+                  readOnly={identityLocked}
+                  onChange={(e) =>
+                    patch({ serialBaudRate: Number(e.target.value) || form.serialBaudRate })
+                  }
+                />
+                <datalist id="host-baud-rates">
+                  {SERIAL_BAUD_RATES.map((rate) => (
+                    <option key={rate} value={rate} />
+                  ))}
+                </datalist>
+              </div>
+            </div>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Data bits</strong>
+              </div>
+              <select
+                value={form.serialDataBits}
+                disabled={identityLocked}
+                onChange={(e) =>
+                  patch({ serialDataBits: Number(e.target.value) as SerialDataBits })
+                }
               >
-                Browse…
-              </button>
-            ) : null}
-          </div>
-        </div>
-        {!identityLocked ? (
-          <div className="settings-row">
-            <div className="settings-row-label">
-              <strong>Key passphrase</strong>
-              <span>
-                {mode === 'editHost' ? 'Vaulted with the host profile.' : 'Session-local only.'}
-              </span>
+                <option value={SERIAL_DATA_BITS_5}>5</option>
+                <option value={SERIAL_DATA_BITS_6}>6</option>
+                <option value={SERIAL_DATA_BITS_7}>7</option>
+                <option value={SERIAL_DATA_BITS_8}>8</option>
+              </select>
             </div>
-            <input
-              type="password"
-              value={passphrase}
-              placeholder={form.passphraseVaultId ? '(stored)' : ''}
-              onChange={(e) => setPassphrase(e.target.value)}
-            />
-          </div>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Parity</strong>
+              </div>
+              <select
+                value={form.serialParity}
+                disabled={identityLocked}
+                onChange={(e) => patch({ serialParity: e.target.value as SerialParity })}
+              >
+                <option value={SERIAL_PARITY_NONE}>None</option>
+                <option value={SERIAL_PARITY_EVEN}>Even</option>
+                <option value={SERIAL_PARITY_ODD}>Odd</option>
+                <option value={SERIAL_PARITY_MARK}>Mark</option>
+                <option value={SERIAL_PARITY_SPACE}>Space</option>
+              </select>
+            </div>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Stop bits</strong>
+              </div>
+              <select
+                value={form.serialStopBits}
+                disabled={identityLocked}
+                onChange={(e) =>
+                  patch({ serialStopBits: Number(e.target.value) as SerialStopBits })
+                }
+              >
+                <option value={SERIAL_STOP_BITS_1}>1</option>
+                <option value={SERIAL_STOP_BITS_1_5}>1.5</option>
+                <option value={SERIAL_STOP_BITS_2}>2</option>
+              </select>
+            </div>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Flow control</strong>
+              </div>
+              <select
+                value={form.serialFlowControl}
+                disabled={identityLocked}
+                onChange={(e) =>
+                  patch({ serialFlowControl: e.target.value as SerialFlowControl })
+                }
+              >
+                <option value={SERIAL_FLOW_NONE}>None</option>
+                <option value={SERIAL_FLOW_RTSCTS}>Hardware (RTS/CTS)</option>
+                <option value={SERIAL_FLOW_XONXOFF}>Software (XON/XOFF)</option>
+              </select>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Host</strong>
+                <span>Hostname or IP.</span>
+              </div>
+              <input
+                type="text"
+                value={form.host}
+                onChange={(e) => patch({ host: e.target.value })}
+                readOnly={identityLocked}
+              />
+            </div>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Port</strong>
+                <span>{isSsh ? 'SSH port.' : 'Telnet port.'}</span>
+              </div>
+              <input
+                type="number"
+                value={form.port}
+                onChange={(e) =>
+                  patch({
+                    port: Number(e.target.value) || defaultPortForType(connType)
+                  })
+                }
+                readOnly={identityLocked}
+              />
+            </div>
+          </>
+        )}
+        {isSsh ? (
+          <>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Username</strong>
+                <span>Leave empty to prompt in the terminal.</span>
+              </div>
+              <input
+                type="text"
+                value={form.username}
+                onChange={(e) => patch({ username: e.target.value })}
+                readOnly={identityLocked}
+              />
+            </div>
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Auth method</strong>
+                <span>Preferred authentication.</span>
+              </div>
+              <select
+                value={form.authMethod}
+                onChange={(e) => patch({ authMethod: e.target.value as AuthMethod })}
+                disabled={identityLocked}
+              >
+                <option value="password">Password</option>
+                <option value="privateKey">Private key</option>
+                <option value="none">Prompt / none stored</option>
+              </select>
+            </div>
+            {!identityLocked ? (
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <strong>Password</strong>
+                  <span>
+                    {mode === 'editHost'
+                      ? 'Stored in host settings (vaulted). Empty = prompt in terminal.'
+                      : 'Session-local only; does not update the saved host.'}
+                  </span>
+                </div>
+                <input
+                  type="password"
+                  value={password}
+                  placeholder={form.passwordVaultId ? '(stored)' : ''}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </div>
+            ) : null}
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Private key path</strong>
+                <span>Path to OpenSSH private key file.</span>
+              </div>
+              <div className="stack">
+                <input
+                  type="text"
+                  value={form.privateKeyPath}
+                  onChange={(e) => patch({ privateKeyPath: e.target.value })}
+                  readOnly={identityLocked}
+                />
+                {!identityLocked ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void pickPrivateKey().then((p) => {
+                        if (p) {
+                          patch({ privateKeyPath: p, authMethod: 'privateKey' })
+                        }
+                      })
+                    }}
+                  >
+                    Browse…
+                  </button>
+                ) : null}
+              </div>
+            </div>
+            {!identityLocked ? (
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <strong>Key passphrase</strong>
+                  <span>
+                    {mode === 'editHost' ? 'Vaulted with the host profile.' : 'Session-local only.'}
+                  </span>
+                </div>
+                <input
+                  type="password"
+                  value={passphrase}
+                  placeholder={form.passphraseVaultId ? '(stored)' : ''}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                />
+              </div>
+            ) : null}
+            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+              <div className="settings-row-label">
+                <strong>Proxy / jump host</strong>
+                <span>
+                  Connect through another saved SSH host first (for closed networks / bastion access).
+                </span>
+              </div>
+              <select
+                value={form.proxyHostId}
+                onChange={(e) => patch({ proxyHostId: e.target.value })}
+                disabled={identityLocked}
+              >
+                <option value="">None (direct)</option>
+                {proxyOptions.map((h) => (
+                  <option key={h.id} value={h.id}>
+                    {h.name || `${h.username}@${h.host}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </>
         ) : null}
-        <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
-          <div className="settings-row-label">
-            <strong>Proxy / jump host</strong>
-            <span>
-              Connect through another saved host first (for closed networks / bastion access).
-            </span>
-          </div>
-          <select
-            value={form.proxyHostId}
-            onChange={(e) => patch({ proxyHostId: e.target.value })}
-            disabled={identityLocked}
-          >
-            <option value="">None (direct)</option>
-            {proxyOptions.map((h) => (
-              <option key={h.id} value={h.id}>
-                {h.name || `${h.username}@${h.host}`}
-              </option>
-            ))}
-          </select>
-        </div>
       </>
     )
 
@@ -559,18 +744,20 @@ export default function HostSessionSettingsDialog({
         id: 'connection',
         title: 'Connection',
         content: connectionRows
-      },
-      {
+      }
+    ]
+    if (isSsh) {
+      list.push({
         id: 'tunnels',
         title: 'Tunnels',
         content: tunnelRows
-      },
-      {
-        id: 'appearance',
-        title: 'Appearance',
-        content: appearanceRows
-      }
-    ]
+      })
+    }
+    list.push({
+      id: 'appearance',
+      title: 'Appearance',
+      content: appearanceRows
+    })
 
     if (mode === 'editOpenSession') {
       list.push({
@@ -593,7 +780,19 @@ export default function HostSessionSettingsDialog({
     }
 
     return list
-  }, [form, fontFamilies, identityLocked, mode, password, passphrase, pickPrivateKey, proxyOptions])
+  }, [
+    form,
+    fontFamilies,
+    identityLocked,
+    mode,
+    password,
+    passphrase,
+    pickPrivateKey,
+    proxyOptions,
+    connType,
+    isSsh,
+    isSerial
+  ])
 
   const handleSave = (): void => {
     if (mode === 'editHost') {
@@ -602,7 +801,13 @@ export default function HostSessionSettingsDialog({
         ('id' in initial ? initial.id : crypto.randomUUID())
       const host: HostProfile = {
         id,
-        name: form.name || `${form.username}@${form.host}`,
+        name:
+          form.name ||
+          (isSerial
+            ? form.host
+            : form.username
+              ? `${form.username}@${form.host}`
+              : form.host),
         host: form.host,
         port: form.port,
         username: form.username,
@@ -610,9 +815,10 @@ export default function HostSessionSettingsDialog({
         privateKeyPath: form.privateKeyPath,
         passphraseVaultId: form.passphraseVaultId || (passphrase ? `pp-${id}` : ''),
         authMethod: form.authMethod,
-        proxyHostId: form.proxyHostId || '',
+        proxyHostId: isSsh ? form.proxyHostId || '' : '',
+        ...protocolConfigFrom(form),
         ...sessionStyleFrom(form),
-        ...tunnelConfigFrom(form)
+        ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false })
       }
       onSaveHost(host, password, passphrase)
       onClose()
@@ -621,6 +827,7 @@ export default function HostSessionSettingsDialog({
 
     onSaveSession({
       ...form,
+      ...protocolConfigFrom(form),
       ...sessionStyleFrom(form),
       ...tunnelConfigFrom(form),
       ephemeralPassword: password || form.ephemeralPassword,

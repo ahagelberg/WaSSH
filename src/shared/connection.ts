@@ -3,21 +3,49 @@ import {
   BELL_MODE_INVERT_WINDOW,
   BELL_MODE_SYSTEM,
   BUNDLED_FONT_FAMILIES,
+  CONNECTION_TYPE_SERIAL,
+  CONNECTION_TYPE_SSH,
+  CONNECTION_TYPE_TELNET,
   CURSOR_STYLE_BAR,
   CURSOR_STYLE_BLOCK,
   CURSOR_STYLE_UNDERLINE,
   DEFAULT_BELL_MODE,
+  DEFAULT_CONNECTION_TYPE,
   DEFAULT_CURSOR_BLINK,
   DEFAULT_CURSOR_STYLE,
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE_PX,
   DEFAULT_SCROLLBACK_LINES,
+  DEFAULT_SERIAL_BAUD_RATE,
+  DEFAULT_SERIAL_DATA_BITS,
+  DEFAULT_SERIAL_FLOW_CONTROL,
+  DEFAULT_SERIAL_PARITY,
+  DEFAULT_SERIAL_STOP_BITS,
+  DEFAULT_SSH_PORT,
+  DEFAULT_TELNET_PORT,
   DEFAULT_TUNNEL_LISTEN_HOST,
   DEFAULT_X11_FORWARDING,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
+  SERIAL_BAUD_MAX,
+  SERIAL_BAUD_MIN,
+  SERIAL_DATA_BITS_5,
+  SERIAL_DATA_BITS_6,
+  SERIAL_DATA_BITS_7,
+  SERIAL_DATA_BITS_8,
+  SERIAL_FLOW_NONE,
+  SERIAL_FLOW_RTSCTS,
+  SERIAL_FLOW_XONXOFF,
+  SERIAL_PARITY_EVEN,
+  SERIAL_PARITY_MARK,
+  SERIAL_PARITY_NONE,
+  SERIAL_PARITY_ODD,
+  SERIAL_PARITY_SPACE,
+  SERIAL_STOP_BITS_1,
+  SERIAL_STOP_BITS_1_5,
+  SERIAL_STOP_BITS_2,
   THEME_COLOR_UNSET,
   TUNNEL_PORT_MAX,
   TUNNEL_PORT_MIN,
@@ -26,8 +54,14 @@ import {
   TUNNEL_TYPE_REMOTE,
   type BellMode,
   type ConnectionParams,
+  type ConnectionType,
   type CursorStyle,
   type HostProfile,
+  type SerialConfig,
+  type SerialDataBits,
+  type SerialFlowControl,
+  type SerialParity,
+  type SerialStopBits,
   type SshTunnel,
   type TunnelType
 } from './types'
@@ -206,12 +240,172 @@ export function emptyTunnel(): SshTunnel {
   }
 }
 
+export function connectionTypeOf(
+  src: Partial<Pick<ConnectionParams, 'connectionType'>> | null | undefined
+): ConnectionType {
+  const value = src?.connectionType
+  if (
+    value === CONNECTION_TYPE_SSH ||
+    value === CONNECTION_TYPE_TELNET ||
+    value === CONNECTION_TYPE_SERIAL
+  ) {
+    return value
+  }
+  return DEFAULT_CONNECTION_TYPE
+}
+
+export function isSshConnectionType(type: ConnectionType): boolean {
+  return type === CONNECTION_TYPE_SSH
+}
+
+export function defaultPortForType(type: ConnectionType): number {
+  if (type === CONNECTION_TYPE_TELNET) {
+    return DEFAULT_TELNET_PORT
+  }
+  if (type === CONNECTION_TYPE_SERIAL) {
+    return 0
+  }
+  return DEFAULT_SSH_PORT
+}
+
+function serialDataBitsOrDefault(value: number | undefined): SerialDataBits {
+  if (
+    value === SERIAL_DATA_BITS_5 ||
+    value === SERIAL_DATA_BITS_6 ||
+    value === SERIAL_DATA_BITS_7 ||
+    value === SERIAL_DATA_BITS_8
+  ) {
+    return value
+  }
+  return DEFAULT_SERIAL_DATA_BITS
+}
+
+function serialStopBitsOrDefault(value: number | undefined): SerialStopBits {
+  if (
+    value === SERIAL_STOP_BITS_1 ||
+    value === SERIAL_STOP_BITS_1_5 ||
+    value === SERIAL_STOP_BITS_2
+  ) {
+    return value
+  }
+  return DEFAULT_SERIAL_STOP_BITS
+}
+
+function serialParityOrDefault(value: string | undefined): SerialParity {
+  if (
+    value === SERIAL_PARITY_NONE ||
+    value === SERIAL_PARITY_EVEN ||
+    value === SERIAL_PARITY_ODD ||
+    value === SERIAL_PARITY_MARK ||
+    value === SERIAL_PARITY_SPACE
+  ) {
+    return value
+  }
+  return DEFAULT_SERIAL_PARITY
+}
+
+function serialFlowOrDefault(value: string | undefined): SerialFlowControl {
+  if (
+    value === SERIAL_FLOW_NONE ||
+    value === SERIAL_FLOW_RTSCTS ||
+    value === SERIAL_FLOW_XONXOFF
+  ) {
+    return value
+  }
+  return DEFAULT_SERIAL_FLOW_CONTROL
+}
+
+function serialBaudOrDefault(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_SERIAL_BAUD_RATE
+  }
+  const baud = Math.floor(value)
+  if (baud < SERIAL_BAUD_MIN) {
+    return SERIAL_BAUD_MIN
+  }
+  if (baud > SERIAL_BAUD_MAX) {
+    return SERIAL_BAUD_MAX
+  }
+  return baud
+}
+
+export function serialConfigFrom(
+  src: Partial<SerialConfig> | null | undefined
+): SerialConfig {
+  return {
+    serialBaudRate: serialBaudOrDefault(src?.serialBaudRate),
+    serialDataBits: serialDataBitsOrDefault(src?.serialDataBits),
+    serialStopBits: serialStopBitsOrDefault(src?.serialStopBits),
+    serialParity: serialParityOrDefault(src?.serialParity),
+    serialFlowControl: serialFlowOrDefault(src?.serialFlowControl)
+  }
+}
+
+export function protocolConfigFrom(
+  src: Partial<ConnectionParams | HostProfile> | null | undefined
+): { connectionType: ConnectionType } & SerialConfig {
+  return {
+    connectionType: connectionTypeOf(src),
+    ...serialConfigFrom(src)
+  }
+}
+
+function serialParityAbbrev(parity: SerialParity): string {
+  if (parity === SERIAL_PARITY_EVEN) {
+    return 'E'
+  }
+  if (parity === SERIAL_PARITY_ODD) {
+    return 'O'
+  }
+  if (parity === SERIAL_PARITY_MARK) {
+    return 'M'
+  }
+  if (parity === SERIAL_PARITY_SPACE) {
+    return 'S'
+  }
+  return 'N'
+}
+
+export function serialFormatLabel(cfg: SerialConfig): string {
+  const stop =
+    cfg.serialStopBits === SERIAL_STOP_BITS_1_5 ? '1.5' : String(cfg.serialStopBits)
+  return `${cfg.serialBaudRate} ${cfg.serialDataBits}${serialParityAbbrev(cfg.serialParity)}${stop}`
+}
+
+export function sessionTitle(
+  c: Pick<ConnectionParams, 'name' | 'host' | 'username' | 'connectionType'>
+): string {
+  const trimmed = (c.name ?? '').trim()
+  if (trimmed) {
+    return trimmed
+  }
+  if (connectionTypeOf(c) === CONNECTION_TYPE_SERIAL) {
+    return c.host || 'Serial'
+  }
+  if (c.username) {
+    return `${c.username}@${c.host}`
+  }
+  return c.host || 'Session'
+}
+
 export function hostDisplayName(host: Pick<HostProfile, 'name' | 'host'>): string {
   const trimmed = (host.name ?? '').trim()
   if (trimmed) {
     return trimmed
   }
   return host.host ?? ''
+}
+
+export function hostSubtitle(host: HostProfile): string {
+  const type = connectionTypeOf(host)
+  if (type === CONNECTION_TYPE_SERIAL) {
+    return `${host.host} · ${serialFormatLabel(serialConfigFrom(host))}`
+  }
+  if (type === CONNECTION_TYPE_TELNET) {
+    return `telnet ${host.host}:${host.port}`
+  }
+  const user = host.username ? `${host.username}@` : ''
+  return `${user}${host.host}:${host.port}`
 }
 
 export function hostToConnection(host: HostProfile): ConnectionParams {
@@ -226,10 +420,32 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     passphraseVaultId: host.passphraseVaultId,
     authMethod: host.authMethod,
     proxyHostId: host.proxyHostId || '',
+    ...protocolConfigFrom(host),
     ...sessionStyleFrom(host),
     ...tunnelConfigFrom(host),
     ephemeralPassword: '',
     ephemeralPassphrase: ''
+  }
+}
+
+export function hostProfileFromConnection(
+  src: ConnectionParams,
+  id: string
+): HostProfile {
+  return {
+    id,
+    name: src.name,
+    host: src.host,
+    port: src.port,
+    username: src.username,
+    passwordVaultId: src.passwordVaultId,
+    privateKeyPath: src.privateKeyPath,
+    passphraseVaultId: src.passphraseVaultId,
+    authMethod: src.authMethod,
+    proxyHostId: src.proxyHostId || '',
+    ...protocolConfigFrom(src),
+    ...sessionStyleFrom(src),
+    ...tunnelConfigFrom(src)
   }
 }
 
@@ -238,6 +454,9 @@ export function resolveProxyChain(
   target: ConnectionParams,
   hosts: HostProfile[]
 ): ConnectionParams[] {
+  if (!isSshConnectionType(connectionTypeOf(target))) {
+    return [target]
+  }
   const byId = new Map(hosts.map((h) => [h.id, h]))
   const hops: ConnectionParams[] = []
   const seen = new Set<string>()
@@ -250,6 +469,9 @@ export function resolveProxyChain(
     const profile = byId.get(proxyId)
     if (!profile) {
       throw new Error(`Proxy host not found (${proxyId})`)
+    }
+    if (!isSshConnectionType(connectionTypeOf(profile))) {
+      throw new Error(`Proxy host must be SSH (${profile.name || profile.host})`)
     }
     hops.unshift(hostToConnection(profile))
     proxyId = profile.proxyHostId || ''

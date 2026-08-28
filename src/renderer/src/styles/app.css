@@ -14,6 +14,7 @@
   --tab-color-bar-width: 4px;
   --tab-active-border-width: 2px;
   --tab-bar-edge-width: 1px;
+  --serial-combo-menu-max-height: 12rem;
 }
 
 :root,
@@ -295,6 +296,87 @@ textarea:focus {
 .quick-connect-row {
   display: grid;
   grid-template-columns: 1fr 72px;
+  gap: var(--gap);
+}
+
+.serial-port-field {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: stretch;
+  min-width: 0;
+  width: 100%;
+}
+
+.serial-port-field input {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.serial-port-combo-toggle {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: calc(-1 * var(--tab-bar-edge-width));
+  height: auto;
+}
+
+.serial-port-field.open .serial-port-combo-toggle {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.serial-port-combo-menu {
+  position: fixed;
+  z-index: var(--host-menu-z);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: var(--serial-combo-menu-max-height);
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.serial-port-combo-option,
+.serial-port-combo-empty {
+  display: grid;
+  padding: 8px 12px;
+}
+
+.serial-port-combo-empty {
+  color: var(--text-muted);
+}
+
+.serial-port-combo-option {
+  cursor: pointer;
+}
+
+.serial-port-combo-option.active,
+.serial-port-combo-option:hover {
+  background: var(--bg-panel-2);
+}
+
+.serial-port-combo-option.selected .serial-port-combo-path {
+  color: var(--accent);
+}
+
+.serial-port-combo-path {
+  font-weight: 600;
+}
+
+.serial-port-combo-detail {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quick-connect-serial-format {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: var(--gap);
 }
 

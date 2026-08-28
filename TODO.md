@@ -5,5 +5,7 @@
 
 ## Advanced ##
 - ~~Tunnels~~
+- ~~Support for telnet~~
+- ~~Support for serial~~
 
 # Nice to have ##

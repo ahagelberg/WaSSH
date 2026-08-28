@@ -1,6 +1,86 @@
 /** Default SSH port */
 export const DEFAULT_SSH_PORT = 22
 
+/** Default Telnet port */
+export const DEFAULT_TELNET_PORT = 23
+
+export const CONNECTION_TYPE_SSH = 'ssh'
+export const CONNECTION_TYPE_TELNET = 'telnet'
+export const CONNECTION_TYPE_SERIAL = 'serial'
+
+export type ConnectionType =
+  | typeof CONNECTION_TYPE_SSH
+  | typeof CONNECTION_TYPE_TELNET
+  | typeof CONNECTION_TYPE_SERIAL
+
+/** Default protocol for saved hosts and quick connect */
+export const DEFAULT_CONNECTION_TYPE: ConnectionType = CONNECTION_TYPE_SSH
+
+/** Common serial baud rates (datalist suggestions; any rate in range is allowed) */
+export const SERIAL_BAUD_RATES = [
+  300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600
+] as const
+
+export const SERIAL_BAUD_MIN = 300
+export const SERIAL_BAUD_MAX = 3000000
+export const DEFAULT_SERIAL_BAUD_RATE = 115200
+
+export const SERIAL_DATA_BITS_5 = 5
+export const SERIAL_DATA_BITS_6 = 6
+export const SERIAL_DATA_BITS_7 = 7
+export const SERIAL_DATA_BITS_8 = 8
+export type SerialDataBits =
+  | typeof SERIAL_DATA_BITS_5
+  | typeof SERIAL_DATA_BITS_6
+  | typeof SERIAL_DATA_BITS_7
+  | typeof SERIAL_DATA_BITS_8
+export const DEFAULT_SERIAL_DATA_BITS: SerialDataBits = SERIAL_DATA_BITS_8
+
+export const SERIAL_STOP_BITS_1 = 1
+export const SERIAL_STOP_BITS_1_5 = 1.5
+export const SERIAL_STOP_BITS_2 = 2
+export type SerialStopBits =
+  | typeof SERIAL_STOP_BITS_1
+  | typeof SERIAL_STOP_BITS_1_5
+  | typeof SERIAL_STOP_BITS_2
+export const DEFAULT_SERIAL_STOP_BITS: SerialStopBits = SERIAL_STOP_BITS_1
+
+export const SERIAL_PARITY_NONE = 'none'
+export const SERIAL_PARITY_EVEN = 'even'
+export const SERIAL_PARITY_ODD = 'odd'
+export const SERIAL_PARITY_MARK = 'mark'
+export const SERIAL_PARITY_SPACE = 'space'
+export type SerialParity =
+  | typeof SERIAL_PARITY_NONE
+  | typeof SERIAL_PARITY_EVEN
+  | typeof SERIAL_PARITY_ODD
+  | typeof SERIAL_PARITY_MARK
+  | typeof SERIAL_PARITY_SPACE
+export const DEFAULT_SERIAL_PARITY: SerialParity = SERIAL_PARITY_NONE
+
+export const SERIAL_FLOW_NONE = 'none'
+export const SERIAL_FLOW_RTSCTS = 'rtscts'
+export const SERIAL_FLOW_XONXOFF = 'xonxoff'
+export type SerialFlowControl =
+  | typeof SERIAL_FLOW_NONE
+  | typeof SERIAL_FLOW_RTSCTS
+  | typeof SERIAL_FLOW_XONXOFF
+export const DEFAULT_SERIAL_FLOW_CONTROL: SerialFlowControl = SERIAL_FLOW_NONE
+
+export interface SerialPortInfo {
+  path: string
+  /** Manufacturer / friendly name when the OS provides one */
+  detail: string
+}
+
+export interface SerialConfig {
+  serialBaudRate: number
+  serialDataBits: SerialDataBits
+  serialStopBits: SerialStopBits
+  serialParity: SerialParity
+  serialFlowControl: SerialFlowControl
+}
+
 /** Default local bind address for tunnels */
 export const DEFAULT_TUNNEL_LISTEN_HOST = '127.0.0.1'
 
@@ -201,6 +281,8 @@ export interface HostProfile {
   /** Vault id for key passphrase; empty if unset */
   passphraseVaultId: string
   authMethod: AuthMethod
+  /** ssh | telnet | serial; missing in old files = ssh */
+  connectionType: ConnectionType
   /** Saved host id used as SSH jump/proxy; empty = direct */
   proxyHostId: string
   /** Tab accent color (hex); empty = app theme */
@@ -225,6 +307,11 @@ export interface HostProfile {
   tunnels: SshTunnel[]
   /** Forward remote X11 clients to the local display */
   x11Forwarding: boolean
+  serialBaudRate: number
+  serialDataBits: SerialDataBits
+  serialStopBits: SerialStopBits
+  serialParity: SerialParity
+  serialFlowControl: SerialFlowControl
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -238,6 +325,8 @@ export interface ConnectionParams {
   privateKeyPath: string
   passphraseVaultId: string
   authMethod: AuthMethod
+  /** ssh | telnet | serial; missing in old files = ssh */
+  connectionType: ConnectionType
   /** Saved host id used as SSH jump/proxy; empty = direct */
   proxyHostId: string
   /** Tab accent color (hex); empty = app theme */
@@ -262,6 +351,11 @@ export interface ConnectionParams {
   tunnels: SshTunnel[]
   /** Forward remote X11 clients to the local display */
   x11Forwarding: boolean
+  serialBaudRate: number
+  serialDataBits: SerialDataBits
+  serialStopBits: SerialStopBits
+  serialParity: SerialParity
+  serialFlowControl: SerialFlowControl
   /** Session-local password not yet vaulted (ephemeral) */
   ephemeralPassword: string
   ephemeralPassphrase: string
@@ -355,6 +449,7 @@ export interface WasshApi {
     hostName?: string
   ) => Promise<void>
   pickPrivateKeyFile: () => Promise<string | null>
+  listSerialPorts: () => Promise<SerialPortInfo[]>
   beep: () => Promise<void>
   onSessionData: (cb: (tabId: string, data: string) => void) => () => void
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void

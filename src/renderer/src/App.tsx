@@ -3,7 +3,6 @@ import {
   AppSettings,
   ConnectionParams,
   DEFAULT_SETTINGS,
-  DEFAULT_SSH_PORT,
   DEFAULT_TERM_COLS,
   DEFAULT_TERM_ROWS,
   DEFAULT_THEME,
@@ -14,7 +13,15 @@ import {
   TAB_SNAPSHOT_DEBOUNCE_MS,
   TabSnapshot
 } from '@shared/types'
-import { sessionStyleFrom, hostToConnection, tunnelConfigFrom } from '@shared/connection'
+import {
+  sessionStyleFrom,
+  hostToConnection,
+  tunnelConfigFrom,
+  protocolConfigFrom,
+  hostProfileFromConnection,
+  sessionTitle,
+  defaultPortForType
+} from '@shared/connection'
 import SessionsSidebar from './components/SessionsSidebar'
 import QuickConnect from './components/QuickConnect'
 import TabBar from './components/TabBar'
@@ -33,16 +40,6 @@ interface TabState {
   savePasswordPrompt?: SavePasswordPrompt
 }
 
-function titleOf(c: ConnectionParams): string {
-  if (c.name) {
-    return c.name
-  }
-  if (c.username) {
-    return `${c.username}@${c.host}`
-  }
-  return c.host
-}
-
 function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
   return tabs.slice().sort((a, b) => {
     if (a.id < b.id) {
@@ -56,17 +53,19 @@ function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
 }
 
 function emptyHost(): HostProfile {
+  const proto = protocolConfigFrom(null)
   return {
     id: crypto.randomUUID(),
     name: '',
     host: '',
-    port: DEFAULT_SSH_PORT,
+    port: defaultPortForType(proto.connectionType),
     username: '',
     passwordVaultId: '',
     privateKeyPath: '',
     passphraseVaultId: '',
     authMethod: 'none',
     proxyHostId: '',
+    ...proto,
     ...sessionStyleFrom(null),
     ...tunnelConfigFrom(null)
   }
@@ -102,7 +101,7 @@ export default function App() {
 
   const refreshHosts = useCallback(async () => {
     const list = await window.wassh.listHosts()
-    setHosts(list.map((h) => ({ ...h, ...sessionStyleFrom(h), ...tunnelConfigFrom(h) })))
+    setHosts(list.map((h) => ({ ...h, ...protocolConfigFrom(h), ...sessionStyleFrom(h), ...tunnelConfigFrom(h) })))
   }, [])
 
   const persistTabs = useCallback(() => {
@@ -110,6 +109,7 @@ export default function App() {
       id: t.id,
       connection: {
         ...t.connection,
+        ...protocolConfigFrom(t.connection),
         ...sessionStyleFrom(t.connection),
         ...tunnelConfigFrom(t.connection),
         ephemeralPassword: '',
@@ -174,6 +174,7 @@ export default function App() {
         id: t.id,
         connection: {
           ...t.connection,
+          ...protocolConfigFrom(t.connection),
           ...sessionStyleFrom(t.connection),
           ...tunnelConfigFrom(t.connection)
         },
@@ -254,7 +255,7 @@ export default function App() {
       )
       if (!prompt.hasHostProfile) {
         const tab = tabsRef.current.find((t) => t.id === prompt.tabId)
-        setSaveAsHostName(tab ? titleOf(tab.connection) : '')
+        setSaveAsHostName(tab ? sessionTitle(tab.connection) : '')
       }
     })
     const offCycle = window.wassh.onCycleTab(cycleTab)
@@ -341,7 +342,7 @@ export default function App() {
         <TabBar
           tabs={tabs.map((t) => ({
             id: t.id,
-            title: titleOf(t.connection),
+            title: sessionTitle(t.connection),
             status: t.status,
             active: t.id === activeTabId,
             tabColor: sessionStyleFrom(t.connection).tabColor,
@@ -380,18 +381,10 @@ export default function App() {
             setHostEditor({
               mode: 'editHost',
               initial: {
-                id: crypto.randomUUID(),
-                name: titleOf(tab.connection),
-                host: tab.connection.host,
-                port: tab.connection.port,
-                username: tab.connection.username,
+                ...hostProfileFromConnection(tab.connection, crypto.randomUUID()),
+                name: sessionTitle(tab.connection),
                 passwordVaultId: '',
-                privateKeyPath: tab.connection.privateKeyPath,
-                passphraseVaultId: '',
-                authMethod: tab.connection.authMethod,
-                proxyHostId: tab.connection.proxyHostId || '',
-                ...sessionStyleFrom(tab.connection),
-                ...tunnelConfigFrom(tab.connection)
+                passphraseVaultId: ''
               },
               connected: false,
               linkTabId: id

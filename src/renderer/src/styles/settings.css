@@ -153,6 +153,11 @@
   gap: 8px;
 }
 
+.settings-row .serial-port-field {
+  width: 100%;
+  min-width: 0;
+}
+
 .settings-row-block {
   grid-template-columns: 1fr;
   align-items: start;

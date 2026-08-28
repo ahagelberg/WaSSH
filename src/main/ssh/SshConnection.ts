@@ -3,7 +3,7 @@ import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
 import { Client, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import { Readable } from 'stream'
-import { sessionStyleFrom, proxyLabel, resolveProxyChain, tunnelConfigFrom } from '../../shared/connection'
+import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_TERM_COLS,
@@ -118,20 +118,11 @@ export class SshConnection extends EventEmitter {
     const vaultId = `pwd-${id}`
     this.vault.set(vaultId, password)
     const name = hostName || `${this.connection.username}@${this.connection.host}`
-    this.sessionStore.saveHost({
-      id,
-      name,
-      host: this.connection.host,
-      port: this.connection.port,
-      username: this.connection.username,
-      passwordVaultId: vaultId,
-      privateKeyPath: this.connection.privateKeyPath,
-      passphraseVaultId: this.connection.passphraseVaultId,
-      authMethod: 'password',
-      proxyHostId: this.connection.proxyHostId || '',
-      ...sessionStyleFrom(this.connection),
-      ...tunnelConfigFrom(this.connection)
-    })
+    const profile = hostProfileFromConnection(this.connection, id)
+    profile.name = name
+    profile.passwordVaultId = vaultId
+    profile.authMethod = 'password'
+    this.sessionStore.saveHost(profile)
     this.connection.hostId = id
     this.connection.name = name
     this.connection.passwordVaultId = vaultId

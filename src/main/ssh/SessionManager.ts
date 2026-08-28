@@ -1,16 +1,23 @@
 import { BrowserWindow } from 'electron'
 import {
+  CONNECTION_TYPE_SERIAL,
+  CONNECTION_TYPE_TELNET,
   ConnectRequest,
   HostKeyDecision,
   SavePasswordDecision,
   SessionStatus
 } from '../../shared/types'
+import { connectionTypeOf } from '../../shared/connection'
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore, SettingsStore } from '../store/sessionStore'
+import { SerialConnection } from '../serial/SerialConnection'
+import { TelnetConnection } from '../telnet/TelnetConnection'
 import { SshConnection } from './SshConnection'
 
+type LiveSession = SshConnection | TelnetConnection | SerialConnection
+
 export class SessionManager {
-  private sessions = new Map<string, SshConnection>()
+  private sessions = new Map<string, LiveSession>()
 
   constructor(
     private vault: CredentialVault,
@@ -28,7 +35,7 @@ export class SessionManager {
     win.webContents.send(channel, ...args)
   }
 
-  private wire(conn: SshConnection): void {
+  private wire(conn: LiveSession): void {
     const settings = this.settingsStore.get()
     conn.setReconnectPolicy(settings.autoReconnectOnDrop, settings.reconnectMaxAttempts)
 
@@ -48,13 +55,21 @@ export class SessionManager {
 
   async connect(req: ConnectRequest): Promise<void> {
     this.disconnect(req.tabId)
-    const conn = new SshConnection(
-      req.tabId,
-      req.connection,
-      this.vault,
-      this.knownHosts,
-      this.sessionStore
-    )
+    const type = connectionTypeOf(req.connection)
+    let conn: LiveSession
+    if (type === CONNECTION_TYPE_TELNET) {
+      conn = new TelnetConnection(req.tabId, req.connection)
+    } else if (type === CONNECTION_TYPE_SERIAL) {
+      conn = new SerialConnection(req.tabId, req.connection)
+    } else {
+      conn = new SshConnection(
+        req.tabId,
+        req.connection,
+        this.vault,
+        this.knownHosts,
+        this.sessionStore
+      )
+    }
     this.sessions.set(req.tabId, conn)
     this.wire(conn)
     await conn.connect(req.cols, req.rows, req.termType)

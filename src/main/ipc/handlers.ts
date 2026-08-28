@@ -17,6 +17,7 @@ import {
   TabStore
 } from '../store/sessionStore'
 import { SessionManager } from '../ssh/SessionManager'
+import { listSerialPorts } from '../serial/listSerialPorts'
 
 export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): void {
   nativeTheme.themeSource = theme
@@ -106,4 +107,6 @@ export function registerIpc(
     }
     return result.filePaths[0]
   })
+
+  ipcMain.handle('serial:listPorts', () => listSerialPorts())
 }

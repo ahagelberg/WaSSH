@@ -46,6 +46,7 @@ const api: WasshApi = {
   respondSavePassword: (tabId: string, decision: SavePasswordDecision, hostName?: string) =>
     ipcRenderer.invoke('session:respondSavePassword', tabId, decision, hostName),
   pickPrivateKeyFile: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
+  listSerialPorts: () => ipcRenderer.invoke('serial:listPorts'),
   beep: () => ipcRenderer.invoke('app:beep'),
   onSessionData: (cb) =>
     on('session:data', (tabId, data) => cb(tabId as string, data as string)),
@@ -60,3 +61,4 @@ const api: WasshApi = {
 }
 
 contextBridge.exposeInMainWorld('wassh', api)
+

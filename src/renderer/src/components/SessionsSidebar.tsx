@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { HostProfile } from '@shared/types'
-import { hostDisplayName } from '@shared/connection'
+import { hostDisplayName, hostSubtitle } from '@shared/connection'
 
 interface Props {
   hosts: HostProfile[]
@@ -126,8 +126,7 @@ export default function SessionsSidebar({
                     >
                       <div className="host-item-name">{hostDisplayName(host)}</div>
                       <div className="host-item-meta">
-                        {host.username ? `${host.username}@` : ''}
-                        {host.host}:{host.port}
+                        {hostSubtitle(host)}
                         {proxy ? ` · via ${hostDisplayName(proxy)}` : ''}
                       </div>
                     </div>
