@@ -18,6 +18,9 @@ import {
 } from '../store/sessionStore'
 import { SessionManager } from '../ssh/SessionManager'
 import { listSerialPorts } from '../serial/listSerialPorts'
+import type { PluginHost } from '../plugins/PluginHost'
+import { queuePluginRestore } from '../plugins/createPluginSystem'
+import type { PluginDataStore } from '../store/pluginDataStore'
 
 export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): void {
   nativeTheme.themeSource = theme
@@ -33,13 +36,19 @@ export function registerIpc(
   settingsStore: SettingsStore,
   knownHosts: KnownHostsStore,
   sessions: SessionManager,
-  getWindow: () => BrowserWindow | null
+  getWindow: () => BrowserWindow | null,
+  pluginHost: PluginHost,
+  pluginData: PluginDataStore
 ): void {
   ipcMain.handle('settings:get', () => settingsStore.get())
-  ipcMain.handle('settings:set', (_e, partial: Partial<AppSettings>) => {
+  ipcMain.handle('settings:set', async (_e, partial: Partial<AppSettings>) => {
+    const prev = settingsStore.get()
     const next = settingsStore.set(partial)
     sessions.updateReconnectPolicies()
     applyChromeTheme(next.theme, getWindow())
+    if (partial.enabledPlugins) {
+      await pluginHost.onEnabledPluginsChanged(prev.enabledPlugins, next.enabledPlugins)
+    }
     return next
   })
 
@@ -109,4 +118,29 @@ export function registerIpc(
   })
 
   ipcMain.handle('serial:listPorts', () => listSerialPorts())
+
+  ipcMain.handle('plugins:list', () => pluginHost.listPlugins())
+  ipcMain.handle('plugins:activate', async (_e, tabId: string, pluginId: string) => {
+    await pluginHost.activate(tabId, pluginId)
+  })
+  ipcMain.handle('plugins:deactivate', async (_e, tabId: string, pluginId: string) => {
+    await pluginHost.deactivate(tabId, pluginId)
+  })
+  ipcMain.handle('plugins:getActive', (_e, tabId: string) => pluginHost.getActivePlugins(tabId))
+  ipcMain.handle(
+    'plugins:message',
+    async (_e, tabId: string, pluginId: string, payload: unknown) => {
+      await pluginHost.handleRendererMessage(tabId, pluginId, payload)
+    }
+  )
+  ipcMain.handle(
+    'plugins:queueRestore',
+    (_e, tabId: string, activePluginIds: string[]) => {
+      queuePluginRestore(tabId, activePluginIds)
+    }
+  )
+  ipcMain.handle('plugins:getData', (_e, pluginId: string) => pluginData.get(pluginId))
+  ipcMain.handle('plugins:setData', (_e, pluginId: string, data: unknown) => {
+    pluginData.set(pluginId, data)
+  })
 }

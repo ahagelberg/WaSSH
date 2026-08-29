@@ -13,11 +13,17 @@ import { KnownHostsStore, SessionStore, SettingsStore } from '../store/sessionSt
 import { SerialConnection } from '../serial/SerialConnection'
 import { TelnetConnection } from '../telnet/TelnetConnection'
 import { SshConnection } from './SshConnection'
+import type { SessionDataPipeline } from '../plugins/SessionDataPipeline'
+import type { PluginSessionHandle } from '../plugins/types'
+import { openDirectTcpSocket } from '../plugins/SideConnectionBroker'
 
 type LiveSession = SshConnection | TelnetConnection | SerialConnection
 
 export class SessionManager {
   private sessions = new Map<string, LiveSession>()
+  private pipeline: SessionDataPipeline | null = null
+  private onStatusConnected: ((tabId: string) => void) | null = null
+  private onSessionRemoved: ((tabId: string) => void) | null = null
 
   constructor(
     private vault: CredentialVault,
@@ -26,6 +32,18 @@ export class SessionManager {
     private settingsStore: SettingsStore,
     private getWindow: () => BrowserWindow | null
   ) {}
+
+  setPipeline(pipeline: SessionDataPipeline): void {
+    this.pipeline = pipeline
+  }
+
+  setPluginHooks(hooks: {
+    onStatusConnected?: (tabId: string) => void
+    onSessionRemoved?: (tabId: string) => void
+  }): void {
+    this.onStatusConnected = hooks.onStatusConnected ?? null
+    this.onSessionRemoved = hooks.onSessionRemoved ?? null
+  }
 
   private send(channel: string, ...args: unknown[]): void {
     const win = this.getWindow()
@@ -40,10 +58,18 @@ export class SessionManager {
     conn.setReconnectPolicy(settings.autoReconnectOnDrop, settings.reconnectMaxAttempts)
 
     conn.on('data', (data: string) => {
-      this.send('session:data', conn.tabId, data)
+      const pipeline = this.pipeline
+      const out = pipeline ? pipeline.processInbound(conn.tabId, data) : data
+      if (out === null) {
+        return
+      }
+      this.send('session:data', conn.tabId, out)
     })
     conn.on('status', (status: SessionStatus, message?: string) => {
       this.send('session:status', { tabId: conn.tabId, status, message })
+      if (status === 'connected') {
+        this.onStatusConnected?.(conn.tabId)
+      }
     })
     conn.on('hostKeyPrompt', (prompt) => {
       this.send('session:hostKeyPrompt', prompt)
@@ -82,9 +108,20 @@ export class SessionManager {
     }
     conn.dispose()
     this.sessions.delete(tabId)
+    this.onSessionRemoved?.(tabId)
   }
 
   write(tabId: string, data: string): void {
+    const pipeline = this.pipeline
+    const out = pipeline ? pipeline.processOutbound(tabId, data) : data
+    if (out === null) {
+      return
+    }
+    this.sessions.get(tabId)?.write(out)
+  }
+
+  /** Write bypassing the plugin outbound pipeline (used by plugins injecting macros). */
+  writeRaw(tabId: string, data: string): void {
     this.sessions.get(tabId)?.write(data)
   }
 
@@ -106,6 +143,46 @@ export class SessionManager {
 
   getConnection(tabId: string) {
     return this.sessions.get(tabId)?.getConnection()
+  }
+
+  getPluginSessionHandle(tabId: string): PluginSessionHandle | null {
+    const conn = this.sessions.get(tabId)
+    if (!conn) {
+      return null
+    }
+    const connection = conn.getConnection()
+    if (conn instanceof SshConnection) {
+      return {
+        tabId,
+        connection,
+        isSsh: true,
+        getSshClient: () => conn.getSshClient(),
+        exec: (command) => conn.execCommand(command),
+        openExtraShell: () => conn.openExtraShell(),
+        forwardOut: (host, port) => conn.forwardOut(host, port),
+        openDuplicateClient: () => conn.openDuplicateClient(),
+        openDirectTcp: (host, port) => openDirectTcpSocket(host, port)
+      }
+    }
+    return {
+      tabId,
+      connection,
+      isSsh: false,
+      getSshClient: () => null,
+      exec: async () => {
+        throw new Error('SSH exec requires an SSH session')
+      },
+      openExtraShell: async () => {
+        throw new Error('SSH shell requires an SSH session')
+      },
+      forwardOut: async () => {
+        throw new Error('SSH forward requires an SSH session')
+      },
+      openDuplicateClient: async () => {
+        throw new Error('Duplicate SSH requires an SSH session')
+      },
+      openDirectTcp: (host, port) => openDirectTcpSocket(host, port)
+    }
   }
 
   updateReconnectPolicies(): void {

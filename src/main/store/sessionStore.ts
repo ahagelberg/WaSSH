@@ -132,6 +132,7 @@ export class TabStore {
     const fallback = storedStyleFallback()
     return readJson<TabSnapshot[]>(TABS_FILE, []).map((t) => ({
       ...t,
+      activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
       connection: {
         ...t.connection,
         ...protocolConfigFrom(t.connection),
@@ -156,7 +157,20 @@ export class SettingsStore {
       ...rest
     } = raw
     const theme: AppTheme = rest.theme === 'light' ? 'light' : DEFAULT_THEME
-    return { ...DEFAULT_SETTINGS, ...rest, theme }
+    const enabledPlugins = Array.isArray(rest.enabledPlugins)
+      ? rest.enabledPlugins
+      : DEFAULT_SETTINGS.enabledPlugins
+    const pluginSettings =
+      rest.pluginSettings && typeof rest.pluginSettings === 'object' && !Array.isArray(rest.pluginSettings)
+        ? rest.pluginSettings
+        : {}
+    return {
+      ...DEFAULT_SETTINGS,
+      ...rest,
+      theme,
+      enabledPlugins,
+      pluginSettings
+    }
   }
 
   set(partial: Partial<AppSettings>): AppSettings {

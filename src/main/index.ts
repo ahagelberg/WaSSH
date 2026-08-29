@@ -21,6 +21,8 @@ import {
   TabStore
 } from './store/sessionStore'
 import { attachWindowBoundsPersistence, restoreWindowBounds } from './windowBounds'
+import { createPluginSystem } from './plugins/createPluginSystem'
+import { PluginDataStore } from './store/pluginDataStore'
 
 /** Accelerator for File > Preferences */
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
@@ -95,6 +97,7 @@ const ALLOWED_WEB_PERMISSIONS = new Set([
 let mainWindow: BrowserWindow | null = null
 let sessions: SessionManager | null = null
 let settingsStore: SettingsStore | null = null
+let pluginSystem: ReturnType<typeof createPluginSystem> | null = null
 
 function getWindow(): BrowserWindow | null {
   return mainWindow
@@ -204,6 +207,7 @@ app.whenReady().then(() => {
   const tabStore = new TabStore()
   settingsStore = new SettingsStore()
   const knownHosts = new KnownHostsStore()
+  const pluginData = new PluginDataStore()
   sessions = new SessionManager(
     vault,
     knownHosts,
@@ -211,7 +215,18 @@ app.whenReady().then(() => {
     settingsStore,
     getWindow
   )
-  registerIpc(vault, sessionStore, tabStore, settingsStore, knownHosts, sessions, getWindow)
+  pluginSystem = createPluginSystem(settingsStore, sessions, getWindow, pluginData)
+  registerIpc(
+    vault,
+    sessionStore,
+    tabStore,
+    settingsStore,
+    knownHosts,
+    sessions,
+    getWindow,
+    pluginSystem.host,
+    pluginData
+  )
   installAppMenu()
   attachPowerMonitor()
   createWindow()
@@ -223,6 +238,7 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  pluginSystem?.dispose()
   sessions?.disposeAll()
   if (process.platform !== 'darwin') {
     app.quit()
@@ -230,6 +246,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  pluginSystem?.dispose()
   sessions?.disposeAll()
 })
 

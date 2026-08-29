@@ -1,3 +1,12 @@
+import type {
+  PluginActiveStateEvent,
+  PluginListItem,
+  PluginMessageEvent,
+  SideConnectionClosedEvent,
+  SideConnectionDataEvent
+} from './plugins'
+import { DEFAULT_ENABLED_PLUGINS } from './plugins'
+
 /** Default SSH port */
 export const DEFAULT_SSH_PORT = 22
 
@@ -371,6 +380,8 @@ export interface TabSnapshot {
   id: string
   connection: ConnectionParams
   active: boolean
+  /** Plugin ids active for this tab when the app last exited */
+  activePluginIds: string[]
 }
 
 export interface AppSettings {
@@ -381,6 +392,10 @@ export interface AppSettings {
   sidebarCollapsed: boolean
   windowBounds: WindowBounds | null
   theme: AppTheme
+  /** Globally enabled (loaded) plugin ids */
+  enabledPlugins: string[]
+  /** Per-plugin settings keyed by plugin id */
+  pluginSettings: Record<string, unknown>
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -390,7 +405,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   termType: DEFAULT_TERM_TYPE,
   sidebarCollapsed: false,
   windowBounds: null,
-  theme: DEFAULT_THEME
+  theme: DEFAULT_THEME,
+  enabledPlugins: [...DEFAULT_ENABLED_PLUGINS],
+  pluginSettings: {}
 }
 
 export interface KnownHostEntry {
@@ -457,6 +474,16 @@ export interface WasshApi {
   pickPrivateKeyFile: () => Promise<string | null>
   listSerialPorts: () => Promise<SerialPortInfo[]>
   beep: () => Promise<void>
+  listPlugins: () => Promise<PluginListItem[]>
+  activatePlugin: (tabId: string, pluginId: string) => Promise<void>
+  deactivatePlugin: (tabId: string, pluginId: string) => Promise<void>
+  getActivePlugins: (tabId: string) => Promise<string[]>
+  sendPluginMessage: (tabId: string, pluginId: string, payload: unknown) => Promise<void>
+  queuePluginRestore: (tabId: string, activePluginIds: string[]) => Promise<void>
+  /** Read plugin-owned JSON from userData/plugin-<id>.json */
+  getPluginData: (pluginId: string) => Promise<unknown>
+  /** Write plugin-owned JSON to userData/plugin-<id>.json */
+  setPluginData: (pluginId: string, data: unknown) => Promise<void>
   onSessionData: (cb: (tabId: string, data: string) => void) => () => void
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void
   onCycleTab: (cb: (delta: number) => void) => () => void
@@ -464,6 +491,10 @@ export interface WasshApi {
   onOpenPreferences: (cb: () => void) => () => void
   onHostKeyPrompt: (cb: (prompt: HostKeyPrompt) => void) => () => void
   onSavePasswordPrompt: (cb: (prompt: SavePasswordPrompt) => void) => () => void
+  onPluginActive: (cb: (ev: PluginActiveStateEvent) => void) => () => void
+  onPluginMessage: (cb: (ev: PluginMessageEvent) => void) => () => void
+  onSideConnectionData: (cb: (ev: SideConnectionDataEvent) => void) => () => void
+  onSideConnectionClosed: (cb: (ev: SideConnectionClosedEvent) => void) => () => void
 }
 
 declare global {

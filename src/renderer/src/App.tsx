@@ -30,6 +30,10 @@ import OptionsDialog from './components/OptionsDialog'
 import HostSessionSettingsDialog, {
   type HostSessionMode
 } from './components/HostSessionSettingsDialog'
+import type { PluginListItem } from '@shared/plugins'
+import { mergePluginSettings } from '@shared/plugins'
+import PluginToolbar from './plugins/PluginToolbar'
+import PluginSessionFrame from './plugins/PluginSessionFrame'
 
 interface TabState {
   id: string
@@ -38,6 +42,7 @@ interface TabState {
   statusMessage?: string
   hostKeyPrompt?: HostKeyPrompt
   savePasswordPrompt?: SavePasswordPrompt
+  activePluginIds: string[]
 }
 
 function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
@@ -85,6 +90,7 @@ export default function App() {
     linkTabId?: string
   } | null>(null)
   const [saveAsHostName, setSaveAsHostName] = useState('')
+  const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const writers = useRef<Map<string, (data: string) => void>>(new Map())
   const tabsRef = useRef(tabs)
   const activeRef = useRef(activeTabId)
@@ -104,6 +110,11 @@ export default function App() {
     setHosts(list.map((h) => ({ ...h, ...protocolConfigFrom(h), ...sessionStyleFrom(h), ...tunnelConfigFrom(h) })))
   }, [])
 
+  const refreshPlugins = useCallback(async () => {
+    const list = await window.wassh.listPlugins()
+    setPlugins(list)
+  }, [])
+
   const persistTabs = useCallback(() => {
     const snapshot: TabSnapshot[] = tabsRef.current.map((t) => ({
       id: t.id,
@@ -115,7 +126,8 @@ export default function App() {
         ephemeralPassword: '',
         ephemeralPassphrase: ''
       },
-      active: t.id === activeRef.current
+      active: t.id === activeRef.current,
+      activePluginIds: t.activePluginIds
     }))
     void window.wassh.saveTabSnapshot(snapshot)
   }, [])
@@ -144,7 +156,8 @@ export default function App() {
         {
           id,
           connection,
-          status: 'connecting' as SessionStatus
+          status: 'connecting' as SessionStatus,
+          activePluginIds: []
         }
       ])
       setActiveTabId(id)
@@ -159,6 +172,7 @@ export default function App() {
       const s = await window.wassh.getSettings()
       setSettings(s)
       await refreshHosts()
+      await refreshPlugins()
       if (restoredRef.current) {
         return
       }
@@ -178,16 +192,21 @@ export default function App() {
           ...sessionStyleFrom(t.connection),
           ...tunnelConfigFrom(t.connection)
         },
-        status: 'connecting'
+        status: 'connecting',
+        activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : []
       }))
       setTabs(restored)
       const active = snapshot.find((t) => t.active)?.id || snapshot[0]?.id || null
       setActiveTabId(active)
       for (const t of snapshot) {
+        const ids = Array.isArray(t.activePluginIds) ? t.activePluginIds : []
+        if (ids.length > 0) {
+          await window.wassh.queuePluginRestore(t.id, ids)
+        }
         void connectTab(t.id, t.connection)
       }
     })()
-  }, [refreshHosts, connectTab])
+  }, [refreshHosts, refreshPlugins, connectTab])
 
   const closeTab = useCallback((id: string): void => {
     void window.wassh.disconnect(id)
@@ -268,6 +287,22 @@ export default function App() {
     const offPrefs = window.wassh.onOpenPreferences(() => {
       setShowOptions(true)
     })
+    const offPluginActive = window.wassh.onPluginActive((ev) => {
+      setTabs((prev) =>
+        prev.map((t) => {
+          if (t.id !== ev.tabId) {
+            return t
+          }
+          const set = new Set(t.activePluginIds)
+          if (ev.active) {
+            set.add(ev.pluginId)
+          } else {
+            set.delete(ev.pluginId)
+          }
+          return { ...t, activePluginIds: Array.from(set) }
+        })
+      )
+    })
     return () => {
       offData()
       offStatus()
@@ -276,12 +311,41 @@ export default function App() {
       offCycle()
       offCloseActive()
       offPrefs()
+      offPluginActive()
     }
   }, [refreshHosts, closeTab, cycleTab])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
-    void window.wassh.setSettings(partial).then(setSettings)
+    void window.wassh.setSettings(partial).then((next) => {
+      setSettings(next)
+      void refreshPlugins()
+    })
   }
+
+  const onPluginSettingsPatch = useCallback(
+    (pluginId: string, partial: Record<string, unknown>) => {
+      const plugin = plugins.find((p) => p.id === pluginId)
+      const current = mergePluginSettings(
+        plugin?.contributes.settingsSchema,
+        settingsRef.current.pluginSettings[pluginId]
+      )
+      const nextSettings = {
+        ...settingsRef.current.pluginSettings,
+        [pluginId]: { ...current, ...partial }
+      }
+      setSettings((prev) => ({ ...prev, pluginSettings: nextSettings }))
+      void window.wassh.setSettings({ pluginSettings: nextSettings }).then(setSettings)
+    },
+    [plugins]
+  )
+
+  const togglePlugin = useCallback(async (tabId: string, pluginId: string, nextActive: boolean) => {
+    if (nextActive) {
+      await window.wassh.activatePlugin(tabId, pluginId)
+    } else {
+      await window.wassh.deactivatePlugin(tabId, pluginId)
+    }
+  }, [])
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
 
@@ -363,8 +427,14 @@ export default function App() {
             if (!tab) {
               return
             }
-            void window.wassh.disconnect(id)
-            void connectTab(id, tab.connection)
+            void (async () => {
+              const restoreIds = tab.activePluginIds.slice()
+              await window.wassh.disconnect(id)
+              if (restoreIds.length > 0) {
+                await window.wassh.queuePluginRestore(id, restoreIds)
+              }
+              await connectTab(id, tab.connection)
+            })()
           }}
           onConfigure={(id) => {
             const tab = tabsRef.current.find((t) => t.id === id)
@@ -398,6 +468,20 @@ export default function App() {
             })
           }}
         />
+
+        {tabs.length > 0 ? (
+          <PluginToolbar
+            plugins={plugins}
+            activePluginIds={activeTab?.activePluginIds ?? []}
+            disabled={!activeTabId}
+            onToggle={(pluginId, nextActive) => {
+              if (!activeTabId) {
+                return
+              }
+              void togglePlugin(activeTabId, pluginId, nextActive)
+            }}
+          />
+        ) : null}
 
         <div
           className="terminal-area"
@@ -519,23 +603,32 @@ export default function App() {
                   key={t.id}
                   className={`terminal-pane${t.id === activeTabId ? ' active' : ''}`}
                 >
-                  <TerminalView
+                  <PluginSessionFrame
                     tabId={t.id}
                     active={t.id === activeTabId}
+                    plugins={plugins}
+                    activePluginIds={t.activePluginIds}
                     settings={settings}
-                    fontSizePx={sessionStyleFrom(t.connection).fontSizePx}
-                    fontFamily={sessionStyleFrom(t.connection).fontFamily}
-                    scrollbackLines={sessionStyleFrom(t.connection).scrollbackLines}
-                    bellMode={sessionStyleFrom(t.connection).bellMode}
-                    cursorStyle={sessionStyleFrom(t.connection).cursorStyle}
-                    cursorBlink={sessionStyleFrom(t.connection).cursorBlink}
-                    termBackground={sessionStyleFrom(t.connection).termBackground}
-                    termForeground={sessionStyleFrom(t.connection).termForeground}
-                    onData={onTermData}
-                    onResize={onTermResize}
-                    registerWriter={registerWriter}
-                    unregisterWriter={unregisterWriter}
-                  />
+                    onPluginSettingsPatch={onPluginSettingsPatch}
+                  >
+                    <TerminalView
+                      tabId={t.id}
+                      active={t.id === activeTabId}
+                      settings={settings}
+                      fontSizePx={sessionStyleFrom(t.connection).fontSizePx}
+                      fontFamily={sessionStyleFrom(t.connection).fontFamily}
+                      scrollbackLines={sessionStyleFrom(t.connection).scrollbackLines}
+                      bellMode={sessionStyleFrom(t.connection).bellMode}
+                      cursorStyle={sessionStyleFrom(t.connection).cursorStyle}
+                      cursorBlink={sessionStyleFrom(t.connection).cursorBlink}
+                      termBackground={sessionStyleFrom(t.connection).termBackground}
+                      termForeground={sessionStyleFrom(t.connection).termForeground}
+                      onData={onTermData}
+                      onResize={onTermResize}
+                      registerWriter={registerWriter}
+                      unregisterWriter={unregisterWriter}
+                    />
+                  </PluginSessionFrame>
                 </div>
               ))}
             </div>

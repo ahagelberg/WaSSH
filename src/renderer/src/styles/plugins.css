@@ -1,0 +1,187 @@
+/* Plugin toolbar + session slots */
+
+:root {
+  --plugin-toolbar-height: 32px;
+  --plugin-split-right-width: 240px;
+  --plugin-split-left-width: 220px;
+  --plugin-split-bottom-height: 160px;
+  --plugin-split-top-height: 120px;
+}
+
+.plugin-toolbar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  height: var(--plugin-toolbar-height);
+  padding: 0 var(--gap);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.plugin-toolbar-btn {
+  padding: 2px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.plugin-toolbar-btn.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-panel-2));
+}
+
+.plugin-session-frame {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.plugin-session-mid {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
+.plugin-session-terminal {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
+
+.plugin-session-terminal .terminal-host {
+  height: 100%;
+}
+
+.plugin-slot {
+  flex-shrink: 0;
+  background: var(--bg-panel);
+  border-color: var(--border);
+  border-style: solid;
+  border-width: 0;
+  overflow: auto;
+  min-height: 0;
+}
+
+.plugin-slot-split-left {
+  width: var(--plugin-split-left-width);
+  border-right-width: 1px;
+}
+
+.plugin-slot-split-right {
+  width: var(--plugin-split-right-width);
+  border-left-width: 1px;
+}
+
+.plugin-slot-split-top {
+  height: var(--plugin-split-top-height);
+  border-bottom-width: 1px;
+}
+
+.plugin-slot-split-bottom {
+  height: var(--plugin-split-bottom-height);
+  border-top-width: 1px;
+}
+
+.plugin-slot-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  border: none;
+  background: var(--bg-panel);
+}
+
+.plugin-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: var(--gap);
+  gap: var(--gap);
+}
+
+.plugin-panel-header {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.plugin-monitor-output {
+  flex: 1;
+  margin: 0;
+  padding: var(--gap);
+  overflow: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  user-select: text;
+}
+
+.plugin-monitor-error {
+  color: var(--danger);
+}
+
+.plugin-monitor-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.plugin-scratchpad-input {
+  flex: 1;
+  min-height: 80px;
+  resize: none;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--gap);
+  user-select: text;
+}
+
+.plugin-macro-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.plugin-macro-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 72px;
+}
+
+.plugin-macro-label {
+  font-weight: 600;
+}
+
+.plugin-macro-hotkey {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.plugin-settings-macros {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  width: 100%;
+}
+
+.plugin-settings-macro-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.plugin-settings-external-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 12px 0 0;
+}

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'crypto'
 import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
-import { Client, ConnectConfig, PseudoTtyOptions } from 'ssh2'
+import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import { Readable } from 'stream'
 import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection } from '../../shared/connection'
 import {
@@ -191,6 +191,163 @@ export class SshConnection extends EventEmitter {
     this.reconnectAttempt = 0
     this.clearReconnectTimer()
     void this.open()
+  }
+
+  getSshClient(): Client | null {
+    return this.client
+  }
+
+  execCommand(command: string): Promise<ClientChannel> {
+    const client = this.client
+    if (!client) {
+      return Promise.reject(new Error('SSH session is not connected'))
+    }
+    return new Promise((resolve, reject) => {
+      client.exec(command, (err, channel) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        resolve(channel)
+      })
+    })
+  }
+
+  openExtraShell(): Promise<ClientChannel> {
+    const client = this.client
+    if (!client) {
+      return Promise.reject(new Error('SSH session is not connected'))
+    }
+    const pty: PseudoTtyOptions = {
+      term: this.termType,
+      cols: this.cols,
+      rows: this.rows
+    }
+    return new Promise((resolve, reject) => {
+      client.shell(pty, (err, channel) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        resolve(channel)
+      })
+    })
+  }
+
+  forwardOut(destHost: string, destPort: number): Promise<ClientChannel> {
+    const client = this.client
+    if (!client) {
+      return Promise.reject(new Error('SSH session is not connected'))
+    }
+    return new Promise((resolve, reject) => {
+      client.forwardOut('127.0.0.1', 0, destHost, destPort, (err, stream) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        resolve(stream)
+      })
+    })
+  }
+
+  /**
+   * Opens an isolated SSH client using the same profile/proxy chain.
+   * Does not disturb the interactive shell.
+   */
+  async openDuplicateClient(): Promise<{ client: Client; dispose: () => void }> {
+    let chain: ConnectionParams[]
+    try {
+      chain = resolveProxyChain(this.connection, this.sessionStore.listHosts())
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new Error(msg)
+    }
+
+    const proxies: Client[] = []
+    let sock: Readable | undefined
+    try {
+      for (let i = 0; i < chain.length - 1; i++) {
+        const hop = chain[i]
+        const next = chain[i + 1]
+        const hopClient = await this.connectPluginClient(hop)
+        proxies.push(hopClient)
+        sock = await this.forwardThroughQuiet(hopClient, next.host, next.port)
+      }
+      const target = chain[chain.length - 1]
+      const client = await this.connectPluginClient(target, sock)
+      return {
+        client,
+        dispose: () => {
+          this.quietEnd(client)
+          for (const proxy of proxies) {
+            this.quietEnd(proxy)
+          }
+        }
+      }
+    } catch (err) {
+      for (const proxy of proxies) {
+        this.quietEnd(proxy)
+      }
+      throw err
+    }
+  }
+
+  private connectPluginClient(params: ConnectionParams, sock?: Readable): Promise<Client> {
+    return new Promise((resolve, reject) => {
+      const client = new Client()
+      this.attachKeyboardInteractive(client, params)
+
+      const onReady = (): void => {
+        cleanup()
+        resolve(client)
+      }
+      const onError = (err: Error): void => {
+        cleanup()
+        reject(err)
+      }
+      const onClose = (): void => {
+        cleanup()
+        reject(new Error(`Connection closed (${params.name || params.host})`))
+      }
+      const cleanup = (): void => {
+        client.removeListener('ready', onReady)
+        client.removeListener('error', onError)
+        client.removeListener('close', onClose)
+      }
+
+      client.once('ready', onReady)
+      client.once('error', onError)
+      client.once('close', onClose)
+      client.on('error', () => {
+        /* absorb after ready */
+      })
+
+      try {
+        client.connect(this.buildConfig(params, sock))
+      } catch (err) {
+        cleanup()
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    })
+  }
+
+  private forwardThroughQuiet(
+    client: Client,
+    destHost: string,
+    destPort: number
+  ): Promise<Readable> {
+    return new Promise((resolve, reject) => {
+      client.forwardOut('127.0.0.1', 0, destHost, destPort, (err, stream) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        stream.on('error', () => {
+          /* absorb — plugin duplicate path */
+        })
+        resolve(stream)
+      })
+    })
   }
 
   private emitStatus(status: SessionStatus, message?: string): void {

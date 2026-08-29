@@ -11,6 +11,12 @@ import type {
   TabSnapshot,
   WasshApi
 } from '../shared/types'
+import type {
+  PluginActiveStateEvent,
+  PluginMessageEvent,
+  SideConnectionClosedEvent,
+  SideConnectionDataEvent
+} from '../shared/plugins'
 
 function on(
   channel: string,
@@ -48,6 +54,17 @@ const api: WasshApi = {
   pickPrivateKeyFile: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
   listSerialPorts: () => ipcRenderer.invoke('serial:listPorts'),
   beep: () => ipcRenderer.invoke('app:beep'),
+  listPlugins: () => ipcRenderer.invoke('plugins:list'),
+  activatePlugin: (tabId, pluginId) => ipcRenderer.invoke('plugins:activate', tabId, pluginId),
+  deactivatePlugin: (tabId, pluginId) =>
+    ipcRenderer.invoke('plugins:deactivate', tabId, pluginId),
+  getActivePlugins: (tabId) => ipcRenderer.invoke('plugins:getActive', tabId),
+  sendPluginMessage: (tabId, pluginId, payload) =>
+    ipcRenderer.invoke('plugins:message', tabId, pluginId, payload),
+  queuePluginRestore: (tabId, activePluginIds) =>
+    ipcRenderer.invoke('plugins:queueRestore', tabId, activePluginIds),
+  getPluginData: (pluginId) => ipcRenderer.invoke('plugins:getData', pluginId),
+  setPluginData: (pluginId, data) => ipcRenderer.invoke('plugins:setData', pluginId, data),
   onSessionData: (cb) =>
     on('session:data', (tabId, data) => cb(tabId as string, data as string)),
   onSessionStatus: (cb) =>
@@ -58,8 +75,15 @@ const api: WasshApi = {
   onHostKeyPrompt: (cb) =>
     on('session:hostKeyPrompt', (prompt) => cb(prompt as HostKeyPrompt)),
   onSavePasswordPrompt: (cb) =>
-    on('session:savePasswordPrompt', (prompt) => cb(prompt as SavePasswordPrompt))
+    on('session:savePasswordPrompt', (prompt) => cb(prompt as SavePasswordPrompt)),
+  onPluginActive: (cb) =>
+    on('plugin:active', (ev) => cb(ev as PluginActiveStateEvent)),
+  onPluginMessage: (cb) =>
+    on('plugin:message', (ev) => cb(ev as PluginMessageEvent)),
+  onSideConnectionData: (cb) =>
+    on('plugin:sideData', (ev) => cb(ev as SideConnectionDataEvent)),
+  onSideConnectionClosed: (cb) =>
+    on('plugin:sideClosed', (ev) => cb(ev as SideConnectionClosedEvent))
 }
 
 contextBridge.exposeInMainWorld('wassh', api)
-
