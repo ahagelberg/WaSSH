@@ -53,6 +53,7 @@ const api: WasshApi = {
   onSessionStatus: (cb) =>
     on('session:status', (ev) => cb(ev as SessionStatusEvent)),
   onCycleTab: (cb) => on('tabs:cycle', (delta) => cb(delta as number)),
+  onCloseActiveTab: (cb) => on('tabs:closeActive', () => cb()),
   onOpenPreferences: (cb) => on('app:openPreferences', () => cb()),
   onHostKeyPrompt: (cb) =>
     on('session:hostKeyPrompt', (prompt) => cb(prompt as HostKeyPrompt)),

@@ -4,6 +4,7 @@ import {
   DEFAULT_THEME,
   DEFAULT_WINDOW_MIN_HEIGHT,
   DEFAULT_WINDOW_MIN_WIDTH,
+  TAB_CLOSE_KEY,
   TAB_CYCLE_KEY,
   TAB_CYCLE_NEXT,
   TAB_CYCLE_PREV,
@@ -148,15 +149,19 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') {
+    if (input.type !== 'keyDown' || !input.control || input.alt || input.meta) {
       return
     }
-    if (input.key !== TAB_CYCLE_KEY || !input.control || input.alt || input.meta) {
+    if (input.key === TAB_CYCLE_KEY) {
+      event.preventDefault()
+      const delta = input.shift ? TAB_CYCLE_PREV : TAB_CYCLE_NEXT
+      mainWindow?.webContents.send('tabs:cycle', delta)
       return
     }
-    event.preventDefault()
-    const delta = input.shift ? TAB_CYCLE_PREV : TAB_CYCLE_NEXT
-    mainWindow?.webContents.send('tabs:cycle', delta)
+    if (input.key === TAB_CLOSE_KEY && !input.shift) {
+      event.preventDefault()
+      mainWindow?.webContents.send('tabs:closeActive')
+    }
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {

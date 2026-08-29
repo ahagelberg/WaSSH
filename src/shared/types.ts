@@ -233,6 +233,9 @@ export const TAB_CYCLE_NEXT = 1
 /** Ctrl+Shift+Tab moves to the previous session tab */
 export const TAB_CYCLE_PREV = -1
 
+/** Ctrl+F4 closes the active session tab */
+export const TAB_CLOSE_KEY = 'F4'
+
 /** Default main window width px */
 export const DEFAULT_WINDOW_WIDTH = 1280
 
@@ -457,6 +460,7 @@ export interface WasshApi {
   onSessionData: (cb: (tabId: string, data: string) => void) => () => void
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void
   onCycleTab: (cb: (delta: number) => void) => () => void
+  onCloseActiveTab: (cb: () => void) => () => void
   onOpenPreferences: (cb: () => void) => () => void
   onHostKeyPrompt: (cb: (prompt: HostKeyPrompt) => void) => () => void
   onSavePasswordPrompt: (cb: (prompt: SavePasswordPrompt) => void) => () => void

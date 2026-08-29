@@ -7,6 +7,7 @@ import {
   BELL_MODE_INVERT_LINE,
   BELL_MODE_INVERT_WINDOW,
   BELL_MODE_SYSTEM,
+  TAB_CLOSE_KEY,
   TAB_CYCLE_KEY,
   type AppSettings,
   type BellMode,
@@ -214,8 +215,12 @@ export default function TerminalView({
       if (ev.type !== 'keydown') {
         return true
       }
-      // Let Alt+F4 reach the window manager (xterm must not preventDefault)
-      if (ev.altKey && !ev.ctrlKey && !ev.metaKey && ev.key === 'F4') {
+      // Let Alt+F4 / Ctrl+F4 reach the app / window manager (xterm must not preventDefault)
+      if (
+        !ev.metaKey &&
+        ev.key === TAB_CLOSE_KEY &&
+        ((ev.altKey && !ev.ctrlKey) || (ev.ctrlKey && !ev.altKey && !ev.shiftKey))
+      ) {
         return false
       }
       if (ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key === TAB_CYCLE_KEY) {

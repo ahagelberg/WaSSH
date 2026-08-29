@@ -259,6 +259,12 @@ export default function App() {
       }
     })
     const offCycle = window.wassh.onCycleTab(cycleTab)
+    const offCloseActive = window.wassh.onCloseActiveTab(() => {
+      const id = activeRef.current
+      if (id) {
+        closeTab(id)
+      }
+    })
     const offPrefs = window.wassh.onOpenPreferences(() => {
       setShowOptions(true)
     })
@@ -268,6 +274,7 @@ export default function App() {
       offHostKey()
       offSavePwd()
       offCycle()
+      offCloseActive()
       offPrefs()
     }
   }, [refreshHosts, closeTab, cycleTab])
