@@ -181,24 +181,44 @@ export default function TerminalView({
       }
     })
 
+    const copySelection = (): void => {
+      const sel = term.getSelection()
+      if (sel) {
+        void navigator.clipboard.writeText(sel)
+      }
+    }
+
+    const pasteClipboard = (): void => {
+      void navigator.clipboard.readText().then((text) => {
+        if (text) {
+          onData(tabId, text)
+        }
+      })
+    }
+
+    // PuTTY: finishing a left-button selection copies; right-click pastes
+    const onMouseUp = (ev: MouseEvent): void => {
+      if (ev.button === 0) {
+        copySelection()
+      }
+    }
+    const onContextMenu = (ev: MouseEvent): void => {
+      ev.preventDefault()
+      ev.stopPropagation()
+      pasteClipboard()
+    }
+    host.addEventListener('mouseup', onMouseUp)
+    host.addEventListener('contextmenu', onContextMenu)
+
     term.attachCustomKeyEventHandler((ev) => {
-      if (ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key === TAB_CYCLE_KEY) {
+      if (ev.type !== 'keydown') {
+        return true
+      }
+      // Let Alt+F4 reach the window manager (xterm must not preventDefault)
+      if (ev.altKey && !ev.ctrlKey && !ev.metaKey && ev.key === 'F4') {
         return false
       }
-      const mod = ev.ctrlKey && ev.shiftKey
-      if (mod && ev.key.toLowerCase() === 'c') {
-        const sel = term.getSelection()
-        if (sel) {
-          void navigator.clipboard.writeText(sel)
-          return false
-        }
-      }
-      if (mod && ev.key.toLowerCase() === 'v') {
-        void navigator.clipboard.readText().then((text) => {
-          if (text) {
-            onData(tabId, text)
-          }
-        })
+      if (ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key === TAB_CYCLE_KEY) {
         return false
       }
       return true
@@ -226,6 +246,8 @@ export default function TerminalView({
       cursorSeqDisp.dispose()
       bellDisp.dispose()
       clearBellFlash()
+      host.removeEventListener('mouseup', onMouseUp)
+      host.removeEventListener('contextmenu', onContextMenu)
       ro.disconnect()
       if (resizeTimer) {
         clearTimeout(resizeTimer)

@@ -46,6 +46,8 @@ export class SshConnection extends EventEmitter {
   private intentionalDisconnect = false
   private authInputActive = false
   private everConnected = false
+  /** True while open() is connecting, before the shell stream is ready */
+  private opening = false
   /** True after the remote shell sent an exit-status / exit-signal (logout, not a drop) */
   private remoteShellExited = false
   private tunnels = new TunnelManager((message) => {
@@ -134,13 +136,21 @@ export class SshConnection extends EventEmitter {
       this.emit('terminalInput', data)
       return
     }
-    this.stream?.write(data)
+    try {
+      this.stream?.write(data)
+    } catch {
+      /* ignore */
+    }
   }
 
   resize(cols: number, rows: number): void {
     this.cols = cols
     this.rows = rows
-    this.stream?.setWindow(rows, cols, 0, 0)
+    try {
+      this.stream?.setWindow(rows, cols, 0, 0)
+    } catch {
+      /* ignore */
+    }
   }
 
   disconnect(): void {
@@ -154,6 +164,33 @@ export class SshConnection extends EventEmitter {
     this.disposed = true
     this.disconnect()
     this.removeAllListeners()
+  }
+
+  prepareForSleep(): void {
+    if (this.disposed || this.intentionalDisconnect) {
+      return
+    }
+    this.clearReconnectTimer()
+    if (!this.stream && !this.client && !this.everConnected) {
+      return
+    }
+    this.closeClientOnly()
+    this.emitStatus('disconnected', 'Computer sleep')
+  }
+
+  reconnectNow(): void {
+    if (this.disposed || this.intentionalDisconnect) {
+      return
+    }
+    if (!this.everConnected) {
+      return
+    }
+    if (this.stream || this.opening) {
+      return
+    }
+    this.reconnectAttempt = 0
+    this.clearReconnectTimer()
+    void this.open()
   }
 
   private emitStatus(status: SessionStatus, message?: string): void {
@@ -373,10 +410,44 @@ export class SshConnection extends EventEmitter {
     })
   }
 
+  private guardClient(client: Client): void {
+    client.on('error', (err: Error) => {
+      if (this.client !== client && !this.proxyClients.includes(client)) {
+        return
+      }
+      this.onTransportError(err)
+    })
+  }
+
+  private onTransportError(err: Error): void {
+    if (this.intentionalDisconnect || this.disposed || this.opening) {
+      return
+    }
+    this.emitStatus('disconnected', err.message)
+    this.closeClientOnly()
+    this.scheduleReconnect()
+  }
+
+  private quietEnd(client: Client | null): void {
+    if (!client) {
+      return
+    }
+    client.removeAllListeners()
+    client.on('error', () => {
+      /* absorb errors from ending a dead socket */
+    })
+    try {
+      client.end()
+    } catch {
+      /* ignore */
+    }
+  }
+
   private connectClient(params: ConnectionParams, sock?: Readable): Promise<Client> {
     return new Promise((resolve, reject) => {
       const client = new Client()
       this.attachKeyboardInteractive(client, params)
+      this.guardClient(client)
 
       const onReady = (): void => {
         cleanup()
@@ -420,6 +491,9 @@ export class SshConnection extends EventEmitter {
           reject(err)
           return
         }
+        stream.on('error', (streamErr: Error) => {
+          this.onTransportError(streamErr)
+        })
         resolve(stream)
       })
     })
@@ -429,6 +503,7 @@ export class SshConnection extends EventEmitter {
     if (this.disposed) {
       return
     }
+    this.opening = true
     this.clearReconnectTimer()
     this.closeClientOnly()
     this.remoteShellExited = false
@@ -438,6 +513,7 @@ export class SshConnection extends EventEmitter {
     try {
       chain = resolveProxyChain(this.connection, this.sessionStore.listHosts())
     } catch (err) {
+      this.opening = false
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       return
@@ -450,6 +526,7 @@ export class SshConnection extends EventEmitter {
 
     for (const hop of chain.slice(0, -1)) {
       if (!this.proxyCredentialsReady(hop)) {
+        this.opening = false
         this.emitStatus(
           'failed',
           `Proxy ${hop.name || hop.host} needs username and credentials in host settings`
@@ -460,6 +537,7 @@ export class SshConnection extends EventEmitter {
 
     await this.ensureTargetCredentials()
     if (this.disposed || this.intentionalDisconnect) {
+      this.opening = false
       return
     }
 
@@ -478,6 +556,7 @@ export class SshConnection extends EventEmitter {
       const target = chain[chain.length - 1]
       this.client = await this.connectClient(target, sock)
     } catch (err) {
+      this.opening = false
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeClientOnly()
@@ -486,12 +565,19 @@ export class SshConnection extends EventEmitter {
     }
 
     if (this.disposed || this.intentionalDisconnect) {
+      this.opening = false
       this.closeClientOnly()
       return
     }
 
     this.emitStatus('authenticating')
-    await this.startShell(this.client)
+    const client = this.client
+    if (!client) {
+      this.opening = false
+      this.emitStatus('failed', 'SSH client missing after connect')
+      return
+    }
+    await this.startShell(client)
   }
 
   private startShell(client: Client): Promise<void> {
@@ -504,57 +590,74 @@ export class SshConnection extends EventEmitter {
       const tunnelOpts = tunnelConfigFrom(this.connection)
       const shellOptions = tunnelOpts.x11Forwarding ? { x11: true } : {}
 
-      void this.tunnels.start(client, tunnelOpts.tunnels, tunnelOpts.x11Forwarding).then(() => {
-        client.shell(pty, shellOptions, (err, stream) => {
-          if (err) {
-            this.tunnels.stop()
-            this.emitStatus('failed', err.message)
-            this.scheduleReconnect()
-            resolve()
-            return
-          }
-          this.stream = stream
-          this.reconnectAttempt = 0
-          this.everConnected = true
-          this.emitStatus('connected')
-
-          if (this.usedInteractivePassword && this.interactivePassword) {
-            this.pendingSavePassword = this.interactivePassword
-            this.usedInteractivePassword = false
-            this.emit('savePasswordPrompt', {
-              tabId: this.tabId,
-              hasHostProfile: Boolean(this.connection.hostId)
-            } satisfies SavePasswordPrompt)
-          }
-
-          stream.on('data', (data: Buffer) => {
-            this.emit('data', data.toString('utf8'))
-          })
-          stream.stderr.on('data', (data: Buffer) => {
-            this.emit('data', data.toString('utf8'))
-          })
-          stream.on('exit', () => {
-            this.remoteShellExited = true
-          })
-          stream.on('close', () => {
-            this.stream = null
-            this.tunnels.stop()
-            if (this.intentionalDisconnect || this.disposed) {
-              this.emitStatus('disconnected')
+      void this.tunnels
+        .start(client, tunnelOpts.tunnels, tunnelOpts.x11Forwarding)
+        .then(() => {
+          client.shell(pty, shellOptions, (err, stream) => {
+            if (err) {
+              this.opening = false
+              this.tunnels.stop()
+              this.emitStatus('failed', err.message)
+              this.scheduleReconnect()
               resolve()
               return
             }
-            if (this.remoteShellExited) {
-              this.endAfterRemoteLogout()
-              resolve()
-              return
+            this.stream = stream
+            this.opening = false
+            this.reconnectAttempt = 0
+            this.everConnected = true
+            this.emitStatus('connected')
+
+            if (this.usedInteractivePassword && this.interactivePassword) {
+              this.pendingSavePassword = this.interactivePassword
+              this.usedInteractivePassword = false
+              this.emit('savePasswordPrompt', {
+                tabId: this.tabId,
+                hasHostProfile: Boolean(this.connection.hostId)
+              } satisfies SavePasswordPrompt)
             }
-            this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
-            this.scheduleReconnect()
-            resolve()
+
+            stream.on('data', (data: Buffer) => {
+              this.emit('data', data.toString('utf8'))
+            })
+            stream.stderr?.on('data', (data: Buffer) => {
+              this.emit('data', data.toString('utf8'))
+            })
+            stream.on('error', (streamErr: Error) => {
+              this.onTransportError(streamErr)
+            })
+            stream.stderr?.on('error', () => {
+              /* absorb stderr socket resets */
+            })
+            stream.on('exit', () => {
+              this.remoteShellExited = true
+            })
+            stream.on('close', () => {
+              this.stream = null
+              this.tunnels.stop()
+              if (this.intentionalDisconnect || this.disposed) {
+                this.emitStatus('disconnected')
+                resolve()
+                return
+              }
+              if (this.remoteShellExited) {
+                this.endAfterRemoteLogout()
+                resolve()
+                return
+              }
+              this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
+              this.scheduleReconnect()
+              resolve()
+            })
           })
         })
-      })
+        .catch((err: unknown) => {
+          this.opening = false
+          const msg = err instanceof Error ? err.message : String(err)
+          this.emitStatus('failed', msg)
+          this.scheduleReconnect()
+          resolve()
+        })
 
       client.on('close', () => {
         if (this.intentionalDisconnect || this.disposed) {
@@ -610,25 +713,26 @@ export class SshConnection extends EventEmitter {
 
   private closeClientOnly(): void {
     this.tunnels.stop()
-    try {
-      this.stream?.close()
-    } catch {
-      /* ignore */
-    }
+    const stream = this.stream
     this.stream = null
-    try {
-      this.client?.end()
-    } catch {
-      /* ignore */
-    }
-    this.client = null
-    for (const proxy of this.proxyClients) {
+    if (stream) {
+      stream.removeAllListeners()
+      stream.on('error', () => {
+        /* absorb */
+      })
       try {
-        proxy.end()
+        stream.close()
       } catch {
         /* ignore */
       }
     }
+    const client = this.client
+    this.client = null
+    this.quietEnd(client)
+    const proxies = this.proxyClients
     this.proxyClients = []
+    for (const proxy of proxies) {
+      this.quietEnd(proxy)
+    }
   }
 }

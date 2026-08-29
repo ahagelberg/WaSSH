@@ -186,6 +186,10 @@ export class TunnelManager {
 
   stop(): void {
     for (const server of this.localServers) {
+      server.removeAllListeners()
+      server.on('error', () => {
+        /* absorb errors from closing a dead listen socket */
+      })
       try {
         server.close()
       } catch {
@@ -289,6 +293,9 @@ export class TunnelManager {
   private startLocal(client: Client, tunnel: SshTunnel): Promise<void> {
     return new Promise((resolve, reject) => {
       const server = createServer((socket) => {
+        socket.on('error', () => {
+          socket.destroy()
+        })
         client.forwardOut(
           FORWARD_SRC_IP,
           FORWARD_SRC_PORT,
@@ -305,6 +312,10 @@ export class TunnelManager {
       })
       server.once('error', reject)
       server.listen(tunnel.listenPort, tunnel.listenHost, () => {
+        server.removeListener('error', reject)
+        server.on('error', () => {
+          /* absorb listen-socket errors after the tunnel is up */
+        })
         this.localServers.push(server)
         resolve()
       })
@@ -337,6 +348,10 @@ export class TunnelManager {
       })
       server.once('error', reject)
       server.listen(tunnel.listenPort, tunnel.listenHost, () => {
+        server.removeListener('error', reject)
+        server.on('error', () => {
+          /* absorb listen-socket errors after the tunnel is up */
+        })
         this.localServers.push(server)
         resolve()
       })

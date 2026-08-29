@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, shell } from 'electron'
+import { app, BrowserWindow, Menu, powerMonitor, shell } from 'electron'
 import { join } from 'path'
 import {
   DEFAULT_THEME,
@@ -7,7 +7,8 @@ import {
   TAB_CYCLE_KEY,
   TAB_CYCLE_NEXT,
   TAB_CYCLE_PREV,
-  THEME_WINDOW_BACKGROUND
+  THEME_WINDOW_BACKGROUND,
+  WAKE_RECONNECT_DELAY_MS
 } from '../shared/types'
 import { applyChromeTheme, registerIpc } from './ipc/handlers'
 import { SessionManager } from './ssh/SessionManager'
@@ -22,6 +23,66 @@ import { attachWindowBoundsPersistence, restoreWindowBounds } from './windowBoun
 
 /** Accelerator for File > Preferences */
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
+
+/** Network resets that happen on sleep/wake; must not crash the main process */
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ENETRESET',
+  'ECONNABORTED',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENOTCONN',
+  'ERR_STREAM_DESTROYED'
+])
+
+let wakeReconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+function errorCodeOf(err: unknown): string {
+  if (!err || typeof err !== 'object' || !('code' in err)) {
+    return ''
+  }
+  return String((err as { code?: unknown }).code)
+}
+
+function isTransientNetworkError(err: unknown): boolean {
+  return TRANSIENT_NETWORK_ERROR_CODES.has(errorCodeOf(err))
+}
+
+function installProcessErrorGuards(): void {
+  process.on('uncaughtException', (err) => {
+    if (isTransientNetworkError(err)) {
+      return
+    }
+    console.error(err)
+  })
+  process.on('unhandledRejection', (reason) => {
+    if (isTransientNetworkError(reason)) {
+      return
+    }
+    console.error(reason)
+  })
+}
+
+function attachPowerMonitor(): void {
+  powerMonitor.on('suspend', () => {
+    if (wakeReconnectTimer) {
+      clearTimeout(wakeReconnectTimer)
+      wakeReconnectTimer = null
+    }
+    sessions?.prepareForSleep()
+  })
+  powerMonitor.on('resume', () => {
+    if (wakeReconnectTimer) {
+      clearTimeout(wakeReconnectTimer)
+    }
+    wakeReconnectTimer = setTimeout(() => {
+      wakeReconnectTimer = null
+      sessions?.reconnectOnWake()
+    }, WAKE_RECONNECT_DELAY_MS)
+  })
+}
 
 const ALLOWED_WEB_PERMISSIONS = new Set([
   'local-fonts',
@@ -130,6 +191,8 @@ function installAppMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
+installProcessErrorGuards()
+
 app.whenReady().then(() => {
   const vault = new CredentialVault()
   const sessionStore = new SessionStore()
@@ -145,6 +208,7 @@ app.whenReady().then(() => {
   )
   registerIpc(vault, sessionStore, tabStore, settingsStore, knownHosts, sessions, getWindow)
   installAppMenu()
+  attachPowerMonitor()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

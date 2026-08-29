@@ -218,6 +218,9 @@ export const RECONNECT_MAX_BACKOFF_MS = 30000
 /** Mid-session reconnect: default max attempts */
 export const DEFAULT_RECONNECT_MAX_ATTEMPTS = 10
 
+/** Wait after OS resume so the network stack is up before reconnecting */
+export const WAKE_RECONNECT_DELAY_MS = 2000
+
 /** Tab snapshot write debounce ms */
 export const TAB_SNAPSHOT_DEBOUNCE_MS = 500
 

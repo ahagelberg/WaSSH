@@ -222,13 +222,21 @@ export class TelnetConnection extends ByteSession {
   private socket: Socket | null = null
   private filter: TelnetFilter | null = null
 
+  protected isTransportOpen(): boolean {
+    return Boolean(this.socket && !this.socket.destroyed)
+  }
+
   write(data: string): void {
     const sock = this.socket
     const filter = this.filter
     if (!sock || !filter) {
       return
     }
-    sock.write(filter.escapeWrite(data))
+    try {
+      sock.write(filter.escapeWrite(data))
+    } catch {
+      /* ignore */
+    }
   }
 
   resize(cols: number, rows: number): void {
@@ -245,6 +253,7 @@ export class TelnetConnection extends ByteSession {
     if (this.disposed) {
       return
     }
+    this.opening = true
     this.clearReconnectTimer()
     this.closeTransport()
     this.remoteEnded = false
@@ -253,15 +262,29 @@ export class TelnetConnection extends ByteSession {
     const host = this.connection.host.trim()
     const port = this.connection.port
     if (!host) {
+      this.opening = false
       this.emitStatus('failed', 'Host is required')
       return
     }
 
     const socket = new Socket()
     this.socket = socket
+    socket.on('error', (err: Error) => {
+      if (this.intentionalDisconnect || this.disposed || !this.everConnected) {
+        return
+      }
+      this.emitStatus('disconnected', err.message)
+      this.closeTransport()
+      this.scheduleReconnect()
+    })
     const filter = new TelnetFilter((bytes) => {
-      if (!socket.destroyed) {
+      if (socket.destroyed) {
+        return
+      }
+      try {
         socket.write(Buffer.from(bytes))
+      } catch {
+        /* ignore */
       }
     })
     filter.termType = this.termType
@@ -288,6 +311,7 @@ export class TelnetConnection extends ByteSession {
         socket.connect(port, host)
       })
     } catch (err) {
+      this.opening = false
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
@@ -296,6 +320,7 @@ export class TelnetConnection extends ByteSession {
     }
 
     if (this.disposed || this.intentionalDisconnect) {
+      this.opening = false
       this.closeTransport()
       return
     }
@@ -305,13 +330,6 @@ export class TelnetConnection extends ByteSession {
       if (app.length > 0) {
         this.emit('data', app.toString('utf8'))
       }
-    })
-    socket.on('error', (err) => {
-      if (this.intentionalDisconnect || this.disposed) {
-        return
-      }
-      this.emitStatus('disconnected', err.message)
-      this.scheduleReconnect()
     })
     socket.on('close', () => {
       this.handleTransportClose()
@@ -330,6 +348,9 @@ export class TelnetConnection extends ByteSession {
       return
     }
     sock.removeAllListeners()
+    sock.on('error', () => {
+      /* absorb errors from destroying a dead socket */
+    })
     try {
       sock.destroy()
     } catch {

@@ -120,4 +120,16 @@ export class SessionManager {
       this.disconnect(id)
     }
   }
+
+  prepareForSleep(): void {
+    for (const conn of Array.from(this.sessions.values())) {
+      conn.prepareForSleep()
+    }
+  }
+
+  reconnectOnWake(): void {
+    for (const conn of Array.from(this.sessions.values())) {
+      conn.reconnectNow()
+    }
+  }
 }

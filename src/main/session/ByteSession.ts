@@ -23,6 +23,8 @@ export abstract class ByteSession extends EventEmitter {
   protected reconnectTimer: ReturnType<typeof setTimeout> | null = null
   protected autoReconnect = false
   protected maxReconnectAttempts = 0
+  /** True while open() is connecting, before the transport is ready */
+  protected opening = false
   protected cols = DEFAULT_TERM_COLS
   protected rows = DEFAULT_TERM_ROWS
   protected termType = DEFAULT_TERM_TYPE
@@ -85,7 +87,37 @@ export abstract class ByteSession extends EventEmitter {
     this.emit('status', status, message)
   }
 
+  protected abstract isTransportOpen(): boolean
+
+  prepareForSleep(): void {
+    if (this.disposed || this.intentionalDisconnect) {
+      return
+    }
+    this.clearReconnectTimer()
+    if (!this.isTransportOpen() && !this.everConnected) {
+      return
+    }
+    this.closeTransport()
+    this.emitStatus('disconnected', 'Computer sleep')
+  }
+
+  reconnectNow(): void {
+    if (this.disposed || this.intentionalDisconnect) {
+      return
+    }
+    if (!this.everConnected) {
+      return
+    }
+    if (this.isTransportOpen() || this.opening) {
+      return
+    }
+    this.reconnectAttempt = 0
+    this.clearReconnectTimer()
+    void this.open()
+  }
+
   protected markConnected(): void {
+    this.opening = false
     this.reconnectAttempt = 0
     this.everConnected = true
     this.emitStatus('connected')

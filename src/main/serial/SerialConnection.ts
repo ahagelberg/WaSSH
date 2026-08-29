@@ -20,8 +20,16 @@ function flowFlags(flow: SerialFlowControl): { rtscts: boolean; xon: boolean; xo
 export class SerialConnection extends ByteSession {
   private port: SerialPort | null = null
 
+  protected isTransportOpen(): boolean {
+    return Boolean(this.port?.isOpen)
+  }
+
   write(data: string): void {
-    this.port?.write(data)
+    try {
+      this.port?.write(data)
+    } catch {
+      /* ignore */
+    }
   }
 
   resize(cols: number, rows: number): void {
@@ -33,6 +41,7 @@ export class SerialConnection extends ByteSession {
     if (this.disposed) {
       return
     }
+    this.opening = true
     this.clearReconnectTimer()
     this.closeTransport()
     this.remoteEnded = false
@@ -40,6 +49,7 @@ export class SerialConnection extends ByteSession {
 
     const path = this.connection.host.trim()
     if (!path) {
+      this.opening = false
       this.emitStatus('failed', 'Serial port is required')
       return
     }
@@ -52,6 +62,7 @@ export class SerialConnection extends ByteSession {
       const mod = await import('serialport')
       SerialPortCtor = mod.SerialPort
     } catch (err) {
+      this.opening = false
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', `Serial support unavailable: ${msg}`)
       return
@@ -69,6 +80,14 @@ export class SerialConnection extends ByteSession {
       autoOpen: false
     })
     this.port = port
+    port.on('error', (err: Error) => {
+      if (this.intentionalDisconnect || this.disposed || !this.everConnected) {
+        return
+      }
+      this.emitStatus('disconnected', err.message)
+      this.closeTransport()
+      this.scheduleReconnect()
+    })
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -81,6 +100,7 @@ export class SerialConnection extends ByteSession {
         })
       })
     } catch (err) {
+      this.opening = false
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
@@ -89,19 +109,13 @@ export class SerialConnection extends ByteSession {
     }
 
     if (this.disposed || this.intentionalDisconnect) {
+      this.opening = false
       this.closeTransport()
       return
     }
 
     port.on('data', (chunk: Buffer) => {
       this.emit('data', chunk.toString('utf8'))
-    })
-    port.on('error', (err) => {
-      if (this.intentionalDisconnect || this.disposed) {
-        return
-      }
-      this.emitStatus('disconnected', err.message)
-      this.scheduleReconnect()
     })
     port.on('close', () => {
       this.handleTransportClose()
@@ -117,6 +131,9 @@ export class SerialConnection extends ByteSession {
       return
     }
     port.removeAllListeners()
+    port.on('error', () => {
+      /* absorb errors from closing a dead port */
+    })
     if (port.isOpen) {
       try {
         port.close()
