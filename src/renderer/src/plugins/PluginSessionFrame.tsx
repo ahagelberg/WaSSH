@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -275,8 +276,10 @@ export default function PluginSessionFrame({
   layoutRef.current = layout
   onLayoutChangeRef.current = onLayoutChange
 
+  // Keep inactive plugins in stored layout (reconnect briefly deactivates them).
+  // Only add missing actives; user close removes via onDeactivatePlugin.
   useEffect(() => {
-    let next = pruneLayoutToActive(layoutRef.current, activePluginIds)
+    let next = layoutRef.current
     for (const id of activePluginIds) {
       next = ensurePluginInLayout(
         next,
@@ -288,6 +291,11 @@ export default function PluginSessionFrame({
       onLayoutChangeRef.current(next)
     }
   }, [activePluginIds, plugins])
+
+  const displayLayout = useMemo(
+    () => pruneLayoutToActive(layout, activePluginIds),
+    [layout, activePluginIds]
+  )
 
   const resolveDropTarget = useCallback(
     (clientX: number, clientY: number, movingId: string): DropTarget | null => {
@@ -423,12 +431,12 @@ export default function PluginSessionFrame({
   const renderDock = (edge: DockEdge, node: LayoutNode): ReactNode => {
     const sizeStyle: CSSProperties =
       edge === 'left'
-        ? { width: layout.leftWidthPx }
+        ? { width: displayLayout.leftWidthPx }
         : edge === 'right'
-          ? { width: layout.rightWidthPx }
+          ? { width: displayLayout.rightWidthPx }
           : edge === 'top'
-            ? { height: layout.topHeightPx }
-            : { height: layout.bottomHeightPx }
+            ? { height: displayLayout.topHeightPx }
+            : { height: displayLayout.bottomHeightPx }
 
     return (
       <div
@@ -510,7 +518,7 @@ export default function PluginSessionFrame({
                 : ''
             }`}
           />
-          {layout.bottom ? (
+          {displayLayout.bottom ? (
             <div
               className={`plugin-inner-drop plugin-inner-drop-bottom${
                 dropTarget?.kind === 'edge' &&
@@ -524,23 +532,23 @@ export default function PluginSessionFrame({
         </>
       ) : null}
 
-      {layout.top ? (
+      {displayLayout.top ? (
         <>
-          {renderDock('top', layout.top)}
+          {renderDock('top', displayLayout.top)}
           <DockSplitter orientation="horizontal" onDrag={(d) => resizeDock('top', d)} />
         </>
       ) : null}
 
       <div className="plugin-session-mid">
-        {layout.left ? (
+        {displayLayout.left ? (
           <>
-            {renderDock('left', layout.left)}
+            {renderDock('left', displayLayout.left)}
             <DockSplitter orientation="vertical" onDrag={(d) => resizeDock('left', d)} />
           </>
         ) : null}
 
         <div ref={terminalRef} className="plugin-session-terminal">
-          {draggingId && layout.left ? (
+          {draggingId && displayLayout.left ? (
             <div
               className={`plugin-inner-drop plugin-inner-drop-left${
                 dropTarget?.kind === 'edge' &&
@@ -551,7 +559,7 @@ export default function PluginSessionFrame({
               }`}
             />
           ) : null}
-          {draggingId && layout.right ? (
+          {draggingId && displayLayout.right ? (
             <div
               className={`plugin-inner-drop plugin-inner-drop-right${
                 dropTarget?.kind === 'edge' &&
@@ -562,7 +570,7 @@ export default function PluginSessionFrame({
               }`}
             />
           ) : null}
-          {draggingId && layout.top ? (
+          {draggingId && displayLayout.top ? (
             <div
               className={`plugin-inner-drop plugin-inner-drop-top${
                 dropTarget?.kind === 'edge' &&
@@ -573,7 +581,7 @@ export default function PluginSessionFrame({
               }`}
             />
           ) : null}
-          {draggingId && layout.bottom ? (
+          {draggingId && displayLayout.bottom ? (
             <div
               className={`plugin-inner-drop plugin-inner-drop-bottom${
                 dropTarget?.kind === 'edge' &&
@@ -587,25 +595,25 @@ export default function PluginSessionFrame({
           {children}
         </div>
 
-        {layout.right ? (
+        {displayLayout.right ? (
           <>
             <DockSplitter orientation="vertical" onDrag={(d) => resizeDock('right', d)} />
-            {renderDock('right', layout.right)}
+            {renderDock('right', displayLayout.right)}
           </>
         ) : null}
       </div>
 
-      {layout.bottom ? (
+      {displayLayout.bottom ? (
         <>
           <DockSplitter orientation="horizontal" onDrag={(d) => resizeDock('bottom', d)} />
-          {renderDock('bottom', layout.bottom)}
+          {renderDock('bottom', displayLayout.bottom)}
         </>
       ) : null}
 
-      {layout.overlay ? (
+      {displayLayout.overlay ? (
         <div className="plugin-dock plugin-dock-overlay">
           <LayoutTreeView
-            node={layout.overlay}
+            node={displayLayout.overlay}
             edge="overlay"
             path={[]}
             tabId={tabId}

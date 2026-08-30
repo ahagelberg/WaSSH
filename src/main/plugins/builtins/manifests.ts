@@ -47,7 +47,10 @@ export const serverMonitorManifest: PluginManifest = {
         type: 'number',
         default: SERVER_MONITOR_DEFAULT_INTERVAL_MS,
         description: 'How often to refresh remote stats.'
-      },
+      }
+    ],
+    hostSettingsHeading: 'Server monitor',
+    hostSettingsSchema: [
       {
         key: 'showGauges',
         label: 'Show gauges',

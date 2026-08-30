@@ -42,6 +42,7 @@ import { mergePluginSettings } from '@shared/plugins'
 import {
   emptyTabPluginLayout,
   normalizeTabPluginLayout,
+  removePluginFromLayout,
   type TabPluginLayout
 } from '@shared/pluginLayout'
 import PluginToolbar from './plugins/PluginToolbar'
@@ -612,9 +613,16 @@ export default function App() {
   const togglePlugin = useCallback(async (tabId: string, pluginId: string, nextActive: boolean) => {
     if (nextActive) {
       await window.wassh.activatePlugin(tabId, pluginId)
-    } else {
-      await window.wassh.deactivatePlugin(tabId, pluginId)
+      return
     }
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.id === tabId
+          ? { ...t, pluginLayout: removePluginFromLayout(t.pluginLayout, pluginId) }
+          : t
+      )
+    )
+    await window.wassh.deactivatePlugin(tabId, pluginId)
   }, [])
 
   const styleDefaults = sessionStyleDefaultsFrom(settings.sessionStyleDefaults)

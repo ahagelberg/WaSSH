@@ -335,10 +335,20 @@ export function mergePluginSettings(
   stored: unknown
 ): Record<string, unknown> {
   const defaults = defaultPluginSettingsFromSchema(schema)
+  if (!schema || schema.length === 0) {
+    return defaults
+  }
   if (!stored || typeof stored !== 'object' || Array.isArray(stored)) {
     return defaults
   }
-  return { ...defaults, ...(stored as Record<string, unknown>) }
+  const src = stored as Record<string, unknown>
+  const out = { ...defaults }
+  for (const field of schema) {
+    if (Object.prototype.hasOwnProperty.call(src, field.key)) {
+      out[field.key] = src[field.key]
+    }
+  }
+  return out
 }
 
 /**
