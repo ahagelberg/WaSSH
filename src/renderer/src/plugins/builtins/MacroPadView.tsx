@@ -69,7 +69,16 @@ export default function MacroPadView({
   }, [buttons, tabId, pluginId, activeTab])
 
   return (
-    <div className="plugin-panel plugin-macro-pad">
+    <div
+      className="plugin-panel plugin-macro-pad"
+      onMouseDown={(e) => {
+        // Keep terminal focus when interacting with the pad.
+        if ((e.target as HTMLElement).closest('button, input, select, textarea, a')) {
+          return
+        }
+        e.preventDefault()
+      }}
+    >
       <div className="plugin-panel-header">Macros</div>
       <div className="plugin-macro-grid">
         {buttons.map((btn) => (
@@ -78,6 +87,8 @@ export default function MacroPadView({
             type="button"
             className="plugin-macro-btn"
             title={btn.hotkey ? `${btn.label} (${btn.hotkey})` : btn.label}
+            tabIndex={-1}
+            onMouseDown={(e) => e.preventDefault()}
             onClick={() => send(btn.text)}
           >
             <span className="plugin-macro-label">{btn.label}</span>
