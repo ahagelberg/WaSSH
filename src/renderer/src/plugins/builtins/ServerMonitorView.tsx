@@ -243,82 +243,84 @@ export default function ServerMonitorView({ tabId, pluginId }: PluginViewProps) 
 
       {snapshot?.error ? <div className="plugin-monitor-error">{snapshot.error}</div> : null}
 
-      <div className="monitor-gauges">
-        <Gauge
-          label="CPU"
-          percent={snapshot?.cpuPercent ?? null}
-          detail={
-            snapshot
-              ? `Load ${formatLoad(snapshot.load1)}`
-              : 'Sampling…'
-          }
-          tone="cpu"
-        />
-        <Gauge
-          label="Memory"
-          percent={memPct}
-          detail={
-            snapshot
-              ? `${formatBytes(snapshot.memUsedBytes)} / ${formatBytes(snapshot.memTotalBytes)}`
-              : '—'
-          }
-          tone="mem"
-        />
-        <Gauge
-          label="Disk /"
-          percent={diskPct}
-          detail={
-            snapshot
-              ? `${formatBytes(snapshot.diskUsedBytes)} / ${formatBytes(snapshot.diskTotalBytes)}`
-              : '—'
-          }
-          tone="disk"
-        />
-      </div>
-
-      <div className="monitor-sparks">
-        <SparkCard
-          title="CPU"
-          values={cpuHistory}
-          tone="cpu"
-          current={
-            snapshot?.cpuPercent == null ? '—' : `${Math.round(snapshot.cpuPercent)}%`
-          }
-        />
-        <SparkCard
-          title="Memory"
-          values={memHistory}
-          tone="mem"
-          current={memPct == null ? '—' : `${Math.round(memPct)}%`}
-        />
-        <SparkCard
-          title="Disk"
-          values={diskHistory}
-          tone="disk"
-          current={diskPct == null ? '—' : `${Math.round(diskPct)}%`}
-        />
-      </div>
-
-      <div className="monitor-facts">
-        <div className="monitor-fact">
-          <span>Uptime</span>
-          <strong>{formatUptime(snapshot?.uptimeSec ?? 0)}</strong>
+      <div className="monitor-body">
+        <div className="monitor-gauges">
+          <Gauge
+            label="CPU"
+            percent={snapshot?.cpuPercent ?? null}
+            detail={
+              snapshot
+                ? `Load ${formatLoad(snapshot.load1)}`
+                : 'Sampling…'
+            }
+            tone="cpu"
+          />
+          <Gauge
+            label="Memory"
+            percent={memPct}
+            detail={
+              snapshot
+                ? `${formatBytes(snapshot.memUsedBytes)} / ${formatBytes(snapshot.memTotalBytes)}`
+                : '—'
+            }
+            tone="mem"
+          />
+          <Gauge
+            label="Disk /"
+            percent={diskPct}
+            detail={
+              snapshot
+                ? `${formatBytes(snapshot.diskUsedBytes)} / ${formatBytes(snapshot.diskTotalBytes)}`
+                : '—'
+            }
+            tone="disk"
+          />
         </div>
-        <div className="monitor-fact">
-          <span>Load</span>
-          <strong>
-            {snapshot
-              ? `${formatLoad(snapshot.load1)} · ${formatLoad(snapshot.load5)} · ${formatLoad(snapshot.load15)}`
-              : '—'}
-          </strong>
+
+        <div className="monitor-sparks">
+          <SparkCard
+            title="CPU"
+            values={cpuHistory}
+            tone="cpu"
+            current={
+              snapshot?.cpuPercent == null ? '—' : `${Math.round(snapshot.cpuPercent)}%`
+            }
+          />
+          <SparkCard
+            title="Memory"
+            values={memHistory}
+            tone="mem"
+            current={memPct == null ? '—' : `${Math.round(memPct)}%`}
+          />
+          <SparkCard
+            title="Disk"
+            values={diskHistory}
+            tone="disk"
+            current={diskPct == null ? '—' : `${Math.round(diskPct)}%`}
+          />
         </div>
-        <div className="monitor-fact">
-          <span>Swap</span>
-          <strong>
-            {snapshot && snapshot.swapTotalBytes > 0
-              ? `${formatBytes(snapshot.swapUsedBytes)} / ${formatBytes(snapshot.swapTotalBytes)}`
-              : '—'}
-          </strong>
+
+        <div className="monitor-facts">
+          <div className="monitor-fact">
+            <span>Uptime</span>
+            <strong>{formatUptime(snapshot?.uptimeSec ?? 0)}</strong>
+          </div>
+          <div className="monitor-fact">
+            <span>Load</span>
+            <strong>
+              {snapshot
+                ? `${formatLoad(snapshot.load1)} · ${formatLoad(snapshot.load5)} · ${formatLoad(snapshot.load15)}`
+                : '—'}
+            </strong>
+          </div>
+          <div className="monitor-fact">
+            <span>Swap</span>
+            <strong>
+              {snapshot && snapshot.swapTotalBytes > 0
+                ? `${formatBytes(snapshot.swapUsedBytes)} / ${formatBytes(snapshot.swapTotalBytes)}`
+                : '—'}
+            </strong>
+          </div>
         </div>
       </div>
 

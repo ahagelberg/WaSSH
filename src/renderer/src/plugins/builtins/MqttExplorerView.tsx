@@ -22,9 +22,12 @@ interface TopicMessage {
 }
 
 interface TopicNode {
-  /** Segment name ('' for synthetic root) */
+  /** Segment name ('' for empty MQTT level or synthetic root) */
   name: string
-  /** Full topic path; empty for root */
+  /**
+   * Full topic path for this node.
+   * Root uses ROOT_PATH so it never collides with an empty leading segment (path '').
+   */
   path: string
   children: Map<string, TopicNode>
   /** Messages received on this exact topic */
@@ -37,10 +40,13 @@ interface TopicNode {
   hasOwnMessages: boolean
 }
 
+/** Sentinel path for the invisible tree root (not a real MQTT topic) */
+const ROOT_PATH = '\0'
+
 function createRoot(): TopicNode {
   return {
     name: '',
-    path: '',
+    path: ROOT_PATH,
     children: new Map(),
     messages: [],
     messageCount: 0,
@@ -62,15 +68,22 @@ function ensureChild(parent: TopicNode, segment: string, fullPath: string): Topi
       hasOwnMessages: false
     }
     parent.children.set(segment, child)
+  } else if (child.path !== fullPath) {
+    child.path = fullPath
   }
   return child
 }
 
 function topicSegments(topic: string): string[] {
-  if (!topic) {
+  if (typeof topic !== 'string' || topic.length === 0) {
     return []
   }
   return topic.split('/')
+}
+
+/** Join MQTT segments into a full path (`['', 'a']` → `/a`) */
+function pathFromSegments(segments: string[]): string {
+  return segments.join('/')
 }
 
 function recomputeCounts(node: TopicNode): void {
@@ -89,14 +102,16 @@ function recomputeCounts(node: TopicNode): void {
 }
 
 function insertMessage(root: TopicNode, msg: TopicMessage, topic: string): TopicNode {
-  const next = cloneTree(root)
   const segments = topicSegments(topic)
+  if (segments.length === 0) {
+    return root
+  }
+  const next = cloneTree(root)
   let node = next
-  let built = ''
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i]
-    built = i === 0 ? seg : `${built}/${seg}`
-    node = ensureChild(node, seg, built)
+    const fullPath = pathFromSegments(segments.slice(0, i + 1))
+    node = ensureChild(node, seg, fullPath)
   }
   node.hasOwnMessages = true
   node.messages = [msg, ...node.messages].slice(0, MQTT_EXPLORER_HISTORY_LIMIT)
@@ -121,10 +136,11 @@ function cloneTree(node: TopicNode): TopicNode {
 }
 
 function findNode(root: TopicNode, path: string): TopicNode | null {
-  if (!path) {
-    return root
-  }
   const segments = topicSegments(path)
+  // path '' is a real empty leading segment under root, not the root itself
+  if (path.length === 0) {
+    return root.children.get('') ?? null
+  }
   let node: TopicNode = root
   for (const seg of segments) {
     const child = node.children.get(seg)
@@ -139,12 +155,21 @@ function findNode(root: TopicNode, path: string): TopicNode | null {
 function ancestorPaths(topic: string): string[] {
   const segments = topicSegments(topic)
   const paths: string[] = []
-  let built = ''
-  for (let i = 0; i < segments.length - 1; i++) {
-    built = i === 0 ? segments[i] : `${built}/${segments[i]}`
-    paths.push(built)
+  for (let i = 1; i < segments.length; i++) {
+    paths.push(pathFromSegments(segments.slice(0, i)))
   }
   return paths
+}
+
+/** Label for an empty MQTT topic level in the tree */
+const EMPTY_SEGMENT_LABEL = '/'
+
+function segmentLabel(name: string): string {
+  return name.length === 0 ? EMPTY_SEGMENT_LABEL : name
+}
+
+function displayTopicPath(path: string): string {
+  return path.length === 0 ? EMPTY_SEGMENT_LABEL : path
 }
 
 function formatTime(ts: number): string {
@@ -299,6 +324,9 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
         return
       }
       if (payload.type === 'message') {
+        if (typeof payload.topic !== 'string' || payload.topic.length === 0) {
+          return
+        }
         const msg: TopicMessage = {
           id: nextMessageId(),
           timestamp: payload.timestamp,
@@ -321,12 +349,12 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
   }, [tabId, pluginId])
 
   useEffect(() => {
-    if (selectedPath) {
-      setPublishTopic(selectedPath)
+    if (selectedPath !== null) {
+      setPublishTopic(displayTopicPath(selectedPath) === EMPTY_SEGMENT_LABEL ? '/' : selectedPath)
     }
   }, [selectedPath])
 
-  const selectedNode = selectedPath ? findNode(root, selectedPath) : null
+  const selectedNode = selectedPath !== null ? findNode(root, selectedPath) : null
 
   const toggleExpand = (path: string): void => {
     setExpanded((prev) => {
@@ -436,7 +464,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
             ) : (
               <span className="mqtt-tree-twist mqtt-tree-twist-empty" />
             )}
-            <span className="mqtt-tree-name">{child.name || '/'}</span>
+            <span className="mqtt-tree-name">{segmentLabel(child.name)}</span>
             {showCollapsedMeta ? (
               <span className="mqtt-tree-meta">
                 {child.subTopicCount} topic{child.subTopicCount === 1 ? '' : 's'},{' '}
@@ -493,13 +521,13 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
 
         <div className="mqtt-detail-pane">
           <div className="mqtt-pane-label">Details</div>
-          {!selectedNode || !selectedPath ? (
+          {selectedPath === null || !selectedNode ? (
             <div className="mqtt-empty">Select a topic</div>
           ) : (
             <>
               <div className="mqtt-detail-meta">
-                <div className="mqtt-detail-topic" title={selectedPath}>
-                  {selectedPath}
+                <div className="mqtt-detail-topic" title={displayTopicPath(selectedPath)}>
+                  {displayTopicPath(selectedPath)}
                 </div>
                 <div className="mqtt-detail-facts">
                   <span>{selectedNode.messages.length} in history</span>
@@ -510,7 +538,11 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
 
               <div className="mqtt-history">
                 {selectedNode.messages.length === 0 ? (
-                  <div className="mqtt-empty">No messages on this topic</div>
+                  <div className="mqtt-empty">
+                    {selectedNode.children.size > 0
+                      ? 'Branch node — expand and select a leaf topic with messages'
+                      : 'No messages on this topic'}
+                  </div>
                 ) : (
                   selectedNode.messages.map((msg) => (
                     <div key={msg.id} className="mqtt-history-item">

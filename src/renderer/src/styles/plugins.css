@@ -13,6 +13,15 @@
   --monitor-mem: #3dd68c;
   --monitor-disk: #f0b429;
   --monitor-card-radius: 8px;
+  /* Container-query breakpoints for server monitor panel shape */
+  --monitor-cq-md: 360px;
+  --monitor-cq-lg: 560px;
+  --monitor-cq-xl: 760px;
+  --monitor-cq-short: 240px;
+  --monitor-gauge-size: 64px;
+  --monitor-gauge-size-compact: 48px;
+  --monitor-spark-height: 40px;
+  --monitor-spark-height-compact: 28px;
   --mqtt-tree-indent: 14px;
   --mqtt-blink-bg: color-mix(in srgb, var(--accent) 35%, transparent);
   --mqtt-tree-pane-width: 42%;
@@ -413,6 +422,8 @@
 .plugin-server-monitor {
   gap: 10px;
   overflow: auto;
+  container-type: size;
+  container-name: server-monitor;
 }
 
 .monitor-header {
@@ -437,10 +448,19 @@
   text-overflow: ellipsis;
 }
 
+.monitor-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
 .monitor-gauges {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 
 .monitor-gauge {
@@ -452,11 +472,12 @@
   border-radius: var(--monitor-card-radius);
   background: var(--bg-input);
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  min-width: 0;
 }
 
 .monitor-gauge-svg {
-  width: 64px;
-  height: 64px;
+  width: var(--monitor-gauge-size);
+  height: var(--monitor-gauge-size);
   flex-shrink: 0;
 }
 
@@ -514,6 +535,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .monitor-spark {
@@ -521,6 +543,7 @@
   border-radius: var(--monitor-card-radius);
   background: var(--bg-input);
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  min-width: 0;
 }
 
 .monitor-spark-head {
@@ -541,7 +564,7 @@
 .monitor-spark-svg {
   display: block;
   width: 100%;
-  height: 40px;
+  height: var(--monitor-spark-height);
 }
 
 .monitor-spark-line {
@@ -578,6 +601,7 @@
   border-radius: var(--monitor-card-radius);
   background: color-mix(in srgb, var(--bg-panel-2) 80%, var(--bg-input));
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  min-width: 0;
 }
 
 .monitor-fact {
@@ -585,16 +609,215 @@
   justify-content: space-between;
   gap: 8px;
   font-size: 11px;
+  min-width: 0;
 }
 
 .monitor-fact span {
   color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .monitor-fact strong {
   font-weight: 600;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Medium+: gauges side-by-side; stacked ring+label for card columns */
+@container server-monitor (min-width: 360px) {
+  .monitor-gauges {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .monitor-gauge {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    text-align: center;
+    padding: 8px 6px;
+    gap: 6px;
+  }
+
+  .monitor-gauge-meta {
+    align-items: center;
+    width: 100%;
+  }
+
+  .monitor-gauge-detail {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+}
+
+/* Large: sparks and facts in rows */
+@container server-monitor (min-width: 560px) {
+  .monitor-sparks {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .monitor-facts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px 12px;
+  }
+
+  .monitor-fact {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .monitor-fact strong {
+    text-align: left;
+  }
+}
+
+/* Extra wide + tall enough: gauges | sparks, facts spanning */
+@container server-monitor (min-width: 760px) and (min-height: 280px) {
+  .monitor-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "gauges sparks"
+      "facts facts";
+    gap: 10px 12px;
+    align-items: start;
+  }
+
+  .monitor-gauges {
+    grid-area: gauges;
+  }
+
+  .monitor-sparks {
+    grid-area: sparks;
+    align-self: stretch;
+  }
+
+  .monitor-facts {
+    grid-area: facts;
+  }
+}
+
+/* Short landscape (e.g. bottom dock): compact horizontal strip */
+@container server-monitor (max-height: 240px) and (min-width: 480px) {
+  .plugin-server-monitor {
+    gap: 6px;
+  }
+
+  .monitor-header {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .monitor-title {
+    flex-shrink: 0;
+  }
+
+  .monitor-body {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: stretch;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .monitor-gauges {
+    display: flex;
+    flex-direction: row;
+    gap: 6px;
+    grid-template-columns: none;
+  }
+
+  .monitor-gauge {
+    grid-template-columns: auto 1fr;
+    justify-items: stretch;
+    text-align: left;
+    padding: 6px 8px;
+    gap: 8px;
+    --monitor-gauge-size: var(--monitor-gauge-size-compact);
+  }
+
+  .monitor-gauge-meta {
+    align-items: flex-start;
+  }
+
+  .monitor-gauge-detail {
+    display: block;
+    -webkit-line-clamp: unset;
+    white-space: nowrap;
+  }
+
+  .monitor-gauge-text {
+    font-size: 10px;
+  }
+
+  .monitor-sparks {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    --monitor-spark-height: var(--monitor-spark-height-compact);
+  }
+
+  .monitor-spark {
+    padding: 4px 8px 2px;
+  }
+
+  .monitor-spark-head {
+    margin-bottom: 2px;
+  }
+
+  .monitor-facts {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    padding: 6px 8px;
+    grid-template-columns: none;
+  }
+
+  .monitor-fact {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .monitor-fact strong {
+    text-align: right;
+  }
+
+  .plugin-monitor-meta {
+    display: none;
+  }
+}
+
+/* Ultra-narrow: tighter padding so tall side docks stay readable */
+@container server-monitor (max-width: 220px) {
+  .monitor-gauge {
+    padding: 8px;
+    gap: 8px;
+    --monitor-gauge-size: var(--monitor-gauge-size-compact);
+  }
+
+  .monitor-gauge-text {
+    font-size: 10px;
+  }
+
+  .monitor-spark {
+    padding: 6px 8px 4px;
+  }
+
+  .monitor-facts {
+    padding: 6px 8px;
+  }
 }
 
 .plugin-monitor-output {

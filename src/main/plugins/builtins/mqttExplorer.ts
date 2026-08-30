@@ -206,11 +206,20 @@ async function connectBroker(ctx: PluginMainContext, state: SessionState): Promi
     if (state.stopped) {
       return
     }
+    const topicName =
+      typeof topic === 'string' && topic.length > 0
+        ? topic
+        : typeof packet.topic === 'string' && packet.topic.length > 0
+          ? packet.topic
+          : ''
+    if (!topicName) {
+      return
+    }
     const encoded = encodePayload(payload)
     const qos = (packet.qos === 1 || packet.qos === 2 ? packet.qos : 0) as 0 | 1 | 2
     ctx.sendToRenderer({
       type: 'message',
-      topic,
+      topic: topicName,
       ...encoded,
       qos,
       retain: Boolean(packet.retain),
