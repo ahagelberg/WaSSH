@@ -39,18 +39,15 @@ export const serverMonitorManifest: PluginManifest = {
   source: 'builtin',
   contributes: {
     toolbar: { label: 'Monitor' },
-    settingsHeading: 'Server monitor',
-    settingsSchema: [
+    hostSettingsHeading: 'Server monitor',
+    hostSettingsSchema: [
       {
         key: 'intervalMs',
         label: 'Poll interval (ms)',
         type: 'number',
         default: SERVER_MONITOR_DEFAULT_INTERVAL_MS,
-        description: 'How often to refresh remote stats.'
-      }
-    ],
-    hostSettingsHeading: 'Server monitor',
-    hostSettingsSchema: [
+        description: 'How often to refresh remote stats for this session.'
+      },
       {
         key: 'showGauges',
         label: 'Show gauges',

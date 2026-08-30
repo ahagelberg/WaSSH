@@ -470,10 +470,23 @@ export const serverMonitorMain: PluginMainModule = {
     }
 
     void poll()
-    const interval = parseInterval(ctx.getSettings())
-    timer = setInterval(() => {
-      void poll()
-    }, interval)
+    let intervalMs = parseInterval(ctx.getSettings())
+    const armTimer = (): void => {
+      timer = setInterval(() => {
+        const nextInterval = parseInterval(ctx.getSettings())
+        if (nextInterval !== intervalMs) {
+          intervalMs = nextInterval
+          if (timer) {
+            clearInterval(timer)
+            timer = null
+          }
+          armTimer()
+          return
+        }
+        void poll()
+      }, intervalMs)
+    }
+    armTimer()
 
     ctx.onDeactivateCleanup(() => {
       stopped = true
