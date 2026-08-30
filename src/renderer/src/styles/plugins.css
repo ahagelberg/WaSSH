@@ -568,29 +568,37 @@
 }
 
 .monitor-spark-line {
+  fill: none;
   stroke-width: 1.75;
   vector-effect: non-scaling-stroke;
 }
 
 .monitor-spark-area {
+  stroke: none;
   opacity: 0.22;
 }
 
-.monitor-spark-cpu .monitor-spark-line,
-.monitor-spark-cpu .monitor-spark-area {
+.monitor-spark-cpu .monitor-spark-line {
   stroke: var(--monitor-cpu);
+}
+
+.monitor-spark-cpu .monitor-spark-area {
   fill: var(--monitor-cpu);
 }
 
-.monitor-spark-mem .monitor-spark-line,
-.monitor-spark-mem .monitor-spark-area {
+.monitor-spark-mem .monitor-spark-line {
   stroke: var(--monitor-mem);
+}
+
+.monitor-spark-mem .monitor-spark-area {
   fill: var(--monitor-mem);
 }
 
-.monitor-spark-disk .monitor-spark-line,
-.monitor-spark-disk .monitor-spark-area {
+.monitor-spark-disk .monitor-spark-line {
   stroke: var(--monitor-disk);
+}
+
+.monitor-spark-disk .monitor-spark-area {
   fill: var(--monitor-disk);
 }
 
