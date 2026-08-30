@@ -2,9 +2,9 @@
 - sudo helper
 - ~~Colored tabs~~
 - Tab grouping like browsers
-- Search function
-- Line wrapping
-- Prevent scrolling display if scrolled up and more input is coming in
+- ~~Search function~~
+- ~~Line wrapping~~
+- ~~Reconnect all button~~
 
 ## Advanced ##
 - ~~Tunnels~~
@@ -13,8 +13,7 @@
 - Tunnel tool to create tunnels for multiple ports through multiple layers of machines
 - Detect when running in a screen and indicate it visually
 - ~~Allow opening session directly in a (named) screen~~
-- Scratchpad for copy-paste and common commands.
-- Reconnect all button
+- ~~Scratchpad for copy-paste and common commands.~~
 - Add option to return to path on reconnect
 - ~~Plugin support~~
 
