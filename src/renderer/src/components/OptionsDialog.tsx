@@ -1,9 +1,28 @@
 import type { ReactElement } from 'react'
 import { useEffect, useMemo, useState } from 'react'
-import type { AppSettings, AppTheme } from '@shared/types'
+import {
+  BELL_MODE_INVERT_LINE,
+  BELL_MODE_INVERT_WINDOW,
+  BELL_MODE_SYSTEM,
+  BUNDLED_FONT_FAMILIES,
+  CURSOR_STYLE_BAR,
+  CURSOR_STYLE_BLOCK,
+  CURSOR_STYLE_UNDERLINE,
+  FONT_SIZE_MAX_PX,
+  FONT_SIZE_MIN_PX,
+  SCROLLBACK_LINES_MAX,
+  SCROLLBACK_LINES_MIN,
+  type AppSettings,
+  type AppTheme,
+  type BellMode,
+  type CursorStyle,
+  type SessionStyleDefaults
+} from '@shared/types'
 import type { PluginListItem, PluginMacroButton, PluginSettingsField } from '@shared/plugins'
 import { mergePluginSettings } from '@shared/plugins'
+import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
+import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 
 interface Props {
   settings: AppSettings
@@ -19,8 +38,75 @@ function optionsPayload(draft: AppSettings): Partial<AppSettings> {
     termType: draft.termType,
     theme: draft.theme,
     enabledPlugins: draft.enabledPlugins,
-    pluginSettings: draft.pluginSettings
+    pluginSettings: draft.pluginSettings,
+    sessionStyleDefaults: sessionStyleDefaultsFrom(draft.sessionStyleDefaults)
   }
+}
+
+/** CSS vars for theme-default color sampling */
+const TAB_COLOR_THEME_VAR = '--accent'
+const TERM_BG_THEME_VAR = '--bg-term'
+const TERM_FG_THEME_VAR = '--text'
+const HEX_CHANNEL_DIGITS = 2
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
+
+function themeVarHex(cssVar: string): string {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim()
+  if (HEX_COLOR_RE.test(raw)) {
+    return raw
+  }
+  const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(raw)
+  if (!rgb) {
+    return raw
+  }
+  return `#${[rgb[1], rgb[2], rgb[3]]
+    .map((n) => Number(n).toString(16).padStart(HEX_CHANNEL_DIGITS, '0'))
+    .join('')}`
+}
+
+function DefaultsColorRow({
+  label,
+  hint,
+  value,
+  themeVar,
+  onChange
+}: {
+  label: string
+  hint: string
+  value: string
+  themeVar: string
+  onChange: (value: string) => void
+}): ReactElement {
+  const useTheme = !value
+  const pickerValue = useTheme ? themeVarHex(themeVar) : value
+  return (
+    <div className="settings-row">
+      <div className="settings-row-label">
+        <strong>{label}</strong>
+        <span>{hint}</span>
+      </div>
+      <div className="settings-color-field">
+        <label className="settings-theme-default">
+          <input
+            type="checkbox"
+            checked={useTheme}
+            onChange={(e) =>
+              onChange(e.target.checked ? '' : themeVarHex(themeVar))
+            }
+          />
+          Theme default
+        </label>
+        {HEX_COLOR_RE.test(pickerValue) ? (
+          <input
+            type="color"
+            value={pickerValue}
+            disabled={useTheme}
+            onChange={(e) => onChange(e.target.value)}
+          />
+        ) : null}
+      </div>
+    </div>
+  )
 }
 
 function MacroListEditor({
@@ -150,11 +236,25 @@ function PluginFieldEditor({
 }
 
 export default function OptionsDialog({ settings, onChange, onClose }: Props) {
-  const [draft, setDraft] = useState<AppSettings>(settings)
+  const [draft, setDraft] = useState<AppSettings>(() => ({
+    ...settings,
+    sessionStyleDefaults: sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
+  }))
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
+  const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
 
   const patch = (partial: Partial<AppSettings>): void => {
     setDraft((prev) => ({ ...prev, ...partial }))
+  }
+
+  const patchDefaults = (partial: Partial<SessionStyleDefaults>): void => {
+    setDraft((prev) => ({
+      ...prev,
+      sessionStyleDefaults: sessionStyleDefaultsFrom({
+        ...prev.sessionStyleDefaults,
+        ...partial
+      })
+    }))
   }
 
   useEffect(() => {
@@ -163,6 +263,18 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
 
   useEffect(() => {
     void window.wassh.listPlugins().then(setPlugins)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    void listMonospaceFontFamilies().then((list) => {
+      if (!cancelled) {
+        setFontFamilies(list)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const handleCancel = (): void => {
@@ -279,7 +391,7 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
           <div className="settings-row">
             <div className="settings-row-label">
               <strong>TERM</strong>
-              <span>PTY terminal type sent to the remote host. Scrollback is set per host or session.</span>
+              <span>PTY terminal type sent to the remote host.</span>
             </div>
             <input
               type="text"
@@ -287,6 +399,126 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
               onChange={(e) => patch({ termType: e.target.value })}
             />
           </div>
+        )
+      },
+      {
+        id: 'host-defaults',
+        title: 'Host defaults',
+        content: (
+          <>
+            <p className="plugin-settings-external-note">
+              Applied to new hosts and quick connect, and to any host/session field set to “Use
+              default”. Changing a value here updates those fields immediately.
+            </p>
+            <DefaultsColorRow
+              label="Tab color"
+              hint="Theme default follows the app accent."
+              value={draft.sessionStyleDefaults.tabColor}
+              themeVar={TAB_COLOR_THEME_VAR}
+              onChange={(tabColor) => patchDefaults({ tabColor })}
+            />
+            <DefaultsColorRow
+              label="Terminal background"
+              hint="Theme default follows the app terminal background."
+              value={draft.sessionStyleDefaults.termBackground}
+              themeVar={TERM_BG_THEME_VAR}
+              onChange={(termBackground) => patchDefaults({ termBackground })}
+            />
+            <DefaultsColorRow
+              label="Terminal text"
+              hint="Theme default follows the app text color."
+              value={draft.sessionStyleDefaults.termForeground}
+              themeVar={TERM_FG_THEME_VAR}
+              onChange={(termForeground) => patchDefaults({ termForeground })}
+            />
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Font family</strong>
+                <span>Default monospace font for hosts using default.</span>
+              </div>
+              <select
+                value={draft.sessionStyleDefaults.fontFamily}
+                onChange={(e) => patchDefaults({ fontFamily: e.target.value })}
+              >
+                {fontSelectOptions(fontFamilies, draft.sessionStyleDefaults.fontFamily).map(
+                  (family) => (
+                    <option key={family} value={family}>
+                      {family}
+                    </option>
+                  )
+                )}
+              </select>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Font size</strong>
+              </div>
+              <input
+                type="number"
+                min={FONT_SIZE_MIN_PX}
+                max={FONT_SIZE_MAX_PX}
+                value={draft.sessionStyleDefaults.fontSizePx}
+                onChange={(e) =>
+                  patchDefaults({ fontSizePx: Number(e.target.value) || draft.sessionStyleDefaults.fontSizePx })
+                }
+              />
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Scrollback lines</strong>
+              </div>
+              <input
+                type="number"
+                min={SCROLLBACK_LINES_MIN}
+                max={SCROLLBACK_LINES_MAX}
+                value={draft.sessionStyleDefaults.scrollbackLines}
+                onChange={(e) =>
+                  patchDefaults({
+                    scrollbackLines:
+                      Number(e.target.value) || draft.sessionStyleDefaults.scrollbackLines
+                  })
+                }
+              />
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Bell</strong>
+              </div>
+              <select
+                value={draft.sessionStyleDefaults.bellMode}
+                onChange={(e) => patchDefaults({ bellMode: e.target.value as BellMode })}
+              >
+                <option value={BELL_MODE_SYSTEM}>Default system sound</option>
+                <option value={BELL_MODE_INVERT_WINDOW}>
+                  Blink whole terminal (invert background)
+                </option>
+                <option value={BELL_MODE_INVERT_LINE}>Blink current line</option>
+              </select>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Cursor</strong>
+              </div>
+              <select
+                value={draft.sessionStyleDefaults.cursorStyle}
+                onChange={(e) => patchDefaults({ cursorStyle: e.target.value as CursorStyle })}
+              >
+                <option value={CURSOR_STYLE_BLOCK}>Block</option>
+                <option value={CURSOR_STYLE_UNDERLINE}>Underline</option>
+                <option value={CURSOR_STYLE_BAR}>Vertical line</option>
+              </select>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Cursor blink</strong>
+              </div>
+              <input
+                type="checkbox"
+                checked={draft.sessionStyleDefaults.cursorBlink}
+                onChange={(e) => patchDefaults({ cursorBlink: e.target.checked })}
+              />
+            </div>
+          </>
         )
       },
       {
@@ -352,7 +584,7 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
     }
 
     return base
-  }, [draft, plugins])
+  }, [draft, plugins, fontFamilies])
 
   return (
     <SettingsDialog

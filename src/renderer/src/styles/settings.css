@@ -140,6 +140,33 @@
   white-space: nowrap;
 }
 
+.settings-defaultable-field {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  justify-self: start;
+  width: 100%;
+  max-width: 280px;
+}
+
+.settings-defaultable-control {
+  width: 100%;
+}
+
+.settings-defaultable-control.is-default {
+  opacity: 0.55;
+}
+
+.settings-defaultable-control input,
+.settings-defaultable-control select {
+  width: 100%;
+}
+
+.settings-defaultable-control input[type='checkbox'] {
+  width: auto;
+}
+
 .settings-footer {
   display: flex;
   justify-content: flex-end;

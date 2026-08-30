@@ -78,6 +78,19 @@ export interface SessionStyle {
   scrollbackLines: number
 }
 
+/** Stored per-host / per-session overrides; null/empty means inherit app defaults */
+export interface SessionStyleOverrides {
+  tabColor: string
+  termBackground: string
+  termForeground: string
+  fontSizePx: number | null
+  fontFamily: string
+  bellMode: BellMode | null
+  cursorStyle: CursorStyle | null
+  cursorBlink: boolean | null
+  scrollbackLines: number | null
+}
+
 /** Hex values treated as theme default (empty) */
 const UNSET_TAB_COLOR_HEX = '#3d8bfd'
 const UNSET_TERM_BACKGROUND_HEX = '#0c0d0f'
@@ -90,7 +103,7 @@ function colorOrTheme(value: string | undefined, unsetHex: string): string {
   return value
 }
 
-function bellModeOrDefault(value: string | undefined): BellMode {
+function bellModeOrDefault(value: string | undefined | null): BellMode {
   if (
     value === BELL_MODE_SYSTEM ||
     value === BELL_MODE_INVERT_WINDOW ||
@@ -101,7 +114,7 @@ function bellModeOrDefault(value: string | undefined): BellMode {
   return DEFAULT_BELL_MODE
 }
 
-function cursorStyleOrDefault(value: string | undefined): CursorStyle {
+function cursorStyleOrDefault(value: string | undefined | null): CursorStyle {
   if (
     value === CURSOR_STYLE_BLOCK ||
     value === CURSOR_STYLE_UNDERLINE ||
@@ -112,7 +125,7 @@ function cursorStyleOrDefault(value: string | undefined): CursorStyle {
   return DEFAULT_CURSOR_STYLE
 }
 
-function fontFamilyOrDefault(value: string | undefined): string {
+function fontFamilyOrDefault(value: string | undefined | null): string {
   const first = value?.split(',')[0]?.trim().replace(/^["']|["']$/g, '')
   return first || DEFAULT_FONT_FAMILY
 }
@@ -135,7 +148,7 @@ export function terminalFontStack(family: string): string {
   return unique.map(quoteFontFamily).join(', ')
 }
 
-function fontSizeOrDefault(value: number | undefined): number {
+function fontSizeOrDefault(value: number | undefined | null): number {
   if (typeof value !== 'number' || Number.isNaN(value)) {
     return DEFAULT_FONT_SIZE_PX
   }
@@ -148,7 +161,7 @@ function fontSizeOrDefault(value: number | undefined): number {
   return value
 }
 
-function scrollbackLinesOrDefault(value: number | undefined): number {
+function scrollbackLinesOrDefault(value: number | undefined | null): number {
   if (typeof value !== 'number' || Number.isNaN(value)) {
     return DEFAULT_SCROLLBACK_LINES
   }
@@ -161,7 +174,121 @@ function scrollbackLinesOrDefault(value: number | undefined): number {
   return Math.floor(value)
 }
 
-export function sessionStyleFrom(
+function fontSizeOverride(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return null
+  }
+  return fontSizeOrDefault(value)
+}
+
+function scrollbackOverride(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return null
+  }
+  return scrollbackLinesOrDefault(value)
+}
+
+function bellModeOverride(value: unknown): BellMode | null {
+  if (value === null || value === undefined || value === '') {
+    return null
+  }
+  if (
+    value === BELL_MODE_SYSTEM ||
+    value === BELL_MODE_INVERT_WINDOW ||
+    value === BELL_MODE_INVERT_LINE
+  ) {
+    return value
+  }
+  return null
+}
+
+function cursorStyleOverride(value: unknown): CursorStyle | null {
+  if (value === null || value === undefined || value === '') {
+    return null
+  }
+  if (
+    value === CURSOR_STYLE_BLOCK ||
+    value === CURSOR_STYLE_UNDERLINE ||
+    value === CURSOR_STYLE_BAR
+  ) {
+    return value
+  }
+  return null
+}
+
+function cursorBlinkOverride(value: unknown): boolean | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (typeof value === 'boolean') {
+    return value
+  }
+  return null
+}
+
+function fontFamilyOverride(value: unknown): string {
+  if (value === null || value === undefined) {
+    return ''
+  }
+  if (typeof value !== 'string') {
+    return ''
+  }
+  const first = value.split(',')[0]?.trim().replace(/^["']|["']$/g, '')
+  return first || ''
+}
+
+/** Normalize stored host/session style overrides (preserves inherit sentinels). */
+export function sessionStyleOverridesFrom(
+  src: Partial<SessionStyleOverrides> | null | undefined
+): SessionStyleOverrides {
+  return {
+    tabColor: colorOrTheme(src?.tabColor, UNSET_TAB_COLOR_HEX),
+    termBackground: colorOrTheme(src?.termBackground, UNSET_TERM_BACKGROUND_HEX),
+    termForeground: colorOrTheme(src?.termForeground, UNSET_TERM_FOREGROUND_HEX),
+    fontSizePx: fontSizeOverride(src?.fontSizePx),
+    fontFamily: fontFamilyOverride(src?.fontFamily),
+    bellMode: bellModeOverride(src?.bellMode),
+    cursorStyle: cursorStyleOverride(src?.cursorStyle),
+    cursorBlink: cursorBlinkOverride(src?.cursorBlink),
+    scrollbackLines: scrollbackOverride(src?.scrollbackLines)
+  }
+}
+
+/** All-inherit overrides for new hosts and quick connect */
+export function emptySessionStyleOverrides(): SessionStyleOverrides {
+  return sessionStyleOverridesFrom(null)
+}
+
+/**
+ * Resolve overrides against app defaults into concrete style for the terminal.
+ * Empty color after resolve still means “follow CSS theme”.
+ */
+export function resolveSessionStyle(
+  overrides: Partial<SessionStyleOverrides> | null | undefined,
+  defaults: SessionStyle
+): SessionStyle {
+  const o = sessionStyleOverridesFrom(overrides)
+  return {
+    tabColor: o.tabColor || defaults.tabColor || THEME_COLOR_UNSET,
+    termBackground: o.termBackground || defaults.termBackground || THEME_COLOR_UNSET,
+    termForeground: o.termForeground || defaults.termForeground || THEME_COLOR_UNSET,
+    fontSizePx: o.fontSizePx ?? fontSizeOrDefault(defaults.fontSizePx),
+    fontFamily: o.fontFamily || fontFamilyOrDefault(defaults.fontFamily),
+    bellMode: o.bellMode ?? bellModeOrDefault(defaults.bellMode),
+    cursorStyle: o.cursorStyle ?? cursorStyleOrDefault(defaults.cursorStyle),
+    cursorBlink: o.cursorBlink ?? defaults.cursorBlink,
+    scrollbackLines: o.scrollbackLines ?? scrollbackLinesOrDefault(defaults.scrollbackLines)
+  }
+}
+
+/** Normalize app-level session style defaults (always concrete except theme colors). */
+export function sessionStyleDefaultsFrom(
   src: Partial<SessionStyle> | null | undefined
 ): SessionStyle {
   return {
@@ -175,6 +302,16 @@ export function sessionStyleFrom(
     cursorBlink: typeof src?.cursorBlink === 'boolean' ? src.cursorBlink : DEFAULT_CURSOR_BLINK,
     scrollbackLines: scrollbackLinesOrDefault(src?.scrollbackLines)
   }
+}
+
+/**
+ * @deprecated Prefer sessionStyleOverridesFrom + resolveSessionStyle.
+ * Kept as resolve against built-in defaults for call sites without AppSettings.
+ */
+export function sessionStyleFrom(
+  src: Partial<SessionStyleOverrides> | null | undefined
+): SessionStyleOverrides {
+  return sessionStyleOverridesFrom(src)
 }
 
 function tunnelTypeOrDefault(value: string | undefined): TunnelType {

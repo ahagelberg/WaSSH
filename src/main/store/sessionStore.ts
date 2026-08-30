@@ -12,7 +12,8 @@ import {
   TabSnapshot,
   type AppTheme
 } from '../../shared/types'
-import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom } from '../../shared/connection'
+import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom } from '../../shared/connection'
+import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 
 const HOSTS_FILE = 'hosts.json'
 const PREVIOUS_HOSTS_FILE = 'sessions.json'
@@ -133,6 +134,9 @@ export class TabStore {
     return readJson<TabSnapshot[]>(TABS_FILE, []).map((t) => ({
       ...t,
       activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
+      pluginLayout: normalizeTabPluginLayout(
+        (t as TabSnapshot & { pluginLayout?: unknown }).pluginLayout
+      ),
       connection: {
         ...t.connection,
         ...protocolConfigFrom(t.connection),
@@ -164,12 +168,31 @@ export class SettingsStore {
       rest.pluginSettings && typeof rest.pluginSettings === 'object' && !Array.isArray(rest.pluginSettings)
         ? rest.pluginSettings
         : {}
+    const pluginPanelPlacements =
+      rest.pluginPanelPlacements &&
+      typeof rest.pluginPanelPlacements === 'object' &&
+      !Array.isArray(rest.pluginPanelPlacements)
+        ? rest.pluginPanelPlacements
+        : {}
+    const pluginPanelOrder = Array.isArray(rest.pluginPanelOrder) ? rest.pluginPanelOrder : []
+    const sessionStyleDefaults = sessionStyleDefaultsFrom(
+      rest.sessionStyleDefaults && typeof rest.sessionStyleDefaults === 'object'
+        ? rest.sessionStyleDefaults
+        : {
+            fontSizePx: raw.fontSizePx,
+            fontFamily: raw.fontFamily,
+            scrollbackLines: raw.scrollbackLines
+          }
+    )
     return {
       ...DEFAULT_SETTINGS,
       ...rest,
       theme,
       enabledPlugins,
-      pluginSettings
+      pluginSettings,
+      pluginPanelPlacements,
+      pluginPanelOrder,
+      sessionStyleDefaults
     }
   }
 

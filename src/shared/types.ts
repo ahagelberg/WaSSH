@@ -2,10 +2,12 @@ import type {
   PluginActiveStateEvent,
   PluginListItem,
   PluginMessageEvent,
+  PluginViewPlacement,
   SideConnectionClosedEvent,
   SideConnectionDataEvent
 } from './plugins'
 import { DEFAULT_ENABLED_PLUGINS } from './plugins'
+import type { TabPluginLayout } from './pluginLayout'
 
 /** Default SSH port */
 export const DEFAULT_SSH_PORT = 22
@@ -300,24 +302,24 @@ export interface HostProfile {
   connectionType: ConnectionType
   /** Saved host id used as SSH jump/proxy; empty = direct */
   proxyHostId: string
-  /** Tab accent color (hex); empty = app theme */
+  /** Tab accent color (hex); empty = use app host defaults (then theme) */
   tabColor: string
-  /** Terminal background (hex); empty = app theme */
+  /** Terminal background (hex); empty = use app host defaults (then theme) */
   termBackground: string
-  /** Terminal default text color (hex); empty = app theme */
+  /** Terminal default text color (hex); empty = use app host defaults (then theme) */
   termForeground: string
-  /** Terminal font size in px */
-  fontSizePx: number
-  /** Terminal font family */
+  /** Terminal font size in px; null = use app host defaults */
+  fontSizePx: number | null
+  /** Terminal font family; empty = use app host defaults */
   fontFamily: string
-  /** Action when the remote sends BEL */
-  bellMode: BellMode
-  /** Cursor shape */
-  cursorStyle: CursorStyle
-  /** Whether the cursor blinks */
-  cursorBlink: boolean
-  /** Primary-buffer scrollback lines */
-  scrollbackLines: number
+  /** Action when the remote sends BEL; null = use app host defaults */
+  bellMode: BellMode | null
+  /** Cursor shape; null = use app host defaults */
+  cursorStyle: CursorStyle | null
+  /** Whether the cursor blinks; null = use app host defaults */
+  cursorBlink: boolean | null
+  /** Primary-buffer scrollback lines; null = use app host defaults */
+  scrollbackLines: number | null
   /** Port forwards / SOCKS tunnels for this host */
   tunnels: SshTunnel[]
   /** Forward remote X11 clients to the local display */
@@ -344,24 +346,24 @@ export interface ConnectionParams {
   connectionType: ConnectionType
   /** Saved host id used as SSH jump/proxy; empty = direct */
   proxyHostId: string
-  /** Tab accent color (hex); empty = app theme */
+  /** Tab accent color (hex); empty = use app host defaults (then theme) */
   tabColor: string
-  /** Terminal background (hex); empty = app theme */
+  /** Terminal background (hex); empty = use app host defaults (then theme) */
   termBackground: string
-  /** Terminal default text color (hex); empty = app theme */
+  /** Terminal default text color (hex); empty = use app host defaults (then theme) */
   termForeground: string
-  /** Terminal font size in px */
-  fontSizePx: number
-  /** Terminal font family */
+  /** Terminal font size in px; null = use app host defaults */
+  fontSizePx: number | null
+  /** Terminal font family; empty = use app host defaults */
   fontFamily: string
-  /** Action when the remote sends BEL */
-  bellMode: BellMode
-  /** Cursor shape */
-  cursorStyle: CursorStyle
-  /** Whether the cursor blinks */
-  cursorBlink: boolean
-  /** Primary-buffer scrollback lines */
-  scrollbackLines: number
+  /** Action when the remote sends BEL; null = use app host defaults */
+  bellMode: BellMode | null
+  /** Cursor shape; null = use app host defaults */
+  cursorStyle: CursorStyle | null
+  /** Whether the cursor blinks; null = use app host defaults */
+  cursorBlink: boolean | null
+  /** Primary-buffer scrollback lines; null = use app host defaults */
+  scrollbackLines: number | null
   /** Port forwards / SOCKS tunnels for this session */
   tunnels: SshTunnel[]
   /** Forward remote X11 clients to the local display */
@@ -382,6 +384,8 @@ export interface TabSnapshot {
   active: boolean
   /** Plugin ids active for this tab when the app last exited */
   activePluginIds: string[]
+  /** Per-tab dock/split layout for plugin panels */
+  pluginLayout: TabPluginLayout
 }
 
 export interface AppSettings {
@@ -396,6 +400,37 @@ export interface AppSettings {
   enabledPlugins: string[]
   /** Per-plugin settings keyed by plugin id */
   pluginSettings: Record<string, unknown>
+  /** User overrides for where each plugin panel is docked */
+  pluginPanelPlacements: Record<string, PluginViewPlacement>
+  /** Stacking order of plugin panels (earlier = first in slot) */
+  pluginPanelOrder: string[]
+  /** Defaults for new hosts / quick connect; hosts with “use default” inherit these */
+  sessionStyleDefaults: SessionStyleDefaults
+}
+
+/** App-level appearance defaults (concrete values; colors may be theme-unset) */
+export interface SessionStyleDefaults {
+  tabColor: string
+  termBackground: string
+  termForeground: string
+  fontSizePx: number
+  fontFamily: string
+  bellMode: BellMode
+  cursorStyle: CursorStyle
+  cursorBlink: boolean
+  scrollbackLines: number
+}
+
+export const DEFAULT_SESSION_STYLE_DEFAULTS: SessionStyleDefaults = {
+  tabColor: THEME_COLOR_UNSET,
+  termBackground: THEME_COLOR_UNSET,
+  termForeground: THEME_COLOR_UNSET,
+  fontSizePx: DEFAULT_FONT_SIZE_PX,
+  fontFamily: DEFAULT_FONT_FAMILY,
+  bellMode: DEFAULT_BELL_MODE,
+  cursorStyle: DEFAULT_CURSOR_STYLE,
+  cursorBlink: DEFAULT_CURSOR_BLINK,
+  scrollbackLines: DEFAULT_SCROLLBACK_LINES
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -407,7 +442,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   windowBounds: null,
   theme: DEFAULT_THEME,
   enabledPlugins: [...DEFAULT_ENABLED_PLUGINS],
-  pluginSettings: {}
+  pluginSettings: {},
+  pluginPanelPlacements: {},
+  pluginPanelOrder: [],
+  sessionStyleDefaults: { ...DEFAULT_SESSION_STYLE_DEFAULTS }
 }
 
 export interface KnownHostEntry {

@@ -19,6 +19,32 @@ export type PluginViewPlacement =
   | 'split-top'
   | 'split-bottom'
 
+export const PLUGIN_VIEW_PLACEMENTS: PluginViewPlacement[] = [
+  'split-left',
+  'split-right',
+  'split-top',
+  'split-bottom',
+  'overlay'
+]
+
+export const PLUGIN_VIEW_PLACEMENT_LABELS: Record<PluginViewPlacement, string> = {
+  'split-left': 'Left',
+  'split-right': 'Right',
+  'split-top': 'Top',
+  'split-bottom': 'Bottom',
+  overlay: 'Overlay'
+}
+
+export function isPluginViewPlacement(value: unknown): value is PluginViewPlacement {
+  return (
+    value === 'overlay' ||
+    value === 'split-left' ||
+    value === 'split-right' ||
+    value === 'split-top' ||
+    value === 'split-bottom'
+  )
+}
+
 export type StreamMode = 'observe' | 'intercept'
 
 export type StreamDirection = 'inbound' | 'outbound'

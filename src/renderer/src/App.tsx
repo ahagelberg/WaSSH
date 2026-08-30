@@ -14,13 +14,16 @@ import {
   TabSnapshot
 } from '@shared/types'
 import {
-  sessionStyleFrom,
+  defaultPortForType,
   hostToConnection,
-  tunnelConfigFrom,
-  protocolConfigFrom,
   hostProfileFromConnection,
+  protocolConfigFrom,
+  resolveSessionStyle,
+  sessionStyleDefaultsFrom,
+  sessionStyleOverridesFrom,
+  emptySessionStyleOverrides,
   sessionTitle,
-  defaultPortForType
+  tunnelConfigFrom
 } from '@shared/connection'
 import SessionsSidebar from './components/SessionsSidebar'
 import QuickConnect from './components/QuickConnect'
@@ -32,6 +35,11 @@ import HostSessionSettingsDialog, {
 } from './components/HostSessionSettingsDialog'
 import type { PluginListItem } from '@shared/plugins'
 import { mergePluginSettings } from '@shared/plugins'
+import {
+  emptyTabPluginLayout,
+  normalizeTabPluginLayout,
+  type TabPluginLayout
+} from '@shared/pluginLayout'
 import PluginToolbar from './plugins/PluginToolbar'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
@@ -43,6 +51,7 @@ interface TabState {
   hostKeyPrompt?: HostKeyPrompt
   savePasswordPrompt?: SavePasswordPrompt
   activePluginIds: string[]
+  pluginLayout: TabPluginLayout
 }
 
 function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
@@ -71,7 +80,7 @@ function emptyHost(): HostProfile {
     authMethod: 'none',
     proxyHostId: '',
     ...proto,
-    ...sessionStyleFrom(null),
+    ...emptySessionStyleOverrides(),
     ...tunnelConfigFrom(null)
   }
 }
@@ -107,7 +116,14 @@ export default function App() {
 
   const refreshHosts = useCallback(async () => {
     const list = await window.wassh.listHosts()
-    setHosts(list.map((h) => ({ ...h, ...protocolConfigFrom(h), ...sessionStyleFrom(h), ...tunnelConfigFrom(h) })))
+    setHosts(
+      list.map((h) => ({
+        ...h,
+        ...protocolConfigFrom(h),
+        ...sessionStyleOverridesFrom(h),
+        ...tunnelConfigFrom(h)
+      }))
+    )
   }, [])
 
   const refreshPlugins = useCallback(async () => {
@@ -121,13 +137,14 @@ export default function App() {
       connection: {
         ...t.connection,
         ...protocolConfigFrom(t.connection),
-        ...sessionStyleFrom(t.connection),
+        ...sessionStyleOverridesFrom(t.connection),
         ...tunnelConfigFrom(t.connection),
         ephemeralPassword: '',
         ephemeralPassphrase: ''
       },
       active: t.id === activeRef.current,
-      activePluginIds: t.activePluginIds
+      activePluginIds: t.activePluginIds,
+      pluginLayout: t.pluginLayout
     }))
     void window.wassh.saveTabSnapshot(snapshot)
   }, [])
@@ -157,7 +174,8 @@ export default function App() {
           id,
           connection,
           status: 'connecting' as SessionStatus,
-          activePluginIds: []
+          activePluginIds: [],
+          pluginLayout: emptyTabPluginLayout()
         }
       ])
       setActiveTabId(id)
@@ -189,11 +207,12 @@ export default function App() {
         connection: {
           ...t.connection,
           ...protocolConfigFrom(t.connection),
-          ...sessionStyleFrom(t.connection),
+          ...sessionStyleOverridesFrom(t.connection),
           ...tunnelConfigFrom(t.connection)
         },
         status: 'connecting',
-        activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : []
+        activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
+        pluginLayout: normalizeTabPluginLayout(t.pluginLayout)
       }))
       setTabs(restored)
       const active = snapshot.find((t) => t.active)?.id || snapshot[0]?.id || null
@@ -339,6 +358,10 @@ export default function App() {
     [plugins]
   )
 
+  const onPanelLayoutChange = useCallback((tabId: string, pluginLayout: TabPluginLayout) => {
+    setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, pluginLayout } : t)))
+  }, [])
+
   const togglePlugin = useCallback(async (tabId: string, pluginId: string, nextActive: boolean) => {
     if (nextActive) {
       await window.wassh.activatePlugin(tabId, pluginId)
@@ -347,7 +370,12 @@ export default function App() {
     }
   }, [])
 
+  const styleDefaults = sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
+
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
+  const activeStyle = activeTab
+    ? resolveSessionStyle(activeTab.connection, styleDefaults)
+    : null
 
   const registerWriter = useCallback((tabId: string, write: (data: string) => void) => {
     writers.current.set(tabId, write)
@@ -411,14 +439,16 @@ export default function App() {
 
       <div className="main-pane">
         <TabBar
-          tabs={tabs.map((t) => ({
+          tabs={tabs.map((t) => {
+            const style = resolveSessionStyle(t.connection, styleDefaults)
+            return {
             id: t.id,
             title: sessionTitle(t.connection),
             status: t.status,
             active: t.id === activeTabId,
-            tabColor: sessionStyleFrom(t.connection).tabColor,
+            tabColor: style.tabColor,
             canSaveAsHost: !t.connection.hostId
-          }))}
+          }})}
           onSelect={setActiveTabId}
           onClose={closeTab}
           onReorder={reorderTabs}
@@ -485,11 +515,7 @@ export default function App() {
 
         <div
           className="terminal-area"
-          data-term-bg={
-            activeTab
-              ? sessionStyleFrom(activeTab.connection).termBackground || undefined
-              : undefined
-          }
+          data-term-bg={activeStyle?.termBackground || undefined}
         >
           {activeTab?.hostKeyPrompt ? (
             <div className="inline-banner warn">
@@ -598,7 +624,9 @@ export default function App() {
             </div>
           ) : (
             <div className="terminal-stack">
-              {tabsByStablePaneOrder(tabs).map((t) => (
+              {tabsByStablePaneOrder(tabs).map((t) => {
+                const style = resolveSessionStyle(t.connection, styleDefaults)
+                return (
                 <div
                   key={t.id}
                   className={`terminal-pane${t.id === activeTabId ? ' active' : ''}`}
@@ -608,21 +636,23 @@ export default function App() {
                     active={t.id === activeTabId}
                     plugins={plugins}
                     activePluginIds={t.activePluginIds}
+                    layout={t.pluginLayout}
                     settings={settings}
                     onPluginSettingsPatch={onPluginSettingsPatch}
+                    onLayoutChange={(pluginLayout) => onPanelLayoutChange(t.id, pluginLayout)}
                   >
                     <TerminalView
                       tabId={t.id}
                       active={t.id === activeTabId}
                       settings={settings}
-                      fontSizePx={sessionStyleFrom(t.connection).fontSizePx}
-                      fontFamily={sessionStyleFrom(t.connection).fontFamily}
-                      scrollbackLines={sessionStyleFrom(t.connection).scrollbackLines}
-                      bellMode={sessionStyleFrom(t.connection).bellMode}
-                      cursorStyle={sessionStyleFrom(t.connection).cursorStyle}
-                      cursorBlink={sessionStyleFrom(t.connection).cursorBlink}
-                      termBackground={sessionStyleFrom(t.connection).termBackground}
-                      termForeground={sessionStyleFrom(t.connection).termForeground}
+                      fontSizePx={style.fontSizePx}
+                      fontFamily={style.fontFamily}
+                      scrollbackLines={style.scrollbackLines}
+                      bellMode={style.bellMode}
+                      cursorStyle={style.cursorStyle}
+                      cursorBlink={style.cursorBlink}
+                      termBackground={style.termBackground}
+                      termForeground={style.termForeground}
                       onData={onTermData}
                       onResize={onTermResize}
                       registerWriter={registerWriter}
@@ -630,7 +660,7 @@ export default function App() {
                     />
                   </PluginSessionFrame>
                 </div>
-              ))}
+              )})}
             </div>
           )}
         </div>
@@ -650,6 +680,7 @@ export default function App() {
           connected={hostEditor.connected}
           hosts={hosts}
           initial={hostEditor.initial}
+          styleDefaults={styleDefaults}
           pickPrivateKey={() => window.wassh.pickPrivateKeyFile()}
           onClose={() => setHostEditor(null)}
           onSaveHost={(host, password, passphrase) => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   BELL_MODE_INVERT_LINE,
   BELL_MODE_INVERT_WINDOW,
@@ -61,8 +61,10 @@ import {
   hostToConnection,
   isSshConnectionType,
   protocolConfigFrom,
-  sessionStyleFrom,
-  tunnelConfigFrom
+  resolveSessionStyle,
+  sessionStyleOverridesFrom,
+  tunnelConfigFrom,
+  type SessionStyle
 } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
@@ -75,6 +77,8 @@ interface Props {
   connected: boolean
   hosts: HostProfile[]
   initial: ConnectionParams | HostProfile
+  /** App-level defaults used when a field is set to “Use default” */
+  styleDefaults: SessionStyle
   onSaveHost: (host: HostProfile, password: string, passphrase: string) => void
   onSaveSession: (connection: ConnectionParams) => void
   onClose: () => void
@@ -87,7 +91,7 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
       ...initial,
       proxyHostId: initial.proxyHostId || '',
       ...protocolConfigFrom(initial),
-      ...sessionStyleFrom(initial),
+      ...sessionStyleOverridesFrom(initial),
       ...tunnelConfigFrom(initial)
     }
   }
@@ -123,16 +127,26 @@ function ColorRow({
   hint,
   value,
   themeVar,
+  defaultLabel,
+  resolvedFallback,
   onChange
 }: {
   label: string
   hint: string
   value: string
   themeVar: string
+  defaultLabel: string
+  /** Hex used when turning off “use default” if theme var is not a hex */
+  resolvedFallback: string
   onChange: (value: string) => void
 }) {
-  const useTheme = !value
-  const pickerValue = useTheme ? themeVarHex(themeVar) : value
+  const useDefault = !value
+  const themeHex = themeVarHex(themeVar)
+  const pickerValue = useDefault
+    ? HEX_COLOR_RE.test(resolvedFallback)
+      ? resolvedFallback
+      : themeHex
+    : value
   return (
     <div className="settings-row">
       <div className="settings-row-label">
@@ -143,21 +157,63 @@ function ColorRow({
         <label className="settings-theme-default">
           <input
             type="checkbox"
-            checked={useTheme}
+            checked={useDefault}
             onChange={(e) =>
-              onChange(e.target.checked ? '' : themeVarHex(themeVar))
+              onChange(
+                e.target.checked
+                  ? ''
+                  : HEX_COLOR_RE.test(resolvedFallback)
+                    ? resolvedFallback
+                    : themeHex
+              )
             }
           />
-          Theme default
+          {defaultLabel}
         </label>
         {HEX_COLOR_RE.test(pickerValue) ? (
           <input
             type="color"
             value={pickerValue}
-            disabled={useTheme}
+            disabled={useDefault}
             onChange={(e) => onChange(e.target.value)}
           />
         ) : null}
+      </div>
+    </div>
+  )
+}
+
+function DefaultableControl({
+  label,
+  hint,
+  useDefault,
+  onUseDefaultChange,
+  children
+}: {
+  label: string
+  hint: string
+  useDefault: boolean
+  onUseDefaultChange: (useDefault: boolean) => void
+  children: ReactNode
+}) {
+  return (
+    <div className="settings-row">
+      <div className="settings-row-label">
+        <strong>{label}</strong>
+        <span>{hint}</span>
+      </div>
+      <div className="settings-defaultable-field">
+        <label className="settings-theme-default">
+          <input
+            type="checkbox"
+            checked={useDefault}
+            onChange={(e) => onUseDefaultChange(e.target.checked)}
+          />
+          Use default
+        </label>
+        <div className={useDefault ? 'settings-defaultable-control is-default' : 'settings-defaultable-control'}>
+          {children}
+        </div>
       </div>
     </div>
   )
@@ -168,6 +224,7 @@ export default function HostSessionSettingsDialog({
   connected,
   hosts,
   initial,
+  styleDefaults,
   onSaveHost,
   onSaveSession,
   onClose,
@@ -498,89 +555,123 @@ export default function HostSessionSettingsDialog({
 
     const fontHint =
       mode === 'editHost'
-        ? 'Used for new sessions from this host. Open tabs keep their own copy.'
-        : 'Applies only to this tab. Does not change the saved host.'
+        ? 'Used for new sessions from this host. Open tabs keep their own copy. “Use default” follows Options → Host defaults.'
+        : 'Applies only to this tab. “Use default” follows Options → Host defaults.'
+
+    const resolved = resolveSessionStyle(form, styleDefaults)
+    const colorFallback = (
+      key: 'tabColor' | 'termBackground' | 'termForeground',
+      themeVar: string
+    ): string => {
+      const fromDefaults = styleDefaults[key]
+      if (fromDefaults) {
+        return fromDefaults
+      }
+      return themeVarHex(themeVar)
+    }
 
     const appearanceRows = (
       <>
         <ColorRow
           label="Tab color"
-          hint="Leave as theme default for no accent. A custom color does not follow Dark/Light."
+          hint={fontHint}
           value={form.tabColor}
           themeVar={TAB_COLOR_THEME_VAR}
+          defaultLabel="Use default"
+          resolvedFallback={colorFallback('tabColor', TAB_COLOR_THEME_VAR)}
           onChange={(tabColor) => patch({ tabColor })}
         />
         <ColorRow
           label="Terminal background"
-          hint="Theme default follows the app theme. A custom color stays fixed."
+          hint={fontHint}
           value={form.termBackground}
           themeVar={TERM_BG_THEME_VAR}
+          defaultLabel="Use default"
+          resolvedFallback={colorFallback('termBackground', TERM_BG_THEME_VAR)}
           onChange={(termBackground) => patch({ termBackground })}
         />
         <ColorRow
           label="Terminal text"
-          hint="Theme default follows the app theme. A custom color stays fixed."
+          hint={fontHint}
           value={form.termForeground}
           themeVar={TERM_FG_THEME_VAR}
+          defaultLabel="Use default"
+          resolvedFallback={colorFallback('termForeground', TERM_FG_THEME_VAR)}
           onChange={(termForeground) => patch({ termForeground })}
         />
-        <div className="settings-row">
-          <div className="settings-row-label">
-            <strong>Font family</strong>
-            <span>{fontHint}</span>
-          </div>
+        <DefaultableControl
+          label="Font family"
+          hint={fontHint}
+          useDefault={!form.fontFamily}
+          onUseDefaultChange={(useDefault) =>
+            patch({ fontFamily: useDefault ? '' : resolved.fontFamily })
+          }
+        >
           <select
-            value={form.fontFamily}
+            value={form.fontFamily || resolved.fontFamily}
+            disabled={!form.fontFamily}
             onChange={(e) => patch({ fontFamily: e.target.value })}
           >
-            {fontSelectOptions(fontFamilies, form.fontFamily).map((family) => (
-              <option key={family} value={family}>
-                {family}
-              </option>
-            ))}
+            {fontSelectOptions(fontFamilies, form.fontFamily || resolved.fontFamily).map(
+              (family) => (
+                <option key={family} value={family}>
+                  {family}
+                </option>
+              )
+            )}
           </select>
-        </div>
-        <div className="settings-row">
-          <div className="settings-row-label">
-            <strong>Font size</strong>
-            <span>{fontHint}</span>
-          </div>
+        </DefaultableControl>
+        <DefaultableControl
+          label="Font size"
+          hint={fontHint}
+          useDefault={form.fontSizePx === null}
+          onUseDefaultChange={(useDefault) =>
+            patch({ fontSizePx: useDefault ? null : resolved.fontSizePx })
+          }
+        >
           <input
             type="number"
             min={FONT_SIZE_MIN_PX}
             max={FONT_SIZE_MAX_PX}
-            value={form.fontSizePx}
+            disabled={form.fontSizePx === null}
+            value={form.fontSizePx ?? resolved.fontSizePx}
             onChange={(e) =>
-              patch({ fontSizePx: Number(e.target.value) || DEFAULT_FONT_SIZE_PX })
+              patch({ fontSizePx: Number(e.target.value) || resolved.fontSizePx })
             }
           />
-        </div>
-        <div className="settings-row">
-          <div className="settings-row-label">
-            <strong>Scrollback lines</strong>
-            <span>
-              Primary-buffer history (PuTTY-like). {fontHint}
-            </span>
-          </div>
+        </DefaultableControl>
+        <DefaultableControl
+          label="Scrollback lines"
+          hint={`Primary-buffer history (PuTTY-like). ${fontHint}`}
+          useDefault={form.scrollbackLines === null}
+          onUseDefaultChange={(useDefault) =>
+            patch({ scrollbackLines: useDefault ? null : resolved.scrollbackLines })
+          }
+        >
           <input
             type="number"
             min={SCROLLBACK_LINES_MIN}
             max={SCROLLBACK_LINES_MAX}
-            value={form.scrollbackLines}
+            disabled={form.scrollbackLines === null}
+            value={form.scrollbackLines ?? resolved.scrollbackLines}
             onChange={(e) =>
               patch({
-                scrollbackLines: Number(e.target.value) || DEFAULT_SCROLLBACK_LINES
+                scrollbackLines: Number(e.target.value) || resolved.scrollbackLines
               })
             }
           />
-        </div>
-        <div className="settings-row">
-          <div className="settings-row-label">
-            <strong>Bell</strong>
-            <span>{fontHint}</span>
-          </div>
+        </DefaultableControl>
+        <DefaultableControl
+          label="Bell"
+          hint={fontHint}
+          useDefault={form.bellMode === null}
+          onUseDefaultChange={(useDefault) =>
+            patch({ bellMode: useDefault ? null : resolved.bellMode })
+          }
+        >
           <select
-            value={form.bellMode}
+            value={form.bellMode ?? resolved.bellMode}
+            disabled={form.bellMode === null}
             onChange={(e) => patch({ bellMode: e.target.value as BellMode })}
           >
             <option value={BELL_MODE_SYSTEM}>Default system sound</option>
@@ -589,32 +680,40 @@ export default function HostSessionSettingsDialog({
             </option>
             <option value={BELL_MODE_INVERT_LINE}>Blink current line</option>
           </select>
-        </div>
-        <div className="settings-row">
-          <div className="settings-row-label">
-            <strong>Cursor</strong>
-            <span>{fontHint}</span>
-          </div>
+        </DefaultableControl>
+        <DefaultableControl
+          label="Cursor"
+          hint={fontHint}
+          useDefault={form.cursorStyle === null}
+          onUseDefaultChange={(useDefault) =>
+            patch({ cursorStyle: useDefault ? null : resolved.cursorStyle })
+          }
+        >
           <select
-            value={form.cursorStyle || DEFAULT_CURSOR_STYLE}
+            value={form.cursorStyle ?? resolved.cursorStyle}
+            disabled={form.cursorStyle === null}
             onChange={(e) => patch({ cursorStyle: e.target.value as CursorStyle })}
           >
             <option value={CURSOR_STYLE_BLOCK}>Block</option>
             <option value={CURSOR_STYLE_UNDERLINE}>Underline</option>
             <option value={CURSOR_STYLE_BAR}>Vertical line</option>
           </select>
-        </div>
-        <div className="settings-row">
-          <div className="settings-row-label">
-            <strong>Cursor blink</strong>
-            <span>{fontHint}</span>
-          </div>
+        </DefaultableControl>
+        <DefaultableControl
+          label="Cursor blink"
+          hint={fontHint}
+          useDefault={form.cursorBlink === null}
+          onUseDefaultChange={(useDefault) =>
+            patch({ cursorBlink: useDefault ? null : resolved.cursorBlink })
+          }
+        >
           <input
             type="checkbox"
-            checked={form.cursorBlink ?? DEFAULT_CURSOR_BLINK}
+            disabled={form.cursorBlink === null}
+            checked={form.cursorBlink ?? resolved.cursorBlink}
             onChange={(e) => patch({ cursorBlink: e.target.checked })}
           />
-        </div>
+        </DefaultableControl>
       </>
     )
 
@@ -791,7 +890,8 @@ export default function HostSessionSettingsDialog({
     proxyOptions,
     connType,
     isSsh,
-    isSerial
+    isSerial,
+    styleDefaults
   ])
 
   const handleSave = (): void => {
@@ -817,7 +917,7 @@ export default function HostSessionSettingsDialog({
         authMethod: form.authMethod,
         proxyHostId: isSsh ? form.proxyHostId || '' : '',
         ...protocolConfigFrom(form),
-        ...sessionStyleFrom(form),
+        ...sessionStyleOverridesFrom(form),
         ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false })
       }
       onSaveHost(host, password, passphrase)
@@ -828,7 +928,7 @@ export default function HostSessionSettingsDialog({
     onSaveSession({
       ...form,
       ...protocolConfigFrom(form),
-      ...sessionStyleFrom(form),
+      ...sessionStyleOverridesFrom(form),
       ...tunnelConfigFrom(form),
       ephemeralPassword: password || form.ephemeralPassword,
       ephemeralPassphrase: passphrase || form.ephemeralPassphrase

@@ -6,6 +6,9 @@
   --plugin-split-left-width: 220px;
   --plugin-split-bottom-height: 160px;
   --plugin-split-top-height: 120px;
+  --plugin-outer-drop-band: 28px;
+  --plugin-inner-drop-band: 36px;
+  --plugin-splitter-size: 4px;
   --monitor-cpu: #3d8bfd;
   --monitor-mem: #3dd68c;
   --monitor-disk: #f0b429;
@@ -61,14 +64,290 @@
   height: 100%;
 }
 
-.plugin-slot {
+.plugin-dock {
   flex-shrink: 0;
   background: var(--bg-panel);
-  border-color: var(--border);
-  border-style: solid;
-  border-width: 0;
-  overflow: auto;
+  min-width: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.plugin-dock-left {
+  border-right: 1px solid var(--border);
+}
+
+.plugin-dock-right {
+  border-left: 1px solid var(--border);
+}
+
+.plugin-dock-top {
+  border-bottom: 1px solid var(--border);
+}
+
+.plugin-dock-bottom {
+  border-top: 1px solid var(--border);
+}
+
+.plugin-dock-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  border: none;
+}
+
+.plugin-dock.drop-active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.plugin-layout-split {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.plugin-layout-split-row {
+  flex-direction: row;
+}
+
+.plugin-layout-split-column {
+  flex-direction: column;
+}
+
+.plugin-layout-split-pane {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.plugin-layout-leaf {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.plugin-leaf-drop-preview {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border: 2px solid var(--accent);
+}
+
+.plugin-leaf-drop-preview.zone-left {
+  right: 50%;
+}
+
+.plugin-leaf-drop-preview.zone-right {
+  left: 50%;
+}
+
+.plugin-leaf-drop-preview.zone-top {
+  bottom: 50%;
+}
+
+.plugin-leaf-drop-preview.zone-bottom {
+  top: 50%;
+}
+
+.plugin-splitter {
+  flex-shrink: 0;
+  background: var(--border);
+  z-index: 2;
+}
+
+.plugin-splitter-vertical {
+  width: var(--plugin-splitter-size);
+  cursor: col-resize;
+}
+
+.plugin-splitter-horizontal {
+  height: var(--plugin-splitter-size);
+  cursor: row-resize;
+}
+
+.plugin-splitter:hover,
+.plugin-splitter:active {
+  background: var(--accent);
+}
+
+.plugin-outer-drop {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  background: transparent;
+  border: 2px dashed transparent;
+}
+
+.plugin-outer-drop.active {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: var(--accent);
+}
+
+.plugin-outer-drop-left {
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--plugin-outer-drop-band);
+}
+
+.plugin-outer-drop-right {
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--plugin-outer-drop-band);
+}
+
+.plugin-outer-drop-top {
+  left: 0;
+  right: 0;
+  top: 0;
+  height: var(--plugin-outer-drop-band);
+}
+
+.plugin-outer-drop-bottom {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--plugin-outer-drop-band);
+}
+
+.plugin-inner-drop {
+  position: absolute;
+  z-index: 7;
+  pointer-events: none;
+  background: transparent;
+  border: 2px dashed transparent;
+}
+
+.plugin-inner-drop.active {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+}
+
+.plugin-inner-drop-left {
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--plugin-inner-drop-band);
+}
+
+.plugin-inner-drop-right {
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--plugin-inner-drop-band);
+}
+
+.plugin-inner-drop-top {
+  left: 0;
+  right: 0;
+  top: 0;
+  height: var(--plugin-inner-drop-band);
+}
+
+.plugin-inner-drop-bottom {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--plugin-inner-drop-band);
+}
+
+.plugin-dock.drop-insert-inner {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+
+.plugin-panel-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.plugin-panel-shell.dragging {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.plugin-layout-leaf:has(.plugin-panel-shell.dragging) {
+  pointer-events: none;
+}
+
+.plugin-panel-chrome {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 4px 6px;
+  background: var(--bg-panel-2);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.plugin-panel-drag {
+  cursor: grab;
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: -2px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.plugin-panel-drag:active {
+  cursor: grabbing;
+}
+
+.plugin-panel-chrome-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.plugin-panel-placement select {
+  max-width: 96px;
+  padding: 2px 4px;
+  font-size: 11px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.plugin-panel-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.plugin-panel-body > .plugin-panel {
+  height: 100%;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .plugin-slot-split-left {
