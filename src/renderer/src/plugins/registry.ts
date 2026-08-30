@@ -3,6 +3,7 @@ import type { PluginListItem, PluginViewPlacement } from '@shared/plugins'
 import ServerMonitorView from './builtins/ServerMonitorView'
 import ScratchpadView from './builtins/ScratchpadView'
 import MacroPadView from './builtins/MacroPadView'
+import MqttExplorerView from './builtins/MqttExplorerView'
 
 export interface PluginViewProps {
   tabId: string
@@ -14,7 +15,8 @@ export interface PluginViewProps {
 const VIEW_REGISTRY: Record<string, ComponentType<PluginViewProps>> = {
   'server-monitor': ServerMonitorView,
   scratchpad: ScratchpadView,
-  'macro-pad': MacroPadView
+  'macro-pad': MacroPadView,
+  'mqtt-explorer': MqttExplorerView
 }
 
 export function getPluginView(pluginId: string): ComponentType<PluginViewProps> | null {

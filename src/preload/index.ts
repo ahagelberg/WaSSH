@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppSettings,
   ConnectRequest,
+  ConnectionParams,
   HostKeyDecision,
   HostKeyPrompt,
   HostProfile,
@@ -47,6 +48,8 @@ const api: WasshApi = {
   write: (tabId: string, data: string) => ipcRenderer.invoke('session:write', tabId, data),
   resize: (tabId: string, cols: number, rows: number) =>
     ipcRenderer.invoke('session:resize', tabId, cols, rows),
+  updateConnection: (tabId: string, partial: Partial<ConnectionParams>) =>
+    ipcRenderer.invoke('session:updateConnection', tabId, partial),
   respondHostKey: (tabId: string, decision: HostKeyDecision) =>
     ipcRenderer.invoke('session:respondHostKey', tabId, decision),
   respondSavePassword: (tabId: string, decision: SavePasswordDecision, hostName?: string) =>

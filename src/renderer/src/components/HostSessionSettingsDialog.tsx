@@ -66,9 +66,15 @@ import {
   tunnelConfigFrom,
   type SessionStyle
 } from '@shared/connection'
+import {
+  mergePluginSettings,
+  normalizeHostPluginSettings,
+  type PluginListItem
+} from '@shared/plugins'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
+import PluginFieldEditor from '../plugins/PluginFieldEditor'
 
 export type HostSessionMode = 'editHost' | 'editOpenSession'
 
@@ -92,7 +98,8 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
       proxyHostId: initial.proxyHostId || '',
       ...protocolConfigFrom(initial),
       ...sessionStyleOverridesFrom(initial),
-      ...tunnelConfigFrom(initial)
+      ...tunnelConfigFrom(initial),
+      pluginSettings: normalizeHostPluginSettings(initial.pluginSettings)
     }
   }
   return hostToConnection(initial)
@@ -234,6 +241,7 @@ export default function HostSessionSettingsDialog({
   const [password, setPassword] = useState('')
   const [passphrase, setPassphrase] = useState('')
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
+  const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const identityLocked = mode === 'editOpenSession' && connected
   const editingHostId =
     mode === 'editHost' && 'id' in initial ? initial.id : form.hostId || ''
@@ -246,6 +254,27 @@ export default function HostSessionSettingsDialog({
 
   const patch = (partial: Partial<ConnectionParams>): void => {
     setForm((prev) => ({ ...prev, ...partial }))
+  }
+
+  const patchPluginHostSetting = (
+    pluginId: string,
+    key: string,
+    value: unknown
+  ): void => {
+    setForm((prev) => {
+      const plugin = plugins.find((p) => p.id === pluginId)
+      const current = mergePluginSettings(
+        plugin?.contributes.hostSettingsSchema,
+        prev.pluginSettings[pluginId]
+      )
+      return {
+        ...prev,
+        pluginSettings: {
+          ...prev.pluginSettings,
+          [pluginId]: { ...current, [key]: value }
+        }
+      }
+    })
   }
 
   const changeType = (next: ConnectionType): void => {
@@ -267,6 +296,10 @@ export default function HostSessionSettingsDialog({
 
   useEffect(() => {
     void listMonospaceFontFamilies().then(setFontFamilies)
+  }, [])
+
+  useEffect(() => {
+    void window.wassh.listPlugins().then(setPlugins)
   }, [])
 
   const sections: SettingsSection[] = useMemo(() => {
@@ -878,6 +911,38 @@ export default function HostSessionSettingsDialog({
       })
     }
 
+    for (const plugin of plugins) {
+      if (!plugin.enabled) {
+        continue
+      }
+      const schema = plugin.contributes.hostSettingsSchema
+      if (!schema || schema.length === 0) {
+        continue
+      }
+      const values = mergePluginSettings(schema, form.pluginSettings[plugin.id])
+      list.push({
+        id: `plugin-host-${plugin.id}`,
+        title: plugin.contributes.hostSettingsHeading || plugin.name,
+        content: (
+          <>
+            {schema.map((field) => (
+              <div key={field.key} className="settings-row">
+                <div className="settings-row-label">
+                  <strong>{field.label}</strong>
+                  {field.description ? <span>{field.description}</span> : null}
+                </div>
+                <PluginFieldEditor
+                  field={field}
+                  value={values[field.key]}
+                  onChange={(value) => patchPluginHostSetting(plugin.id, field.key, value)}
+                />
+              </div>
+            ))}
+          </>
+        )
+      })
+    }
+
     return list
   }, [
     form,
@@ -891,7 +956,8 @@ export default function HostSessionSettingsDialog({
     connType,
     isSsh,
     isSerial,
-    styleDefaults
+    styleDefaults,
+    plugins
   ])
 
   const handleSave = (): void => {
@@ -918,7 +984,8 @@ export default function HostSessionSettingsDialog({
         proxyHostId: isSsh ? form.proxyHostId || '' : '',
         ...protocolConfigFrom(form),
         ...sessionStyleOverridesFrom(form),
-        ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false })
+        ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false }),
+        pluginSettings: normalizeHostPluginSettings(form.pluginSettings)
       }
       onSaveHost(host, password, passphrase)
       onClose()
@@ -931,7 +998,8 @@ export default function HostSessionSettingsDialog({
       ...sessionStyleOverridesFrom(form),
       ...tunnelConfigFrom(form),
       ephemeralPassword: password || form.ephemeralPassword,
-      ephemeralPassphrase: passphrase || form.ephemeralPassphrase
+      ephemeralPassphrase: passphrase || form.ephemeralPassphrase,
+      pluginSettings: normalizeHostPluginSettings(form.pluginSettings)
     })
     onClose()
   }

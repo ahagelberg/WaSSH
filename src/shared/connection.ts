@@ -65,6 +65,7 @@ import {
   type SshTunnel,
   type TunnelType
 } from './types'
+import { normalizeHostPluginSettings } from './plugins'
 
 export interface SessionStyle {
   tabColor: string
@@ -561,7 +562,8 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     ...sessionStyleFrom(host),
     ...tunnelConfigFrom(host),
     ephemeralPassword: '',
-    ephemeralPassphrase: ''
+    ephemeralPassphrase: '',
+    pluginSettings: normalizeHostPluginSettings(host.pluginSettings)
   }
 }
 
@@ -582,7 +584,8 @@ export function hostProfileFromConnection(
     proxyHostId: src.proxyHostId || '',
     ...protocolConfigFrom(src),
     ...sessionStyleFrom(src),
-    ...tunnelConfigFrom(src)
+    ...tunnelConfigFrom(src),
+    pluginSettings: normalizeHostPluginSettings(src.pluginSettings)
   }
 }
 

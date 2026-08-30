@@ -84,6 +84,12 @@ export function registerIpc(
     sessions.resize(tabId, cols, rows)
   })
   ipcMain.handle(
+    'session:updateConnection',
+    (_e, tabId: string, partial: Partial<import('../../shared/types').ConnectionParams>) => {
+      sessions.updateConnection(tabId, partial)
+    }
+  )
+  ipcMain.handle(
     'session:respondHostKey',
     (_e, tabId: string, decision: HostKeyDecision) => {
       sessions.respondHostKey(tabId, decision)

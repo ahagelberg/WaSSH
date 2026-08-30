@@ -5,7 +5,8 @@ import {
   ConnectRequest,
   HostKeyDecision,
   SavePasswordDecision,
-  SessionStatus
+  SessionStatus,
+  type ConnectionParams
 } from '../../shared/types'
 import { connectionTypeOf } from '../../shared/connection'
 import { CredentialVault } from '../store/credentialVault'
@@ -143,6 +144,16 @@ export class SessionManager {
 
   getConnection(tabId: string) {
     return this.sessions.get(tabId)?.getConnection()
+  }
+
+  updateConnection(tabId: string, partial: Partial<ConnectionParams>): void {
+    const conn = this.sessions.get(tabId)
+    if (!conn) {
+      return
+    }
+    if ('updateConnection' in conn && typeof conn.updateConnection === 'function') {
+      conn.updateConnection(partial)
+    }
   }
 
   getPluginSessionHandle(tabId: string): PluginSessionHandle | null {

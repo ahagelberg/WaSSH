@@ -10,10 +10,12 @@ import {
   HostProfile,
   KnownHostEntry,
   TabSnapshot,
-  type AppTheme
+  type AppTheme,
+  type ConnectionParams
 } from '../../shared/types'
 import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
+import { normalizeHostPluginSettings } from '../../shared/plugins'
 
 const HOSTS_FILE = 'hosts.json'
 const PREVIOUS_HOSTS_FILE = 'sessions.json'
@@ -79,7 +81,8 @@ function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile 
     proxyHostId: raw.proxyHostId ?? '',
     ...protocolConfigFrom(raw),
     ...sessionStyleFrom({ ...storedStyleFallback(), ...raw }),
-    ...tunnelConfigFrom(raw)
+    ...tunnelConfigFrom(raw),
+    pluginSettings: normalizeHostPluginSettings(raw.pluginSettings)
   }
 }
 
@@ -141,7 +144,10 @@ export class TabStore {
         ...t.connection,
         ...protocolConfigFrom(t.connection),
         ...sessionStyleFrom({ ...fallback, ...t.connection }),
-        ...tunnelConfigFrom(t.connection)
+        ...tunnelConfigFrom(t.connection),
+        pluginSettings: normalizeHostPluginSettings(
+          (t.connection as ConnectionParams & { pluginSettings?: unknown }).pluginSettings
+        )
       }
     }))
   }

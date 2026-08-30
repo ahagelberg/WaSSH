@@ -9,7 +9,7 @@ import {
 } from 'react'
 import type { AppSettings } from '@shared/types'
 import type { PluginListItem } from '@shared/plugins'
-import { mergePluginSettings } from '@shared/plugins'
+import { mergePluginSessionSettings } from '@shared/plugins'
 import {
   INNER_DROP_BAND_PX,
   MIN_DOCK_SIZE_PX,
@@ -38,6 +38,8 @@ interface Props {
   activePluginIds: string[]
   layout: TabPluginLayout
   settings: AppSettings
+  /** Per-host plugin settings from the tab connection / host profile */
+  hostPluginSettings: Record<string, Record<string, unknown>>
   onPluginSettingsPatch: (pluginId: string, partial: Record<string, unknown>) => void
   onLayoutChange: (layout: TabPluginLayout) => void
   onDeactivatePlugin: (pluginId: string) => void
@@ -112,6 +114,7 @@ function LayoutTreeView({
   active,
   plugins,
   settings,
+  hostPluginSettings,
   draggingId,
   dropTarget,
   onPluginSettingsPatch,
@@ -126,6 +129,7 @@ function LayoutTreeView({
   active: boolean
   plugins: PluginListItem[]
   settings: AppSettings
+  hostPluginSettings: Record<string, Record<string, unknown>>
   draggingId: string | null
   dropTarget: DropTarget | null
   onPluginSettingsPatch: (pluginId: string, partial: Record<string, unknown>) => void
@@ -144,9 +148,10 @@ function LayoutTreeView({
     if (!View) {
       return null
     }
-    const pluginSettings = mergePluginSettings(
-      plugin.contributes.settingsSchema,
-      settings.pluginSettings[plugin.id]
+    const pluginSettings = mergePluginSessionSettings(
+      plugin,
+      settings.pluginSettings[plugin.id],
+      hostPluginSettings[plugin.id]
     )
     const props = {
       tabId,
@@ -201,6 +206,7 @@ function LayoutTreeView({
           active={active}
           plugins={plugins}
           settings={settings}
+          hostPluginSettings={hostPluginSettings}
           draggingId={draggingId}
           dropTarget={dropTarget}
           onPluginSettingsPatch={onPluginSettingsPatch}
@@ -233,6 +239,7 @@ function LayoutTreeView({
           active={active}
           plugins={plugins}
           settings={settings}
+          hostPluginSettings={hostPluginSettings}
           draggingId={draggingId}
           dropTarget={dropTarget}
           onPluginSettingsPatch={onPluginSettingsPatch}
@@ -252,6 +259,7 @@ export default function PluginSessionFrame({
   activePluginIds,
   layout,
   settings,
+  hostPluginSettings,
   onPluginSettingsPatch,
   onLayoutChange,
   onDeactivatePlugin,
@@ -447,6 +455,7 @@ export default function PluginSessionFrame({
           active={active}
           plugins={plugins}
           settings={settings}
+          hostPluginSettings={hostPluginSettings}
           draggingId={draggingId}
           dropTarget={dropTarget}
           onPluginSettingsPatch={onPluginSettingsPatch}
@@ -603,6 +612,7 @@ export default function PluginSessionFrame({
             active={active}
             plugins={plugins}
             settings={settings}
+            hostPluginSettings={hostPluginSettings}
             draggingId={draggingId}
             dropTarget={dropTarget}
             onPluginSettingsPatch={onPluginSettingsPatch}

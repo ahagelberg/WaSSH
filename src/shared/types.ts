@@ -329,6 +329,11 @@ export interface HostProfile {
   serialStopBits: SerialStopBits
   serialParity: SerialParity
   serialFlowControl: SerialFlowControl
+  /**
+   * Per-plugin settings for this host (pluginId → settings object).
+   * Populated from plugins that contribute hostSettingsSchema.
+   */
+  pluginSettings: Record<string, Record<string, unknown>>
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -376,6 +381,8 @@ export interface ConnectionParams {
   /** Session-local password not yet vaulted (ephemeral) */
   ephemeralPassword: string
   ephemeralPassphrase: string
+  /** Per-plugin host-scoped settings for this tab (copied from host on connect) */
+  pluginSettings: Record<string, Record<string, unknown>>
 }
 
 export interface TabSnapshot {
@@ -503,6 +510,8 @@ export interface WasshApi {
   disconnect: (tabId: string) => Promise<void>
   write: (tabId: string, data: string) => Promise<void>
   resize: (tabId: string, cols: number, rows: number) => Promise<void>
+  /** Patch live session connection params (e.g. per-host plugin settings) */
+  updateConnection: (tabId: string, partial: Partial<ConnectionParams>) => Promise<void>
   respondHostKey: (tabId: string, decision: HostKeyDecision) => Promise<void>
   respondSavePassword: (
     tabId: string,

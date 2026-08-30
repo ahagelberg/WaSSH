@@ -40,6 +40,10 @@ export abstract class ByteSession extends EventEmitter {
     return this.connection
   }
 
+  updateConnection(partial: Partial<ConnectionParams>): void {
+    this.connection = { ...this.connection, ...partial }
+  }
+
   setReconnectPolicy(enabled: boolean, maxAttempts: number): void {
     this.autoReconnect = enabled
     this.maxReconnectAttempts = maxAttempts

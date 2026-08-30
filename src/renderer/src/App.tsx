@@ -81,7 +81,8 @@ function emptyHost(): HostProfile {
     proxyHostId: '',
     ...proto,
     ...emptySessionStyleOverrides(),
-    ...tunnelConfigFrom(null)
+    ...tunnelConfigFrom(null),
+    pluginSettings: {}
   }
 }
 
@@ -121,7 +122,8 @@ export default function App() {
         ...h,
         ...protocolConfigFrom(h),
         ...sessionStyleOverridesFrom(h),
-        ...tunnelConfigFrom(h)
+        ...tunnelConfigFrom(h),
+        pluginSettings: h.pluginSettings ?? {}
       }))
     )
   }, [])
@@ -140,7 +142,8 @@ export default function App() {
         ...sessionStyleOverridesFrom(t.connection),
         ...tunnelConfigFrom(t.connection),
         ephemeralPassword: '',
-        ephemeralPassphrase: ''
+        ephemeralPassphrase: '',
+        pluginSettings: t.connection.pluginSettings ?? {}
       },
       active: t.id === activeRef.current,
       activePluginIds: t.activePluginIds,
@@ -412,6 +415,24 @@ export default function App() {
     }
     await window.wassh.saveHost(host)
     await refreshHosts()
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.connection.hostId === host.id
+          ? {
+              ...t,
+              connection: {
+                ...t.connection,
+                pluginSettings: host.pluginSettings
+              }
+            }
+          : t
+      )
+    )
+    for (const t of tabsRef.current) {
+      if (t.connection.hostId === host.id) {
+        void window.wassh.updateConnection(t.id, { pluginSettings: host.pluginSettings })
+      }
+    }
   }
 
   return (
@@ -638,6 +659,7 @@ export default function App() {
                     activePluginIds={t.activePluginIds}
                     layout={t.pluginLayout}
                     settings={settings}
+                    hostPluginSettings={t.connection.pluginSettings ?? {}}
                     onPluginSettingsPatch={onPluginSettingsPatch}
                     onLayoutChange={(pluginLayout) => onPanelLayoutChange(t.id, pluginLayout)}
                     onDeactivatePlugin={(pluginId) => {
@@ -702,7 +724,8 @@ export default function App() {
                         hostId: host.id,
                         passwordVaultId: host.passwordVaultId || t.connection.passwordVaultId,
                         passphraseVaultId:
-                          host.passphraseVaultId || t.connection.passphraseVaultId
+                          host.passphraseVaultId || t.connection.passphraseVaultId,
+                        pluginSettings: host.pluginSettings
                       }
                     }
                   : t
@@ -717,6 +740,27 @@ export default function App() {
             setTabs((prev) =>
               prev.map((t) => (t.id === tabId ? { ...t, connection } : t))
             )
+            void window.wassh.updateConnection(tabId, {
+              pluginSettings: connection.pluginSettings,
+              name: connection.name,
+              ...sessionStyleOverridesFrom(connection),
+              ...tunnelConfigFrom(connection)
+            })
+            if (connection.hostId) {
+              const existing = hosts.find((h) => h.id === connection.hostId)
+              if (existing) {
+                void saveHost(
+                  {
+                    ...existing,
+                    ...sessionStyleOverridesFrom(connection),
+                    ...tunnelConfigFrom(connection),
+                    pluginSettings: connection.pluginSettings
+                  },
+                  '',
+                  ''
+                )
+              }
+            }
           }}
         />
       ) : null}

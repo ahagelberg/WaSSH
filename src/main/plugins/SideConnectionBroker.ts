@@ -1,12 +1,14 @@
 import { randomUUID } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { Socket, connect as netConnect } from 'net'
+import type { Duplex } from 'stream'
 import type { ClientChannel } from 'ssh2'
 import type {
   SideConnectionClosedEvent,
   SideConnectionDataEvent,
   SideConnectionOpenRequest
 } from '../../shared/plugins'
+import type { ConnectionParams } from '../../shared/types'
 import type { PluginSessionHandle } from './types'
 
 interface OpenSideConnection {
@@ -17,8 +19,18 @@ interface OpenSideConnection {
   write: (data: string) => void
 }
 
+/** Binary duplex tracked for plugins that speak non-UTF8 protocols (e.g. MQTT). */
+interface OpenRawTcpStream {
+  id: string
+  tabId: string
+  pluginId: string
+  stream: Duplex
+  dispose: () => void
+}
+
 export class SideConnectionBroker {
   private connections = new Map<string, OpenSideConnection>()
+  private rawStreams = new Map<string, OpenRawTcpStream>()
 
   constructor(
     private getSession: (tabId: string) => PluginSessionHandle | null,
@@ -26,6 +38,68 @@ export class SideConnectionBroker {
     private onData?: (connectionId: string, data: string) => void,
     private onClosed?: (connectionId: string, error?: string) => void
   ) {}
+
+  isSshSession(tabId: string): boolean {
+    return this.getSession(tabId)?.isSsh ?? false
+  }
+
+  /** Live connection params for a tab, if connected */
+  getConnectionParams(tabId: string): ConnectionParams | null {
+    return this.getSession(tabId)?.connection ?? null
+  }
+
+  /**
+   * Open a binary TCP duplex to host:port via SSH forwardOut (or direct TCP when not SSH).
+   * Does not convert buffers to UTF-8 or emit side-data IPC.
+   */
+  async openTcpStream(
+    tabId: string,
+    pluginId: string,
+    host: string,
+    port: number
+  ): Promise<{ id: string; stream: Duplex }> {
+    const session = this.getSession(tabId)
+    if (!session) {
+      throw new Error('Session is not connected')
+    }
+    const destHost = host.trim()
+    if (!destHost || !port) {
+      throw new Error('TCP stream requires host and port')
+    }
+
+    let stream: Duplex
+    if (session.isSsh && session.getSshClient()) {
+      stream = await session.forwardOut(destHost, port)
+    } else {
+      stream = await session.openDirectTcp(destHost, port)
+    }
+
+    const id = randomUUID()
+    const dispose = (): void => {
+      try {
+        stream.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+    stream.on('close', () => {
+      this.rawStreams.delete(id)
+    })
+    stream.on('error', () => {
+      this.rawStreams.delete(id)
+    })
+    this.rawStreams.set(id, { id, tabId, pluginId, stream, dispose })
+    return { id, stream }
+  }
+
+  closeTcpStream(streamId: string): void {
+    const entry = this.rawStreams.get(streamId)
+    if (!entry) {
+      return
+    }
+    this.rawStreams.delete(streamId)
+    entry.dispose()
+  }
 
   private send(channel: string, payload: unknown): void {
     const win = this.getWindow()
@@ -136,6 +210,11 @@ export class SideConnectionBroker {
         this.close(id)
       }
     }
+    for (const [id, raw] of Array.from(this.rawStreams.entries())) {
+      if (raw.tabId === tabId && raw.pluginId === pluginId) {
+        this.closeTcpStream(id)
+      }
+    }
   }
 
   closeForTab(tabId: string): void {
@@ -144,11 +223,19 @@ export class SideConnectionBroker {
         this.close(id)
       }
     }
+    for (const [id, raw] of Array.from(this.rawStreams.entries())) {
+      if (raw.tabId === tabId) {
+        this.closeTcpStream(id)
+      }
+    }
   }
 
   disposeAll(): void {
     for (const id of Array.from(this.connections.keys())) {
       this.close(id)
+    }
+    for (const id of Array.from(this.rawStreams.keys())) {
+      this.closeTcpStream(id)
     }
   }
 

@@ -1,5 +1,5 @@
 import { BrowserWindow } from 'electron'
-import type { SettingsStore } from '../store/sessionStore'
+import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import type { SessionManager } from '../ssh/SessionManager'
 import { PluginHost } from './PluginHost'
@@ -18,6 +18,7 @@ const pendingRestore = new Map<string, string[]>()
 
 export function createPluginSystem(
   settingsStore: SettingsStore,
+  sessionStore: SessionStore,
   sessions: SessionManager,
   getWindow: () => BrowserWindow | null,
   pluginData: PluginDataStore
@@ -36,6 +37,7 @@ export function createPluginSystem(
 
   const host = new PluginHost(
     settingsStore,
+    sessionStore,
     pipeline,
     broker,
     (tabId, data) => sessions.writeRaw(tabId, data),

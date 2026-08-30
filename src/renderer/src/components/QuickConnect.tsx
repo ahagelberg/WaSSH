@@ -108,7 +108,8 @@ export default function QuickConnect({ onConnect }: Props) {
       ...sessionStyleFrom(null),
       ...tunnelConfigFrom(null),
       ephemeralPassword: type === CONNECTION_TYPE_SSH ? password : '',
-      ephemeralPassphrase: ''
+      ephemeralPassphrase: '',
+      pluginSettings: {}
     })
   }
 

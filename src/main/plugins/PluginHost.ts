@@ -1,4 +1,5 @@
 import { BrowserWindow } from 'electron'
+import type { Duplex } from 'stream'
 import type {
   PluginActiveStateEvent,
   PluginListItem,
@@ -8,11 +9,12 @@ import type {
   StreamDirection,
   StreamMode
 } from '../../shared/plugins'
-import { mergePluginSettings } from '../../shared/plugins'
-import type { SettingsStore } from '../store/sessionStore'
+import { mergePluginSessionSettings, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR } from '../../shared/plugins'
+import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import { BUILTIN_MANIFESTS } from './builtins/manifests'
 import { macroPadMain } from './builtins/macroPad'
+import { mqttExplorerMain } from './builtins/mqttExplorer'
 import { scratchpadMain } from './builtins/scratchpad'
 import { serverMonitorMain } from './builtins/serverMonitor'
 import { loadExternalPlugins } from './externalLoader'
@@ -34,6 +36,13 @@ export interface PluginMainContext {
   writeSideConnection: (connectionId: string, data: string) => void
   onSideData: (connectionId: string, cb: (data: string) => void) => () => void
   onSideClosed: (connectionId: string, cb: (error?: string) => void) => () => void
+  /** Whether the tab's live session is SSH (required for remote MQTT tunnel). */
+  isSshSession: () => boolean
+  /**
+   * Binary TCP duplex via SSH forwardOut (or direct TCP).
+   * Not UTF-8 side-data — for protocols like MQTT.
+   */
+  openTcpStream: (host: string, port: number) => Promise<Duplex>
   registerStreamHandler: (
     mode: StreamMode,
     direction: StreamDirection,
@@ -66,6 +75,7 @@ export class PluginHost {
 
   constructor(
     private settingsStore: SettingsStore,
+    private sessionStore: SessionStore,
     private pipeline: SessionDataPipeline,
     private broker: SideConnectionBroker,
     private writeSession: (tabId: string, data: string) => void,
@@ -75,9 +85,10 @@ export class PluginHost {
 
   /** Call after construction once builtin modules are registered */
   registerBuiltins(): void {
-    this.modules.set('server-monitor', serverMonitorMain)
-    this.modules.set('scratchpad', scratchpadMain)
-    this.modules.set('macro-pad', macroPadMain)
+    this.modules.set(PLUGIN_ID_SERVER_MONITOR, serverMonitorMain)
+    this.modules.set(PLUGIN_ID_SCRATCHPAD, scratchpadMain)
+    this.modules.set(PLUGIN_ID_MACRO_PAD, macroPadMain)
+    this.modules.set(PLUGIN_ID_MQTT_EXPLORER, mqttExplorerMain)
   }
 
   private send(channel: string, payload: unknown): void {
@@ -99,6 +110,27 @@ export class PluginHost {
 
   getManifest(pluginId: string): PluginManifest | undefined {
     return this.listPlugins().find((p) => p.id === pluginId)
+  }
+
+  /**
+   * Host-scoped settings for a plugin: prefer saved HostProfile (fresh after save),
+   * else the live connection snapshot (quick-connect / unsaved).
+   */
+  private resolveHostPluginSettings(
+    tabId: string,
+    pluginId: string
+  ): Record<string, unknown> | undefined {
+    const connection = this.broker.getConnectionParams(tabId)
+    if (!connection) {
+      return undefined
+    }
+    if (connection.hostId) {
+      const fromHost = this.sessionStore.getHost(connection.hostId)?.pluginSettings?.[pluginId]
+      if (fromHost) {
+        return fromHost
+      }
+    }
+    return connection.pluginSettings?.[pluginId]
   }
 
   isEnabled(pluginId: string): boolean {
@@ -133,8 +165,9 @@ export class PluginHost {
       pluginId,
       getSettings: () => {
         const manifest = this.getManifest(pluginId)
-        const stored = this.settingsStore.get().pluginSettings[pluginId]
-        return mergePluginSettings(manifest?.contributes.settingsSchema, stored)
+        const appStored = this.settingsStore.get().pluginSettings[pluginId]
+        const hostStored = this.resolveHostPluginSettings(tabId, pluginId)
+        return mergePluginSessionSettings(manifest, appStored, hostStored)
       },
       getData: () => this.pluginData.get(pluginId),
       setData: (data: unknown) => {
@@ -178,6 +211,11 @@ export class PluginHost {
         return () => {
           set?.delete(cb)
         }
+      },
+      isSshSession: () => this.broker.isSshSession(tabId),
+      openTcpStream: async (host, port) => {
+        const { stream } = await this.broker.openTcpStream(tabId, pluginId, host, port)
+        return stream
       },
       registerStreamHandler: (mode, direction, handler) => {
         this.pipeline.register(tabId, { pluginId, mode, direction, handler })
