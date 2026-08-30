@@ -83,6 +83,7 @@ import {
   type PluginListItem
 } from '@shared/plugins'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
+import ClampedNumberInput from './ClampedNumberInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
 import PluginFieldEditor from '../plugins/PluginFieldEditor'
@@ -757,15 +758,13 @@ export default function HostSessionSettingsDialog({
             patch({ fontSizePx: useDefault ? null : resolved.fontSizePx })
           }
         >
-          <input
-            type="number"
+          <ClampedNumberInput
             min={FONT_SIZE_MIN_PX}
             max={FONT_SIZE_MAX_PX}
             disabled={form.fontSizePx === null}
             value={form.fontSizePx ?? resolved.fontSizePx}
-            onChange={(e) =>
-              patch({ fontSizePx: Number(e.target.value) || resolved.fontSizePx })
-            }
+            integer
+            onCommit={(fontSizePx) => patch({ fontSizePx })}
           />
         </DefaultableControl>
         <DefaultableControl
@@ -776,17 +775,13 @@ export default function HostSessionSettingsDialog({
             patch({ scrollbackLines: useDefault ? null : resolved.scrollbackLines })
           }
         >
-          <input
-            type="number"
+          <ClampedNumberInput
             min={SCROLLBACK_LINES_MIN}
             max={SCROLLBACK_LINES_MAX}
             disabled={form.scrollbackLines === null}
             value={form.scrollbackLines ?? resolved.scrollbackLines}
-            onChange={(e) =>
-              patch({
-                scrollbackLines: Number(e.target.value) || resolved.scrollbackLines
-              })
-            }
+            integer
+            onCommit={(scrollbackLines) => patch({ scrollbackLines })}
           />
         </DefaultableControl>
         <DefaultableControl

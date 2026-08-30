@@ -11,6 +11,7 @@ import {
   THEME_WINDOW_BACKGROUND,
   WAKE_RECONNECT_DELAY_MS
 } from '../shared/types'
+import { APP_NAME } from '../shared/version'
 import { applyChromeTheme, registerIpc } from './ipc/handlers'
 import { SessionManager } from './ssh/SessionManager'
 import { CredentialVault } from './store/credentialVault'
@@ -178,10 +179,35 @@ function createWindow(): void {
   }
 }
 
+function openAboutDialog(): void {
+  getWindow()?.webContents.send('app:openAbout')
+}
+
 function installAppMenu(): void {
   const isMac = process.platform === 'darwin'
+  const aboutLabel = `About ${APP_NAME}`
   const template: Electron.MenuItemConstructorOptions[] = [
-    ...(isMac ? [{ role: 'appMenu' as const }] : []),
+    ...(isMac
+      ? [
+          {
+            label: APP_NAME,
+            submenu: [
+              {
+                label: aboutLabel,
+                click: () => openAboutDialog()
+              },
+              { type: 'separator' as const },
+              { role: 'services' as const },
+              { type: 'separator' as const },
+              { role: 'hide' as const },
+              { role: 'hideOthers' as const },
+              { role: 'unhide' as const },
+              { type: 'separator' as const },
+              { role: 'quit' as const }
+            ]
+          }
+        ]
+      : []),
     {
       label: 'File',
       submenu: [
@@ -198,7 +224,15 @@ function installAppMenu(): void {
     },
     { role: 'editMenu' },
     { role: 'viewMenu' },
-    { role: 'windowMenu' }
+    {
+      role: 'help',
+      submenu: [
+        {
+          label: aboutLabel,
+          click: () => openAboutDialog()
+        }
+      ]
+    }
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }

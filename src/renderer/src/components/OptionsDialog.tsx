@@ -22,6 +22,7 @@ import type { PluginListItem } from '@shared/plugins'
 import { mergePluginSettings } from '@shared/plugins'
 import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
+import ClampedNumberInput from './ClampedNumberInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import PluginFieldEditor from '../plugins/PluginFieldEditor'
 
@@ -292,31 +293,24 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
               <div className="settings-row-label">
                 <strong>Font size</strong>
               </div>
-              <input
-                type="number"
+              <ClampedNumberInput
                 min={FONT_SIZE_MIN_PX}
                 max={FONT_SIZE_MAX_PX}
                 value={draft.sessionStyleDefaults.fontSizePx}
-                onChange={(e) =>
-                  patchDefaults({ fontSizePx: Number(e.target.value) || draft.sessionStyleDefaults.fontSizePx })
-                }
+                integer
+                onCommit={(fontSizePx) => patchDefaults({ fontSizePx })}
               />
             </div>
             <div className="settings-row">
               <div className="settings-row-label">
                 <strong>Scrollback lines</strong>
               </div>
-              <input
-                type="number"
+              <ClampedNumberInput
                 min={SCROLLBACK_LINES_MIN}
                 max={SCROLLBACK_LINES_MAX}
                 value={draft.sessionStyleDefaults.scrollbackLines}
-                onChange={(e) =>
-                  patchDefaults({
-                    scrollbackLines:
-                      Number(e.target.value) || draft.sessionStyleDefaults.scrollbackLines
-                  })
-                }
+                integer
+                onCommit={(scrollbackLines) => patchDefaults({ scrollbackLines })}
               />
             </div>
             <div className="settings-row">

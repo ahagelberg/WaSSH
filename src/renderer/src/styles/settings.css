@@ -237,3 +237,98 @@
   justify-self: start;
 }
 
+.about-dialog {
+  width: min(480px, calc(100vw - 48px));
+  max-height: min(640px, calc(100vh - 48px));
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+}
+
+.about-dialog-body {
+  overflow: auto;
+  padding: 16px 20px 24px;
+  min-height: 0;
+}
+
+.about-app-name {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.about-app-version {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.about-app-desc {
+  margin: 12px 0 0;
+  color: var(--text);
+}
+
+.about-app-meta {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.about-licenses {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.about-licenses h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.about-licenses-intro {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.about-license-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.about-license-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  font-size: 13px;
+}
+
+.about-license-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.about-license-spdx {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.about-license-note {
+  flex-basis: 100%;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+

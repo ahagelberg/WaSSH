@@ -75,6 +75,7 @@ const api: WasshApi = {
   onCycleTab: (cb) => on('tabs:cycle', (delta) => cb(delta as number)),
   onCloseActiveTab: (cb) => on('tabs:closeActive', () => cb()),
   onOpenPreferences: (cb) => on('app:openPreferences', () => cb()),
+  onOpenAbout: (cb) => on('app:openAbout', () => cb()),
   onHostKeyPrompt: (cb) =>
     on('session:hostKeyPrompt', (prompt) => cb(prompt as HostKeyPrompt)),
   onSavePasswordPrompt: (cb) =>

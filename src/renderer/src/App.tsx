@@ -31,6 +31,7 @@ import SessionsSidebar from './components/SessionsSidebar'
 import QuickConnect from './components/QuickConnect'
 import TabBar from './components/TabBar'
 import TerminalView from './components/TerminalView'
+import AboutDialog from './components/AboutDialog'
 import OptionsDialog from './components/OptionsDialog'
 import HostSessionSettingsDialog, {
   type HostSessionMode
@@ -96,6 +97,7 @@ export default function App() {
   const [tabs, setTabs] = useState<TabState[]>([])
   const [activeTabId, setActiveTabId] = useState<string | null>(null)
   const [showOptions, setShowOptions] = useState(false)
+  const [showAbout, setShowAbout] = useState(false)
   const [hostEditor, setHostEditor] = useState<{
     mode: HostSessionMode
     initial: ConnectionParams | HostProfile
@@ -319,6 +321,9 @@ export default function App() {
     const offPrefs = window.wassh.onOpenPreferences(() => {
       setShowOptions(true)
     })
+    const offAbout = window.wassh.onOpenAbout(() => {
+      setShowAbout(true)
+    })
     const offPluginActive = window.wassh.onPluginActive((ev) => {
       setTabs((prev) =>
         prev.map((t) => {
@@ -343,6 +348,7 @@ export default function App() {
       offCycle()
       offCloseActive()
       offPrefs()
+      offAbout()
       offPluginActive()
     }
   }, [refreshHosts, closeTab, cycleTab])
@@ -720,6 +726,8 @@ export default function App() {
           onClose={() => setShowOptions(false)}
         />
       ) : null}
+
+      {showAbout ? <AboutDialog onClose={() => setShowAbout(false)} /> : null}
 
       {hostEditor ? (
         <HostSessionSettingsDialog
