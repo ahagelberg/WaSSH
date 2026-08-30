@@ -3,7 +3,7 @@ import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
 import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import { Readable } from 'stream'
-import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus } from '../../shared/connection'
+import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, screenBusyFallbackMessage, type ScreenSessionConfig } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_RECONNECT_MODE,
@@ -14,6 +14,9 @@ import {
   HostKeyPrompt,
   RECONNECT_INITIAL_BACKOFF_MS,
   RECONNECT_MAX_BACKOFF_MS,
+  SCREEN_BUSY_DO_NOT_ATTACH,
+  SCREEN_BUSY_FORCE_DETACH,
+  SCREEN_BUSY_SHARE,
   SavePasswordDecision,
   SavePasswordPrompt,
   SessionStatus,
@@ -29,6 +32,26 @@ const CONNECT_READY_TIMEOUT_MS = 20000
 const SESSION_CLOSED_MESSAGE = 'Session closed'
 /** ms → whole seconds for reconnect status text */
 const MS_PER_SECOND = 1000
+/** Exit status when the remote executable is missing */
+const EXEC_NOT_FOUND_STATUS = 127
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function screenAttachCommand(
+  sessionName: string,
+  busyHandling: ScreenSessionConfig['screenBusyHandling']
+): string {
+  const quoted = shellSingleQuote(sessionName)
+  if (busyHandling === SCREEN_BUSY_SHARE) {
+    return `screen -S ${quoted} -xR`
+  }
+  if (busyHandling === SCREEN_BUSY_FORCE_DETACH) {
+    return `screen -S ${quoted} -d -RR`
+  }
+  return `screen -S ${quoted}`
+}
 
 export class SshConnection extends EventEmitter {
   private client: Client | null = null
@@ -755,68 +778,19 @@ export class SshConnection extends EventEmitter {
         rows: this.rows
       }
       const tunnelOpts = tunnelConfigFrom(this.connection)
-      const shellOptions = tunnelOpts.x11Forwarding ? { x11: true } : {}
+      const channelOptions = tunnelOpts.x11Forwarding ? { x11: true as const } : {}
 
       void this.tunnels
         .start(client, tunnelOpts.tunnels, tunnelOpts.x11Forwarding)
-        .then(() => {
-          client.shell(pty, shellOptions, (err, stream) => {
-            if (err) {
-              this.opening = false
-              this.tunnels.stop()
-              this.emitStatus('failed', err.message)
-              this.scheduleReconnect()
-              resolve()
-              return
-            }
-            this.stream = stream
-            this.opening = false
-            this.reconnectAttempt = 0
-            this.everConnected = true
-            this.emitStatus('connected')
-
-            if (this.usedInteractivePassword && this.interactivePassword) {
-              this.pendingSavePassword = this.interactivePassword
-              this.usedInteractivePassword = false
-              this.emit('savePasswordPrompt', {
-                tabId: this.tabId,
-                hasHostProfile: Boolean(this.connection.hostId)
-              } satisfies SavePasswordPrompt)
-            }
-
-            stream.on('data', (data: Buffer) => {
-              this.emit('data', data.toString('utf8'))
-            })
-            stream.stderr?.on('data', (data: Buffer) => {
-              this.emit('data', data.toString('utf8'))
-            })
-            stream.on('error', (streamErr: Error) => {
-              this.onTransportError(streamErr)
-            })
-            stream.stderr?.on('error', () => {
-              /* absorb stderr socket resets */
-            })
-            stream.on('exit', () => {
-              this.remoteShellExited = true
-            })
-            stream.on('close', () => {
-              this.stream = null
-              this.tunnels.stop()
-              if (this.intentionalDisconnect || this.disposed) {
-                this.emitStatus('disconnected')
-                resolve()
-                return
-              }
-              if (this.remoteShellExited) {
-                this.endAfterRemoteLogout()
-                resolve()
-                return
-              }
-              this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
-              this.scheduleReconnect()
-              resolve()
-            })
-          })
+        .then(async () => {
+          const screenPlan = await this.resolveScreenChannel(client)
+          this.openInteractiveChannel(
+            client,
+            pty,
+            channelOptions,
+            screenPlan,
+            resolve
+          )
         })
         .catch((err: unknown) => {
           this.opening = false
@@ -833,6 +807,168 @@ export class SshConnection extends EventEmitter {
         if (!this.stream) {
           this.scheduleReconnect()
         }
+      })
+    })
+  }
+
+  private openInteractiveChannel(
+    client: Client,
+    pty: PseudoTtyOptions,
+    channelOptions: { x11?: true },
+    screenPlan: { command: string | null; statusMessage?: string },
+    resolve: () => void
+  ): void {
+    const wireStream = (stream: ClientChannel, statusMessage?: string): void => {
+      this.stream = stream
+      this.opening = false
+      this.reconnectAttempt = 0
+      this.everConnected = true
+      this.emitStatus('connected', statusMessage)
+
+      if (this.usedInteractivePassword && this.interactivePassword) {
+        this.pendingSavePassword = this.interactivePassword
+        this.usedInteractivePassword = false
+        this.emit('savePasswordPrompt', {
+          tabId: this.tabId,
+          hasHostProfile: Boolean(this.connection.hostId)
+        } satisfies SavePasswordPrompt)
+      }
+
+      stream.on('data', (data: Buffer) => {
+        this.emit('data', data.toString('utf8'))
+      })
+      stream.stderr?.on('data', (data: Buffer) => {
+        this.emit('data', data.toString('utf8'))
+      })
+      stream.on('error', (streamErr: Error) => {
+        this.onTransportError(streamErr)
+      })
+      stream.stderr?.on('error', () => {
+        /* absorb stderr socket resets */
+      })
+      stream.on('exit', () => {
+        this.remoteShellExited = true
+      })
+      stream.on('close', () => {
+        this.stream = null
+        this.tunnels.stop()
+        if (this.intentionalDisconnect || this.disposed) {
+          this.emitStatus('disconnected')
+          resolve()
+          return
+        }
+        if (this.remoteShellExited) {
+          this.endAfterRemoteLogout()
+          resolve()
+          return
+        }
+        this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
+        this.scheduleReconnect()
+        resolve()
+      })
+    }
+
+    const openLoginShell = (statusMessage?: string): void => {
+      client.shell(pty, channelOptions, (err, stream) => {
+        if (err) {
+          this.opening = false
+          this.tunnels.stop()
+          this.emitStatus('failed', err.message)
+          this.scheduleReconnect()
+          resolve()
+          return
+        }
+        wireStream(stream, statusMessage)
+      })
+    }
+
+    if (!screenPlan.command) {
+      openLoginShell(screenPlan.statusMessage)
+      return
+    }
+
+    client.exec(screenPlan.command, { pty, ...channelOptions }, (err, stream) => {
+      if (err) {
+        openLoginShell()
+        return
+      }
+      wireStream(stream)
+    })
+  }
+
+  private async resolveScreenChannel(
+    client: Client
+  ): Promise<{ command: string | null; statusMessage?: string }> {
+    const screen = screenConfigFrom(this.connection)
+    if (!screen.openInScreen) {
+      return { command: null }
+    }
+
+    if (
+      screen.screenBusyHandling === SCREEN_BUSY_SHARE ||
+      screen.screenBusyHandling === SCREEN_BUSY_FORCE_DETACH
+    ) {
+      return {
+        command: screenAttachCommand(screen.screenSessionName, screen.screenBusyHandling)
+      }
+    }
+
+    const presence = await this.probeScreenSession(client, screen.screenSessionName)
+    if (presence === 'unavailable') {
+      return { command: null }
+    }
+    if (presence === 'attached') {
+      return {
+        command: null,
+        statusMessage: screenBusyFallbackMessage(screen.screenSessionName)
+      }
+    }
+    if (presence === 'detached') {
+      return {
+        command: `screen -S ${shellSingleQuote(screen.screenSessionName)} -r`
+      }
+    }
+    return {
+      command: screenAttachCommand(screen.screenSessionName, SCREEN_BUSY_DO_NOT_ATTACH)
+    }
+  }
+
+  private probeScreenSession(
+    client: Client,
+    sessionName: string
+  ): Promise<'none' | 'detached' | 'attached' | 'unknown' | 'unavailable'> {
+    return new Promise((resolve) => {
+      client.exec('screen -ls', (err, channel) => {
+        if (err) {
+          resolve('unavailable')
+          return
+        }
+        let output = ''
+        let exitStatus: number | null = null
+        channel.on('data', (data: Buffer) => {
+          output += data.toString('utf8')
+        })
+        channel.stderr?.on('data', (data: Buffer) => {
+          output += data.toString('utf8')
+        })
+        channel.on('exit', (code) => {
+          exitStatus = typeof code === 'number' ? code : null
+        })
+        channel.on('close', () => {
+          if (exitStatus === EXEC_NOT_FOUND_STATUS) {
+            resolve('unavailable')
+            return
+          }
+          const lower = output.toLowerCase()
+          if (
+            lower.includes('command not found') ||
+            lower.includes('no such file or directory')
+          ) {
+            resolve('unavailable')
+            return
+          }
+          resolve(parseScreenListForName(output, sessionName))
+        })
       })
     })
   }

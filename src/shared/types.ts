@@ -240,8 +240,31 @@ export type ReconnectMode =
   | typeof RECONNECT_MODE_ON_FOCUS
   | typeof RECONNECT_MODE_ALWAYS
 
-/** Default for new hosts / quick connect (matches prior global auto-reconnect) */
-export const DEFAULT_RECONNECT_MODE: ReconnectMode = RECONNECT_MODE_ALWAYS
+/** Default for new hosts / quick connect */
+export const DEFAULT_RECONNECT_MODE: ReconnectMode = RECONNECT_MODE_ON_FOCUS
+
+/** Default GNU screen session name when “open in screen” is enabled */
+export const DEFAULT_SCREEN_SESSION_NAME = 'WaSSH'
+
+/** Saved hosts: do not open in screen unless opted in */
+export const DEFAULT_OPEN_IN_SCREEN = false
+
+/** Busy session: skip attach and use a normal shell */
+export const SCREEN_BUSY_DO_NOT_ATTACH = 'doNotAttach'
+
+/** Busy session: multi-attach with screen -x */
+export const SCREEN_BUSY_SHARE = 'share'
+
+/** Busy session: detach other displays then attach */
+export const SCREEN_BUSY_FORCE_DETACH = 'forceDetach'
+
+export type ScreenBusyHandling =
+  | typeof SCREEN_BUSY_DO_NOT_ATTACH
+  | typeof SCREEN_BUSY_SHARE
+  | typeof SCREEN_BUSY_FORCE_DETACH
+
+/** Default when enabling open-in-screen */
+export const DEFAULT_SCREEN_BUSY_HANDLING: ScreenBusyHandling = SCREEN_BUSY_DO_NOT_ATTACH
 
 /** Wait after OS resume so the network stack is up before reconnecting */
 export const WAKE_RECONNECT_DELAY_MS = 2000
@@ -350,6 +373,12 @@ export interface HostProfile {
   pluginSettings: Record<string, Record<string, unknown>>
   /** How to reconnect after a mid-session drop */
   reconnectMode: ReconnectMode
+  /** SSH: open a named GNU screen session on connect */
+  openInScreen: boolean
+  /** GNU screen session name when openInScreen is set */
+  screenSessionName: string
+  /** What to do if the named screen session already has a display attached */
+  screenBusyHandling: ScreenBusyHandling
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -401,6 +430,12 @@ export interface ConnectionParams {
   pluginSettings: Record<string, Record<string, unknown>>
   /** How to reconnect after a mid-session drop */
   reconnectMode: ReconnectMode
+  /** SSH: open a named GNU screen session on connect (from saved host) */
+  openInScreen: boolean
+  /** GNU screen session name when openInScreen is set */
+  screenSessionName: string
+  /** What to do if the named screen session already has a display attached */
+  screenBusyHandling: ScreenBusyHandling
 }
 
 export interface TabSnapshot {

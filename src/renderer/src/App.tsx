@@ -20,6 +20,7 @@ import {
   protocolConfigFrom,
   reconnectModeFrom,
   resolveSessionStyle,
+  screenConfigFrom,
   sessionStyleDefaultsFrom,
   sessionStyleOverridesFrom,
   emptySessionStyleOverrides,
@@ -84,7 +85,8 @@ function emptyHost(): HostProfile {
     ...emptySessionStyleOverrides(),
     ...tunnelConfigFrom(null),
     pluginSettings: {},
-    reconnectMode: reconnectModeFrom(null)
+    reconnectMode: reconnectModeFrom(null),
+    ...screenConfigFrom(null)
   }
 }
 
@@ -126,7 +128,8 @@ export default function App() {
         ...sessionStyleOverridesFrom(h),
         ...tunnelConfigFrom(h),
         pluginSettings: h.pluginSettings ?? {},
-        reconnectMode: reconnectModeFrom(h)
+        reconnectMode: reconnectModeFrom(h),
+        ...screenConfigFrom(h)
       }))
     )
   }, [])
@@ -147,7 +150,8 @@ export default function App() {
         ephemeralPassword: '',
         ephemeralPassphrase: '',
         pluginSettings: t.connection.pluginSettings ?? {},
-        reconnectMode: reconnectModeFrom(t.connection)
+        reconnectMode: reconnectModeFrom(t.connection),
+        ...screenConfigFrom(t.connection)
       },
       active: t.id === activeRef.current,
       activePluginIds: t.activePluginIds,
@@ -216,7 +220,8 @@ export default function App() {
           ...protocolConfigFrom(t.connection),
           ...sessionStyleOverridesFrom(t.connection),
           ...tunnelConfigFrom(t.connection),
-          reconnectMode: reconnectModeFrom(t.connection)
+          reconnectMode: reconnectModeFrom(t.connection),
+          ...screenConfigFrom(t.connection)
         },
         status: 'connecting',
         activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
@@ -225,8 +230,8 @@ export default function App() {
       setTabs(restored)
       const active = snapshot.find((t) => t.active)?.id || snapshot[0]?.id || null
       setActiveTabId(active)
-      for (const t of snapshot) {
-        const ids = Array.isArray(t.activePluginIds) ? t.activePluginIds : []
+      for (const t of restored) {
+        const ids = t.activePluginIds
         if (ids.length > 0) {
           await window.wassh.queuePluginRestore(t.id, ids)
         }
@@ -428,7 +433,8 @@ export default function App() {
               connection: {
                 ...t.connection,
                 pluginSettings: host.pluginSettings,
-                reconnectMode: host.reconnectMode
+                reconnectMode: host.reconnectMode,
+                ...screenConfigFrom(host)
               }
             }
           : t
@@ -438,7 +444,8 @@ export default function App() {
       if (t.connection.hostId === host.id) {
         void window.wassh.updateConnection(t.id, {
           pluginSettings: host.pluginSettings,
-          reconnectMode: host.reconnectMode
+          reconnectMode: host.reconnectMode,
+          ...screenConfigFrom(host)
         })
       }
     }
@@ -637,10 +644,16 @@ export default function App() {
           ) : null}
 
           {activeTab?.statusMessage &&
-          (activeTab.status === 'reconnecting' || activeTab.status === 'failed') ? (
-            <div className="inline-banner info">
+          (activeTab.status === 'reconnecting' ||
+            activeTab.status === 'failed' ||
+            activeTab.status === 'connected') ? (
+            <div
+              className={`inline-banner ${activeTab.status === 'connected' ? 'warn' : 'info'}`}
+            >
               <div className="msg">
-                {activeTab.status}: {activeTab.statusMessage}
+                {activeTab.status === 'connected'
+                  ? activeTab.statusMessage
+                  : `${activeTab.status}: ${activeTab.statusMessage}`}
               </div>
             </div>
           ) : null}
@@ -735,7 +748,8 @@ export default function App() {
                         passphraseVaultId:
                           host.passphraseVaultId || t.connection.passphraseVaultId,
                         pluginSettings: host.pluginSettings,
-                        reconnectMode: host.reconnectMode
+                        reconnectMode: host.reconnectMode,
+                        ...screenConfigFrom(host)
                       }
                     }
                   : t

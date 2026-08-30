@@ -16,7 +16,7 @@ import {
   type ConnectionParams,
   type ReconnectMode
 } from '../../shared/types'
-import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom } from '../../shared/connection'
+import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 import { normalizeHostPluginSettings } from '../../shared/plugins'
 
@@ -102,7 +102,8 @@ function normalizeHost(
     ...sessionStyleFrom({ ...storedStyleFallback(), ...raw }),
     ...tunnelConfigFrom(raw),
     pluginSettings: normalizeHostPluginSettings(raw.pluginSettings),
-    reconnectMode: reconnectModeFrom(raw, fallbackMode)
+    reconnectMode: reconnectModeFrom(raw, fallbackMode),
+    ...screenConfigFrom(raw)
   }
 }
 
@@ -134,7 +135,9 @@ export class SessionStore {
     const hosts = rawList.map((h) =>
       normalizeHost({ ...h, id: h.id ?? randomUUID() }, fallbackMode)
     )
-    const needsWrite = rawList.some((h) => h.reconnectMode === undefined)
+    const needsWrite = rawList.some(
+      (h) => h.reconnectMode === undefined || h.openInScreen === undefined
+    )
     if (needsWrite && hosts.length > 0) {
       writeJson(HOSTS_FILE, hosts)
     }
@@ -185,10 +188,14 @@ export class TabStore {
         pluginSettings: normalizeHostPluginSettings(
           (t.connection as ConnectionParams & { pluginSettings?: unknown }).pluginSettings
         ),
-        reconnectMode: reconnectModeFrom(t.connection, fallbackMode)
+        reconnectMode: reconnectModeFrom(t.connection, fallbackMode),
+        ...screenConfigFrom(t.connection)
       }
     }))
-    const needsWrite = rawTabs.some((t) => t.connection?.reconnectMode === undefined)
+    const needsWrite = rawTabs.some(
+      (t) =>
+        t.connection?.reconnectMode === undefined || t.connection?.openInScreen === undefined
+    )
     if (needsWrite && tabs.length > 0) {
       writeJson(TABS_FILE, tabs)
     }

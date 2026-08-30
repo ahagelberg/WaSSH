@@ -25,6 +25,9 @@ import {
   DEFAULT_TELNET_PORT,
   DEFAULT_TUNNEL_LISTEN_HOST,
   DEFAULT_RECONNECT_MODE,
+  DEFAULT_SCREEN_BUSY_HANDLING,
+  DEFAULT_SCREEN_SESSION_NAME,
+  DEFAULT_OPEN_IN_SCREEN,
   DEFAULT_X11_FORWARDING,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
@@ -33,6 +36,9 @@ import {
   RECONNECT_MODE_ON_FOCUS,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
+  SCREEN_BUSY_DO_NOT_ATTACH,
+  SCREEN_BUSY_FORCE_DETACH,
+  SCREEN_BUSY_SHARE,
   SERIAL_BAUD_MAX,
   SERIAL_BAUD_MIN,
   SERIAL_DATA_BITS_5,
@@ -62,6 +68,7 @@ import {
   type CursorStyle,
   type HostProfile,
   type ReconnectMode,
+  type ScreenBusyHandling,
   type SerialConfig,
   type SerialDataBits,
   type SerialFlowControl,
@@ -518,6 +525,68 @@ export function reconnectModeWantsFocus(mode: ReconnectMode): boolean {
   return mode === RECONNECT_MODE_ON_FOCUS || mode === RECONNECT_MODE_ALWAYS
 }
 
+export interface ScreenSessionConfig {
+  openInScreen: boolean
+  screenSessionName: string
+  screenBusyHandling: ScreenBusyHandling
+}
+
+export function screenBusyHandlingFrom(
+  src: Partial<Pick<ConnectionParams, 'screenBusyHandling'>> | null | undefined,
+  fallback: ScreenBusyHandling = DEFAULT_SCREEN_BUSY_HANDLING
+): ScreenBusyHandling {
+  const value = src?.screenBusyHandling
+  if (
+    value === SCREEN_BUSY_DO_NOT_ATTACH ||
+    value === SCREEN_BUSY_SHARE ||
+    value === SCREEN_BUSY_FORCE_DETACH
+  ) {
+    return value
+  }
+  return fallback
+}
+
+export function screenConfigFrom(
+  src: Partial<ScreenSessionConfig> | null | undefined
+): ScreenSessionConfig {
+  const name = (src?.screenSessionName ?? '').trim()
+  return {
+    openInScreen: src?.openInScreen ?? DEFAULT_OPEN_IN_SCREEN,
+    screenSessionName: name || DEFAULT_SCREEN_SESSION_NAME,
+    screenBusyHandling: screenBusyHandlingFrom(src)
+  }
+}
+
+/** Presence of a named session in `screen -ls` output */
+export type ScreenSessionPresence = 'none' | 'detached' | 'attached' | 'unknown'
+
+/** Match `PID.name (State)` lines for a session name set with `screen -S` */
+export function parseScreenListForName(
+  output: string,
+  sessionName: string
+): ScreenSessionPresence {
+  const escaped = sessionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(String.raw`^\s*\d+\.${escaped}\s+\(([^)]+)\)`, 'gim')
+  let found: ScreenSessionPresence = 'none'
+  let match: RegExpExecArray | null
+  while ((match = re.exec(output)) !== null) {
+    const state = match[1].toLowerCase()
+    if (state.includes('attached')) {
+      return 'attached'
+    }
+    if (state.includes('detached')) {
+      found = 'detached'
+    } else if (found === 'none') {
+      found = 'unknown'
+    }
+  }
+  return found
+}
+
+export function screenBusyFallbackMessage(sessionName: string): string {
+  return `Screen session "${sessionName}" is busy; opened a normal shell instead.`
+}
+
 function serialParityAbbrev(parity: SerialParity): string {
   if (parity === SERIAL_PARITY_EVEN) {
     return 'E'
@@ -594,7 +663,8 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     ephemeralPassword: '',
     ephemeralPassphrase: '',
     pluginSettings: normalizeHostPluginSettings(host.pluginSettings),
-    reconnectMode: reconnectModeFrom(host)
+    reconnectMode: reconnectModeFrom(host),
+    ...screenConfigFrom(host)
   }
 }
 
@@ -617,7 +687,8 @@ export function hostProfileFromConnection(
     ...sessionStyleFrom(src),
     ...tunnelConfigFrom(src),
     pluginSettings: normalizeHostPluginSettings(src.pluginSettings),
-    reconnectMode: reconnectModeFrom(src)
+    reconnectMode: reconnectModeFrom(src),
+    ...screenConfigFrom(src)
   }
 }
 

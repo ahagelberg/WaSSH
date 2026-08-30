@@ -19,6 +19,10 @@ import {
   RECONNECT_MODE_ALWAYS,
   RECONNECT_MODE_NONE,
   RECONNECT_MODE_ON_FOCUS,
+  SCREEN_BUSY_DO_NOT_ATTACH,
+  SCREEN_BUSY_FORCE_DETACH,
+  SCREEN_BUSY_SHARE,
+  DEFAULT_SCREEN_SESSION_NAME,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
   SERIAL_BAUD_MAX,
@@ -51,6 +55,7 @@ import {
   type CursorStyle,
   type HostProfile,
   type ReconnectMode,
+  type ScreenBusyHandling,
   type SerialDataBits,
   type SerialFlowControl,
   type SerialParity,
@@ -67,6 +72,7 @@ import {
   protocolConfigFrom,
   reconnectModeFrom,
   resolveSessionStyle,
+  screenConfigFrom,
   sessionStyleOverridesFrom,
   tunnelConfigFrom,
   type SessionStyle
@@ -105,7 +111,8 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
       ...sessionStyleOverridesFrom(initial),
       ...tunnelConfigFrom(initial),
       pluginSettings: normalizeHostPluginSettings(initial.pluginSettings),
-      reconnectMode: reconnectModeFrom(initial)
+      reconnectMode: reconnectModeFrom(initial),
+      ...screenConfigFrom(initial)
     }
   }
   return hostToConnection(initial)
@@ -567,26 +574,6 @@ export default function HostSessionSettingsDialog({
                 />
               </div>
             ) : null}
-            <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
-              <div className="settings-row-label">
-                <strong>Proxy / jump host</strong>
-                <span>
-                  Connect through another saved SSH host first (for closed networks / bastion access).
-                </span>
-              </div>
-              <select
-                value={form.proxyHostId}
-                onChange={(e) => patch({ proxyHostId: e.target.value })}
-                disabled={identityLocked}
-              >
-                <option value="">None (direct)</option>
-                {proxyOptions.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    {h.name || `${h.username}@${h.host}`}
-                  </option>
-                ))}
-              </select>
-            </div>
           </>
         ) : null}
         <div className="settings-row">
@@ -606,6 +593,91 @@ export default function HostSessionSettingsDialog({
             <option value={RECONNECT_MODE_ALWAYS}>Always</option>
           </select>
         </div>
+      </>
+    )
+
+    const proxyRows = (
+      <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
+        <div className="settings-row-label">
+          <strong>Proxy / jump host</strong>
+          <span>
+            Connect through another saved SSH host first (for closed networks / bastion access).
+          </span>
+        </div>
+        <select
+          value={form.proxyHostId}
+          onChange={(e) => patch({ proxyHostId: e.target.value })}
+          disabled={identityLocked}
+        >
+          <option value="">None (direct)</option>
+          {proxyOptions.map((h) => (
+            <option key={h.id} value={h.id}>
+              {h.name || `${h.username}@${h.host}`}
+            </option>
+          ))}
+        </select>
+      </div>
+    )
+
+    const screenRows = (
+      <>
+        <div className="settings-row">
+          <div className="settings-row-label">
+            <strong>Open in screen</strong>
+            <span>
+              On connect, create or attach a named GNU screen session so work survives client
+              disconnects.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={form.openInScreen}
+            onChange={(e) => {
+              const openInScreen = e.target.checked
+              patch({
+                openInScreen,
+                screenSessionName:
+                  openInScreen && !form.screenSessionName.trim()
+                    ? DEFAULT_SCREEN_SESSION_NAME
+                    : form.screenSessionName
+              })
+            }}
+          />
+        </div>
+        {form.openInScreen ? (
+          <>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Screen session name</strong>
+                <span>Remote session name used with screen -S / attach.</span>
+              </div>
+              <input
+                value={form.screenSessionName}
+                onChange={(e) => patch({ screenSessionName: e.target.value })}
+                placeholder={DEFAULT_SCREEN_SESSION_NAME}
+              />
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Session busy handling</strong>
+                <span>
+                  When the named session already has another display attached: skip attach, share
+                  (-x), or force-detach the other display.
+                </span>
+              </div>
+              <select
+                value={form.screenBusyHandling}
+                onChange={(e) =>
+                  patch({ screenBusyHandling: e.target.value as ScreenBusyHandling })
+                }
+              >
+                <option value={SCREEN_BUSY_DO_NOT_ATTACH}>Do not attach</option>
+                <option value={SCREEN_BUSY_SHARE}>Share</option>
+                <option value={SCREEN_BUSY_FORCE_DETACH}>Force detach</option>
+              </select>
+            </div>
+          </>
+        ) : null}
       </>
     )
 
@@ -903,6 +975,18 @@ export default function HostSessionSettingsDialog({
     ]
     if (isSsh) {
       list.push({
+        id: 'proxy',
+        title: 'Proxy',
+        content: proxyRows
+      })
+      if (mode === 'editHost') {
+        list.push({
+          id: 'screen',
+          title: 'Screen',
+          content: screenRows
+        })
+      }
+      list.push({
         id: 'tunnels',
         title: 'Tunnels',
         content: tunnelRows
@@ -1009,7 +1093,8 @@ export default function HostSessionSettingsDialog({
         ...sessionStyleOverridesFrom(form),
         ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false }),
         pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
-        reconnectMode: reconnectModeFrom(form)
+        reconnectMode: reconnectModeFrom(form),
+        ...screenConfigFrom(form)
       }
       onSaveHost(host, password, passphrase)
       onClose()
@@ -1024,7 +1109,8 @@ export default function HostSessionSettingsDialog({
       ephemeralPassword: password || form.ephemeralPassword,
       ephemeralPassphrase: passphrase || form.ephemeralPassphrase,
       pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
-      reconnectMode: reconnectModeFrom(form)
+      reconnectMode: reconnectModeFrom(form),
+      ...screenConfigFrom(form)
     })
     onClose()
   }
