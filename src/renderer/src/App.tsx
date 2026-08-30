@@ -640,6 +640,9 @@ export default function App() {
                     settings={settings}
                     onPluginSettingsPatch={onPluginSettingsPatch}
                     onLayoutChange={(pluginLayout) => onPanelLayoutChange(t.id, pluginLayout)}
+                    onDeactivatePlugin={(pluginId) => {
+                      void togglePlugin(t.id, pluginId, false)
+                    }}
                   >
                     <TerminalView
                       tabId={t.id}

@@ -8,7 +8,7 @@ import {
   type ReactNode
 } from 'react'
 import type { AppSettings } from '@shared/types'
-import type { PluginListItem, PluginViewPlacement } from '@shared/plugins'
+import type { PluginListItem } from '@shared/plugins'
 import { mergePluginSettings } from '@shared/plugins'
 import {
   INNER_DROP_BAND_PX,
@@ -16,12 +16,9 @@ import {
   OUTER_DROP_BAND_PX,
   clampSplitRatio,
   dockPluginOnEdge,
-  edgeToPlacement,
   ensurePluginInLayout,
   innerInsertZone,
-  movePluginToOverlay,
   outerInsertZone,
-  placementToEdge,
   pruneLayoutToActive,
   setDockSplitRatio,
   splitPluginLeaf,
@@ -43,6 +40,7 @@ interface Props {
   settings: AppSettings
   onPluginSettingsPatch: (pluginId: string, partial: Record<string, unknown>) => void
   onLayoutChange: (layout: TabPluginLayout) => void
+  onDeactivatePlugin: (pluginId: string) => void
   children: ReactNode
 }
 
@@ -117,7 +115,7 @@ function LayoutTreeView({
   draggingId,
   dropTarget,
   onPluginSettingsPatch,
-  onPlacementChange,
+  onClose,
   onGripPointerDown,
   onSplitRatioChange
 }: {
@@ -131,7 +129,7 @@ function LayoutTreeView({
   draggingId: string | null
   dropTarget: DropTarget | null
   onPluginSettingsPatch: (pluginId: string, partial: Record<string, unknown>) => void
-  onPlacementChange: (pluginId: string, placement: PluginViewPlacement) => void
+  onClose: (pluginId: string) => void
   onGripPointerDown: (pluginId: string, event: ReactPointerEvent) => void
   onSplitRatioChange: (edge: DockEdge | 'overlay', path: number[], ratio: number) => void
 }): ReactNode {
@@ -178,9 +176,8 @@ function LayoutTreeView({
         <PluginPanelShell
           pluginId={plugin.id}
           title={title}
-          placement={edgeToPlacement(edge)}
           dragging={draggingId === plugin.id}
-          onPlacementChange={(placement) => onPlacementChange(plugin.id, placement)}
+          onClose={onClose}
           onGripPointerDown={onGripPointerDown}
         >
           {body}
@@ -207,7 +204,7 @@ function LayoutTreeView({
           draggingId={draggingId}
           dropTarget={dropTarget}
           onPluginSettingsPatch={onPluginSettingsPatch}
-          onPlacementChange={onPlacementChange}
+          onClose={onClose}
           onGripPointerDown={onGripPointerDown}
           onSplitRatioChange={onSplitRatioChange}
         />
@@ -239,7 +236,7 @@ function LayoutTreeView({
           draggingId={draggingId}
           dropTarget={dropTarget}
           onPluginSettingsPatch={onPluginSettingsPatch}
-          onPlacementChange={onPlacementChange}
+          onClose={onClose}
           onGripPointerDown={onGripPointerDown}
           onSplitRatioChange={onSplitRatioChange}
         />
@@ -257,6 +254,7 @@ export default function PluginSessionFrame({
   settings,
   onPluginSettingsPatch,
   onLayoutChange,
+  onDeactivatePlugin,
   children
 }: Props) {
   const frameRef = useRef<HTMLDivElement>(null)
@@ -393,15 +391,6 @@ export default function PluginSessionFrame({
     [applyDrop, resolveDropTarget]
   )
 
-  const onPlacementChange = useCallback((pluginId: string, placement: PluginViewPlacement) => {
-    const edge = placementToEdge(placement)
-    if (edge === 'overlay') {
-      onLayoutChangeRef.current(movePluginToOverlay(layoutRef.current, pluginId))
-      return
-    }
-    onLayoutChangeRef.current(dockPluginOnEdge(layoutRef.current, pluginId, edge))
-  }, [])
-
   const onSplitRatioChange = useCallback(
     (edge: DockEdge | 'overlay', path: number[], ratio: number) => {
       onLayoutChangeRef.current(setDockSplitRatio(layoutRef.current, edge, path, ratio))
@@ -461,7 +450,7 @@ export default function PluginSessionFrame({
           draggingId={draggingId}
           dropTarget={dropTarget}
           onPluginSettingsPatch={onPluginSettingsPatch}
-          onPlacementChange={onPlacementChange}
+          onClose={onDeactivatePlugin}
           onGripPointerDown={onGripPointerDown}
           onSplitRatioChange={onSplitRatioChange}
         />
@@ -617,7 +606,7 @@ export default function PluginSessionFrame({
             draggingId={draggingId}
             dropTarget={dropTarget}
             onPluginSettingsPatch={onPluginSettingsPatch}
-            onPlacementChange={onPlacementChange}
+            onClose={onDeactivatePlugin}
             onGripPointerDown={onGripPointerDown}
             onSplitRatioChange={onSplitRatioChange}
           />

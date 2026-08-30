@@ -1,16 +1,10 @@
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import {
-  PLUGIN_VIEW_PLACEMENT_LABELS,
-  PLUGIN_VIEW_PLACEMENTS,
-  type PluginViewPlacement
-} from '@shared/plugins'
 
 interface Props {
   pluginId: string
   title: string
-  placement: PluginViewPlacement
   dragging: boolean
-  onPlacementChange: (placement: PluginViewPlacement) => void
+  onClose: (pluginId: string) => void
   onGripPointerDown: (pluginId: string, event: ReactPointerEvent) => void
   children: ReactNode
 }
@@ -18,9 +12,8 @@ interface Props {
 export default function PluginPanelShell({
   pluginId,
   title,
-  placement,
   dragging,
-  onPlacementChange,
+  onClose,
   onGripPointerDown,
   children
 }: Props) {
@@ -45,20 +38,15 @@ export default function PluginPanelShell({
           ⋮⋮
         </span>
         <span className="plugin-panel-chrome-title">{title}</span>
-        <label className="plugin-panel-placement">
-          <span className="visually-hidden">Panel position</span>
-          <select
-            value={placement}
-            aria-label={`Position for ${title}`}
-            onChange={(e) => onPlacementChange(e.target.value as PluginViewPlacement)}
-          >
-            {PLUGIN_VIEW_PLACEMENTS.map((p) => (
-              <option key={p} value={p}>
-                {PLUGIN_VIEW_PLACEMENT_LABELS[p]}
-              </option>
-            ))}
-          </select>
-        </label>
+        <button
+          type="button"
+          className="plugin-panel-close"
+          title={`Close ${title}`}
+          aria-label={`Close ${title}`}
+          onClick={() => onClose(pluginId)}
+        >
+          ×
+        </button>
       </div>
       <div className="plugin-panel-body">{children}</div>
     </div>
