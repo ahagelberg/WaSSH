@@ -32,8 +32,9 @@ export const DEFAULT_MACRO_BUTTONS: PluginMacroButton[] = [
 export const serverMonitorManifest: PluginManifest = {
   id: PLUGIN_ID_SERVER_MONITOR,
   name: 'Server monitor',
-  version: '1.0.0',
-  description: 'CPU, memory, disk, process, and network stats via SSH exec without disturbing the shell.',
+  version: '1.1.0',
+  description:
+    'htop/btop-style remote stats: per-core CPU, memory breakdown, disk I/O, processes, network, and temps via SSH exec.',
   activation: 'manual',
   source: 'builtin',
   contributes: {
@@ -52,35 +53,35 @@ export const serverMonitorManifest: PluginManifest = {
         label: 'Show gauges',
         type: 'boolean',
         default: SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
-        description: 'CPU, memory, and disk ring gauges.'
+        description: 'CPU, memory, and swap gauges, per-core bars, and memory breakdown.'
       },
       {
         key: 'showSparks',
         label: 'Show history graphs',
         type: 'boolean',
         default: SERVER_MONITOR_SHOW_SPARKS_DEFAULT,
-        description: 'Sparkline history for CPU, memory, and disk.'
+        description: 'Sparkline history inside CPU, network, and disk panels.'
       },
       {
         key: 'showStatus',
         label: 'Show status',
         type: 'boolean',
         default: SERVER_MONITOR_SHOW_STATUS_DEFAULT,
-        description: 'Uptime, load, swap, kernel, and process counts.'
+        description: 'Uptime, load, temperatures, kernel, and task counts.'
       },
       {
         key: 'showProcesses',
         label: 'Show process list',
         type: 'boolean',
         default: SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
-        description: 'Top processes by CPU usage.'
+        description: 'Top processes with state, nice, threads, and sort by CPU/mem.'
       },
       {
         key: 'showNetwork',
         label: 'Show network',
         type: 'boolean',
         default: SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
-        description: 'Per-interface receive/transmit rates.'
+        description: 'Network panel with rate history, totals, and per-interface stats.'
       }
     ],
     views: [{ id: 'panel', placement: 'split-right', title: 'Server' }]

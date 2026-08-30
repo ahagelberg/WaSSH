@@ -2,17 +2,22 @@ import type { PluginMainModule } from '../PluginHost'
 import type {
   ServerMonitorNetIface,
   ServerMonitorProcess,
-  ServerMonitorSnapshot
+  ServerMonitorSnapshot,
+  ServerMonitorTemp
 } from '../../../shared/plugins'
 import {
+  BYTES_PER_KIB,
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
+  SERVER_MONITOR_DISK_SECTOR_BYTES,
+  SERVER_MONITOR_LOOPBACK_IFACE,
   SERVER_MONITOR_MIN_INTERVAL_MS,
+  SERVER_MONITOR_TEMP_MILLI_PER_C,
   SERVER_MONITOR_TOP_PROCESS_COUNT
 } from '../../../shared/plugins'
 
 /**
- * Machine-readable remote sample (Linux). CPU % and net rates need consecutive samples.
- * Process list is CPU-sorted; count matches SERVER_MONITOR_TOP_PROCESS_COUNT (+ header).
+ * Machine-readable remote sample (Linux). CPU %, disk IO, and net rates need consecutive samples.
+ * Process list is CPU-sorted; count matches SERVER_MONITOR_TOP_PROCESS_COUNT.
  */
 const MONITOR_COMMAND = [
   "echo '===META==='",
@@ -22,15 +27,19 @@ const MONITOR_COMMAND = [
   '(uname -srm 2>/dev/null || echo unknown)',
   '(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)',
   "echo '===CPU==='",
-  "(grep -E '^cpu ' /proc/stat 2>/dev/null || echo cpu 0 0 0 0 0 0 0 0)",
+  "(grep -E '^cpu' /proc/stat 2>/dev/null || echo cpu 0 0 0 0 0 0 0 0)",
   "echo '===MEM==='",
   "grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null || true",
   "echo '===DISK==='",
   '(df -B1 / 2>/dev/null | tail -n 1 || echo)',
+  "echo '===DISKIO==='",
+  '(cat /proc/diskstats 2>/dev/null || true)',
   "echo '===NET==='",
   '(cat /proc/net/dev 2>/dev/null || true)',
+  "echo '===TEMP==='",
+  'for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] || continue; t=$(cat "$z/type" 2>/dev/null || echo zone); v=$(cat "$z/temp" 2>/dev/null || continue); echo "$t $v"; done 2>/dev/null || true',
   "echo '===PROCS==='",
-  `(ps -eo pid=,user:16=,pcpu=,pmem=,rss=,comm= --sort=-pcpu 2>/dev/null | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT} || true)`
+  `(ps -eo pid=,user:16=,state=,ni=,nlwp=,pcpu=,pmem=,rss=,args= --sort=-pcpu 2>/dev/null | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT} || true)`
 ].join('; ')
 
 /** Max wait for one exec sample (ms) */
@@ -39,8 +48,8 @@ const EXEC_WAIT_MS = 10000
 /** Milliseconds per second (rate math) */
 const MS_PER_SEC = 1000
 
-/** Bytes in one kibibyte (ps rss is KiB) */
-const BYTES_PER_KIB = 1024
+/** Whole-disk names in diskstats (skip partitions to avoid double-count) */
+const WHOLE_DISK_RE = /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+)$/
 
 interface CpuJiffies {
   idle: number
@@ -50,6 +59,12 @@ interface CpuJiffies {
 interface NetCounters {
   at: number
   ifaces: Record<string, { rx: number; tx: number }>
+}
+
+interface DiskIoCounters {
+  at: number
+  readBytes: number
+  writeBytes: number
 }
 
 function parseInterval(settings: Record<string, unknown>): number {
@@ -68,13 +83,52 @@ function section(raw: string, name: string): string {
 
 function parseCpuLine(line: string): CpuJiffies | null {
   const parts = line.trim().split(/\s+/)
-  if (parts[0] !== 'cpu' || parts.length < 5) {
+  if (!/^cpu\d*$/.test(parts[0] || '') || parts.length < 5) {
     return null
   }
   const nums = parts.slice(1).map((x) => Number(x) || 0)
   const idle = (nums[3] || 0) + (nums[4] || 0)
   const total = nums.reduce((a, b) => a + b, 0)
   return { idle, total }
+}
+
+/** Aggregate line first, then cpu0..cpuN in order */
+function parseCpuBlock(block: string): { aggregate: CpuJiffies | null; cores: CpuJiffies[] } {
+  let aggregate: CpuJiffies | null = null
+  const cores: CpuJiffies[] = []
+  for (const line of block.split(/\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      continue
+    }
+    const label = trimmed.split(/\s+/)[0] || ''
+    const jiffies = parseCpuLine(trimmed)
+    if (!jiffies) {
+      continue
+    }
+    if (label === 'cpu') {
+      aggregate = jiffies
+      continue
+    }
+    cores.push(jiffies)
+  }
+  return { aggregate, cores }
+}
+
+function cpuPercentFromDelta(cur: CpuJiffies, prev: CpuJiffies): number | null {
+  if (cur.total <= prev.total) {
+    return null
+  }
+  const idleDelta = cur.idle - prev.idle
+  const totalDelta = cur.total - prev.total
+  return Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100))
+}
+
+function rateFromDelta(cur: number, prev: number | undefined, elapsedSec: number): number | null {
+  if (prev == null || elapsedSec <= 0) {
+    return null
+  }
+  return Math.max(0, (cur - prev) / elapsedSec)
 }
 
 function memKb(block: string, key: string): number {
@@ -85,7 +139,6 @@ function memKb(block: string, key: string): number {
 
 function parseDisk(line: string): { total: number; used: number } {
   const parts = line.trim().split(/\s+/)
-  // Filesystem 1B-blocks Used Available Use% Mounted
   if (parts.length < 4) {
     return { total: 0, used: 0 }
   }
@@ -103,6 +156,27 @@ function parseLoadProcs(field: string): { running: number; total: number } {
   }
 }
 
+function parseDiskIo(block: string): { readBytes: number; writeBytes: number } {
+  let readSectors = 0
+  let writeSectors = 0
+  for (const line of block.split(/\n/)) {
+    const parts = line.trim().split(/\s+/)
+    if (parts.length < 10) {
+      continue
+    }
+    const name = parts[2]
+    if (!WHOLE_DISK_RE.test(name)) {
+      continue
+    }
+    readSectors += Number(parts[5]) || 0
+    writeSectors += Number(parts[9]) || 0
+  }
+  return {
+    readBytes: readSectors * SERVER_MONITOR_DISK_SECTOR_BYTES,
+    writeBytes: writeSectors * SERVER_MONITOR_DISK_SECTOR_BYTES
+  }
+}
+
 function parseNetDev(block: string): Record<string, { rx: number; tx: number }> {
   const ifaces: Record<string, { rx: number; tx: number }> = {}
   for (const line of block.split(/\n/)) {
@@ -112,7 +186,7 @@ function parseNetDev(block: string): Record<string, { rx: number; tx: number }> 
       continue
     }
     const name = trimmed.slice(0, colon).trim()
-    if (!name || name === 'face' || name === 'Inter-') {
+    if (!name || name === 'face' || name === 'Inter-' || name === SERVER_MONITOR_LOOPBACK_IFACE) {
       continue
     }
     const nums = trimmed
@@ -120,8 +194,6 @@ function parseNetDev(block: string): Record<string, { rx: number; tx: number }> 
       .trim()
       .split(/\s+/)
       .map((x) => Number(x) || 0)
-    // rx bytes, packets, errs, drop, fifo, frame, compressed, multicast,
-    // tx bytes, ...
     if (nums.length < 9) {
       continue
     }
@@ -135,26 +207,42 @@ function netRates(
   prev: NetCounters | null,
   now: number
 ): ServerMonitorNetIface[] {
-  const elapsedSec =
-    prev && now > prev.at ? (now - prev.at) / MS_PER_SEC : 0
+  const elapsedSec = prev && now > prev.at ? (now - prev.at) / MS_PER_SEC : 0
   const names = Object.keys(current).sort((a, b) => a.localeCompare(b))
   return names.map((name) => {
     const cur = current[name]
     const old = prev?.ifaces[name]
-    let rxRate: number | null = null
-    let txRate: number | null = null
-    if (old && elapsedSec > 0) {
-      rxRate = Math.max(0, (cur.rx - old.rx) / elapsedSec)
-      txRate = Math.max(0, (cur.tx - old.tx) / elapsedSec)
-    }
     return {
       name,
       rxBytes: cur.rx,
       txBytes: cur.tx,
-      rxRate,
-      txRate
+      rxRate: rateFromDelta(cur.rx, old?.rx, elapsedSec),
+      txRate: rateFromDelta(cur.tx, old?.tx, elapsedSec)
     }
   })
+}
+
+function parseTemperatures(block: string): ServerMonitorTemp[] {
+  const rows: ServerMonitorTemp[] = []
+  for (const line of block.split(/\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      continue
+    }
+    const m = /^(\S+)\s+(-?\d+)$/.exec(trimmed)
+    if (!m) {
+      continue
+    }
+    const milli = Number(m[2])
+    if (!Number.isFinite(milli)) {
+      continue
+    }
+    rows.push({
+      name: m[1],
+      celsius: milli / SERVER_MONITOR_TEMP_MILLI_PER_C
+    })
+  }
+  return rows
 }
 
 function parseProcesses(block: string): ServerMonitorProcess[] {
@@ -164,20 +252,23 @@ function parseProcesses(block: string): ServerMonitorProcess[] {
     if (!trimmed) {
       continue
     }
-    // pid user pcpu pmem rss comm  — user may contain spaces if padded; use width-aware split
-    const m = /^(\d+)\s+(\S+)\s+(\d+[.,]?\d*)\s+(\d+[.,]?\d*)\s+(\d+)\s+(.+)$/.exec(
-      trimmed
-    )
+    const m =
+      /^(\d+)\s+(\S+)\s+(\S+)\s+(-?\d+)\s+(\d+)\s+(\d+[.,]?\d*)\s+(\d+[.,]?\d*)\s+(\d+)\s+(.*)$/.exec(
+        trimmed
+      )
     if (!m) {
       continue
     }
     rows.push({
       pid: Number(m[1]) || 0,
       user: m[2],
-      cpuPercent: Number(String(m[3]).replace(',', '.')) || 0,
-      memPercent: Number(String(m[4]).replace(',', '.')) || 0,
-      rssBytes: (Number(m[5]) || 0) * BYTES_PER_KIB,
-      command: m[6].trim()
+      state: m[3],
+      nice: Number(m[4]) || 0,
+      threads: Number(m[5]) || 0,
+      cpuPercent: Number(String(m[6]).replace(',', '.')) || 0,
+      memPercent: Number(String(m[7]).replace(',', '.')) || 0,
+      rssBytes: (Number(m[8]) || 0) * BYTES_PER_KIB,
+      command: m[9].trim()
     })
     if (rows.length >= SERVER_MONITOR_TOP_PROCESS_COUNT) {
       break
@@ -199,13 +290,22 @@ function emptySnapshot(partial: Partial<ServerMonitorSnapshot> = {}): ServerMoni
     procsRunning: 0,
     procsTotal: 0,
     cpuPercent: null,
+    cpuCores: [],
     memTotalBytes: 0,
     memUsedBytes: 0,
     memAvailableBytes: 0,
+    memFreeBytes: 0,
+    memBuffersBytes: 0,
+    memCachedBytes: 0,
     swapTotalBytes: 0,
     swapUsedBytes: 0,
     diskTotalBytes: 0,
     diskUsedBytes: 0,
+    diskReadBytes: 0,
+    diskWriteBytes: 0,
+    diskReadRate: null,
+    diskWriteRate: null,
+    temperatures: [],
     processes: [],
     network: [],
     ...partial
@@ -215,11 +315,15 @@ function emptySnapshot(partial: Partial<ServerMonitorSnapshot> = {}): ServerMoni
 function parseSample(
   raw: string,
   prevCpu: CpuJiffies | null,
-  prevNet: NetCounters | null
+  prevCores: CpuJiffies[],
+  prevNet: NetCounters | null,
+  prevDiskIo: DiskIoCounters | null
 ): {
   snapshot: ServerMonitorSnapshot
   cpu: CpuJiffies | null
+  cores: CpuJiffies[]
   net: NetCounters
+  diskIo: DiskIoCounters
 } {
   const now = Date.now()
   const meta = section(raw, 'META').split(/\n/).map((l) => l.trim()).filter(Boolean)
@@ -233,14 +337,15 @@ function parseSample(
   const kernel = meta[3] || ''
   const cpuCount = Number(meta[4]) || 0
 
-  const cpuLine = section(raw, 'CPU').split(/\n/)[0] || ''
-  const cpu = parseCpuLine(cpuLine)
+  const { aggregate: cpu, cores } = parseCpuBlock(section(raw, 'CPU'))
   let cpuPercent: number | null = null
-  if (cpu && prevCpu && cpu.total > prevCpu.total) {
-    const idleDelta = cpu.idle - prevCpu.idle
-    const totalDelta = cpu.total - prevCpu.total
-    cpuPercent = Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100))
+  if (cpu && prevCpu) {
+    cpuPercent = cpuPercentFromDelta(cpu, prevCpu)
   }
+  const cpuCores: Array<number | null> = cores.map((core, i) => {
+    const prev = prevCores[i]
+    return prev ? cpuPercentFromDelta(core, prev) : null
+  })
 
   const memBlock = section(raw, 'MEM')
   const memTotal = memKb(memBlock, 'MemTotal')
@@ -255,13 +360,22 @@ function parseSample(
   const swapUsed = Math.max(0, swapTotal - swapFree)
 
   const disk = parseDisk(section(raw, 'DISK').split(/\n/)[0] || '')
+  const diskIo = parseDiskIo(section(raw, 'DISKIO'))
+  const diskElapsed =
+    prevDiskIo && now > prevDiskIo.at ? (now - prevDiskIo.at) / MS_PER_SEC : 0
+  const diskReadRate = rateFromDelta(diskIo.readBytes, prevDiskIo?.readBytes, diskElapsed)
+  const diskWriteRate = rateFromDelta(diskIo.writeBytes, prevDiskIo?.writeBytes, diskElapsed)
+
   const netCounters = parseNetDev(section(raw, 'NET'))
   const network = netRates(netCounters, prevNet, now)
+  const temperatures = parseTemperatures(section(raw, 'TEMP'))
   const processes = parseProcesses(section(raw, 'PROCS'))
 
   return {
     cpu,
+    cores,
     net: { at: now, ifaces: netCounters },
+    diskIo: { at: now, readBytes: diskIo.readBytes, writeBytes: diskIo.writeBytes },
     snapshot: emptySnapshot({
       updatedAt: now,
       hostname,
@@ -274,13 +388,22 @@ function parseSample(
       procsRunning: procs.running,
       procsTotal: procs.total,
       cpuPercent,
+      cpuCores,
       memTotalBytes: memTotal,
       memUsedBytes: memUsed,
       memAvailableBytes: available,
+      memFreeBytes: memFree,
+      memBuffersBytes: buffers,
+      memCachedBytes: cached,
       swapTotalBytes: swapTotal,
       swapUsedBytes: swapUsed,
       diskTotalBytes: disk.total,
       diskUsedBytes: disk.used,
+      diskReadBytes: diskIo.readBytes,
+      diskWriteBytes: diskIo.writeBytes,
+      diskReadRate,
+      diskWriteRate,
+      temperatures,
       processes,
       network
     })
@@ -293,7 +416,9 @@ export const serverMonitorMain: PluginMainModule = {
     let busy = false
     let stopped = false
     let prevCpu: CpuJiffies | null = null
+    let prevCores: CpuJiffies[] = []
     let prevNet: NetCounters | null = null
+    let prevDiskIo: DiskIoCounters | null = null
 
     const poll = async (): Promise<void> => {
       if (busy || stopped) {
@@ -322,11 +447,13 @@ export const serverMonitorMain: PluginMainModule = {
           }, EXEC_WAIT_MS)
         })
         offData()
-        const parsed = parseSample(buf, prevCpu, prevNet)
+        const parsed = parseSample(buf, prevCpu, prevCores, prevNet, prevDiskIo)
         if (parsed.cpu) {
           prevCpu = parsed.cpu
         }
+        prevCores = parsed.cores
         prevNet = parsed.net
+        prevDiskIo = parsed.diskIo
         ctx.sendToRenderer({
           type: 'stats',
           snapshot: parsed.snapshot

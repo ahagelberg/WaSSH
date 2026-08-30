@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
-import type { ServerMonitorNetIface, ServerMonitorProcess, ServerMonitorSnapshot } from '@shared/plugins'
+import type {
+  ServerMonitorNetIface,
+  ServerMonitorProcess,
+  ServerMonitorProcessSort,
+  ServerMonitorSnapshot,
+  ServerMonitorTemp
+} from '@shared/plugins'
 import {
+  BYTES_PER_KIB,
   SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
   SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
   SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
@@ -24,8 +31,22 @@ const GAUGE_SIZE = 72
 /** Ring stroke width */
 const GAUGE_STROKE = 7
 
-/** Bytes in one kibibyte */
-const BYTES_PER_KIB = 1024
+/** Seconds in a day / hour / minute (uptime) */
+const SEC_PER_DAY = 86400
+const SEC_PER_HOUR = 3600
+const SEC_PER_MIN = 60
+
+/** Byte-format unit ladder */
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const
+
+/** Rate-bar fill floor so tiny traffic stays visible */
+const RATE_BAR_MIN_PCT = 2
+
+/** Em-dash placeholder for missing samples */
+const MISSING = '—'
+
+type GaugeTone = 'cpu' | 'mem' | 'disk' | 'swap' | 'net'
+type SparkTone = GaugeTone
 
 /** Section toggle definitions (persisted via plugin settings) */
 const SECTION_TOGGLES: Array<{
@@ -56,36 +77,42 @@ function clampPercent(n: number | null | undefined): number {
   return Math.max(0, Math.min(100, n))
 }
 
+function ratioPercent(used: number, total: number): number | null {
+  if (!(total > 0)) {
+    return null
+  }
+  return (used / total) * 100
+}
+
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
-    return '0 B'
+    return `0 ${BYTE_UNITS[0]}`
   }
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let value = bytes
   let unit = 0
-  while (value >= BYTES_PER_KIB && unit < units.length - 1) {
+  while (value >= BYTES_PER_KIB && unit < BYTE_UNITS.length - 1) {
     value /= BYTES_PER_KIB
     unit += 1
   }
   const digits = value >= 100 || unit === 0 ? 0 : value >= 10 ? 1 : 2
-  return `${value.toFixed(digits)} ${units[unit]}`
+  return `${value.toFixed(digits)} ${BYTE_UNITS[unit]}`
 }
 
-function formatRate(bytesPerSec: number | null): string {
+function formatRate(bytesPerSec: number | null | undefined): string {
   if (bytesPerSec == null || !Number.isFinite(bytesPerSec)) {
-    return '—'
+    return MISSING
   }
   return `${formatBytes(bytesPerSec)}/s`
 }
 
 function formatUptime(sec: number): string {
   if (!Number.isFinite(sec) || sec <= 0) {
-    return '—'
+    return MISSING
   }
   const s = Math.floor(sec)
-  const days = Math.floor(s / 86400)
-  const hours = Math.floor((s % 86400) / 3600)
-  const mins = Math.floor((s % 3600) / 60)
+  const days = Math.floor(s / SEC_PER_DAY)
+  const hours = Math.floor((s % SEC_PER_DAY) / SEC_PER_HOUR)
+  const mins = Math.floor((s % SEC_PER_HOUR) / SEC_PER_MIN)
   if (days > 0) {
     return `${days}d ${hours}h`
   }
@@ -96,42 +123,114 @@ function formatUptime(sec: number): string {
 }
 
 function formatLoad(n: number): string {
-  return Number.isFinite(n) ? n.toFixed(2) : '—'
+  return Number.isFinite(n) ? n.toFixed(2) : MISSING
 }
 
 function formatPercent(n: number): string {
-  return Number.isFinite(n) ? n.toFixed(1) : '—'
+  return Number.isFinite(n) ? n.toFixed(1) : MISSING
+}
+
+function formatTemp(celsius: number): string {
+  return Number.isFinite(celsius) ? `${celsius.toFixed(0)}°C` : MISSING
 }
 
 function pushHistory(prev: number[], value: number): number[] {
-  const next = prev.length >= HISTORY_POINTS ? prev.slice(prev.length - HISTORY_POINTS + 1) : prev.slice()
+  const next =
+    prev.length >= HISTORY_POINTS ? prev.slice(prev.length - HISTORY_POINTS + 1) : prev.slice()
   next.push(value)
   return next
 }
 
-function sparkPath(values: number[]): string {
+function sparkCoords(values: number[], maxValue: number): Array<{ x: number; y: number }> {
+  const max = maxValue > 0 ? maxValue : 1
+  const step = values.length > 1 ? SPARK_WIDTH / (values.length - 1) : SPARK_WIDTH
+  return values.map((v, i) => ({
+    x: i * step,
+    y: SPARK_HEIGHT - (Math.max(0, Math.min(v, max)) / max) * (SPARK_HEIGHT - 2) - 1
+  }))
+}
+
+function sparkPath(values: number[], maxValue: number): string {
   if (values.length === 0) {
     return ''
   }
-  const max = 100
-  const step = values.length > 1 ? SPARK_WIDTH / (values.length - 1) : SPARK_WIDTH
-  return values
-    .map((v, i) => {
-      const x = i * step
-      const y = SPARK_HEIGHT - (clampPercent(v) / max) * (SPARK_HEIGHT - 2) - 1
-      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`
-    })
+  return sparkCoords(values, maxValue)
+    .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
     .join(' ')
 }
 
-function sparkArea(values: number[]): string {
-  const line = sparkPath(values)
+function sparkArea(values: number[], maxValue: number): string {
+  const line = sparkPath(values, maxValue)
   if (!line || values.length === 0) {
     return ''
   }
-  const step = values.length > 1 ? SPARK_WIDTH / (values.length - 1) : SPARK_WIDTH
-  const lastX = (values.length - 1) * step
+  const coords = sparkCoords(values, maxValue)
+  const lastX = coords[coords.length - 1].x
   return `${line} L${lastX.toFixed(1)} ${SPARK_HEIGHT} L0 ${SPARK_HEIGHT} Z`
+}
+
+function historyMax(values: number[]): number {
+  let max = 0
+  for (const v of values) {
+    if (v > max) {
+      max = v
+    }
+  }
+  return max
+}
+
+function sortProcesses(
+  rows: ServerMonitorProcess[],
+  sort: ServerMonitorProcessSort
+): ServerMonitorProcess[] {
+  const key = sort === 'mem' ? 'memPercent' : 'cpuPercent'
+  return rows.slice().sort((a, b) => b[key] - a[key])
+}
+
+function netTotals(ifaces: ServerMonitorNetIface[]): {
+  rxBytes: number
+  txBytes: number
+  rxRate: number | null
+  txRate: number | null
+} {
+  let rxBytes = 0
+  let txBytes = 0
+  let rxRate = 0
+  let txRate = 0
+  let haveRx = false
+  let haveTx = false
+  for (const iface of ifaces) {
+    rxBytes += iface.rxBytes
+    txBytes += iface.txBytes
+    if (iface.rxRate != null) {
+      rxRate += iface.rxRate
+      haveRx = true
+    }
+    if (iface.txRate != null) {
+      txRate += iface.txRate
+      haveTx = true
+    }
+  }
+  return {
+    rxBytes,
+    txBytes,
+    rxRate: haveRx ? rxRate : null,
+    txRate: haveTx ? txRate : null
+  }
+}
+
+function memSegments(snapshot: ServerMonitorSnapshot): {
+  app: number
+  buffers: number
+  cached: number
+  free: number
+} {
+  const total = snapshot.memTotalBytes
+  const buffers = snapshot.memBuffersBytes
+  const cached = snapshot.memCachedBytes
+  const free = snapshot.memFreeBytes
+  const app = Math.max(0, total - free - buffers - cached)
+  return { app, buffers, cached, free }
 }
 
 function Gauge({
@@ -143,7 +242,7 @@ function Gauge({
   label: string
   percent: number | null
   detail: string
-  tone: 'cpu' | 'mem' | 'disk'
+  tone: GaugeTone
 }): ReactElement {
   const value = percent == null ? null : clampPercent(percent)
   const radius = (GAUGE_SIZE - GAUGE_STROKE) / 2
@@ -182,7 +281,7 @@ function Gauge({
           dominantBaseline="central"
           textAnchor="middle"
         >
-          {value == null ? '—' : `${Math.round(value)}%`}
+          {value == null ? MISSING : `${Math.round(value)}%`}
         </text>
       </svg>
       <div className="monitor-gauge-meta">
@@ -197,15 +296,19 @@ function SparkCard({
   title,
   values,
   tone,
-  current
+  current,
+  scaleMax
 }: {
   title: string
   values: number[]
-  tone: 'cpu' | 'mem' | 'disk'
+  tone: SparkTone
   current: string
+  /** When set, sparklines scale to this max (rate history); else 0–100 */
+  scaleMax?: number
 }): ReactElement {
-  const line = sparkPath(values)
-  const area = sparkArea(values)
+  const max = scaleMax != null ? Math.max(scaleMax, historyMax(values), 1) : 100
+  const line = sparkPath(values, max)
+  const area = sparkArea(values, max)
   return (
     <div className={`monitor-spark monitor-spark-${tone}`}>
       <div className="monitor-spark-head">
@@ -225,11 +328,172 @@ function SparkCard({
   )
 }
 
-function ProcessTable({ rows }: { rows: ServerMonitorProcess[] }): ReactElement {
+/** SVG viewBox units for bar geometry (avoids inline CSS widths) */
+const BAR_VIEW = 100
+
+function CoreBars({ cores }: { cores: Array<number | null> }): ReactElement | null {
+  if (cores.length <= 1) {
+    return null
+  }
+  return (
+    <div className="monitor-cores" aria-label="Per-core CPU">
+      <div className="monitor-section-title">CPU cores</div>
+      <div className="monitor-cores-grid">
+        {cores.map((pct, i) => {
+          const value = pct == null ? 0 : clampPercent(pct)
+          const fillH = value
+          const fillY = BAR_VIEW - fillH
+          return (
+            <div
+              key={i}
+              className="monitor-core"
+              title={pct == null ? MISSING : `${formatPercent(pct)}%`}
+            >
+              <svg
+                className="monitor-core-svg"
+                viewBox={`0 0 ${BAR_VIEW} ${BAR_VIEW}`}
+                preserveAspectRatio="none"
+                aria-hidden="true"
+              >
+                <rect className="monitor-core-track" x="0" y="0" width={BAR_VIEW} height={BAR_VIEW} />
+                <rect
+                  className="monitor-core-fill"
+                  x="0"
+                  y={fillY}
+                  width={BAR_VIEW}
+                  height={fillH}
+                />
+              </svg>
+              <span className="monitor-core-label">{i}</span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function MemBreakdown({ snapshot }: { snapshot: ServerMonitorSnapshot }): ReactElement | null {
+  if (!(snapshot.memTotalBytes > 0)) {
+    return null
+  }
+  const segs = memSegments(snapshot)
+  const total = snapshot.memTotalBytes
+  const parts: Array<{ key: string; bytes: number; tone: string }> = [
+    { key: 'App', bytes: segs.app, tone: 'app' },
+    { key: 'Buf', bytes: segs.buffers, tone: 'buffers' },
+    { key: 'Cache', bytes: segs.cached, tone: 'cached' },
+    { key: 'Free', bytes: segs.free, tone: 'free' }
+  ]
+  let cursor = 0
+  const rects = parts
+    .map((p) => {
+      const pct = total > 0 ? (p.bytes / total) * BAR_VIEW : 0
+      if (pct <= 0) {
+        return null
+      }
+      const x = cursor
+      cursor += pct
+      return { ...p, x, w: pct }
+    })
+    .filter((r): r is NonNullable<typeof r> => r != null)
+
+  return (
+    <div className="monitor-mem-breakdown">
+      <div className="monitor-section-title">Memory</div>
+      <svg
+        className="monitor-mem-stack"
+        viewBox={`0 0 ${BAR_VIEW} ${BAR_VIEW}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label="Memory breakdown"
+      >
+        {rects.map((r) => (
+          <rect
+            key={r.key}
+            className={`monitor-mem-seg monitor-mem-seg-${r.tone}`}
+            x={r.x}
+            y="0"
+            width={r.w}
+            height={BAR_VIEW}
+          >
+            <title>{`${r.key}: ${formatBytes(r.bytes)}`}</title>
+          </rect>
+        ))}
+      </svg>
+      <div className="monitor-mem-legend">
+        {parts.map((p) => (
+          <span key={p.key} className={`monitor-mem-legend-item monitor-mem-legend-${p.tone}`}>
+            {p.key} {formatBytes(p.bytes)}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function RateBar({
+  label,
+  rate,
+  maxRate,
+  tone
+}: {
+  label: string
+  rate: number | null
+  maxRate: number
+  tone: 'rx' | 'tx'
+}): ReactElement {
+  let pct = 0
+  if (rate != null && rate > 0 && maxRate > 0) {
+    pct = Math.max(RATE_BAR_MIN_PCT, Math.min(BAR_VIEW, (rate / maxRate) * BAR_VIEW))
+  }
+  return (
+    <div className={`monitor-rate-bar monitor-rate-bar-${tone}`}>
+      <span className="monitor-rate-bar-label">{label}</span>
+      <svg
+        className="monitor-rate-bar-svg"
+        viewBox={`0 0 ${BAR_VIEW} ${BAR_VIEW}`}
+        preserveAspectRatio="none"
+        aria-hidden="true"
+      >
+        <rect className="monitor-rate-bar-track" x="0" y="0" width={BAR_VIEW} height={BAR_VIEW} />
+        <rect className="monitor-rate-bar-fill" x="0" y="0" width={pct} height={BAR_VIEW} />
+      </svg>
+      <span className="monitor-rate-bar-value">{formatRate(rate)}</span>
+    </div>
+  )
+}
+
+function ProcessTable({
+  rows,
+  sort,
+  onSort
+}: {
+  rows: ServerMonitorProcess[]
+  sort: ServerMonitorProcessSort
+  onSort: (sort: ServerMonitorProcessSort) => void
+}): ReactElement {
+  const sorted = sortProcesses(rows, sort)
   return (
     <div className="monitor-section monitor-processes">
-      <div className="monitor-section-title">Processes</div>
-      {rows.length === 0 ? (
+      <div className="monitor-section-head">
+        <div className="monitor-section-title">Processes</div>
+        <div className="monitor-sort" role="group" aria-label="Sort processes">
+          {(['cpu', 'mem'] as ServerMonitorProcessSort[]).map((key) => (
+            <button
+              key={key}
+              type="button"
+              className={`monitor-sort-btn${sort === key ? ' active' : ''}`}
+              aria-pressed={sort === key}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onSort(key)}
+            >
+              {key.toUpperCase()}
+            </button>
+          ))}
+        </div>
+      </div>
+      {sorted.length === 0 ? (
         <div className="monitor-section-empty">No process data</div>
       ) : (
         <table className="monitor-table">
@@ -237,18 +501,24 @@ function ProcessTable({ rows }: { rows: ServerMonitorProcess[] }): ReactElement 
             <tr>
               <th scope="col">PID</th>
               <th scope="col">User</th>
+              <th scope="col">S</th>
+              <th scope="col">NI</th>
+              <th scope="col">THR</th>
               <th scope="col">CPU</th>
               <th scope="col">Mem</th>
               <th scope="col">Command</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((p) => (
+            {sorted.map((p) => (
               <tr key={`${p.pid}-${p.command}`}>
                 <td className="monitor-num">{p.pid}</td>
                 <td className="monitor-user" title={p.user}>
                   {p.user}
                 </td>
+                <td className="monitor-num monitor-state">{p.state}</td>
+                <td className="monitor-num">{p.nice}</td>
+                <td className="monitor-num">{p.threads}</td>
                 <td className="monitor-num">{formatPercent(p.cpuPercent)}%</td>
                 <td className="monitor-num">{formatPercent(p.memPercent)}%</td>
                 <td className="monitor-cmd" title={p.command}>
@@ -263,39 +533,200 @@ function ProcessTable({ rows }: { rows: ServerMonitorProcess[] }): ReactElement 
   )
 }
 
-function NetworkTable({ ifaces }: { ifaces: ServerMonitorNetIface[] }): ReactElement {
+function NetworkPanel({
+  ifaces,
+  showSparks,
+  rxHistory,
+  txHistory
+}: {
+  ifaces: ServerMonitorNetIface[]
+  showSparks: boolean
+  rxHistory: number[]
+  txHistory: number[]
+}): ReactElement {
+  const totals = netTotals(ifaces)
+  let maxRate = 0
+  for (const iface of ifaces) {
+    if (iface.rxRate != null && iface.rxRate > maxRate) {
+      maxRate = iface.rxRate
+    }
+    if (iface.txRate != null && iface.txRate > maxRate) {
+      maxRate = iface.txRate
+    }
+  }
+  if (totals.rxRate != null && totals.rxRate > maxRate) {
+    maxRate = totals.rxRate
+  }
+  if (totals.txRate != null && totals.txRate > maxRate) {
+    maxRate = totals.txRate
+  }
+
   return (
     <div className="monitor-section monitor-network">
       <div className="monitor-section-title">Network</div>
+      {showSparks ? (
+        <div className="monitor-panel-sparks monitor-panel-sparks-2">
+          <SparkCard
+            title="Net ↓"
+            values={rxHistory}
+            tone="net"
+            scaleMax={historyMax(rxHistory)}
+            current={formatRate(totals.rxRate)}
+          />
+          <SparkCard
+            title="Net ↑"
+            values={txHistory}
+            tone="net"
+            scaleMax={historyMax(txHistory)}
+            current={formatRate(totals.txRate)}
+          />
+        </div>
+      ) : null}
       {ifaces.length === 0 ? (
         <div className="monitor-section-empty">No interface data</div>
       ) : (
-        <table className="monitor-table">
-          <thead>
-            <tr>
-              <th scope="col">Iface</th>
-              <th scope="col">RX</th>
-              <th scope="col">TX</th>
-              <th scope="col">Total RX</th>
-              <th scope="col">Total TX</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ifaces.map((iface) => (
-              <tr key={iface.name}>
-                <td className="monitor-iface" title={iface.name}>
-                  {iface.name}
-                </td>
-                <td className="monitor-num">{formatRate(iface.rxRate)}</td>
-                <td className="monitor-num">{formatRate(iface.txRate)}</td>
-                <td className="monitor-num">{formatBytes(iface.rxBytes)}</td>
-                <td className="monitor-num">{formatBytes(iface.txBytes)}</td>
+        <>
+          <div className="monitor-net-totals">
+            <RateBar label="↓ RX" rate={totals.rxRate} maxRate={maxRate} tone="rx" />
+            <RateBar label="↑ TX" rate={totals.txRate} maxRate={maxRate} tone="tx" />
+            <div className="monitor-net-total-bytes">
+              <span>Total RX {formatBytes(totals.rxBytes)}</span>
+              <span>Total TX {formatBytes(totals.txBytes)}</span>
+            </div>
+          </div>
+          <table className="monitor-table">
+            <thead>
+              <tr>
+                <th scope="col">Iface</th>
+                <th scope="col">RX</th>
+                <th scope="col">TX</th>
+                <th scope="col">Total RX</th>
+                <th scope="col">Total TX</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {ifaces.map((iface) => (
+                <tr key={iface.name}>
+                  <td className="monitor-iface" title={iface.name}>
+                    {iface.name}
+                  </td>
+                  <td className="monitor-num">{formatRate(iface.rxRate)}</td>
+                  <td className="monitor-num">{formatRate(iface.txRate)}</td>
+                  <td className="monitor-num">{formatBytes(iface.rxBytes)}</td>
+                  <td className="monitor-num">{formatBytes(iface.txBytes)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
       )}
     </div>
+  )
+}
+
+function DiskPanel({
+  snapshot,
+  showGauge,
+  showSparks,
+  diskHistory,
+  readHistory,
+  writeHistory
+}: {
+  snapshot: ServerMonitorSnapshot | null
+  showGauge: boolean
+  showSparks: boolean
+  diskHistory: number[]
+  readHistory: number[]
+  writeHistory: number[]
+}): ReactElement {
+  const diskPct = snapshot ? ratioPercent(snapshot.diskUsedBytes, snapshot.diskTotalBytes) : null
+  const diskFree =
+    snapshot && snapshot.diskTotalBytes > 0
+      ? Math.max(0, snapshot.diskTotalBytes - snapshot.diskUsedBytes)
+      : 0
+
+  return (
+    <div className="monitor-section monitor-disk">
+      <div className="monitor-section-title">Disk</div>
+      {showGauge ? (
+        <div className="monitor-panel-gauge">
+          <Gauge
+            label="Disk /"
+            percent={diskPct}
+            detail={
+              snapshot
+                ? `${formatBytes(snapshot.diskUsedBytes)} / ${formatBytes(snapshot.diskTotalBytes)}`
+                : MISSING
+            }
+            tone="disk"
+          />
+        </div>
+      ) : null}
+      {showSparks ? (
+        <div className="monitor-panel-sparks monitor-panel-sparks-3">
+          <SparkCard
+            title="Used"
+            values={diskHistory}
+            tone="disk"
+            current={diskPct == null ? MISSING : `${Math.round(diskPct)}%`}
+          />
+          <SparkCard
+            title="Read"
+            values={readHistory}
+            tone="disk"
+            scaleMax={historyMax(readHistory)}
+            current={formatRate(snapshot?.diskReadRate)}
+          />
+          <SparkCard
+            title="Write"
+            values={writeHistory}
+            tone="disk"
+            scaleMax={historyMax(writeHistory)}
+            current={formatRate(snapshot?.diskWriteRate)}
+          />
+        </div>
+      ) : null}
+      <div className="monitor-panel-facts">
+        <div className="monitor-fact">
+          <span>Free</span>
+          <strong>
+            {snapshot && snapshot.diskTotalBytes > 0 ? formatBytes(diskFree) : MISSING}
+          </strong>
+        </div>
+        <div className="monitor-fact">
+          <span>Read</span>
+          <strong>{formatRate(snapshot?.diskReadRate)}</strong>
+        </div>
+        <div className="monitor-fact">
+          <span>Write</span>
+          <strong>{formatRate(snapshot?.diskWriteRate)}</strong>
+        </div>
+        <div className="monitor-fact">
+          <span>Read total</span>
+          <strong>{snapshot ? formatBytes(snapshot.diskReadBytes) : MISSING}</strong>
+        </div>
+        <div className="monitor-fact">
+          <span>Write total</span>
+          <strong>{snapshot ? formatBytes(snapshot.diskWriteBytes) : MISSING}</strong>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function TempFacts({ temps }: { temps: ServerMonitorTemp[] }): ReactElement | null {
+  if (temps.length === 0) {
+    return null
+  }
+  return (
+    <>
+      {temps.map((t) => (
+        <div key={t.name} className="monitor-fact">
+          <span title={t.name}>{t.name}</span>
+          <strong>{formatTemp(t.celsius)}</strong>
+        </div>
+      ))}
+    </>
   )
 }
 
@@ -309,6 +740,11 @@ export default function ServerMonitorView({
   const [cpuHistory, setCpuHistory] = useState<number[]>([])
   const [memHistory, setMemHistory] = useState<number[]>([])
   const [diskHistory, setDiskHistory] = useState<number[]>([])
+  const [diskReadHistory, setDiskReadHistory] = useState<number[]>([])
+  const [diskWriteHistory, setDiskWriteHistory] = useState<number[]>([])
+  const [netRxHistory, setNetRxHistory] = useState<number[]>([])
+  const [netTxHistory, setNetTxHistory] = useState<number[]>([])
+  const [procSort, setProcSort] = useState<ServerMonitorProcessSort>('cpu')
   const lastAt = useRef(0)
 
   const showGauges = settingBool(settings, 'showGauges', SERVER_MONITOR_SHOW_GAUGES_DEFAULT)
@@ -320,6 +756,7 @@ export default function ServerMonitorView({
     SERVER_MONITOR_SHOW_PROCESSES_DEFAULT
   )
   const showNetwork = settingBool(settings, 'showNetwork', SERVER_MONITOR_SHOW_NETWORK_DEFAULT)
+  const showDiskPanel = showGauges || showSparks || showStatus
 
   useEffect(() => {
     return window.wassh.onPluginMessage((ev) => {
@@ -339,188 +776,201 @@ export default function ServerMonitorView({
       if (next.cpuPercent != null) {
         setCpuHistory((h) => pushHistory(h, next.cpuPercent as number))
       }
-      if (next.memTotalBytes > 0) {
-        setMemHistory((h) =>
-          pushHistory(h, (next.memUsedBytes / next.memTotalBytes) * 100)
-        )
+      const memPctNext = ratioPercent(next.memUsedBytes, next.memTotalBytes)
+      if (memPctNext != null) {
+        setMemHistory((h) => pushHistory(h, memPctNext))
       }
-      if (next.diskTotalBytes > 0) {
-        setDiskHistory((h) =>
-          pushHistory(h, (next.diskUsedBytes / next.diskTotalBytes) * 100)
-        )
+      const diskPctNext = ratioPercent(next.diskUsedBytes, next.diskTotalBytes)
+      if (diskPctNext != null) {
+        setDiskHistory((h) => pushHistory(h, diskPctNext))
+      }
+      if (next.diskReadRate != null) {
+        setDiskReadHistory((h) => pushHistory(h, next.diskReadRate as number))
+      }
+      if (next.diskWriteRate != null) {
+        setDiskWriteHistory((h) => pushHistory(h, next.diskWriteRate as number))
+      }
+      const totals = netTotals(next.network ?? [])
+      if (totals.rxRate != null) {
+        setNetRxHistory((h) => pushHistory(h, totals.rxRate as number))
+      }
+      if (totals.txRate != null) {
+        setNetTxHistory((h) => pushHistory(h, totals.txRate as number))
       }
     })
   }, [tabId, pluginId])
 
-  const memPct =
-    snapshot && snapshot.memTotalBytes > 0
-      ? (snapshot.memUsedBytes / snapshot.memTotalBytes) * 100
-      : null
-  const diskPct =
-    snapshot && snapshot.diskTotalBytes > 0
-      ? (snapshot.diskUsedBytes / snapshot.diskTotalBytes) * 100
-      : null
-  const diskFree =
-    snapshot && snapshot.diskTotalBytes > 0
-      ? Math.max(0, snapshot.diskTotalBytes - snapshot.diskUsedBytes)
-      : 0
+  const memPct = snapshot ? ratioPercent(snapshot.memUsedBytes, snapshot.memTotalBytes) : null
+  const swapPct = snapshot ? ratioPercent(snapshot.swapUsedBytes, snapshot.swapTotalBytes) : null
+  const showSwapGauge = Boolean(snapshot && snapshot.swapTotalBytes > 0)
+  const showCpuBlock = showGauges || showSparks
 
   return (
     <div className="plugin-panel plugin-server-monitor">
-      <div className="monitor-header">
-        <div className="monitor-header-top">
-          <div className="monitor-title">Server</div>
-          <div className="monitor-host" title={snapshot?.hostname || ''}>
-            {snapshot?.hostname || 'Connecting…'}
+      <div className="monitor-scroll">
+        <div className="monitor-header">
+          <div className="monitor-header-top">
+            <div className="monitor-title">Server</div>
+            <div className="monitor-host" title={snapshot?.hostname || ''}>
+              {snapshot?.hostname || 'Connecting…'}
+            </div>
+          </div>
+          <div className="monitor-section-toggles" role="group" aria-label="Visible sections">
+            {SECTION_TOGGLES.map((tog) => {
+              const on = settingBool(settings, tog.key, tog.fallback)
+              return (
+                <button
+                  key={tog.key}
+                  type="button"
+                  className={`monitor-section-toggle${on ? ' active' : ''}`}
+                  aria-pressed={on}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onSettingsPatch({ [tog.key]: !on })}
+                >
+                  {tog.label}
+                </button>
+              )
+            })}
           </div>
         </div>
-        <div className="monitor-section-toggles" role="group" aria-label="Visible sections">
-          {SECTION_TOGGLES.map((tog) => {
-            const on = settingBool(settings, tog.key, tog.fallback)
-            return (
-              <button
-                key={tog.key}
-                type="button"
-                className={`monitor-section-toggle${on ? ' active' : ''}`}
-                aria-pressed={on}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => onSettingsPatch({ [tog.key]: !on })}
-              >
-                {tog.label}
-              </button>
-            )
-          })}
+
+        {snapshot?.error ? <div className="plugin-monitor-error">{snapshot.error}</div> : null}
+
+        <div className="monitor-body">
+          {showCpuBlock ? (
+            <div className="monitor-overview monitor-cpu-block">
+              {showGauges ? (
+                <div className="monitor-gauges-wrap">
+                  <div className={`monitor-gauges${showSwapGauge ? ' monitor-gauges-3' : ''}`}>
+                    <Gauge
+                      label="CPU"
+                      percent={snapshot?.cpuPercent ?? null}
+                      detail={
+                        snapshot
+                          ? `Load ${formatLoad(snapshot.load1)}${
+                              snapshot.cpuCount > 0 ? ` · ${snapshot.cpuCount} CPU` : ''
+                            }`
+                          : 'Sampling…'
+                      }
+                      tone="cpu"
+                    />
+                    <Gauge
+                      label="Memory"
+                      percent={memPct}
+                      detail={
+                        snapshot
+                          ? `${formatBytes(snapshot.memUsedBytes)} / ${formatBytes(snapshot.memTotalBytes)}`
+                          : MISSING
+                      }
+                      tone="mem"
+                    />
+                    {showSwapGauge ? (
+                      <Gauge
+                        label="Swap"
+                        percent={swapPct}
+                        detail={`${formatBytes(snapshot!.swapUsedBytes)} / ${formatBytes(snapshot!.swapTotalBytes)}`}
+                        tone="swap"
+                      />
+                    ) : null}
+                  </div>
+                  {snapshot ? <CoreBars cores={snapshot.cpuCores ?? []} /> : null}
+                  {snapshot ? <MemBreakdown snapshot={snapshot} /> : null}
+                </div>
+              ) : null}
+
+              {showSparks ? (
+                <div className="monitor-sparks monitor-panel-sparks-2">
+                  <SparkCard
+                    title="CPU"
+                    values={cpuHistory}
+                    tone="cpu"
+                    current={
+                      snapshot?.cpuPercent == null
+                        ? MISSING
+                        : `${Math.round(snapshot.cpuPercent)}%`
+                    }
+                  />
+                  <SparkCard
+                    title="Memory"
+                    values={memHistory}
+                    tone="mem"
+                    current={memPct == null ? MISSING : `${Math.round(memPct)}%`}
+                  />
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {showNetwork ? (
+            <NetworkPanel
+              ifaces={snapshot?.network ?? []}
+              showSparks={showSparks}
+              rxHistory={netRxHistory}
+              txHistory={netTxHistory}
+            />
+          ) : null}
+
+          {showDiskPanel ? (
+            <DiskPanel
+              snapshot={snapshot}
+              showGauge={showGauges}
+              showSparks={showSparks}
+              diskHistory={diskHistory}
+              readHistory={diskReadHistory}
+              writeHistory={diskWriteHistory}
+            />
+          ) : null}
+
+          {showStatus ? (
+            <div className="monitor-facts">
+              <div className="monitor-fact">
+                <span>Uptime</span>
+                <strong>{formatUptime(snapshot?.uptimeSec ?? 0)}</strong>
+              </div>
+              <div className="monitor-fact">
+                <span>Load</span>
+                <strong>
+                  {snapshot
+                    ? `${formatLoad(snapshot.load1)} · ${formatLoad(snapshot.load5)} · ${formatLoad(snapshot.load15)}`
+                    : MISSING}
+                </strong>
+              </div>
+              <div className="monitor-fact">
+                <span>Available</span>
+                <strong>
+                  {snapshot ? formatBytes(snapshot.memAvailableBytes) : MISSING}
+                </strong>
+              </div>
+              <div className="monitor-fact">
+                <span>Tasks</span>
+                <strong>
+                  {snapshot && snapshot.procsTotal > 0
+                    ? `${snapshot.procsRunning} / ${snapshot.procsTotal}`
+                    : MISSING}
+                </strong>
+              </div>
+              <div className="monitor-fact">
+                <span>CPUs</span>
+                <strong>
+                  {snapshot && snapshot.cpuCount > 0 ? String(snapshot.cpuCount) : MISSING}
+                </strong>
+              </div>
+              <TempFacts temps={snapshot?.temperatures ?? []} />
+              <div className="monitor-fact monitor-fact-wide">
+                <span>Kernel</span>
+                <strong title={snapshot?.kernel || ''}>{snapshot?.kernel || MISSING}</strong>
+              </div>
+            </div>
+          ) : null}
+
+          {showProcesses ? (
+            <ProcessTable
+              rows={snapshot?.processes ?? []}
+              sort={procSort}
+              onSort={setProcSort}
+            />
+          ) : null}
         </div>
-      </div>
-
-      {snapshot?.error ? <div className="plugin-monitor-error">{snapshot.error}</div> : null}
-
-      <div className="monitor-body">
-        {showGauges || showSparks ? (
-          <div className="monitor-overview">
-            {showGauges ? (
-              <div className="monitor-gauges">
-                <Gauge
-                  label="CPU"
-                  percent={snapshot?.cpuPercent ?? null}
-                  detail={
-                    snapshot
-                      ? `Load ${formatLoad(snapshot.load1)}${
-                          snapshot.cpuCount > 0 ? ` · ${snapshot.cpuCount} CPU` : ''
-                        }`
-                      : 'Sampling…'
-                  }
-                  tone="cpu"
-                />
-                <Gauge
-                  label="Memory"
-                  percent={memPct}
-                  detail={
-                    snapshot
-                      ? `${formatBytes(snapshot.memUsedBytes)} / ${formatBytes(snapshot.memTotalBytes)}`
-                      : '—'
-                  }
-                  tone="mem"
-                />
-                <Gauge
-                  label="Disk /"
-                  percent={diskPct}
-                  detail={
-                    snapshot
-                      ? `${formatBytes(snapshot.diskUsedBytes)} / ${formatBytes(snapshot.diskTotalBytes)}`
-                      : '—'
-                  }
-                  tone="disk"
-                />
-              </div>
-            ) : null}
-
-            {showSparks ? (
-              <div className="monitor-sparks">
-                <SparkCard
-                  title="CPU"
-                  values={cpuHistory}
-                  tone="cpu"
-                  current={
-                    snapshot?.cpuPercent == null
-                      ? '—'
-                      : `${Math.round(snapshot.cpuPercent)}%`
-                  }
-                />
-                <SparkCard
-                  title="Memory"
-                  values={memHistory}
-                  tone="mem"
-                  current={memPct == null ? '—' : `${Math.round(memPct)}%`}
-                />
-                <SparkCard
-                  title="Disk"
-                  values={diskHistory}
-                  tone="disk"
-                  current={diskPct == null ? '—' : `${Math.round(diskPct)}%`}
-                />
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-
-        {showStatus ? (
-          <div className="monitor-facts">
-            <div className="monitor-fact">
-              <span>Uptime</span>
-              <strong>{formatUptime(snapshot?.uptimeSec ?? 0)}</strong>
-            </div>
-            <div className="monitor-fact">
-              <span>Load</span>
-              <strong>
-                {snapshot
-                  ? `${formatLoad(snapshot.load1)} · ${formatLoad(snapshot.load5)} · ${formatLoad(snapshot.load15)}`
-                  : '—'}
-              </strong>
-            </div>
-            <div className="monitor-fact">
-              <span>Swap</span>
-              <strong>
-                {snapshot && snapshot.swapTotalBytes > 0
-                  ? `${formatBytes(snapshot.swapUsedBytes)} / ${formatBytes(snapshot.swapTotalBytes)}`
-                  : '—'}
-              </strong>
-            </div>
-            <div className="monitor-fact">
-              <span>Available</span>
-              <strong>
-                {snapshot ? formatBytes(snapshot.memAvailableBytes) : '—'}
-              </strong>
-            </div>
-            <div className="monitor-fact">
-              <span>Disk free</span>
-              <strong>{snapshot && snapshot.diskTotalBytes > 0 ? formatBytes(diskFree) : '—'}</strong>
-            </div>
-            <div className="monitor-fact">
-              <span>Tasks</span>
-              <strong>
-                {snapshot && snapshot.procsTotal > 0
-                  ? `${snapshot.procsRunning} / ${snapshot.procsTotal}`
-                  : '—'}
-              </strong>
-            </div>
-            <div className="monitor-fact">
-              <span>CPUs</span>
-              <strong>{snapshot && snapshot.cpuCount > 0 ? String(snapshot.cpuCount) : '—'}</strong>
-            </div>
-            <div className="monitor-fact monitor-fact-wide">
-              <span>Kernel</span>
-              <strong title={snapshot?.kernel || ''}>{snapshot?.kernel || '—'}</strong>
-            </div>
-          </div>
-        ) : null}
-
-        {showProcesses || showNetwork ? (
-          <div className="monitor-tables">
-            {showProcesses ? <ProcessTable rows={snapshot?.processes ?? []} /> : null}
-            {showNetwork ? <NetworkTable ifaces={snapshot?.network ?? []} /> : null}
-          </div>
-        ) : null}
       </div>
 
       {snapshot?.updatedAt ? (

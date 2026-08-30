@@ -12,7 +12,15 @@
   --monitor-cpu: #3d8bfd;
   --monitor-mem: #3dd68c;
   --monitor-disk: #f0b429;
+  --monitor-swap: #f07178;
+  --monitor-net: #2dd4bf;
+  --monitor-mem-buffers: #5eead4;
+  --monitor-mem-cached: #86efac;
+  --monitor-mem-free: color-mix(in srgb, var(--border) 55%, transparent);
   --monitor-card-radius: 8px;
+  --monitor-core-height: 48px;
+  --monitor-mem-stack-height: 10px;
+  --monitor-rate-bar-height: 8px;
   /* Container-query breakpoints for server monitor panel shape */
   --monitor-cq-md: 360px;
   --monitor-cq-lg: 560px;
@@ -22,8 +30,11 @@
   --monitor-gauge-size-compact: 48px;
   --monitor-spark-height: 40px;
   --monitor-spark-height-compact: 28px;
-  --monitor-net: #a78bfa;
   --monitor-toggle-height: 22px;
+  --monitor-meta-inset: 8px;
+  --monitor-meta-reserve: 28px;
+  --monitor-meta-z: 2;
+  --monitor-scrollbar-size: 4px;
   --mqtt-tree-indent: 14px;
   --mqtt-blink-bg: color-mix(in srgb, var(--accent) 35%, transparent);
   --mqtt-history-max-height: 180px;
@@ -422,10 +433,38 @@
 }
 
 .plugin-server-monitor {
-  gap: 10px;
-  overflow: auto;
+  position: relative;
+  gap: 0;
+  overflow: hidden;
   container-type: size;
   container-name: server-monitor;
+}
+
+.monitor-scroll {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: var(--monitor-meta-reserve);
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--border) 80%, transparent) transparent;
+}
+
+.monitor-scroll::-webkit-scrollbar {
+  width: var(--monitor-scrollbar-size);
+  height: var(--monitor-scrollbar-size);
+}
+
+.monitor-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.monitor-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 999px;
 }
 
 .monitor-header {
@@ -495,6 +534,13 @@
   min-width: 0;
 }
 
+.monitor-gauges-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
 .monitor-gauges {
   display: flex;
   flex-direction: column;
@@ -543,6 +589,14 @@
   stroke: var(--monitor-disk);
 }
 
+.monitor-gauge-swap .monitor-gauge-value {
+  stroke: var(--monitor-swap);
+}
+
+.monitor-gauge-net .monitor-gauge-value {
+  stroke: var(--monitor-net);
+}
+
 .monitor-gauge-text {
   fill: var(--text);
   font-size: 12px;
@@ -574,6 +628,24 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
+}
+
+.monitor-panel-sparks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.monitor-panel-gauge {
+  margin-bottom: 8px;
+}
+
+.monitor-panel-facts {
+  display: grid;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -641,6 +713,221 @@
   fill: var(--monitor-disk);
 }
 
+.monitor-spark-swap .monitor-spark-line {
+  stroke: var(--monitor-swap);
+}
+
+.monitor-spark-swap .monitor-spark-area {
+  fill: var(--monitor-swap);
+}
+
+.monitor-spark-net .monitor-spark-line {
+  stroke: var(--monitor-net);
+}
+
+.monitor-spark-net .monitor-spark-area {
+  fill: var(--monitor-net);
+}
+
+.monitor-cores,
+.monitor-mem-breakdown {
+  padding: 8px 10px;
+  border-radius: var(--monitor-card-radius);
+  background: var(--bg-input);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  min-width: 0;
+}
+
+.monitor-cores-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14px, 1fr));
+  gap: 4px;
+  align-items: end;
+}
+
+.monitor-core {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.monitor-core-svg {
+  display: block;
+  width: 100%;
+  height: var(--monitor-core-height);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.monitor-core-track {
+  fill: color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.monitor-core-fill {
+  fill: var(--monitor-cpu);
+  transition: y 0.35s ease, height 0.35s ease;
+}
+
+.monitor-core-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.monitor-mem-stack {
+  display: block;
+  width: 100%;
+  height: var(--monitor-mem-stack-height);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.monitor-mem-seg-app {
+  fill: var(--monitor-mem);
+}
+
+.monitor-mem-seg-buffers {
+  fill: var(--monitor-mem-buffers);
+}
+
+.monitor-mem-seg-cached {
+  fill: var(--monitor-mem-cached);
+}
+
+.monitor-mem-seg-free {
+  fill: var(--monitor-mem-free);
+}
+
+.monitor-mem-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.monitor-mem-legend-item::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.monitor-mem-legend-app::before {
+  background: var(--monitor-mem);
+}
+
+.monitor-mem-legend-buffers::before {
+  background: var(--monitor-mem-buffers);
+}
+
+.monitor-mem-legend-cached::before {
+  background: var(--monitor-mem-cached);
+}
+
+.monitor-mem-legend-free::before {
+  background: var(--monitor-mem-free);
+}
+
+.monitor-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.monitor-section-head .monitor-section-title {
+  margin-bottom: 0;
+}
+
+.monitor-sort {
+  display: flex;
+  gap: 4px;
+}
+
+.monitor-sort-btn {
+  height: var(--monitor-toggle-height);
+  padding: 0 7px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 999px;
+}
+
+.monitor-sort-btn.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.monitor-net-totals {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.monitor-rate-bar {
+  display: grid;
+  grid-template-columns: 2.5rem 1fr auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.monitor-rate-bar-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-rate-bar-svg {
+  display: block;
+  width: 100%;
+  height: var(--monitor-rate-bar-height);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.monitor-rate-bar-track {
+  fill: color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.monitor-rate-bar-rx .monitor-rate-bar-fill {
+  fill: var(--monitor-net);
+  transition: width 0.35s ease;
+}
+
+.monitor-rate-bar-tx .monitor-rate-bar-fill {
+  fill: color-mix(in srgb, var(--monitor-net) 55%, var(--monitor-cpu));
+  transition: width 0.35s ease;
+}
+
+.monitor-rate-bar-value {
+  font-size: 11px;
+  font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.monitor-net-total-bytes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
 .monitor-facts {
   display: grid;
   gap: 6px;
@@ -673,20 +960,13 @@
   white-space: nowrap;
 }
 
-.monitor-tables {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-}
-
 .monitor-section {
   padding: 8px 10px;
   border-radius: var(--monitor-card-radius);
   background: var(--bg-input);
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   min-width: 0;
-  overflow: auto;
+  overflow: visible;
 }
 
 .monitor-section-title {
@@ -740,16 +1020,36 @@
   max-width: 8rem;
 }
 
+.monitor-table .monitor-state {
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
 .monitor-network .monitor-section-title {
   color: color-mix(in srgb, var(--monitor-net) 70%, var(--text-muted));
+}
+
+.monitor-disk .monitor-section-title {
+  color: color-mix(in srgb, var(--monitor-disk) 70%, var(--text-muted));
+}
+
+.monitor-network .monitor-spark,
+.monitor-disk .monitor-spark,
+.monitor-network .monitor-panel-gauge .monitor-gauge,
+.monitor-disk .monitor-panel-gauge .monitor-gauge {
+  background: color-mix(in srgb, var(--bg-panel-2) 55%, var(--bg-input));
 }
 
 /* Medium+ (--monitor-cq-md): gauges side-by-side */
 @container server-monitor (min-width: 360px) {
   .monitor-gauges {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
+  }
+
+  .monitor-gauges-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .monitor-gauge {
@@ -771,13 +1071,40 @@
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
   }
+
+  .monitor-panel-sparks-2 {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .monitor-panel-sparks-3 {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .monitor-panel-facts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px 12px;
+  }
+
+  .monitor-panel-facts .monitor-fact {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .monitor-panel-facts .monitor-fact strong {
+    text-align: left;
+  }
 }
 
 /* Large (--monitor-cq-lg): sparks and facts in rows */
 @container server-monitor (min-width: 560px) {
-  .monitor-sparks {
+  .monitor-sparks.monitor-panel-sparks-2 {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
   }
 
@@ -807,14 +1134,8 @@
     text-align: right;
   }
 
-  .monitor-tables {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-  }
-
-  .monitor-tables > :only-child {
-    grid-column: 1 / -1;
+  .monitor-disk .monitor-panel-gauge .monitor-gauge {
+    max-width: 220px;
   }
 }
 
@@ -912,9 +1233,17 @@
 
   .monitor-sparks {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
     --monitor-spark-height: var(--monitor-spark-height-compact);
+  }
+
+  .monitor-cores,
+  .monitor-mem-breakdown,
+  .monitor-network,
+  .monitor-disk,
+  .monitor-processes {
+    display: none;
   }
 
   .monitor-spark {
@@ -932,7 +1261,7 @@
     gap: 4px;
     padding: 6px 8px;
     grid-template-columns: none;
-    overflow: auto;
+    overflow: visible;
   }
 
   .monitor-fact {
@@ -946,10 +1275,6 @@
   }
 
   .monitor-fact-wide {
-    display: none;
-  }
-
-  .monitor-tables {
     display: none;
   }
 
@@ -1002,9 +1327,17 @@
 }
 
 .plugin-monitor-meta {
+  position: absolute;
+  right: var(--monitor-meta-inset);
+  bottom: var(--monitor-meta-inset);
+  z-index: var(--monitor-meta-z);
   color: var(--text-muted);
   font-size: 10px;
-  flex-shrink: 0;
+  text-align: right;
+  pointer-events: none;
+  padding: 2px 6px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
 }
 
 .plugin-scratchpad-input {
