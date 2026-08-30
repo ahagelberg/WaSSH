@@ -20,6 +20,9 @@ const MQTT_SPLIT_MIN_RATIO = 0.18
 /** Maximum topic-tree pane fraction when dragging the splitter */
 const MQTT_SPLIT_MAX_RATIO = 0.75
 
+/** QoS used when clearing topics via empty retained publish */
+const MQTT_DELETE_QOS = 0 as const
+
 function clampSplitRatio(ratio: number): number {
   return Math.min(MQTT_SPLIT_MAX_RATIO, Math.max(MQTT_SPLIT_MIN_RATIO, ratio))
 }
@@ -183,6 +186,87 @@ function segmentLabel(name: string): string {
 
 function displayTopicPath(path: string): string {
   return path.length === 0 ? EMPTY_SEGMENT_LABEL : path
+}
+
+/** MQTT publish topic for a tree path (empty leading segment → `/`) */
+function mqttTopicFromPath(path: string): string {
+  return path.length === 0 ? EMPTY_SEGMENT_LABEL : path
+}
+
+function isEmptyPayload(msg: Pick<TopicMessage, 'binary' | 'payloadText' | 'payloadBase64'>): boolean {
+  if (msg.binary) {
+    return !msg.payloadBase64 || msg.payloadBase64.length === 0
+  }
+  return (msg.payloadText ?? '').length === 0 && (msg.payloadBase64 ?? '').length === 0
+}
+
+/** Topic paths in a subtree, deepest first (children before parent) */
+function collectSubtreePaths(node: TopicNode): string[] {
+  const paths: string[] = []
+  for (const child of Array.from(node.children.values())) {
+    paths.push(...collectSubtreePaths(child))
+  }
+  if (node.path !== ROOT_PATH) {
+    paths.push(node.path)
+  }
+  return paths
+}
+
+function childKeyForPath(path: string): string {
+  if (path.length === 0) {
+    return ''
+  }
+  const segments = topicSegments(path)
+  return segments[segments.length - 1] ?? ''
+}
+
+function parentPathOf(path: string): string | null {
+  if (path.length === 0) {
+    return null
+  }
+  const segments = topicSegments(path)
+  if (segments.length <= 1) {
+    return null
+  }
+  return pathFromSegments(segments.slice(0, -1))
+}
+
+/** Clear one topic's messages; drop the node if it has no children */
+function clearTopicMessages(root: TopicNode, path: string): TopicNode {
+  const next = cloneTree(root)
+  const node = findNode(next, path)
+  if (!node) {
+    return root
+  }
+  node.messages = []
+  node.hasOwnMessages = false
+  if (node.children.size === 0) {
+    const parentPath = parentPathOf(path)
+    const parent = parentPath === null ? next : findNode(next, parentPath)
+    if (parent) {
+      parent.children.delete(childKeyForPath(path))
+      pruneEmptyAncestors(next, parentPath)
+    }
+  }
+  recomputeCounts(next)
+  return next
+}
+
+function pruneEmptyAncestors(root: TopicNode, startParentPath: string | null): void {
+  let path: string | null = startParentPath
+  while (path !== null) {
+    const node = findNode(root, path)
+    if (!node || node.hasOwnMessages || node.children.size > 0) {
+      return
+    }
+    const parentPath = parentPathOf(path)
+    const parent = parentPath === null ? root : findNode(root, parentPath)
+    if (!parent) {
+      return
+    }
+    parent.children.delete(childKeyForPath(path))
+    path = parentPath
+  }
 }
 
 function formatTime(ts: number): string {
@@ -352,6 +436,12 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
           payloadText: payload.payloadText,
           payloadBase64: payload.payloadBase64
         }
+        // Zero-length payload = topic gone (do not add to tree/history)
+        if (isEmptyPayload(msg)) {
+          setRoot((prev) => clearTopicMessages(prev, payload.topic))
+          setSelectedPath((prev) => (prev === payload.topic ? null : prev))
+          return
+        }
         setRoot((prev) => insertMessage(prev, msg, payload.topic))
         const toBlink = [payload.topic]
         for (const ancestor of ancestorPaths(payload.topic)) {
@@ -430,6 +520,28 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
     })
   }
 
+  const handleDelete = async (): Promise<void> => {
+    if (selectedPath === null || status !== 'connected') {
+      return
+    }
+    const node = findNode(root, selectedPath)
+    if (!node) {
+      return
+    }
+    const paths = collectSubtreePaths(node)
+    for (const path of paths) {
+      await window.wassh.sendPluginMessage(tabId, pluginId, {
+        type: 'publish',
+        topic: mqttTopicFromPath(path),
+        payloadBase64: '',
+        qos: MQTT_DELETE_QOS,
+        retain: true
+      })
+      setRoot((prev) => clearTopicMessages(prev, path))
+    }
+    setSelectedPath(null)
+  }
+
   const onFileChange = async (file: File | null): Promise<void> => {
     if (!file) {
       setFileName(null)
@@ -465,6 +577,11 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
               .filter(Boolean)
               .join(' ')}
             onClick={() => setSelectedPath(child.path)}
+            onDoubleClick={() => {
+              if (hasChildren) {
+                toggleExpand(child.path)
+              }
+            }}
           >
             {hasChildren ? (
               <span
@@ -500,7 +617,31 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
   }
 
   return (
-    <div className="plugin-panel mqtt-explorer">
+    <div
+      className="plugin-panel mqtt-explorer"
+      tabIndex={0}
+      onMouseDown={(e) => {
+        const target = e.target as HTMLElement
+        if (target.closest('input, textarea, select')) {
+          return
+        }
+        e.currentTarget.focus({ preventScroll: true })
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== 'Delete') {
+          return
+        }
+        const target = e.target as HTMLElement
+        if (target.closest('input, textarea, select')) {
+          return
+        }
+        if (selectedPath === null || status !== 'connected') {
+          return
+        }
+        e.preventDefault()
+        void handleDelete()
+      }}
+    >
       <div className="mqtt-status-bar">
         <span
           className={[
@@ -578,8 +719,19 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
           ) : (
             <>
               <div className="mqtt-detail-meta">
-                <div className="mqtt-detail-topic" title={displayTopicPath(selectedPath)}>
-                  {displayTopicPath(selectedPath)}
+                <div className="mqtt-detail-topic-row">
+                  <div className="mqtt-detail-topic" title={displayTopicPath(selectedPath)}>
+                    {displayTopicPath(selectedPath)}
+                  </div>
+                  <button
+                    type="button"
+                    className="danger mqtt-delete-btn"
+                    onClick={() => void handleDelete()}
+                    disabled={status !== 'connected'}
+                    title="Remove topic by publishing an empty retained message"
+                  >
+                    Delete
+                  </button>
                 </div>
                 <div className="mqtt-detail-facts">
                   <span>{selectedNode.messages.length} in history</span>

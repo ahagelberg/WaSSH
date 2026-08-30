@@ -1382,6 +1382,10 @@
   overflow: hidden;
 }
 
+.mqtt-explorer:focus {
+  outline: none;
+}
+
 .mqtt-status-bar {
   display: flex;
   align-items: center;
@@ -1553,11 +1557,25 @@
   padding: 0 var(--gap) 6px;
 }
 
+.mqtt-detail-topic-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
 .mqtt-detail-topic {
+  flex: 1;
+  min-width: 0;
   font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
   font-size: 12px;
   font-weight: 600;
   word-break: break-all;
+}
+
+.mqtt-delete-btn {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 8px;
 }
 
 .mqtt-detail-facts {
