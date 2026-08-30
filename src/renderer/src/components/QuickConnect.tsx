@@ -36,6 +36,7 @@ import {
 import {
   defaultPortForType,
   protocolConfigFrom,
+  reconnectModeFrom,
   sessionStyleFrom,
   tunnelConfigFrom
 } from '@shared/connection'
@@ -109,7 +110,8 @@ export default function QuickConnect({ onConnect }: Props) {
       ...tunnelConfigFrom(null),
       ephemeralPassword: type === CONNECTION_TYPE_SSH ? password : '',
       ephemeralPassphrase: '',
-      pluginSettings: {}
+      pluginSettings: {},
+      reconnectMode: reconnectModeFrom(null)
     })
   }
 

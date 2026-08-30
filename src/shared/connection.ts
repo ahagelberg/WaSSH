@@ -24,9 +24,13 @@ import {
   DEFAULT_SSH_PORT,
   DEFAULT_TELNET_PORT,
   DEFAULT_TUNNEL_LISTEN_HOST,
+  DEFAULT_RECONNECT_MODE,
   DEFAULT_X11_FORWARDING,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
+  RECONNECT_MODE_ALWAYS,
+  RECONNECT_MODE_NONE,
+  RECONNECT_MODE_ON_FOCUS,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
   SERIAL_BAUD_MAX,
@@ -57,6 +61,7 @@ import {
   type ConnectionType,
   type CursorStyle,
   type HostProfile,
+  type ReconnectMode,
   type SerialConfig,
   type SerialDataBits,
   type SerialFlowControl,
@@ -488,6 +493,31 @@ export function protocolConfigFrom(
   }
 }
 
+export function reconnectModeFrom(
+  src: Partial<Pick<ConnectionParams, 'reconnectMode'>> | null | undefined,
+  fallback: ReconnectMode = DEFAULT_RECONNECT_MODE
+): ReconnectMode {
+  const value = src?.reconnectMode
+  if (
+    value === RECONNECT_MODE_NONE ||
+    value === RECONNECT_MODE_ON_FOCUS ||
+    value === RECONNECT_MODE_ALWAYS
+  ) {
+    return value
+  }
+  return fallback
+}
+
+/** True when a drop should schedule backoff retries */
+export function reconnectModeSchedulesBackoff(mode: ReconnectMode): boolean {
+  return mode === RECONNECT_MODE_ALWAYS
+}
+
+/** True when window focus / wake should trigger an immediate reconnect */
+export function reconnectModeWantsFocus(mode: ReconnectMode): boolean {
+  return mode === RECONNECT_MODE_ON_FOCUS || mode === RECONNECT_MODE_ALWAYS
+}
+
 function serialParityAbbrev(parity: SerialParity): string {
   if (parity === SERIAL_PARITY_EVEN) {
     return 'E'
@@ -563,7 +593,8 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     ...tunnelConfigFrom(host),
     ephemeralPassword: '',
     ephemeralPassphrase: '',
-    pluginSettings: normalizeHostPluginSettings(host.pluginSettings)
+    pluginSettings: normalizeHostPluginSettings(host.pluginSettings),
+    reconnectMode: reconnectModeFrom(host)
   }
 }
 
@@ -585,7 +616,8 @@ export function hostProfileFromConnection(
     ...protocolConfigFrom(src),
     ...sessionStyleFrom(src),
     ...tunnelConfigFrom(src),
-    pluginSettings: normalizeHostPluginSettings(src.pluginSettings)
+    pluginSettings: normalizeHostPluginSettings(src.pluginSettings),
+    reconnectMode: reconnectModeFrom(src)
   }
 }
 

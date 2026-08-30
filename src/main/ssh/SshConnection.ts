@@ -3,9 +3,10 @@ import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
 import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import { Readable } from 'stream'
-import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection } from '../../shared/connection'
+import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus } from '../../shared/connection'
 import {
   ConnectionParams,
+  DEFAULT_RECONNECT_MODE,
   DEFAULT_TERM_COLS,
   DEFAULT_TERM_ROWS,
   DEFAULT_TERM_TYPE,
@@ -15,7 +16,8 @@ import {
   RECONNECT_MAX_BACKOFF_MS,
   SavePasswordDecision,
   SavePasswordPrompt,
-  SessionStatus
+  SessionStatus,
+  type ReconnectMode
 } from '../../shared/types'
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore } from '../store/sessionStore'
@@ -25,6 +27,8 @@ import { TunnelManager } from './TunnelManager'
 const CONNECT_READY_TIMEOUT_MS = 20000
 /** Status when the remote shell ends (logout / exit), not a network drop */
 const SESSION_CLOSED_MESSAGE = 'Session closed'
+/** ms → whole seconds for reconnect status text */
+const MS_PER_SECOND = 1000
 
 export class SshConnection extends EventEmitter {
   private client: Client | null = null
@@ -41,8 +45,7 @@ export class SshConnection extends EventEmitter {
   private termType = DEFAULT_TERM_TYPE
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private autoReconnect = false
-  private maxReconnectAttempts = 0
+  private reconnectMode: ReconnectMode = DEFAULT_RECONNECT_MODE
   private intentionalDisconnect = false
   private authInputActive = false
   private everConnected = false
@@ -62,6 +65,7 @@ export class SshConnection extends EventEmitter {
     private sessionStore: SessionStore
   ) {
     super()
+    this.reconnectMode = reconnectModeFrom(connection)
   }
 
   getConnection(): ConnectionParams {
@@ -70,11 +74,17 @@ export class SshConnection extends EventEmitter {
 
   updateConnection(partial: Partial<ConnectionParams>): void {
     this.connection = { ...this.connection, ...partial }
+    if (partial.reconnectMode !== undefined) {
+      this.setReconnectPolicy(reconnectModeFrom(this.connection))
+    }
   }
 
-  setReconnectPolicy(enabled: boolean, maxAttempts: number): void {
-    this.autoReconnect = enabled
-    this.maxReconnectAttempts = maxAttempts
+  setReconnectPolicy(mode: ReconnectMode): void {
+    this.reconnectMode = mode
+  }
+
+  wantsFocusReconnect(): boolean {
+    return reconnectModeWantsFocus(this.reconnectMode)
   }
 
   async connect(cols: number, rows: number, termType: string): Promise<void> {
@@ -835,14 +845,15 @@ export class SshConnection extends EventEmitter {
   }
 
   private scheduleReconnect(): void {
-    if (!this.autoReconnect || this.intentionalDisconnect || this.disposed || !this.everConnected) {
+    if (
+      !reconnectModeSchedulesBackoff(this.reconnectMode) ||
+      this.intentionalDisconnect ||
+      this.disposed ||
+      !this.everConnected
+    ) {
       return
     }
     if (this.reconnectTimer) {
-      return
-    }
-    if (this.reconnectAttempt >= this.maxReconnectAttempts) {
-      this.emitStatus('failed', 'Reconnect attempts exhausted')
       return
     }
     const attempt = this.reconnectAttempt
@@ -851,10 +862,8 @@ export class SshConnection extends EventEmitter {
       RECONNECT_INITIAL_BACKOFF_MS * 2 ** attempt,
       RECONNECT_MAX_BACKOFF_MS
     )
-    this.emitStatus(
-      'reconnecting',
-      `Attempt ${this.reconnectAttempt}/${this.maxReconnectAttempts}`
-    )
+    const delaySec = Math.max(1, Math.round(delay / MS_PER_SECOND))
+    this.emitStatus('reconnecting', `Attempt ${this.reconnectAttempt} (in ${delaySec}s)`)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       void this.open()

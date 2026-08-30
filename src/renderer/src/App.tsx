@@ -18,6 +18,7 @@ import {
   hostToConnection,
   hostProfileFromConnection,
   protocolConfigFrom,
+  reconnectModeFrom,
   resolveSessionStyle,
   sessionStyleDefaultsFrom,
   sessionStyleOverridesFrom,
@@ -82,7 +83,8 @@ function emptyHost(): HostProfile {
     ...proto,
     ...emptySessionStyleOverrides(),
     ...tunnelConfigFrom(null),
-    pluginSettings: {}
+    pluginSettings: {},
+    reconnectMode: reconnectModeFrom(null)
   }
 }
 
@@ -123,7 +125,8 @@ export default function App() {
         ...protocolConfigFrom(h),
         ...sessionStyleOverridesFrom(h),
         ...tunnelConfigFrom(h),
-        pluginSettings: h.pluginSettings ?? {}
+        pluginSettings: h.pluginSettings ?? {},
+        reconnectMode: reconnectModeFrom(h)
       }))
     )
   }, [])
@@ -143,7 +146,8 @@ export default function App() {
         ...tunnelConfigFrom(t.connection),
         ephemeralPassword: '',
         ephemeralPassphrase: '',
-        pluginSettings: t.connection.pluginSettings ?? {}
+        pluginSettings: t.connection.pluginSettings ?? {},
+        reconnectMode: reconnectModeFrom(t.connection)
       },
       active: t.id === activeRef.current,
       activePluginIds: t.activePluginIds,
@@ -211,7 +215,8 @@ export default function App() {
           ...t.connection,
           ...protocolConfigFrom(t.connection),
           ...sessionStyleOverridesFrom(t.connection),
-          ...tunnelConfigFrom(t.connection)
+          ...tunnelConfigFrom(t.connection),
+          reconnectMode: reconnectModeFrom(t.connection)
         },
         status: 'connecting',
         activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
@@ -422,7 +427,8 @@ export default function App() {
               ...t,
               connection: {
                 ...t.connection,
-                pluginSettings: host.pluginSettings
+                pluginSettings: host.pluginSettings,
+                reconnectMode: host.reconnectMode
               }
             }
           : t
@@ -430,7 +436,10 @@ export default function App() {
     )
     for (const t of tabsRef.current) {
       if (t.connection.hostId === host.id) {
-        void window.wassh.updateConnection(t.id, { pluginSettings: host.pluginSettings })
+        void window.wassh.updateConnection(t.id, {
+          pluginSettings: host.pluginSettings,
+          reconnectMode: host.reconnectMode
+        })
       }
     }
   }
@@ -725,7 +734,8 @@ export default function App() {
                         passwordVaultId: host.passwordVaultId || t.connection.passwordVaultId,
                         passphraseVaultId:
                           host.passphraseVaultId || t.connection.passphraseVaultId,
-                        pluginSettings: host.pluginSettings
+                        pluginSettings: host.pluginSettings,
+                        reconnectMode: host.reconnectMode
                       }
                     }
                   : t
@@ -743,6 +753,7 @@ export default function App() {
             void window.wassh.updateConnection(tabId, {
               pluginSettings: connection.pluginSettings,
               name: connection.name,
+              reconnectMode: connection.reconnectMode,
               ...sessionStyleOverridesFrom(connection),
               ...tunnelConfigFrom(connection)
             })
@@ -754,7 +765,8 @@ export default function App() {
                     ...existing,
                     ...sessionStyleOverridesFrom(connection),
                     ...tunnelConfigFrom(connection),
-                    pluginSettings: connection.pluginSettings
+                    pluginSettings: connection.pluginSettings,
+                    reconnectMode: connection.reconnectMode
                   },
                   '',
                   ''

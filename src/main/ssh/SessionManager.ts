@@ -8,9 +8,9 @@ import {
   SessionStatus,
   type ConnectionParams
 } from '../../shared/types'
-import { connectionTypeOf } from '../../shared/connection'
+import { connectionTypeOf, reconnectModeFrom } from '../../shared/connection'
 import { CredentialVault } from '../store/credentialVault'
-import { KnownHostsStore, SessionStore, SettingsStore } from '../store/sessionStore'
+import { KnownHostsStore, SessionStore } from '../store/sessionStore'
 import { SerialConnection } from '../serial/SerialConnection'
 import { TelnetConnection } from '../telnet/TelnetConnection'
 import { SshConnection } from './SshConnection'
@@ -30,7 +30,6 @@ export class SessionManager {
     private vault: CredentialVault,
     private knownHosts: KnownHostsStore,
     private sessionStore: SessionStore,
-    private settingsStore: SettingsStore,
     private getWindow: () => BrowserWindow | null
   ) {}
 
@@ -55,8 +54,7 @@ export class SessionManager {
   }
 
   private wire(conn: LiveSession): void {
-    const settings = this.settingsStore.get()
-    conn.setReconnectPolicy(settings.autoReconnectOnDrop, settings.reconnectMaxAttempts)
+    conn.setReconnectPolicy(reconnectModeFrom(conn.getConnection()))
 
     conn.on('data', (data: string) => {
       const pipeline = this.pipeline
@@ -196,13 +194,6 @@ export class SessionManager {
     }
   }
 
-  updateReconnectPolicies(): void {
-    const settings = this.settingsStore.get()
-    for (const conn of Array.from(this.sessions.values())) {
-      conn.setReconnectPolicy(settings.autoReconnectOnDrop, settings.reconnectMaxAttempts)
-    }
-  }
-
   disposeAll(): void {
     for (const id of Array.from(this.sessions.keys())) {
       this.disconnect(id)
@@ -215,9 +206,16 @@ export class SessionManager {
     }
   }
 
-  reconnectOnWake(): void {
+  /** Immediate reconnect for sessions with On focus or Always mode */
+  reconnectOnFocus(): void {
     for (const conn of Array.from(this.sessions.values())) {
-      conn.reconnectNow()
+      if (conn.wantsFocusReconnect()) {
+        conn.reconnectNow()
+      }
     }
+  }
+
+  reconnectOnWake(): void {
+    this.reconnectOnFocus()
   }
 }

@@ -22,6 +22,8 @@
   --monitor-gauge-size-compact: 48px;
   --monitor-spark-height: 40px;
   --monitor-spark-height-compact: 28px;
+  --monitor-net: #a78bfa;
+  --monitor-toggle-height: 22px;
   --mqtt-tree-indent: 14px;
   --mqtt-blink-bg: color-mix(in srgb, var(--accent) 35%, transparent);
   --mqtt-history-max-height: 180px;
@@ -429,8 +431,15 @@
 .monitor-header {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
   flex-shrink: 0;
+}
+
+.monitor-header-top {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
 .monitor-title {
@@ -448,12 +457,42 @@
   text-overflow: ellipsis;
 }
 
+.monitor-section-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.monitor-section-toggle {
+  height: var(--monitor-toggle-height);
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 999px;
+}
+
+.monitor-section-toggle.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
 .monitor-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
   min-width: 0;
   min-height: 0;
+}
+
+.monitor-overview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
 }
 
 .monitor-gauges {
@@ -634,6 +673,77 @@
   white-space: nowrap;
 }
 
+.monitor-tables {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.monitor-section {
+  padding: 8px 10px;
+  border-radius: var(--monitor-card-radius);
+  background: var(--bg-input);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  min-width: 0;
+  overflow: auto;
+}
+
+.monitor-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.monitor-section-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.monitor-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 2px 6px 4px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  white-space: nowrap;
+}
+
+.monitor-table td {
+  padding: 3px 6px 3px 0;
+  vertical-align: top;
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.monitor-table .monitor-num {
+  font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  white-space: nowrap;
+  max-width: none;
+}
+
+.monitor-table .monitor-cmd,
+.monitor-table .monitor-user,
+.monitor-table .monitor-iface {
+  max-width: 8rem;
+}
+
+.monitor-network .monitor-section-title {
+  color: color-mix(in srgb, var(--monitor-net) 70%, var(--text-muted));
+}
+
 /* Medium+ (--monitor-cq-md): gauges side-by-side */
 @container server-monitor (min-width: 360px) {
   .monitor-gauges {
@@ -672,7 +782,7 @@
   }
 
   .monitor-facts {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 8px 12px;
   }
 
@@ -685,31 +795,44 @@
   .monitor-fact strong {
     text-align: left;
   }
+
+  .monitor-fact-wide {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .monitor-fact-wide strong {
+    text-align: right;
+  }
+
+  .monitor-tables {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .monitor-tables > :only-child {
+    grid-column: 1 / -1;
+  }
 }
 
 /* Extra wide + tall (--monitor-cq-xl): gauges | sparks */
 @container server-monitor (min-width: 760px) and (min-height: 280px) {
-  .monitor-body {
+  .monitor-overview {
     display: grid;
     grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
-    grid-template-areas:
-      "gauges sparks"
-      "facts facts";
     gap: 10px 12px;
     align-items: start;
   }
 
-  .monitor-gauges {
-    grid-area: gauges;
+  .monitor-overview > :only-child {
+    grid-column: 1 / -1;
   }
 
   .monitor-sparks {
-    grid-area: sparks;
     align-self: stretch;
-  }
-
-  .monitor-facts {
-    grid-area: facts;
   }
 }
 
@@ -717,21 +840,44 @@
 @container server-monitor (max-height: 240px) and (min-width: 480px) {
   .monitor-header {
     flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .monitor-header-top {
+    flex-direction: row;
     align-items: baseline;
     gap: 8px;
+    min-width: 0;
   }
 
   .monitor-title {
     flex-shrink: 0;
   }
 
+  .monitor-section-toggles {
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
   .monitor-body {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
     align-items: stretch;
     flex: 1;
     min-height: 0;
+  }
+
+  .monitor-overview {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+    min-height: 0;
+  }
+
+  .monitor-overview > :only-child {
+    grid-column: 1 / -1;
   }
 
   .monitor-gauges {
@@ -786,6 +932,7 @@
     gap: 4px;
     padding: 6px 8px;
     grid-template-columns: none;
+    overflow: auto;
   }
 
   .monitor-fact {
@@ -796,6 +943,14 @@
 
   .monitor-fact strong {
     text-align: right;
+  }
+
+  .monitor-fact-wide {
+    display: none;
+  }
+
+  .monitor-tables {
+    display: none;
   }
 
   .plugin-monitor-meta {

@@ -146,6 +146,10 @@ function createWindow(): void {
     mainWindow?.show()
   })
 
+  mainWindow.on('focus', () => {
+    sessions?.reconnectOnFocus()
+  })
+
   mainWindow.webContents.setWindowOpenHandler((details) => {
     void shell.openExternal(details.url)
     return { action: 'deny' }
@@ -206,13 +210,13 @@ app.whenReady().then(() => {
   const sessionStore = new SessionStore()
   const tabStore = new TabStore()
   settingsStore = new SettingsStore()
+  sessionStore.migrateReconnectModes()
   const knownHosts = new KnownHostsStore()
   const pluginData = new PluginDataStore()
   sessions = new SessionManager(
     vault,
     knownHosts,
     sessionStore,
-    settingsStore,
     getWindow
   )
   pluginSystem = createPluginSystem(settingsStore, sessionStore, sessions, getWindow, pluginData)

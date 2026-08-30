@@ -223,11 +223,25 @@ export const THEME_WINDOW_BACKGROUND: Record<AppTheme, string> = {
 /** Mid-session reconnect: initial backoff ms */
 export const RECONNECT_INITIAL_BACKOFF_MS = 1000
 
-/** Mid-session reconnect: max backoff ms */
-export const RECONNECT_MAX_BACKOFF_MS = 30000
+/** Mid-session reconnect: max backoff (10 minutes) */
+export const RECONNECT_MAX_BACKOFF_MS = 10 * 60 * 1000
 
-/** Mid-session reconnect: default max attempts */
-export const DEFAULT_RECONNECT_MAX_ATTEMPTS = 10
+/** No automatic reconnect after a drop */
+export const RECONNECT_MODE_NONE = 'none'
+
+/** Reconnect when the app window gains focus (or after wake) */
+export const RECONNECT_MODE_ON_FOCUS = 'onFocus'
+
+/** Keep retrying with backoff; also reconnect on focus / wake */
+export const RECONNECT_MODE_ALWAYS = 'always'
+
+export type ReconnectMode =
+  | typeof RECONNECT_MODE_NONE
+  | typeof RECONNECT_MODE_ON_FOCUS
+  | typeof RECONNECT_MODE_ALWAYS
+
+/** Default for new hosts / quick connect (matches prior global auto-reconnect) */
+export const DEFAULT_RECONNECT_MODE: ReconnectMode = RECONNECT_MODE_ALWAYS
 
 /** Wait after OS resume so the network stack is up before reconnecting */
 export const WAKE_RECONNECT_DELAY_MS = 2000
@@ -334,6 +348,8 @@ export interface HostProfile {
    * Populated from plugins that contribute hostSettingsSchema.
    */
   pluginSettings: Record<string, Record<string, unknown>>
+  /** How to reconnect after a mid-session drop */
+  reconnectMode: ReconnectMode
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */
@@ -383,6 +399,8 @@ export interface ConnectionParams {
   ephemeralPassphrase: string
   /** Per-plugin host-scoped settings for this tab (copied from host on connect) */
   pluginSettings: Record<string, Record<string, unknown>>
+  /** How to reconnect after a mid-session drop */
+  reconnectMode: ReconnectMode
 }
 
 export interface TabSnapshot {
@@ -397,8 +415,6 @@ export interface TabSnapshot {
 
 export interface AppSettings {
   reconnectOnStartup: boolean
-  autoReconnectOnDrop: boolean
-  reconnectMaxAttempts: number
   termType: string
   sidebarCollapsed: boolean
   windowBounds: WindowBounds | null
@@ -442,8 +458,6 @@ export const DEFAULT_SESSION_STYLE_DEFAULTS: SessionStyleDefaults = {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   reconnectOnStartup: true,
-  autoReconnectOnDrop: true,
-  reconnectMaxAttempts: DEFAULT_RECONNECT_MAX_ATTEMPTS,
   termType: DEFAULT_TERM_TYPE,
   sidebarCollapsed: false,
   windowBounds: null,

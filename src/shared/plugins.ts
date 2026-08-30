@@ -158,6 +158,37 @@ export const SERVER_MONITOR_DEFAULT_INTERVAL_MS = 1000
 /** Minimum poll interval for server monitor (ms) */
 export const SERVER_MONITOR_MIN_INTERVAL_MS = 500
 
+/** How many top processes to return per sample */
+export const SERVER_MONITOR_TOP_PROCESS_COUNT = 8
+
+/** Visibility defaults for monitor panel sections */
+export const SERVER_MONITOR_SHOW_GAUGES_DEFAULT = true
+export const SERVER_MONITOR_SHOW_SPARKS_DEFAULT = true
+export const SERVER_MONITOR_SHOW_STATUS_DEFAULT = true
+export const SERVER_MONITOR_SHOW_PROCESSES_DEFAULT = true
+export const SERVER_MONITOR_SHOW_NETWORK_DEFAULT = true
+
+/** One row from remote `ps` (CPU-sorted) */
+export interface ServerMonitorProcess {
+  pid: number
+  user: string
+  cpuPercent: number
+  memPercent: number
+  rssBytes: number
+  command: string
+}
+
+/** Per-interface counters and derived rates */
+export interface ServerMonitorNetIface {
+  name: string
+  rxBytes: number
+  txBytes: number
+  /** Bytes/sec; null until two samples exist */
+  rxRate: number | null
+  /** Bytes/sec; null until two samples exist */
+  txRate: number | null
+}
+
 /** Structured stats pushed from the server-monitor main module to the UI */
 export interface ServerMonitorSnapshot {
   updatedAt: number
@@ -166,6 +197,14 @@ export interface ServerMonitorSnapshot {
   load1: number
   load5: number
   load15: number
+  /** Kernel / OS summary from `uname` */
+  kernel: string
+  /** Logical CPU count */
+  cpuCount: number
+  /** Runnable threads (from loadavg) */
+  procsRunning: number
+  /** Total threads (from loadavg) */
+  procsTotal: number
   /** 0–100; null until two CPU samples exist */
   cpuPercent: number | null
   memTotalBytes: number
@@ -175,6 +214,8 @@ export interface ServerMonitorSnapshot {
   swapUsedBytes: number
   diskTotalBytes: number
   diskUsedBytes: number
+  processes: ServerMonitorProcess[]
+  network: ServerMonitorNetIface[]
   error?: string
 }
 

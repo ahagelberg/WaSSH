@@ -6,7 +6,12 @@ import {
   PLUGIN_ID_SERVER_MONITOR,
   MQTT_EXPLORER_DEFAULT_HOST,
   MQTT_EXPLORER_DEFAULT_PORT,
-  SERVER_MONITOR_DEFAULT_INTERVAL_MS
+  SERVER_MONITOR_DEFAULT_INTERVAL_MS,
+  SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
+  SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
+  SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
+  SERVER_MONITOR_SHOW_SPARKS_DEFAULT,
+  SERVER_MONITOR_SHOW_STATUS_DEFAULT
 } from '../../../shared/plugins'
 
 export const DEFAULT_MACRO_BUTTONS: PluginMacroButton[] = [
@@ -28,7 +33,7 @@ export const serverMonitorManifest: PluginManifest = {
   id: PLUGIN_ID_SERVER_MONITOR,
   name: 'Server monitor',
   version: '1.0.0',
-  description: 'CPU, memory, and disk stats via SSH exec without disturbing the shell.',
+  description: 'CPU, memory, disk, process, and network stats via SSH exec without disturbing the shell.',
   activation: 'manual',
   source: 'builtin',
   contributes: {
@@ -41,6 +46,41 @@ export const serverMonitorManifest: PluginManifest = {
         type: 'number',
         default: SERVER_MONITOR_DEFAULT_INTERVAL_MS,
         description: 'How often to refresh remote stats.'
+      },
+      {
+        key: 'showGauges',
+        label: 'Show gauges',
+        type: 'boolean',
+        default: SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
+        description: 'CPU, memory, and disk ring gauges.'
+      },
+      {
+        key: 'showSparks',
+        label: 'Show history graphs',
+        type: 'boolean',
+        default: SERVER_MONITOR_SHOW_SPARKS_DEFAULT,
+        description: 'Sparkline history for CPU, memory, and disk.'
+      },
+      {
+        key: 'showStatus',
+        label: 'Show status',
+        type: 'boolean',
+        default: SERVER_MONITOR_SHOW_STATUS_DEFAULT,
+        description: 'Uptime, load, swap, kernel, and process counts.'
+      },
+      {
+        key: 'showProcesses',
+        label: 'Show process list',
+        type: 'boolean',
+        default: SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
+        description: 'Top processes by CPU usage.'
+      },
+      {
+        key: 'showNetwork',
+        label: 'Show network',
+        type: 'boolean',
+        default: SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
+        description: 'Per-interface receive/transmit rates.'
       }
     ],
     views: [{ id: 'panel', placement: 'split-right', title: 'Server' }]

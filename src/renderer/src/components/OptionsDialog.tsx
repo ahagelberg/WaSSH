@@ -34,8 +34,6 @@ interface Props {
 function optionsPayload(draft: AppSettings): Partial<AppSettings> {
   return {
     reconnectOnStartup: draft.reconnectOnStartup,
-    autoReconnectOnDrop: draft.autoReconnectOnDrop,
-    reconnectMaxAttempts: draft.reconnectMaxAttempts,
     termType: draft.termType,
     theme: draft.theme,
     enabledPlugins: draft.enabledPlugins,
@@ -223,40 +221,6 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
               onChange={(e) => patch({ reconnectOnStartup: e.target.checked })}
             />
           </div>
-        )
-      },
-      {
-        id: 'connection',
-        title: 'Connection',
-        content: (
-          <>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <strong>Auto-reconnect on drop</strong>
-                <span>When an established session drops mid-session, retry with backoff.</span>
-              </div>
-              <input
-                type="checkbox"
-                checked={draft.autoReconnectOnDrop}
-                onChange={(e) => patch({ autoReconnectOnDrop: e.target.checked })}
-              />
-            </div>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <strong>Max reconnect attempts</strong>
-                <span>Stops auto-reconnect after this many failures.</span>
-              </div>
-              <input
-                type="number"
-                min={1}
-                max={100}
-                value={draft.reconnectMaxAttempts}
-                onChange={(e) =>
-                  patch({ reconnectMaxAttempts: Number(e.target.value) || 1 })
-                }
-              />
-            </div>
-          </>
         )
       },
       {

@@ -16,6 +16,9 @@ import {
   DEFAULT_SCROLLBACK_LINES,
   FONT_SIZE_MAX_PX,
   FONT_SIZE_MIN_PX,
+  RECONNECT_MODE_ALWAYS,
+  RECONNECT_MODE_NONE,
+  RECONNECT_MODE_ON_FOCUS,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
   SERIAL_BAUD_MAX,
@@ -47,6 +50,7 @@ import {
   type ConnectionType,
   type CursorStyle,
   type HostProfile,
+  type ReconnectMode,
   type SerialDataBits,
   type SerialFlowControl,
   type SerialParity,
@@ -61,6 +65,7 @@ import {
   hostToConnection,
   isSshConnectionType,
   protocolConfigFrom,
+  reconnectModeFrom,
   resolveSessionStyle,
   sessionStyleOverridesFrom,
   tunnelConfigFrom,
@@ -99,7 +104,8 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
       ...protocolConfigFrom(initial),
       ...sessionStyleOverridesFrom(initial),
       ...tunnelConfigFrom(initial),
-      pluginSettings: normalizeHostPluginSettings(initial.pluginSettings)
+      pluginSettings: normalizeHostPluginSettings(initial.pluginSettings),
+      reconnectMode: reconnectModeFrom(initial)
     }
   }
   return hostToConnection(initial)
@@ -583,6 +589,23 @@ export default function HostSessionSettingsDialog({
             </div>
           </>
         ) : null}
+        <div className="settings-row">
+          <div className="settings-row-label">
+            <strong>Reconnect</strong>
+            <span>
+              After a mid-session drop: none, when the window is focused, or keep retrying with
+              backoff (also on focus).
+            </span>
+          </div>
+          <select
+            value={form.reconnectMode}
+            onChange={(e) => patch({ reconnectMode: e.target.value as ReconnectMode })}
+          >
+            <option value={RECONNECT_MODE_NONE}>None</option>
+            <option value={RECONNECT_MODE_ON_FOCUS}>On focus</option>
+            <option value={RECONNECT_MODE_ALWAYS}>Always</option>
+          </select>
+        </div>
       </>
     )
 
@@ -985,7 +1008,8 @@ export default function HostSessionSettingsDialog({
         ...protocolConfigFrom(form),
         ...sessionStyleOverridesFrom(form),
         ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false }),
-        pluginSettings: normalizeHostPluginSettings(form.pluginSettings)
+        pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
+        reconnectMode: reconnectModeFrom(form)
       }
       onSaveHost(host, password, passphrase)
       onClose()
@@ -999,7 +1023,8 @@ export default function HostSessionSettingsDialog({
       ...tunnelConfigFrom(form),
       ephemeralPassword: password || form.ephemeralPassword,
       ephemeralPassphrase: passphrase || form.ephemeralPassphrase,
-      pluginSettings: normalizeHostPluginSettings(form.pluginSettings)
+      pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
+      reconnectMode: reconnectModeFrom(form)
     })
     onClose()
   }

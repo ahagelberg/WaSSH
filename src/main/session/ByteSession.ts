@@ -1,6 +1,12 @@
 import { EventEmitter } from 'events'
 import {
+  reconnectModeFrom,
+  reconnectModeSchedulesBackoff,
+  reconnectModeWantsFocus
+} from '../../shared/connection'
+import {
   ConnectionParams,
+  DEFAULT_RECONNECT_MODE,
   DEFAULT_TERM_COLS,
   DEFAULT_TERM_ROWS,
   DEFAULT_TERM_TYPE,
@@ -8,11 +14,15 @@ import {
   RECONNECT_INITIAL_BACKOFF_MS,
   RECONNECT_MAX_BACKOFF_MS,
   SavePasswordDecision,
-  SessionStatus
+  SessionStatus,
+  type ReconnectMode
 } from '../../shared/types'
 
 /** Status when the remote side ends the session (not a drop) */
 const SESSION_CLOSED_MESSAGE = 'Session closed'
+
+/** ms → whole seconds for reconnect status text */
+const MS_PER_SECOND = 1000
 
 export abstract class ByteSession extends EventEmitter {
   protected disposed = false
@@ -21,8 +31,7 @@ export abstract class ByteSession extends EventEmitter {
   protected remoteEnded = false
   protected reconnectAttempt = 0
   protected reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  protected autoReconnect = false
-  protected maxReconnectAttempts = 0
+  protected reconnectMode: ReconnectMode = DEFAULT_RECONNECT_MODE
   /** True while open() is connecting, before the transport is ready */
   protected opening = false
   protected cols = DEFAULT_TERM_COLS
@@ -34,6 +43,7 @@ export abstract class ByteSession extends EventEmitter {
     protected connection: ConnectionParams
   ) {
     super()
+    this.reconnectMode = reconnectModeFrom(connection)
   }
 
   getConnection(): ConnectionParams {
@@ -42,11 +52,17 @@ export abstract class ByteSession extends EventEmitter {
 
   updateConnection(partial: Partial<ConnectionParams>): void {
     this.connection = { ...this.connection, ...partial }
+    if (partial.reconnectMode !== undefined) {
+      this.setReconnectPolicy(reconnectModeFrom(this.connection))
+    }
   }
 
-  setReconnectPolicy(enabled: boolean, maxAttempts: number): void {
-    this.autoReconnect = enabled
-    this.maxReconnectAttempts = maxAttempts
+  setReconnectPolicy(mode: ReconnectMode): void {
+    this.reconnectMode = mode
+  }
+
+  wantsFocusReconnect(): boolean {
+    return reconnectModeWantsFocus(this.reconnectMode)
   }
 
   respondHostKey(_decision: HostKeyDecision): void {
@@ -144,14 +160,15 @@ export abstract class ByteSession extends EventEmitter {
   }
 
   protected scheduleReconnect(): void {
-    if (!this.autoReconnect || this.intentionalDisconnect || this.disposed || !this.everConnected) {
+    if (
+      !reconnectModeSchedulesBackoff(this.reconnectMode) ||
+      this.intentionalDisconnect ||
+      this.disposed ||
+      !this.everConnected
+    ) {
       return
     }
     if (this.reconnectTimer) {
-      return
-    }
-    if (this.reconnectAttempt >= this.maxReconnectAttempts) {
-      this.emitStatus('failed', 'Reconnect attempts exhausted')
       return
     }
     const attempt = this.reconnectAttempt
@@ -160,10 +177,8 @@ export abstract class ByteSession extends EventEmitter {
       RECONNECT_INITIAL_BACKOFF_MS * 2 ** attempt,
       RECONNECT_MAX_BACKOFF_MS
     )
-    this.emitStatus(
-      'reconnecting',
-      `Attempt ${this.reconnectAttempt}/${this.maxReconnectAttempts}`
-    )
+    const delaySec = Math.max(1, Math.round(delay / MS_PER_SECOND))
+    this.emitStatus('reconnecting', `Attempt ${this.reconnectAttempt} (in ${delaySec}s)`)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       void this.open()

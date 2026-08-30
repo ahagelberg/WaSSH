@@ -4,16 +4,19 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import {
   AppSettings,
+  DEFAULT_RECONNECT_MODE,
   DEFAULT_SETTINGS,
   DEFAULT_SSH_PORT,
   DEFAULT_THEME,
   HostProfile,
   KnownHostEntry,
+  RECONNECT_MODE_NONE,
   TabSnapshot,
   type AppTheme,
-  type ConnectionParams
+  type ConnectionParams,
+  type ReconnectMode
 } from '../../shared/types'
-import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom } from '../../shared/connection'
+import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 import { normalizeHostPluginSettings } from '../../shared/plugins'
 
@@ -52,6 +55,10 @@ type StoredSettings = Partial<AppSettings> & {
   fontSizePx?: number
   fontFamily?: string
   scrollbackLines?: number
+  /** Removed; stripped on load */
+  autoReconnectOnDrop?: boolean
+  /** Removed; stripped on load */
+  reconnectMaxAttempts?: number
 }
 
 function storedStyleFallback(): {
@@ -67,7 +74,19 @@ function storedStyleFallback(): {
   }
 }
 
-function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile {
+/** Map removed global auto-reconnect toggle onto per-host default once */
+function legacyReconnectModeDefault(): ReconnectMode {
+  const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
+  if (raw.autoReconnectOnDrop === false) {
+    return RECONNECT_MODE_NONE
+  }
+  return DEFAULT_RECONNECT_MODE
+}
+
+function normalizeHost(
+  raw: Partial<HostProfile> & { id: string },
+  fallbackMode: ReconnectMode = DEFAULT_RECONNECT_MODE
+): HostProfile {
   return {
     id: raw.id,
     name: raw.name ?? '',
@@ -82,7 +101,8 @@ function normalizeHost(raw: Partial<HostProfile> & { id: string }): HostProfile 
     ...protocolConfigFrom(raw),
     ...sessionStyleFrom({ ...storedStyleFallback(), ...raw }),
     ...tunnelConfigFrom(raw),
-    pluginSettings: normalizeHostPluginSettings(raw.pluginSettings)
+    pluginSettings: normalizeHostPluginSettings(raw.pluginSettings),
+    reconnectMode: reconnectModeFrom(raw, fallbackMode)
   }
 }
 
@@ -102,8 +122,23 @@ function readHostsFile(): Partial<HostProfile>[] {
 }
 
 export class SessionStore {
+  /** Persist reconnectMode onto hosts/tabs that predate the per-host setting */
+  migrateReconnectModes(): void {
+    this.listHosts()
+    new TabStore().getTabs()
+  }
+
   listHosts(): HostProfile[] {
-    return readHostsFile().map((h) => normalizeHost({ ...h, id: h.id ?? randomUUID() }))
+    const fallbackMode = legacyReconnectModeDefault()
+    const rawList = readHostsFile()
+    const hosts = rawList.map((h) =>
+      normalizeHost({ ...h, id: h.id ?? randomUUID() }, fallbackMode)
+    )
+    const needsWrite = rawList.some((h) => h.reconnectMode === undefined)
+    if (needsWrite && hosts.length > 0) {
+      writeJson(HOSTS_FILE, hosts)
+    }
+    return hosts
   }
 
   saveHost(host: HostProfile): HostProfile {
@@ -134,7 +169,9 @@ export class SessionStore {
 export class TabStore {
   getTabs(): TabSnapshot[] {
     const fallback = storedStyleFallback()
-    return readJson<TabSnapshot[]>(TABS_FILE, []).map((t) => ({
+    const fallbackMode = legacyReconnectModeDefault()
+    const rawTabs = readJson<TabSnapshot[]>(TABS_FILE, [])
+    const tabs = rawTabs.map((t) => ({
       ...t,
       activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
       pluginLayout: normalizeTabPluginLayout(
@@ -147,9 +184,15 @@ export class TabStore {
         ...tunnelConfigFrom(t.connection),
         pluginSettings: normalizeHostPluginSettings(
           (t.connection as ConnectionParams & { pluginSettings?: unknown }).pluginSettings
-        )
+        ),
+        reconnectMode: reconnectModeFrom(t.connection, fallbackMode)
       }
     }))
+    const needsWrite = rawTabs.some((t) => t.connection?.reconnectMode === undefined)
+    if (needsWrite && tabs.length > 0) {
+      writeJson(TABS_FILE, tabs)
+    }
+    return tabs
   }
 
   saveTabs(tabs: TabSnapshot[]): void {
@@ -164,6 +207,8 @@ export class SettingsStore {
       fontSizePx: _fontSizePx,
       fontFamily: _fontFamily,
       scrollbackLines: _scrollbackLines,
+      autoReconnectOnDrop: _autoReconnectOnDrop,
+      reconnectMaxAttempts: _reconnectMaxAttempts,
       ...rest
     } = raw
     const theme: AppTheme = rest.theme === 'light' ? 'light' : DEFAULT_THEME

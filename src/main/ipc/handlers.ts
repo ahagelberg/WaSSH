@@ -44,7 +44,6 @@ export function registerIpc(
   ipcMain.handle('settings:set', async (_e, partial: Partial<AppSettings>) => {
     const prev = settingsStore.get()
     const next = settingsStore.set(partial)
-    sessions.updateReconnectPolicies()
     applyChromeTheme(next.theme, getWindow())
     if (partial.enabledPlugins) {
       await pluginHost.onEnabledPluginsChanged(prev.enabledPlugins, next.enabledPlugins)
