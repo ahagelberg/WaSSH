@@ -2,10 +2,6 @@
 
 :root {
   --plugin-toolbar-height: 32px;
-  --plugin-split-right-width: 440px;
-  --plugin-split-left-width: 220px;
-  --plugin-split-bottom-height: 160px;
-  --plugin-split-top-height: 120px;
   --plugin-outer-drop-band: 28px;
   --plugin-inner-drop-band: 36px;
   --plugin-splitter-size: 4px;
@@ -388,26 +384,6 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
-}
-
-.plugin-slot-split-left {
-  width: var(--plugin-split-left-width);
-  border-right-width: 1px;
-}
-
-.plugin-slot-split-right {
-  width: var(--plugin-split-right-width);
-  border-left-width: 1px;
-}
-
-.plugin-slot-split-top {
-  height: var(--plugin-split-top-height);
-  border-bottom-width: 1px;
-}
-
-.plugin-slot-split-bottom {
-  height: var(--plugin-split-bottom-height);
-  border-top-width: 1px;
 }
 
 .plugin-slot-overlay {

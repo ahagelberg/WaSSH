@@ -43,15 +43,15 @@ export const DEFAULT_DOCK_WIDTH_PX = 300
 /** Default dock height (px) */
 export const DEFAULT_DOCK_HEIGHT_PX = 160
 
-/** Minimum dock / leaf size (px) */
+/** Sole minimum for dock edges and split panes (px) */
 export const MIN_DOCK_SIZE_PX = 100
 
 /** Default split ratio when creating a split */
 export const DEFAULT_SPLIT_RATIO = 0.5
 
-/** Clamp for split ratios */
-export const MIN_SPLIT_RATIO = 0.2
-export const MAX_SPLIT_RATIO = 0.8
+/** Soft ratio bounds when container size is unknown */
+const SPLIT_RATIO_FALLBACK_MIN = 0.01
+const SPLIT_RATIO_FALLBACK_MAX = 0.99
 
 /** Outer edge hit band while dragging (px) */
 export const OUTER_DROP_BAND_PX = 28
@@ -95,11 +95,15 @@ export function emptyTabPluginLayout(): TabPluginLayout {
   }
 }
 
-export function clampSplitRatio(ratio: number): number {
+export function clampSplitRatio(ratio: number, totalPx = 0): number {
   if (!Number.isFinite(ratio)) {
     return DEFAULT_SPLIT_RATIO
   }
-  return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio))
+  if (totalPx > MIN_DOCK_SIZE_PX * 2) {
+    const minRatio = MIN_DOCK_SIZE_PX / totalPx
+    return Math.min(1 - minRatio, Math.max(minRatio, ratio))
+  }
+  return Math.min(SPLIT_RATIO_FALLBACK_MAX, Math.max(SPLIT_RATIO_FALLBACK_MIN, ratio))
 }
 
 export function collectPluginIds(node: LayoutNode | null): string[] {

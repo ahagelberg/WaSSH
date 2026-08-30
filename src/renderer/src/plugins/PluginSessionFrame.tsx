@@ -225,7 +225,7 @@ function LayoutTreeView({
           if (total <= 0) {
             return
           }
-          onSplitRatioChange(edge, path, clampSplitRatio(node.ratio + deltaPx / total))
+          onSplitRatioChange(edge, path, clampSplitRatio(node.ratio + deltaPx / total, total))
         }}
       />
       <div
