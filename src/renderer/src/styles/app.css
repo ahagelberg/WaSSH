@@ -14,6 +14,8 @@
   --tab-color-bar-width: 4px;
   --tab-active-border-width: 2px;
   --tab-bar-edge-width: 1px;
+  --tab-drop-indicator-width: 2px;
+  --tab-drop-indicator-inset: 0;
   --serial-combo-menu-max-height: 12rem;
 }
 
@@ -388,6 +390,7 @@ textarea:focus {
 }
 
 .tab-bar {
+  position: relative;
   display: flex;
   align-items: stretch;
   flex-shrink: 0;
@@ -396,6 +399,18 @@ textarea:focus {
   height: var(--tabbar-height);
   border-bottom: var(--tab-bar-edge-width) solid var(--border);
   background: var(--bg-panel-2);
+}
+
+.tab-drop-indicator {
+  position: absolute;
+  top: var(--tab-drop-indicator-inset);
+  bottom: var(--tab-drop-indicator-inset);
+  width: var(--tab-drop-indicator-width);
+  margin-left: calc(var(--tab-drop-indicator-width) / -2);
+  background: var(--accent);
+  border-radius: 1px;
+  pointer-events: none;
+  z-index: 2;
 }
 
 .tab {
@@ -418,6 +433,16 @@ textarea:focus {
 .tab.dragging {
   opacity: 0.45;
   cursor: grabbing;
+}
+
+.tab-bar.is-dragging .tab:hover {
+  border-color: transparent;
+  border-bottom-color: transparent;
+}
+
+.tab-bar.is-dragging .tab.active:hover {
+  border-color: var(--tab-active-border);
+  border-bottom-color: var(--bg-app);
 }
 
 .tab[data-tab-color]::before {

@@ -3,6 +3,8 @@ import type { SessionStatus } from '@shared/types'
 
 /** Drop before the tab if the pointer is left of this fraction of its width */
 const TAB_DROP_BEFORE_RATIO = 0.5
+/** Pointer movement (px) before a press becomes a tab drag */
+const TAB_DRAG_THRESHOLD_PX = 4
 
 export interface TabInfo {
   id: string
@@ -30,28 +32,56 @@ interface TabMenu {
   canSaveAsHost: boolean
 }
 
-function insertIndexForHover(
-  tabs: TabInfo[],
-  fromId: string,
-  overId: string,
-  clientX: number,
-  tabLeft: number,
-  tabWidth: number
-): number | null {
-  const from = tabs.findIndex((t) => t.id === fromId)
-  const over = tabs.findIndex((t) => t.id === overId)
-  if (from < 0 || over < 0) {
+interface DragState {
+  id: string
+  startX: number
+  startY: number
+  active: boolean
+  /** Gap index 0..tabs.length where the tab would be inserted */
+  dropGap: number | null
+}
+
+interface DropIndicator {
+  left: number
+}
+
+/** Gap index under the pointer: 0 = before first tab, length = after last. */
+function gapIndexAtX(bar: HTMLElement, clientX: number, tabCount: number): number {
+  const nodes = bar.querySelectorAll<HTMLElement>('[data-tab-id]')
+  for (let i = 0; i < nodes.length; i++) {
+    const rect = nodes[i].getBoundingClientRect()
+    const mid = rect.left + rect.width * TAB_DROP_BEFORE_RATIO
+    if (clientX < mid) {
+      return i
+    }
+  }
+  return tabCount
+}
+
+/** Pixel offset of the drop line relative to the tab bar, for gap `gap`. */
+function indicatorLeftForGap(bar: HTMLElement, gap: number): number {
+  const nodes = bar.querySelectorAll<HTMLElement>('[data-tab-id]')
+  const barRect = bar.getBoundingClientRect()
+  if (nodes.length === 0) {
+    return 0
+  }
+  if (gap >= nodes.length) {
+    const last = nodes[nodes.length - 1]
+    return last.getBoundingClientRect().right - barRect.left
+  }
+  return nodes[gap].getBoundingClientRect().left - barRect.left
+}
+
+/**
+ * Convert a visual gap index to the insert index expected by onReorder
+ * (index in the array after the dragged tab is removed).
+ * Returns null when the drop would not change order.
+ */
+function insertIndexFromGap(from: number, gap: number): number | null {
+  if (gap === from || gap === from + 1) {
     return null
   }
-  const before = clientX < tabLeft + tabWidth * TAB_DROP_BEFORE_RATIO
-  let insertIndex = over + (before ? 0 : 1)
-  if (from < insertIndex) {
-    insertIndex -= 1
-  }
-  if (insertIndex === from) {
-    return null
-  }
-  return insertIndex
+  return gap > from ? gap - 1 : gap
 }
 
 export default function TabBar({
@@ -65,7 +95,15 @@ export default function TabBar({
 }: Props) {
   const [menu, setMenu] = useState<TabMenu | null>(null)
   const [draggingId, setDraggingId] = useState<string | null>(null)
+  const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null)
   const suppressClick = useRef(false)
+  const barRef = useRef<HTMLDivElement>(null)
+  const dragRef = useRef<DragState | null>(null)
+  const tabsRef = useRef(tabs)
+  const onReorderRef = useRef(onReorder)
+
+  tabsRef.current = tabs
+  onReorderRef.current = onReorder
 
   useEffect(() => {
     if (!menu) {
@@ -85,6 +123,83 @@ export default function TabBar({
     return () => document.removeEventListener('mousedown', close)
   }, [menu])
 
+  useEffect(() => {
+    const onMove = (e: PointerEvent): void => {
+      const drag = dragRef.current
+      if (!drag) {
+        return
+      }
+      if (!drag.active) {
+        const dx = e.clientX - drag.startX
+        const dy = e.clientY - drag.startY
+        if (dx * dx + dy * dy < TAB_DRAG_THRESHOLD_PX * TAB_DRAG_THRESHOLD_PX) {
+          return
+        }
+        drag.active = true
+        setMenu(null)
+        setDraggingId(drag.id)
+      }
+
+      const bar = barRef.current
+      if (!bar) {
+        return
+      }
+      const list = tabsRef.current
+      const barRect = bar.getBoundingClientRect()
+      if (
+        e.clientY < barRect.top ||
+        e.clientY > barRect.bottom ||
+        e.clientX < barRect.left ||
+        e.clientX > barRect.right
+      ) {
+        return
+      }
+
+      const from = list.findIndex((t) => t.id === drag.id)
+      if (from < 0) {
+        return
+      }
+      const gap = gapIndexAtX(bar, e.clientX, list.length)
+      drag.dropGap = gap
+      const insertIndex = insertIndexFromGap(from, gap)
+      if (insertIndex === null) {
+        setDropIndicator(null)
+        return
+      }
+      setDropIndicator({ left: indicatorLeftForGap(bar, gap) })
+    }
+
+    const onUp = (): void => {
+      const drag = dragRef.current
+      if (!drag) {
+        return
+      }
+      if (drag.active) {
+        suppressClick.current = true
+        const list = tabsRef.current
+        const from = list.findIndex((t) => t.id === drag.id)
+        if (from >= 0 && drag.dropGap !== null) {
+          const insertIndex = insertIndexFromGap(from, drag.dropGap)
+          if (insertIndex !== null) {
+            onReorderRef.current(drag.id, insertIndex)
+          }
+        }
+      }
+      dragRef.current = null
+      setDraggingId(null)
+      setDropIndicator(null)
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+    return () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+    }
+  }, [])
+
   if (tabs.length === 0) {
     return null
   }
@@ -99,34 +214,34 @@ export default function TabBar({
   }
 
   return (
-    <div
-      className="tab-bar"
-      onDragOver={(e) => {
-        if (!draggingId) {
-          return
-        }
-        if (e.target !== e.currentTarget) {
-          return
-        }
-        e.preventDefault()
-        e.dataTransfer.dropEffect = 'move'
-        const last = tabs.length - 1
-        if (tabs[last]?.id !== draggingId) {
-          onReorder(draggingId, last)
-        }
-      }}
-    >
+    <div className={`tab-bar${draggingId ? ' is-dragging' : ''}`} ref={barRef}>
       {tabs.map((tab) => (
         <button
           key={tab.id}
           type="button"
-          draggable
-          className={`tab${tab.active ? ' active' : ''}${draggingId === tab.id ? ' dragging' : ''}`}
+          data-tab-id={tab.id}
+          className={`tab${tab.active && draggingId !== tab.id ? ' active' : ''}${draggingId === tab.id ? ' dragging' : ''}`}
           data-tab-color={tab.tabColor || undefined}
           onMouseDown={(e) => {
             // Don't move focus into the tab bar — TerminalView refocuses the active pane.
+            // HTML5 drag cannot start after preventDefault, so reorder uses pointer events.
             if (e.button === 0) {
               e.preventDefault()
+            }
+          }}
+          onPointerDown={(e) => {
+            if (e.button !== 0) {
+              return
+            }
+            if (e.target instanceof Element && e.target.closest('.tab-close')) {
+              return
+            }
+            dragRef.current = {
+              id: tab.id,
+              startX: e.clientX,
+              startY: e.clientY,
+              active: false,
+              dropGap: null
             }
           }}
           onClick={() => {
@@ -147,46 +262,11 @@ export default function TabBar({
               canSaveAsHost: tab.canSaveAsHost
             })
           }}
-          onDragStart={(e) => {
-            setMenu(null)
-            setDraggingId(tab.id)
-            e.dataTransfer.effectAllowed = 'move'
-            e.dataTransfer.setData('text/plain', tab.id)
-            onSelect(tab.id)
-          }}
-          onDragOver={(e) => {
-            if (!draggingId) {
-              return
-            }
-            e.preventDefault()
-            e.dataTransfer.dropEffect = 'move'
-            const rect = e.currentTarget.getBoundingClientRect()
-            const nextIndex = insertIndexForHover(
-              tabs,
-              draggingId,
-              tab.id,
-              e.clientX,
-              rect.left,
-              rect.width
-            )
-            if (nextIndex !== null) {
-              onReorder(draggingId, nextIndex)
-            }
-          }}
-          onDrop={(e) => {
-            e.preventDefault()
-            setDraggingId(null)
-          }}
-          onDragEnd={() => {
-            suppressClick.current = true
-            setDraggingId(null)
-          }}
         >
           <span className={`tab-status-dot ${tab.status}`} />
           <span className="tab-title">{tab.title}</span>
           <span
             className="tab-close"
-            draggable={false}
             role="button"
             tabIndex={-1}
             onClick={(e) => {
@@ -195,6 +275,9 @@ export default function TabBar({
             }}
             onMouseDown={(e) => {
               e.preventDefault()
+              e.stopPropagation()
+            }}
+            onPointerDown={(e) => {
               e.stopPropagation()
             }}
             onKeyDown={(e) => {
@@ -208,6 +291,13 @@ export default function TabBar({
           </span>
         </button>
       ))}
+      {dropIndicator ? (
+        <div
+          className="tab-drop-indicator"
+          aria-hidden="true"
+          style={{ left: dropIndicator.left }}
+        />
+      ) : null}
       {menu ? (
         <div
           className="tab-context-menu"
