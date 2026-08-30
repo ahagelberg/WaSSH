@@ -7,7 +7,9 @@ import type {
   ServerMonitorTemp
 } from '@shared/plugins'
 import {
+  BITS_PER_BYTE,
   BYTES_PER_KIB,
+  SERVER_MONITOR_MEGABIT_BITS,
   SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
   SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
   SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
@@ -192,13 +194,17 @@ function netTotals(ifaces: ServerMonitorNetIface[]): {
   txBytes: number
   rxRate: number | null
   txRate: number | null
+  /** Combined link capacity in bytes/sec; null if no iface reports speed */
+  capacityBytesPerSec: number | null
 } {
   let rxBytes = 0
   let txBytes = 0
   let rxRate = 0
   let txRate = 0
+  let capacityBits = 0
   let haveRx = false
   let haveTx = false
+  let haveSpeed = false
   for (const iface of ifaces) {
     rxBytes += iface.rxBytes
     txBytes += iface.txBytes
@@ -210,13 +216,30 @@ function netTotals(ifaces: ServerMonitorNetIface[]): {
       txRate += iface.txRate
       haveTx = true
     }
+    if (iface.speedBitsPerSec != null && iface.speedBitsPerSec > 0) {
+      capacityBits += iface.speedBitsPerSec
+      haveSpeed = true
+    }
   }
   return {
     rxBytes,
     txBytes,
     rxRate: haveRx ? rxRate : null,
-    txRate: haveTx ? txRate : null
+    txRate: haveTx ? txRate : null,
+    capacityBytesPerSec: haveSpeed ? capacityBits / BITS_PER_BYTE : null
   }
+}
+
+function formatLinkSpeed(bitsPerSec: number | null): string {
+  if (bitsPerSec == null || !Number.isFinite(bitsPerSec) || bitsPerSec <= 0) {
+    return MISSING
+  }
+  const mbps = bitsPerSec / SERVER_MONITOR_MEGABIT_BITS
+  if (mbps >= 1000) {
+    const gbps = mbps / 1000
+    return `${gbps >= 10 ? gbps.toFixed(0) : gbps.toFixed(1)} Gbps`
+  }
+  return `${mbps.toFixed(0)} Mbps`
 }
 
 function memSegments(snapshot: ServerMonitorSnapshot): {
@@ -545,21 +568,10 @@ function NetworkPanel({
   txHistory: number[]
 }): ReactElement {
   const totals = netTotals(ifaces)
-  let maxRate = 0
-  for (const iface of ifaces) {
-    if (iface.rxRate != null && iface.rxRate > maxRate) {
-      maxRate = iface.rxRate
-    }
-    if (iface.txRate != null && iface.txRate > maxRate) {
-      maxRate = iface.txRate
-    }
-  }
-  if (totals.rxRate != null && totals.rxRate > maxRate) {
-    maxRate = totals.rxRate
-  }
-  if (totals.txRate != null && totals.txRate > maxRate) {
-    maxRate = totals.txRate
-  }
+  const capacity =
+    totals.capacityBytesPerSec != null && totals.capacityBytesPerSec > 0
+      ? totals.capacityBytesPerSec
+      : Math.max(historyMax(rxHistory), historyMax(txHistory), 1)
 
   return (
     <div className="monitor-section monitor-network">
@@ -570,14 +582,14 @@ function NetworkPanel({
             title="Net ↓"
             values={rxHistory}
             tone="net"
-            scaleMax={historyMax(rxHistory)}
+            scaleMax={capacity}
             current={formatRate(totals.rxRate)}
           />
           <SparkCard
             title="Net ↑"
             values={txHistory}
             tone="net"
-            scaleMax={historyMax(txHistory)}
+            scaleMax={capacity}
             current={formatRate(totals.txRate)}
           />
         </div>
@@ -587,17 +599,24 @@ function NetworkPanel({
       ) : (
         <>
           <div className="monitor-net-totals">
-            <RateBar label="↓ RX" rate={totals.rxRate} maxRate={maxRate} tone="rx" />
-            <RateBar label="↑ TX" rate={totals.txRate} maxRate={maxRate} tone="tx" />
+            <RateBar label="↓ RX" rate={totals.rxRate} maxRate={capacity} tone="rx" />
+            <RateBar label="↑ TX" rate={totals.txRate} maxRate={capacity} tone="tx" />
             <div className="monitor-net-total-bytes">
               <span>Total RX {formatBytes(totals.rxBytes)}</span>
               <span>Total TX {formatBytes(totals.txBytes)}</span>
+              <span>
+                Cap{' '}
+                {totals.capacityBytesPerSec != null
+                  ? formatLinkSpeed(totals.capacityBytesPerSec * BITS_PER_BYTE)
+                  : MISSING}
+              </span>
             </div>
           </div>
           <table className="monitor-table">
             <thead>
               <tr>
                 <th scope="col">Iface</th>
+                <th scope="col">Speed</th>
                 <th scope="col">RX</th>
                 <th scope="col">TX</th>
                 <th scope="col">Total RX</th>
@@ -610,6 +629,7 @@ function NetworkPanel({
                   <td className="monitor-iface" title={iface.name}>
                     {iface.name}
                   </td>
+                  <td className="monitor-num">{formatLinkSpeed(iface.speedBitsPerSec)}</td>
                   <td className="monitor-num">{formatRate(iface.rxRate)}</td>
                   <td className="monitor-num">{formatRate(iface.txRate)}</td>
                   <td className="monitor-num">{formatBytes(iface.rxBytes)}</td>

@@ -10,6 +10,7 @@ import {
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
   SERVER_MONITOR_DISK_SECTOR_BYTES,
   SERVER_MONITOR_LOOPBACK_IFACE,
+  SERVER_MONITOR_MEGABIT_BITS,
   SERVER_MONITOR_MIN_INTERVAL_MS,
   SERVER_MONITOR_TEMP_MILLI_PER_C,
   SERVER_MONITOR_TOP_PROCESS_COUNT
@@ -36,6 +37,8 @@ const MONITOR_COMMAND = [
   '(cat /proc/diskstats 2>/dev/null || true)',
   "echo '===NET==='",
   '(cat /proc/net/dev 2>/dev/null || true)',
+  "echo '===NETSPEED==='",
+  'for i in /sys/class/net/*; do [ -d "$i" ] || continue; n=$(basename "$i"); [ "$n" = lo ] && continue; s=$(cat "$i/speed" 2>/dev/null || echo -1); echo "$n $s"; done 2>/dev/null || true',
   "echo '===TEMP==='",
   'for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] || continue; t=$(cat "$z/type" 2>/dev/null || echo zone); v=$(cat "$z/temp" 2>/dev/null || continue); echo "$t $v"; done 2>/dev/null || true',
   "echo '===PROCS==='",
@@ -202,8 +205,30 @@ function parseNetDev(block: string): Record<string, { rx: number; tx: number }> 
   return ifaces
 }
 
+/** sysfs net speed (Mbps) → bits/sec; invalid or down omitted */
+function parseNetSpeeds(block: string): Record<string, number> {
+  const speeds: Record<string, number> = {}
+  for (const line of block.split(/\n/)) {
+    const m = /^(\S+)\s+(-?\d+)$/.exec(line.trim())
+    if (!m) {
+      continue
+    }
+    const name = m[1]
+    if (name === SERVER_MONITOR_LOOPBACK_IFACE) {
+      continue
+    }
+    const mbps = Number(m[2])
+    if (!Number.isFinite(mbps) || mbps <= 0) {
+      continue
+    }
+    speeds[name] = mbps * SERVER_MONITOR_MEGABIT_BITS
+  }
+  return speeds
+}
+
 function netRates(
   current: Record<string, { rx: number; tx: number }>,
+  speeds: Record<string, number>,
   prev: NetCounters | null,
   now: number
 ): ServerMonitorNetIface[] {
@@ -212,12 +237,14 @@ function netRates(
   return names.map((name) => {
     const cur = current[name]
     const old = prev?.ifaces[name]
+    const speedBits = speeds[name]
     return {
       name,
       rxBytes: cur.rx,
       txBytes: cur.tx,
       rxRate: rateFromDelta(cur.rx, old?.rx, elapsedSec),
-      txRate: rateFromDelta(cur.tx, old?.tx, elapsedSec)
+      txRate: rateFromDelta(cur.tx, old?.tx, elapsedSec),
+      speedBitsPerSec: speedBits != null && speedBits > 0 ? speedBits : null
     }
   })
 }
@@ -367,7 +394,8 @@ function parseSample(
   const diskWriteRate = rateFromDelta(diskIo.writeBytes, prevDiskIo?.writeBytes, diskElapsed)
 
   const netCounters = parseNetDev(section(raw, 'NET'))
-  const network = netRates(netCounters, prevNet, now)
+  const netSpeeds = parseNetSpeeds(section(raw, 'NETSPEED'))
+  const network = netRates(netCounters, netSpeeds, prevNet, now)
   const temperatures = parseTemperatures(section(raw, 'TEMP'))
   const processes = parseProcesses(section(raw, 'PROCS'))
 

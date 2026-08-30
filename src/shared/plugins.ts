@@ -164,6 +164,12 @@ export const SERVER_MONITOR_TOP_PROCESS_COUNT = 24
 /** Bytes in one kibibyte (ps rss /proc/meminfo units) */
 export const BYTES_PER_KIB = 1024
 
+/** Bits per byte (link speed → byte rate) */
+export const BITS_PER_BYTE = 8
+
+/** sysfs net speed file unit (decimal megabits) */
+export const SERVER_MONITOR_MEGABIT_BITS = 1_000_000
+
 /** Linux /proc/diskstats sector size */
 export const SERVER_MONITOR_DISK_SECTOR_BYTES = 512
 
@@ -206,6 +212,8 @@ export interface ServerMonitorNetIface {
   rxRate: number | null
   /** Bytes/sec; null until two samples exist */
   txRate: number | null
+  /** Nominal link speed (bits/sec); null if unknown or down */
+  speedBitsPerSec: number | null
 }
 
 /** Thermal zone reading when /sys exposes it */
