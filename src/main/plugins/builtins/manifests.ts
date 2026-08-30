@@ -7,9 +7,18 @@ import {
 } from '../../../shared/plugins'
 
 export const DEFAULT_MACRO_BUTTONS: PluginMacroButton[] = [
-  { id: 'm1', label: 'ls', text: 'ls -la\n', hotkey: '' },
-  { id: 'm2', label: 'pwd', text: 'pwd\n', hotkey: '' },
-  { id: 'm3', label: 'clear', text: 'clear\n', hotkey: '' }
+  {
+    id: 'm1',
+    label: 'syslog',
+    text: 'tail -n 100 /var/log/syslog\n',
+    hotkey: ''
+  },
+  {
+    id: 'm2',
+    label: 'apt upgrade',
+    text: 'sudo apt update;sudo apt upgrade -y;sudo apt autoremove -y\n',
+    hotkey: ''
+  }
 ]
 
 export const serverMonitorManifest: PluginManifest = {
@@ -53,7 +62,7 @@ export const macroPadManifest: PluginManifest = {
   name: 'Macro pad',
   version: '1.0.0',
   description: 'Configurable buttons and hotkeys that inject text into the terminal.',
-  activation: 'auto',
+  activation: 'manual',
   source: 'builtin',
   contributes: {
     toolbar: { label: 'Macros' },
@@ -67,7 +76,7 @@ export const macroPadManifest: PluginManifest = {
         description: 'Label, text to send, and optional hotkey per button.'
       }
     ],
-    views: [{ id: 'panel', placement: 'split-bottom', title: 'Macros' }]
+    views: [{ id: 'panel', placement: 'split-right', title: 'Macros' }]
   }
 }
 
