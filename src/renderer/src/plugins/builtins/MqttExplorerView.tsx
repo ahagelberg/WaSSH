@@ -11,6 +11,19 @@ import type { PluginViewProps } from '../registry'
 
 type PublishMode = 'text' | 'json' | 'file'
 
+/** Default fraction of width for the topic tree pane */
+const MQTT_SPLIT_DEFAULT_RATIO = 0.42
+
+/** Minimum topic-tree pane fraction when dragging the splitter */
+const MQTT_SPLIT_MIN_RATIO = 0.18
+
+/** Maximum topic-tree pane fraction when dragging the splitter */
+const MQTT_SPLIT_MAX_RATIO = 0.75
+
+function clampSplitRatio(ratio: number): number {
+  return Math.min(MQTT_SPLIT_MAX_RATIO, Math.max(MQTT_SPLIT_MIN_RATIO, ratio))
+}
+
 interface TopicMessage {
   id: string
   timestamp: number
@@ -268,6 +281,9 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
   const [publishError, setPublishError] = useState<string | null>(null)
   const [fileName, setFileName] = useState<string | null>(null)
   const [fileBase64, setFileBase64] = useState<string | null>(null)
+  const [treeRatio, setTreeRatio] = useState(MQTT_SPLIT_DEFAULT_RATIO)
+  const splitRef = useRef<HTMLDivElement>(null)
+  const splitterLastX = useRef(0)
   const expandedRef = useRef(expanded)
   expandedRef.current = expanded
 
@@ -507,8 +523,11 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
         </button>
       </div>
 
-      <div className="mqtt-split">
-        <div className="mqtt-tree-pane">
+      <div className="mqtt-split" ref={splitRef}>
+        <div
+          className="mqtt-tree-pane"
+          style={{ flexGrow: treeRatio, flexBasis: 0 }}
+        >
           <div className="mqtt-pane-label">Topics</div>
           <div className="mqtt-tree">
             {root.children.size === 0 ? (
@@ -519,7 +538,40 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
           </div>
         </div>
 
-        <div className="mqtt-detail-pane">
+        <div
+          className="plugin-splitter plugin-splitter-vertical mqtt-splitter"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize topic and detail panes"
+          onPointerDown={(e) => {
+            if (e.button !== 0) {
+              return
+            }
+            e.preventDefault()
+            e.currentTarget.setPointerCapture(e.pointerId)
+            splitterLastX.current = e.clientX
+          }}
+          onPointerMove={(e) => {
+            if (!e.currentTarget.hasPointerCapture(e.pointerId)) {
+              return
+            }
+            const total = splitRef.current?.clientWidth ?? 0
+            if (total <= 0) {
+              return
+            }
+            const delta = e.clientX - splitterLastX.current
+            splitterLastX.current = e.clientX
+            if (delta === 0) {
+              return
+            }
+            setTreeRatio((prev) => clampSplitRatio(prev + delta / total))
+          }}
+        />
+
+        <div
+          className="mqtt-detail-pane"
+          style={{ flexGrow: 1 - treeRatio, flexBasis: 0 }}
+        >
           <div className="mqtt-pane-label">Details</div>
           {selectedPath === null || !selectedNode ? (
             <div className="mqtt-empty">Select a topic</div>

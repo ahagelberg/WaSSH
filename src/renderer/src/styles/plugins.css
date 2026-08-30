@@ -24,8 +24,8 @@
   --monitor-spark-height-compact: 28px;
   --mqtt-tree-indent: 14px;
   --mqtt-blink-bg: color-mix(in srgb, var(--accent) 35%, transparent);
-  --mqtt-tree-pane-width: 42%;
   --mqtt-history-max-height: 180px;
+  --mqtt-pane-min-width: 100px;
 }
 
 .plugin-toolbar {
@@ -626,7 +626,7 @@
   white-space: nowrap;
 }
 
-/* Medium+: gauges side-by-side; stacked ring+label for card columns */
+/* Medium+ (--monitor-cq-md): gauges side-by-side */
 @container server-monitor (min-width: 360px) {
   .monitor-gauges {
     display: grid;
@@ -655,7 +655,7 @@
   }
 }
 
-/* Large: sparks and facts in rows */
+/* Large (--monitor-cq-lg): sparks and facts in rows */
 @container server-monitor (min-width: 560px) {
   .monitor-sparks {
     display: grid;
@@ -679,7 +679,7 @@
   }
 }
 
-/* Extra wide + tall enough: gauges | sparks, facts spanning */
+/* Extra wide + tall (--monitor-cq-xl): gauges | sparks */
 @container server-monitor (min-width: 760px) and (min-height: 280px) {
   .monitor-body {
     display: grid;
@@ -705,12 +705,8 @@
   }
 }
 
-/* Short landscape (e.g. bottom dock): compact horizontal strip */
+/* Short landscape (--monitor-cq-short): compact horizontal strip */
 @container server-monitor (max-height: 240px) and (min-width: 480px) {
-  .plugin-server-monitor {
-    gap: 6px;
-  }
-
   .monitor-header {
     flex-direction: row;
     align-items: baseline;
@@ -799,7 +795,7 @@
   }
 }
 
-/* Ultra-narrow: tighter padding so tall side docks stay readable */
+/* Ultra-narrow side dock */
 @container server-monitor (max-width: 220px) {
   .monitor-gauge {
     padding: 8px;
@@ -956,18 +952,20 @@
 }
 
 .mqtt-tree-pane {
-  width: var(--mqtt-tree-pane-width);
-  min-width: 120px;
-  flex-shrink: 0;
+  min-width: var(--mqtt-pane-min-width);
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.mqtt-splitter {
+  flex-shrink: 0;
+  cursor: col-resize;
 }
 
 .mqtt-detail-pane {
-  flex: 1;
-  min-width: 0;
+  min-width: var(--mqtt-pane-min-width);
   min-height: 0;
   display: flex;
   flex-direction: column;
