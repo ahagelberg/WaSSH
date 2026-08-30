@@ -28,6 +28,12 @@ import { PluginDataStore } from './store/pluginDataStore'
 /** Accelerator for File > Preferences */
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
 
+/** Accelerator for Session > Reconnect */
+const RECONNECT_ACCELERATOR = 'CommandOrControl+R'
+
+/** Accelerator for Session > Reconnect All */
+const RECONNECT_ALL_ACCELERATOR = 'CommandOrControl+Shift+R'
+
 /** Network resets that happen on sleep/wake; must not crash the main process */
 const TRANSIENT_NETWORK_ERROR_CODES = new Set([
   'ECONNRESET',
@@ -183,6 +189,10 @@ function openAboutDialog(): void {
   getWindow()?.webContents.send('app:openAbout')
 }
 
+function sendToRenderer(channel: string): void {
+  getWindow()?.webContents.send(channel)
+}
+
 function installAppMenu(): void {
   const isMac = process.platform === 'darwin'
   const aboutLabel = `About ${APP_NAME}`
@@ -215,7 +225,7 @@ function installAppMenu(): void {
           label: 'Preferences',
           accelerator: PREFERENCES_ACCELERATOR,
           click: () => {
-            getWindow()?.webContents.send('app:openPreferences')
+            sendToRenderer('app:openPreferences')
           }
         },
         { type: 'separator' },
@@ -223,7 +233,33 @@ function installAppMenu(): void {
       ]
     },
     { role: 'editMenu' },
-    { role: 'viewMenu' },
+    {
+      label: 'Session',
+      submenu: [
+        {
+          label: 'Reconnect',
+          accelerator: RECONNECT_ACCELERATOR,
+          click: () => sendToRenderer('session:reconnectActive')
+        },
+        {
+          label: 'Reconnect All',
+          accelerator: RECONNECT_ALL_ACCELERATOR,
+          click: () => sendToRenderer('session:reconnectAll')
+        }
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+        { type: 'separator' },
+        { role: 'toggleDevTools' }
+      ]
+    },
     {
       role: 'help',
       submenu: [

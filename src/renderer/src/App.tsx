@@ -178,6 +178,22 @@ export default function App() {
     })
   }, [])
 
+  const reconnectTab = useCallback(
+    async (id: string): Promise<void> => {
+      const tab = tabsRef.current.find((t) => t.id === id)
+      if (!tab) {
+        return
+      }
+      const restoreIds = tab.activePluginIds.slice()
+      await window.wassh.disconnect(id)
+      if (restoreIds.length > 0) {
+        await window.wassh.queuePluginRestore(id, restoreIds)
+      }
+      await connectTab(id, tab.connection)
+    },
+    [connectTab]
+  )
+
   const openTab = useCallback(
     (connection: ConnectionParams, existingId?: string) => {
       const id = existingId || crypto.randomUUID()
@@ -324,6 +340,17 @@ export default function App() {
     const offAbout = window.wassh.onOpenAbout(() => {
       setShowAbout(true)
     })
+    const offReconnectActive = window.wassh.onReconnectActive(() => {
+      const id = activeRef.current
+      if (id) {
+        void reconnectTab(id)
+      }
+    })
+    const offReconnectAll = window.wassh.onReconnectAll(() => {
+      for (const tab of tabsRef.current) {
+        void reconnectTab(tab.id)
+      }
+    })
     const offPluginActive = window.wassh.onPluginActive((ev) => {
       setTabs((prev) =>
         prev.map((t) => {
@@ -349,9 +376,11 @@ export default function App() {
       offCloseActive()
       offPrefs()
       offAbout()
+      offReconnectActive()
+      offReconnectAll()
       offPluginActive()
     }
-  }, [refreshHosts, closeTab, cycleTab])
+  }, [refreshHosts, closeTab, cycleTab, reconnectTab])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
     void window.wassh.setSettings(partial).then((next) => {
@@ -496,18 +525,7 @@ export default function App() {
           onClose={closeTab}
           onReorder={reorderTabs}
           onReconnect={(id) => {
-            const tab = tabsRef.current.find((t) => t.id === id)
-            if (!tab) {
-              return
-            }
-            void (async () => {
-              const restoreIds = tab.activePluginIds.slice()
-              await window.wassh.disconnect(id)
-              if (restoreIds.length > 0) {
-                await window.wassh.queuePluginRestore(id, restoreIds)
-              }
-              await connectTab(id, tab.connection)
-            })()
+            void reconnectTab(id)
           }}
           onConfigure={(id) => {
             const tab = tabsRef.current.find((t) => t.id === id)

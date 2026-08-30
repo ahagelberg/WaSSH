@@ -586,6 +586,8 @@ export interface WasshApi {
   onCloseActiveTab: (cb: () => void) => () => void
   onOpenPreferences: (cb: () => void) => () => void
   onOpenAbout: (cb: () => void) => () => void
+  onReconnectActive: (cb: () => void) => () => void
+  onReconnectAll: (cb: () => void) => () => void
   onHostKeyPrompt: (cb: (prompt: HostKeyPrompt) => void) => () => void
   onSavePasswordPrompt: (cb: (prompt: SavePasswordPrompt) => void) => () => void
   onPluginActive: (cb: (ev: PluginActiveStateEvent) => void) => () => void
