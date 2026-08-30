@@ -125,7 +125,9 @@ export default function TerminalView({
       host.appendChild(bellLineRef.current)
     }
     fit.fit()
-    term.focus()
+    if (active) {
+      term.focus()
+    }
 
     const applyCursor = (): void => {
       term.options.cursorStyle = cursorStyleRef.current
@@ -300,11 +302,16 @@ export default function TerminalView({
       return
     }
     fitRef.current?.fit()
-    termRef.current?.focus()
     const term = termRef.current
     if (term) {
       onResize(tabId, term.cols, term.rows)
     }
+    // Defer past display:none → visible and past the control that activated this tab
+    // (tab bar, Connect, host menu) so xterm can accept focus.
+    const frame = requestAnimationFrame(() => {
+      termRef.current?.focus()
+    })
+    return () => cancelAnimationFrame(frame)
   }, [active, tabId, onResize])
 
   return (

@@ -123,6 +123,12 @@ export default function TabBar({
           draggable
           className={`tab${tab.active ? ' active' : ''}${draggingId === tab.id ? ' dragging' : ''}`}
           data-tab-color={tab.tabColor || undefined}
+          onMouseDown={(e) => {
+            // Don't move focus into the tab bar — TerminalView refocuses the active pane.
+            if (e.button === 0) {
+              e.preventDefault()
+            }
+          }}
           onClick={() => {
             if (suppressClick.current) {
               suppressClick.current = false
@@ -182,12 +188,15 @@ export default function TabBar({
             className="tab-close"
             draggable={false}
             role="button"
-            tabIndex={0}
+            tabIndex={-1}
             onClick={(e) => {
               e.stopPropagation()
               onClose(tab.id)
             }}
-            onMouseDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' || e.key === ' ') {
                 e.stopPropagation()
