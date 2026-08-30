@@ -35,7 +35,7 @@
     "@types/ssh2": "^1.15.4",
     "@vitejs/plugin-react": "^4.7.0",
     "electron": "^44.0.0",
-    "electron-builder": "^26.15.3",
+    "electron-builder": "^26.13.0",
     "electron-vite": "^5.0.0",
     "typescript": "^5.7.3",
     "vite": "^6.3.5"
@@ -46,8 +46,21 @@
     "directories": {
       "output": "release"
     },
+    "electronLanguages": [
+      "en-US"
+    ],
     "files": [
-      "out/**/*"
+      "out/**/*",
+      "!node_modules/@fontsource/**",
+      "!node_modules/@xterm/**",
+      "!node_modules/react/**",
+      "!node_modules/react-dom/**",
+      "!node_modules/scheduler/**",
+      "!node_modules/**/*.{iobj,ipdb,pdb,lib,obj,exp,ilk,tlog}",
+      "!node_modules/**/build/{Release,Debug}/obj/**",
+      "!node_modules/**/prebuilds/{android,darwin,linux}-*/**",
+      "!node_modules/**/prebuilds/win32-arm64/**",
+      "!node_modules/**/prebuilds/win32-ia32/**"
     ],
     "asarUnpack": [
       "**/*.node"
