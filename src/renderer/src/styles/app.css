@@ -17,6 +17,9 @@
   --tab-drop-indicator-width: 2px;
   --tab-drop-indicator-inset: 0;
   --serial-combo-menu-max-height: 12rem;
+  --terminal-search-inset: 8px;
+  --terminal-search-z: 20;
+  --terminal-search-input-width: 180px;
 }
 
 :root,
@@ -626,6 +629,58 @@ textarea:focus {
 .inline-banner code {
   font-family: Consolas, monospace;
   font-size: 12px;
+}
+
+.terminal-search-bar {
+  position: absolute;
+  top: var(--terminal-search-inset);
+  right: var(--terminal-search-inset);
+  z-index: var(--terminal-search-z);
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--gap);
+  padding: 6px 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.terminal-search-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.terminal-search-label input[type='text'] {
+  width: var(--terminal-search-input-width);
+  min-width: 0;
+}
+
+.terminal-search-case {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.terminal-search-case input {
+  width: auto;
+}
+
+.terminal-search-status {
+  color: var(--ok);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.terminal-search-status.is-miss {
+  color: var(--warn);
 }
 
 .empty-state {

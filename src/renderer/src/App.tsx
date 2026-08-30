@@ -33,6 +33,7 @@ import TabBar from './components/TabBar'
 import TerminalView from './components/TerminalView'
 import AboutDialog from './components/AboutDialog'
 import OptionsDialog from './components/OptionsDialog'
+import type { TerminalSearchController } from './terminalSearch'
 import HostSessionSettingsDialog, {
   type HostSessionMode
 } from './components/HostSessionSettingsDialog'
@@ -46,6 +47,12 @@ import {
 import PluginToolbar from './plugins/PluginToolbar'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
+/** Closed session settings retained for Ctrl+Shift+T reopen */
+const CLOSED_SESSION_RETENTION_MS = 60 * 60 * 1000
+
+/** Max closed sessions kept for reopen */
+const CLOSED_SESSION_STACK_MAX = 20
+
 interface TabState {
   id: string
   connection: ConnectionParams
@@ -55,6 +62,29 @@ interface TabState {
   savePasswordPrompt?: SavePasswordPrompt
   activePluginIds: string[]
   pluginLayout: TabPluginLayout
+}
+
+interface ClosedSession {
+  closedAt: number
+  connection: ConnectionParams
+  activePluginIds: string[]
+  pluginLayout: TabPluginLayout
+  insertIndex: number
+}
+
+function pruneClosedSessions(stack: ClosedSession[]): ClosedSession[] {
+  const cutoff = Date.now() - CLOSED_SESSION_RETENTION_MS
+  return stack.filter((e) => e.closedAt >= cutoff)
+}
+
+function cloneClosedSession(tab: TabState, insertIndex: number): ClosedSession {
+  return {
+    closedAt: Date.now(),
+    connection: structuredClone(tab.connection),
+    activePluginIds: tab.activePluginIds.slice(),
+    pluginLayout: structuredClone(tab.pluginLayout),
+    insertIndex
+  }
 }
 
 function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
@@ -98,6 +128,11 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null)
   const [showOptions, setShowOptions] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
+  const [showFind, setShowFind] = useState(false)
+  const [findQuery, setFindQuery] = useState('')
+  const [findCaseSensitive, setFindCaseSensitive] = useState(false)
+  const [findFound, setFindFound] = useState<boolean | null>(null)
+  const [findFocusNonce, setFindFocusNonce] = useState(0)
   const [hostEditor, setHostEditor] = useState<{
     mode: HostSessionMode
     initial: ConnectionParams | HostProfile
@@ -108,18 +143,32 @@ export default function App() {
   const [saveAsHostName, setSaveAsHostName] = useState('')
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const writers = useRef<Map<string, (data: string) => void>>(new Map())
+  const searchControllers = useRef<Map<string, TerminalSearchController>>(new Map())
+  const closedSessionsRef = useRef<ClosedSession[]>([])
+  const findQueryRef = useRef(findQuery)
+  const findCaseRef = useRef(findCaseSensitive)
+  const lastFindQueryRef = useRef('')
   const tabsRef = useRef(tabs)
+  const hostsRef = useRef(hosts)
   const activeRef = useRef(activeTabId)
   const settingsRef = useRef(settings)
   const restoredRef = useRef(false)
 
   tabsRef.current = tabs
+  hostsRef.current = hosts
   activeRef.current = activeTabId
   settingsRef.current = settings
+  findQueryRef.current = findQuery
+  findCaseRef.current = findCaseSensitive
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme || DEFAULT_THEME
   }, [settings.theme])
+
+  useEffect(() => {
+    lastFindQueryRef.current = ''
+    setFindFound(null)
+  }, [activeTabId])
 
   const refreshHosts = useCallback(async () => {
     const list = await window.wassh.listHosts()
@@ -194,6 +243,20 @@ export default function App() {
     [connectTab]
   )
 
+  const openSessionSettings = useCallback((id: string): void => {
+    const tab = tabsRef.current.find((t) => t.id === id)
+    if (!tab) {
+      return
+    }
+    setActiveTabId(id)
+    setHostEditor({
+      mode: 'editOpenSession',
+      initial: tab.connection,
+      connected: tab.status === 'connected',
+      linkTabId: id
+    })
+  }, [])
+
   const openTab = useCallback(
     (connection: ConnectionParams, existingId?: string) => {
       const id = existingId || crypto.randomUUID()
@@ -259,6 +322,16 @@ export default function App() {
   }, [refreshHosts, refreshPlugins, connectTab])
 
   const closeTab = useCallback((id: string): void => {
+    const list = tabsRef.current
+    const idx = list.findIndex((t) => t.id === id)
+    if (idx >= 0) {
+      const nextClosed = pruneClosedSessions(closedSessionsRef.current)
+      nextClosed.push(cloneClosedSession(list[idx], idx))
+      while (nextClosed.length > CLOSED_SESSION_STACK_MAX) {
+        nextClosed.shift()
+      }
+      closedSessionsRef.current = nextClosed
+    }
     void window.wassh.disconnect(id)
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id)
@@ -268,6 +341,37 @@ export default function App() {
       return next
     })
   }, [])
+
+  const reopenLastClosedSession = useCallback((): void => {
+    const stack = pruneClosedSessions(closedSessionsRef.current)
+    const entry = stack.pop()
+    closedSessionsRef.current = stack
+    if (!entry) {
+      return
+    }
+    const id = crypto.randomUUID()
+    const restoreIds = entry.activePluginIds.slice()
+    setTabs((prev) => {
+      const tab: TabState = {
+        id,
+        connection: entry.connection,
+        status: 'connecting',
+        activePluginIds: restoreIds,
+        pluginLayout: normalizeTabPluginLayout(entry.pluginLayout)
+      }
+      const next = prev.slice()
+      const at = Math.min(Math.max(entry.insertIndex, 0), next.length)
+      next.splice(at, 0, tab)
+      return next
+    })
+    setActiveTabId(id)
+    void (async () => {
+      if (restoreIds.length > 0) {
+        await window.wassh.queuePluginRestore(id, restoreIds)
+      }
+      await connectTab(id, entry.connection)
+    })()
+  }, [connectTab])
 
   const reorderTabs = useCallback((fromId: string, insertIndex: number): void => {
     setTabs((prev) => {
@@ -334,11 +438,18 @@ export default function App() {
         closeTab(id)
       }
     })
+    const offReopenClosed = window.wassh.onReopenClosedTab(() => {
+      reopenLastClosedSession()
+    })
     const offPrefs = window.wassh.onOpenPreferences(() => {
       setShowOptions(true)
     })
     const offAbout = window.wassh.onOpenAbout(() => {
       setShowAbout(true)
+    })
+    const offFind = window.wassh.onOpenFind(() => {
+      setShowFind(true)
+      setFindFocusNonce((n) => n + 1)
     })
     const offReconnectActive = window.wassh.onReconnectActive(() => {
       const id = activeRef.current
@@ -349,6 +460,12 @@ export default function App() {
     const offReconnectAll = window.wassh.onReconnectAll(() => {
       for (const tab of tabsRef.current) {
         void reconnectTab(tab.id)
+      }
+    })
+    const offSessionSettings = window.wassh.onOpenSessionSettings(() => {
+      const id = activeRef.current
+      if (id) {
+        openSessionSettings(id)
       }
     })
     const offPluginActive = window.wassh.onPluginActive((ev) => {
@@ -374,13 +491,16 @@ export default function App() {
       offSavePwd()
       offCycle()
       offCloseActive()
+      offReopenClosed()
       offPrefs()
       offAbout()
+      offFind()
       offReconnectActive()
       offReconnectAll()
+      offSessionSettings()
       offPluginActive()
     }
-  }, [refreshHosts, closeTab, cycleTab, reconnectTab])
+  }, [refreshHosts, closeTab, cycleTab, reconnectTab, openSessionSettings, reopenLastClosedSession])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
     void window.wassh.setSettings(partial).then((next) => {
@@ -390,20 +510,99 @@ export default function App() {
   }
 
   const onPluginSettingsPatch = useCallback(
-    (pluginId: string, partial: Record<string, unknown>) => {
+    (tabId: string, pluginId: string, partial: Record<string, unknown>) => {
       const plugin = plugins.find((p) => p.id === pluginId)
-      const current = mergePluginSettings(
-        plugin?.contributes.settingsSchema,
-        settingsRef.current.pluginSettings[pluginId]
-      )
-      const nextSettings = {
-        ...settingsRef.current.pluginSettings,
-        [pluginId]: { ...current, ...partial }
+      const hostSchema = plugin?.contributes.hostSettingsSchema
+      const appSchema = plugin?.contributes.settingsSchema
+      const hostKeys = new Set((hostSchema ?? []).map((f) => f.key))
+      const appKeys = new Set((appSchema ?? []).map((f) => f.key))
+
+      const hostPartial: Record<string, unknown> = {}
+      const appPartial: Record<string, unknown> = {}
+      for (const [key, value] of Object.entries(partial)) {
+        if (hostKeys.has(key)) {
+          hostPartial[key] = value
+        } else if (appKeys.has(key)) {
+          appPartial[key] = value
+        } else {
+          hostPartial[key] = value
+        }
       }
-      setSettings((prev) => ({ ...prev, pluginSettings: nextSettings }))
-      void window.wassh.setSettings({ pluginSettings: nextSettings }).then(setSettings)
+
+      if (Object.keys(appPartial).length > 0) {
+        const current = mergePluginSettings(
+          appSchema,
+          settingsRef.current.pluginSettings[pluginId]
+        )
+        const nextSettings = {
+          ...settingsRef.current.pluginSettings,
+          [pluginId]: { ...current, ...appPartial }
+        }
+        setSettings((prev) => ({ ...prev, pluginSettings: nextSettings }))
+        void window.wassh.setSettings({ pluginSettings: nextSettings }).then(setSettings)
+      }
+
+      if (Object.keys(hostPartial).length === 0) {
+        return
+      }
+
+      const tab = tabsRef.current.find((t) => t.id === tabId)
+      if (!tab) {
+        return
+      }
+      const hostId = tab.connection.hostId
+      const nextPluginValues = {
+        ...mergePluginSettings(hostSchema, tab.connection.pluginSettings?.[pluginId]),
+        ...hostPartial
+      }
+
+      const withPluginValues = (connection: ConnectionParams): ConnectionParams => ({
+        ...connection,
+        pluginSettings: {
+          ...connection.pluginSettings,
+          [pluginId]: nextPluginValues
+        }
+      })
+
+      setTabs((prev) =>
+        prev.map((t) => {
+          if (t.id === tabId || (hostId && t.connection.hostId === hostId)) {
+            return { ...t, connection: withPluginValues(t.connection) }
+          }
+          return t
+        })
+      )
+
+      for (const t of tabsRef.current) {
+        if (t.id === tabId || (hostId && t.connection.hostId === hostId)) {
+          void window.wassh.updateConnection(t.id, {
+            pluginSettings: withPluginValues(t.connection).pluginSettings
+          })
+        }
+      }
+
+      if (!hostId) {
+        return
+      }
+      const host = hostsRef.current.find((h) => h.id === hostId)
+      if (!host) {
+        return
+      }
+      const nextHost: HostProfile = {
+        ...host,
+        pluginSettings: {
+          ...host.pluginSettings,
+          [pluginId]: {
+            ...mergePluginSettings(hostSchema, host.pluginSettings?.[pluginId]),
+            ...hostPartial
+          }
+        }
+      }
+      void window.wassh.saveHost(nextHost).then(() => {
+        void refreshHosts()
+      })
     },
-    [plugins]
+    [plugins, refreshHosts]
   )
 
   const onPanelLayoutChange = useCallback((tabId: string, pluginLayout: TabPluginLayout) => {
@@ -430,6 +629,45 @@ export default function App() {
   }, [])
   const unregisterWriter = useCallback((tabId: string) => {
     writers.current.delete(tabId)
+  }, [])
+
+  const registerSearch = useCallback((tabId: string, controller: TerminalSearchController) => {
+    searchControllers.current.set(tabId, controller)
+  }, [])
+  const unregisterSearch = useCallback((tabId: string) => {
+    searchControllers.current.delete(tabId)
+  }, [])
+
+  const runFind = useCallback((direction: 'previous' | 'next'): void => {
+    const id = activeRef.current
+    const needle = findQueryRef.current
+    if (!id || !needle) {
+      setFindFound(null)
+      return
+    }
+    const controller = searchControllers.current.get(id)
+    if (!controller) {
+      setFindFound(null)
+      return
+    }
+    const fromEnd = lastFindQueryRef.current !== needle
+    lastFindQueryRef.current = needle
+    const options = { caseSensitive: findCaseRef.current, fromEnd }
+    const found =
+      direction === 'previous'
+        ? controller.findPrevious(needle, options)
+        : controller.findNext(needle, options)
+    setFindFound(found)
+  }, [])
+
+  const closeFind = useCallback((): void => {
+    setShowFind(false)
+    setFindFound(null)
+    lastFindQueryRef.current = ''
+    const id = activeRef.current
+    if (id) {
+      searchControllers.current.get(id)?.clear()
+    }
   }, [])
 
   const onTermData = useCallback((tabId: string, data: string) => {
@@ -527,19 +765,7 @@ export default function App() {
           onReconnect={(id) => {
             void reconnectTab(id)
           }}
-          onConfigure={(id) => {
-            const tab = tabsRef.current.find((t) => t.id === id)
-            if (!tab) {
-              return
-            }
-            setActiveTabId(id)
-            setHostEditor({
-              mode: 'editOpenSession',
-              initial: tab.connection,
-              connected: tab.status === 'connected',
-              linkTabId: id
-            })
-          }}
+          onConfigure={openSessionSettings}
           onSaveAsHost={(id) => {
             const tab = tabsRef.current.find((t) => t.id === id)
             if (!tab) {
@@ -706,7 +932,9 @@ export default function App() {
                     layout={t.pluginLayout}
                     settings={settings}
                     hostPluginSettings={t.connection.pluginSettings ?? {}}
-                    onPluginSettingsPatch={onPluginSettingsPatch}
+                    onPluginSettingsPatch={(pluginId, partial) =>
+                      onPluginSettingsPatch(t.id, pluginId, partial)
+                    }
                     onLayoutChange={(pluginLayout) => onPanelLayoutChange(t.id, pluginLayout)}
                     onDeactivatePlugin={(pluginId) => {
                       void togglePlugin(t.id, pluginId, false)
@@ -724,10 +952,29 @@ export default function App() {
                       cursorBlink={style.cursorBlink}
                       termBackground={style.termBackground}
                       termForeground={style.termForeground}
+                      findOpen={showFind}
+                      findQuery={findQuery}
+                      findCaseSensitive={findCaseSensitive}
+                      findFocusNonce={findFocusNonce}
+                      findFound={findFound}
+                      onFindQueryChange={(q) => {
+                        setFindQuery(q)
+                        setFindFound(null)
+                      }}
+                      onFindCaseSensitiveChange={(v) => {
+                        setFindCaseSensitive(v)
+                        lastFindQueryRef.current = ''
+                        setFindFound(null)
+                      }}
+                      onFindPrevious={() => runFind('previous')}
+                      onFindNext={() => runFind('next')}
+                      onFindClose={closeFind}
                       onData={onTermData}
                       onResize={onTermResize}
                       registerWriter={registerWriter}
                       unregisterWriter={unregisterWriter}
+                      registerSearch={registerSearch}
+                      unregisterSearch={unregisterSearch}
                     />
                   </PluginSessionFrame>
                 </div>

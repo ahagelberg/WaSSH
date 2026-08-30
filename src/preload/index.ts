@@ -74,10 +74,13 @@ const api: WasshApi = {
     on('session:status', (ev) => cb(ev as SessionStatusEvent)),
   onCycleTab: (cb) => on('tabs:cycle', (delta) => cb(delta as number)),
   onCloseActiveTab: (cb) => on('tabs:closeActive', () => cb()),
+  onReopenClosedTab: (cb) => on('tabs:reopenClosed', () => cb()),
   onOpenPreferences: (cb) => on('app:openPreferences', () => cb()),
   onOpenAbout: (cb) => on('app:openAbout', () => cb()),
+  onOpenFind: (cb) => on('app:openFind', () => cb()),
   onReconnectActive: (cb) => on('session:reconnectActive', () => cb()),
   onReconnectAll: (cb) => on('session:reconnectAll', () => cb()),
+  onOpenSessionSettings: (cb) => on('session:openSettings', () => cb()),
   onHostKeyPrompt: (cb) =>
     on('session:hostKeyPrompt', (prompt) => cb(prompt as HostKeyPrompt)),
   onSavePasswordPrompt: (cb) =>

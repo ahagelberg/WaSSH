@@ -11,6 +11,7 @@ export const THIRD_PARTY_LICENSES: ThirdPartyLicense[] = [
   { name: 'React DOM', license: 'MIT' },
   { name: 'xterm.js (@xterm/xterm)', license: 'MIT' },
   { name: '@xterm/addon-fit', license: 'MIT' },
+  { name: '@xterm/addon-search', license: 'MIT' },
   { name: '@xterm/addon-unicode11', license: 'MIT' },
   { name: '@xterm/addon-web-links', license: 'MIT' },
   { name: 'ssh2', license: 'MIT' },

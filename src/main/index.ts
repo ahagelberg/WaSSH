@@ -28,6 +28,12 @@ import { PluginDataStore } from './store/pluginDataStore'
 /** Accelerator for File > Preferences */
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
 
+/** Accelerator for Edit > Find */
+const FIND_ACCELERATOR = 'CommandOrControl+F'
+
+/** Accelerator for Session > Reopen closed session */
+const REOPEN_CLOSED_ACCELERATOR = 'CommandOrControl+Shift+T'
+
 /** Accelerator for Session > Reconnect */
 const RECONNECT_ACCELERATOR = 'CommandOrControl+R'
 
@@ -232,7 +238,26 @@ function installAppMenu(): void {
         isMac ? { role: 'close' } : { role: 'quit' }
       ]
     },
-    { role: 'editMenu' },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'delete' },
+        { type: 'separator' },
+        { role: 'selectAll' },
+        { type: 'separator' },
+        {
+          label: 'Find',
+          accelerator: FIND_ACCELERATOR,
+          click: () => sendToRenderer('app:openFind')
+        }
+      ]
+    },
     {
       label: 'Session',
       submenu: [
@@ -245,6 +270,16 @@ function installAppMenu(): void {
           label: 'Reconnect All',
           accelerator: RECONNECT_ALL_ACCELERATOR,
           click: () => sendToRenderer('session:reconnectAll')
+        },
+        {
+          label: 'Reopen closed session',
+          accelerator: REOPEN_CLOSED_ACCELERATOR,
+          click: () => sendToRenderer('tabs:reopenClosed')
+        },
+        { type: 'separator' },
+        {
+          label: 'Session settings',
+          click: () => sendToRenderer('session:openSettings')
         }
       ]
     },

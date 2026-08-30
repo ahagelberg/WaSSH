@@ -284,6 +284,9 @@ export const TAB_CYCLE_PREV = -1
 /** Ctrl+F4 closes the active session tab */
 export const TAB_CLOSE_KEY = 'F4'
 
+/** Ctrl+Shift+T reopens the last closed session tab */
+export const REOPEN_CLOSED_TAB_KEY = 't'
+
 /** Default main window width px */
 export const DEFAULT_WINDOW_WIDTH = 1280
 
@@ -584,10 +587,13 @@ export interface WasshApi {
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void
   onCycleTab: (cb: (delta: number) => void) => () => void
   onCloseActiveTab: (cb: () => void) => () => void
+  onReopenClosedTab: (cb: () => void) => () => void
   onOpenPreferences: (cb: () => void) => () => void
   onOpenAbout: (cb: () => void) => () => void
+  onOpenFind: (cb: () => void) => () => void
   onReconnectActive: (cb: () => void) => () => void
   onReconnectAll: (cb: () => void) => () => void
+  onOpenSessionSettings: (cb: () => void) => () => void
   onHostKeyPrompt: (cb: (prompt: HostKeyPrompt) => void) => () => void
   onSavePasswordPrompt: (cb: (prompt: SavePasswordPrompt) => void) => () => void
   onPluginActive: (cb: (ev: PluginActiveStateEvent) => void) => () => void

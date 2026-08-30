@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { SearchAddon } from '@xterm/addon-search'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import {
@@ -9,11 +10,17 @@ import {
   BELL_MODE_SYSTEM,
   TAB_CLOSE_KEY,
   TAB_CYCLE_KEY,
+  REOPEN_CLOSED_TAB_KEY,
   type AppSettings,
   type BellMode,
   type CursorStyle
 } from '@shared/types'
 import { terminalFontStack } from '@shared/connection'
+import {
+  toXtermSearchOptions,
+  type TerminalSearchController
+} from '../terminalSearch'
+import TerminalSearchBar from './TerminalSearchBar'
 
 /** Debounce resize observer notifications */
 const RESIZE_DEBOUNCE_MS = 50
@@ -24,6 +31,9 @@ const BELL_FLASH_MS = 200
 /** DECSCUSR: CSI Ps SP q */
 const DECSCUSR_INTERMEDIATE = ' '
 const DECSCUSR_FINAL = 'q'
+
+/** Open find bar (must not be consumed by xterm) */
+const FIND_KEY = 'f'
 
 interface Props {
   tabId: string
@@ -37,10 +47,22 @@ interface Props {
   cursorBlink: boolean
   termBackground: string
   termForeground: string
+  findOpen: boolean
+  findQuery: string
+  findCaseSensitive: boolean
+  findFocusNonce: number
+  findFound: boolean | null
+  onFindQueryChange: (query: string) => void
+  onFindCaseSensitiveChange: (value: boolean) => void
+  onFindPrevious: () => void
+  onFindNext: () => void
+  onFindClose: () => void
   onData: (tabId: string, data: string) => void
   onResize: (tabId: string, cols: number, rows: number) => void
   registerWriter: (tabId: string, write: (data: string) => void) => void
   unregisterWriter: (tabId: string) => void
+  registerSearch: (tabId: string, controller: TerminalSearchController) => void
+  unregisterSearch: (tabId: string) => void
 }
 
 function xtermThemeFromHost(el: HTMLElement) {
@@ -80,15 +102,28 @@ export default function TerminalView({
   cursorBlink,
   termBackground,
   termForeground,
+  findOpen,
+  findQuery,
+  findCaseSensitive,
+  findFocusNonce,
+  findFound,
+  onFindQueryChange,
+  onFindCaseSensitiveChange,
+  onFindPrevious,
+  onFindNext,
+  onFindClose,
   onData,
   onResize,
   registerWriter,
-  unregisterWriter
+  unregisterWriter,
+  registerSearch,
+  unregisterSearch
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const bellLineRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
+  const searchRef = useRef<SearchAddon | null>(null)
   const bellModeRef = useRef(bellMode)
   const cursorStyleRef = useRef(cursorStyle)
   const cursorBlinkRef = useRef(cursorBlink)
@@ -115,8 +150,10 @@ export default function TerminalView({
       theme: xtermThemeFromHost(host)
     })
     const fit = new FitAddon()
+    const search = new SearchAddon()
     const unicode = new Unicode11Addon()
     term.loadAddon(fit)
+    term.loadAddon(search)
     term.loadAddon(unicode)
     term.loadAddon(new WebLinksAddon())
     term.unicode.activeVersion = '11'
@@ -136,9 +173,32 @@ export default function TerminalView({
 
     termRef.current = term
     fitRef.current = fit
+    searchRef.current = search
     registerWriter(tabId, (data) => {
       term.write(data)
       applyCursor()
+    })
+    registerSearch(tabId, {
+      findPrevious: (needle, options) => {
+        const opts = toXtermSearchOptions(options.caseSensitive)
+        if (options.fromEnd) {
+          term.clearSelection()
+          search.clearDecorations()
+        }
+        return search.findPrevious(needle, opts)
+      },
+      findNext: (needle, options) => {
+        const opts = toXtermSearchOptions(options.caseSensitive)
+        if (options.fromEnd) {
+          term.clearSelection()
+          search.clearDecorations()
+        }
+        return search.findNext(needle, opts)
+      },
+      clear: () => {
+        search.clearDecorations()
+        term.clearSelection()
+      }
     })
 
     const dataDisp = term.onData((data) => onData(tabId, data))
@@ -228,6 +288,22 @@ export default function TerminalView({
       if (ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key === TAB_CYCLE_KEY) {
         return false
       }
+      if (
+        (ev.ctrlKey || ev.metaKey) &&
+        !ev.altKey &&
+        !ev.shiftKey &&
+        ev.key.toLowerCase() === FIND_KEY
+      ) {
+        return false
+      }
+      if (
+        (ev.ctrlKey || ev.metaKey) &&
+        ev.shiftKey &&
+        !ev.altKey &&
+        ev.key.toLowerCase() === REOPEN_CLOSED_TAB_KEY
+      ) {
+        return false
+      }
       return true
     })
 
@@ -260,9 +336,11 @@ export default function TerminalView({
         clearTimeout(resizeTimer)
       }
       unregisterWriter(tabId)
+      unregisterSearch(tabId)
       term.dispose()
       termRef.current = null
       fitRef.current = null
+      searchRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId])
@@ -322,6 +400,19 @@ export default function TerminalView({
       data-term-fg={termForeground || undefined}
     >
       <div className="terminal-bell-line" ref={bellLineRef} />
+      {findOpen && active ? (
+        <TerminalSearchBar
+          query={findQuery}
+          caseSensitive={findCaseSensitive}
+          focusNonce={findFocusNonce}
+          found={findFound}
+          onQueryChange={onFindQueryChange}
+          onCaseSensitiveChange={onFindCaseSensitiveChange}
+          onFindPrevious={onFindPrevious}
+          onFindNext={onFindNext}
+          onClose={onFindClose}
+        />
+      ) : null}
     </div>
   )
 }
