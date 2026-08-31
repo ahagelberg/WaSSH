@@ -688,7 +688,8 @@ export function hostProfileFromConnection(
     ...tunnelConfigFrom(src),
     pluginSettings: normalizeHostPluginSettings(src.pluginSettings),
     reconnectMode: reconnectModeFrom(src),
-    ...screenConfigFrom(src)
+    ...screenConfigFrom(src),
+    tags: []
   }
 }
 

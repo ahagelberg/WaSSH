@@ -3,12 +3,14 @@ export const PLUGIN_ID_SERVER_MONITOR = 'server-monitor'
 export const PLUGIN_ID_SCRATCHPAD = 'scratchpad'
 export const PLUGIN_ID_MACRO_PAD = 'macro-pad'
 export const PLUGIN_ID_MQTT_EXPLORER = 'mqtt-explorer'
+export const PLUGIN_ID_SFTP = 'sftp'
 
 export const DEFAULT_ENABLED_PLUGINS: string[] = [
   PLUGIN_ID_SERVER_MONITOR,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_MACRO_PAD,
-  PLUGIN_ID_MQTT_EXPLORER
+  PLUGIN_ID_MQTT_EXPLORER,
+  PLUGIN_ID_SFTP
 ]
 
 export type PluginActivation = 'manual' | 'auto'
@@ -324,6 +326,109 @@ export type MqttExplorerRendererMessage =
       retain: boolean
     }
   | { type: 'reconnect' }
+
+/** SFTP entry kind derived from the remote mode bits */
+export type SftpEntryType = 'file' | 'directory' | 'symlink' | 'other'
+
+/** One row in the remote file manager listing */
+export interface SftpEntry {
+  name: string
+  /** Full remote path (parent + name) */
+  path: string
+  type: SftpEntryType
+  size: number
+  /** Numeric permission bits (e.g. 0o755) */
+  mode: number
+  /** Human-readable permission string (e.g. "-rw-r--r--") */
+  modeSymbolic: string
+  /** Last modified time (epoch ms) */
+  mtime: number
+  uid?: number
+  gid?: number
+}
+
+export type SftpErrorKind =
+  | 'not_ssh'
+  | 'not_found'
+  | 'permission'
+  | 'not_dir'
+  | 'exists'
+  | 'name_in_use'
+  | 'io'
+  | 'connection'
+  | 'cancelled'
+  | 'other'
+
+export type SftpStatusState = 'idle' | 'connecting' | 'connected' | 'error'
+
+/** Main → renderer: connection / cwd status */
+export interface SftpStatusPayload {
+  type: 'status'
+  state: SftpStatusState
+  /** Current remote working directory */
+  cwd?: string
+  reason?: string
+  errorKind?: SftpErrorKind
+}
+
+/** Main → renderer: directory listing result */
+export interface SftpListPayload {
+  type: 'listResult'
+  path: string
+  cwd: string
+  entries: SftpEntry[]
+  error?: string
+  errorKind?: SftpErrorKind
+}
+
+export type SftpOpName = 'mkdir' | 'rename' | 'chmod' | 'delete'
+
+/** Main → renderer: result of a mutating operation */
+export interface SftpOpResultPayload {
+  type: 'opResult'
+  op: SftpOpName
+  path: string
+  ok: boolean
+  error?: string
+  errorKind?: SftpErrorKind
+}
+
+export type SftpTransferDirection = 'upload' | 'download'
+
+/** Main → renderer: byte progress for an active transfer */
+export interface SftpTransferProgressPayload {
+  type: 'transferProgress'
+  direction: SftpTransferDirection
+  remotePath: string
+  transferredBytes: number
+  totalBytes: number
+}
+
+/** Main → renderer: transfer finished */
+export interface SftpTransferDonePayload {
+  type: 'transferDone'
+  direction: SftpTransferDirection
+  remotePath: string
+  state: 'done' | 'error' | 'cancelled'
+  error?: string
+  errorKind?: SftpErrorKind
+}
+
+/** Renderer → main SFTP commands */
+export type SftpRendererMessage =
+  | { type: 'getStatus' }
+  | { type: 'list'; path?: string }
+  | { type: 'mkdir'; path: string }
+  | { type: 'rename'; oldPath: string; newPath: string }
+  | { type: 'chmod'; path: string; mode: number }
+  | { type: 'delete'; path: string }
+  | { type: 'download'; path: string }
+  | { type: 'uploadDialog'; path?: string }
+  | { type: 'uploadStart'; name: string; size: number }
+  | { type: 'uploadChunk'; name: string; data: Uint8Array }
+  | { type: 'uploadEnd'; name: string }
+  | { type: 'cancel' }
+  | { type: 'resetCwd' }
 
 export function defaultPluginSettingsFromSchema(
   schema: PluginSettingsField[] | undefined

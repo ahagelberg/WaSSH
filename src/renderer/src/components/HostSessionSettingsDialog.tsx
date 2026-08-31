@@ -87,6 +87,7 @@ import ClampedNumberInput from './ClampedNumberInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
 import PluginFieldEditor from '../plugins/PluginFieldEditor'
+import TagInput from './TagInput'
 
 export type HostSessionMode = 'editHost' | 'editOpenSession'
 
@@ -254,6 +255,12 @@ export default function HostSessionSettingsDialog({
   const [form, setForm] = useState<ConnectionParams>(() => toConnection(initial))
   const [password, setPassword] = useState('')
   const [passphrase, setPassphrase] = useState('')
+  const [tags, setTags] = useState<string[]>(() => {
+    if (mode !== 'editHost' || !('tags' in initial)) {
+      return []
+    }
+    return initial.tags ?? []
+  })
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const identityLocked = mode === 'editOpenSession' && connected
@@ -330,6 +337,15 @@ export default function HostSessionSettingsDialog({
               value={form.name}
               onChange={(e) => patch({ name: e.target.value })}
             />
+          </div>
+        ) : null}
+        {mode === 'editHost' ? (
+          <div className="settings-row">
+            <div className="settings-row-label">
+              <strong>Tags</strong>
+              <span>Labels for this host. Type a tag and press Enter or comma to add it.</span>
+            </div>
+            <TagInput value={tags} onChange={setTags} placeholder="Add tag…" />
           </div>
         ) : null}
         <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
@@ -600,7 +616,7 @@ export default function HostSessionSettingsDialog({
     const proxyRows = (
       <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
         <div className="settings-row-label">
-          <strong>Proxy / jump host</strong>
+          <strong>Jump host</strong>
           <span>
             Connect through another saved SSH host first (for closed networks / bastion access).
           </span>
@@ -971,7 +987,7 @@ export default function HostSessionSettingsDialog({
     if (isSsh) {
       list.push({
         id: 'proxy',
-        title: 'Proxy',
+        title: 'Jump host',
         content: proxyRows
       })
       if (mode === 'editHost') {
@@ -1053,6 +1069,7 @@ export default function HostSessionSettingsDialog({
     mode,
     password,
     passphrase,
+    tags,
     pickPrivateKey,
     proxyOptions,
     connType,
@@ -1089,7 +1106,8 @@ export default function HostSessionSettingsDialog({
         ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false }),
         pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
         reconnectMode: reconnectModeFrom(form),
-        ...screenConfigFrom(form)
+        ...screenConfigFrom(form),
+        tags
       }
       onSaveHost(host, password, passphrase)
       onClose()

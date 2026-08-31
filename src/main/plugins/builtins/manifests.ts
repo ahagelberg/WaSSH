@@ -4,6 +4,7 @@ import {
   PLUGIN_ID_MQTT_EXPLORER,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_SERVER_MONITOR,
+  PLUGIN_ID_SFTP,
   MQTT_EXPLORER_DEFAULT_HOST,
   MQTT_EXPLORER_DEFAULT_PORT,
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
@@ -172,9 +173,24 @@ export const mqttExplorerManifest: PluginManifest = {
   }
 }
 
+export const sftpManifest: PluginManifest = {
+  id: PLUGIN_ID_SFTP,
+  name: 'SFTP files',
+  version: '1.0.0',
+  description:
+    'Remote file manager over SFTP with drag-and-drop upload onto the terminal.',
+  activation: 'manual',
+  source: 'builtin',
+  contributes: {
+    toolbar: { label: 'Files' },
+    views: [{ id: 'panel', placement: 'split-right', title: 'Files' }]
+  }
+}
+
 export const BUILTIN_MANIFESTS: PluginManifest[] = [
   serverMonitorManifest,
   scratchpadManifest,
   macroPadManifest,
-  mqttExplorerManifest
+  mqttExplorerManifest,
+  sftpManifest
 ]

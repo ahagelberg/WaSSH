@@ -1,0 +1,635 @@
+import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
+import type {
+  SftpEntry,
+  SftpErrorKind,
+  SftpRendererMessage,
+  SftpStatusState
+} from '@shared/plugins'
+import type { PluginViewProps } from '../registry'
+
+type SftpMainPayload =
+  | {
+      type: 'status'
+      state: SftpStatusState
+      cwd?: string
+      reason?: string
+      errorKind?: SftpErrorKind
+    }
+  | {
+      type: 'listResult'
+      path: string
+      cwd: string
+      entries: SftpEntry[]
+      error?: string
+      errorKind?: SftpErrorKind
+    }
+  | {
+      type: 'opResult'
+      op: 'mkdir' | 'rename' | 'chmod' | 'delete'
+      path: string
+      ok: boolean
+      error?: string
+      errorKind?: SftpErrorKind
+    }
+  | {
+      type: 'transferProgress'
+      direction: 'upload' | 'download'
+      remotePath: string
+      transferredBytes: number
+      totalBytes: number
+    }
+  | {
+      type: 'transferDone'
+      direction: 'upload' | 'download'
+      remotePath: string
+      state: 'done' | 'error' | 'cancelled'
+      error?: string
+      errorKind?: SftpErrorKind
+    }
+
+interface TransferProgress {
+  direction: 'upload' | 'download'
+  transferred: number
+  total: number
+}
+
+type SftpDialog =
+  | { kind: 'mkdir' }
+  | { kind: 'rename'; path: string; name: string }
+  | { kind: 'chmod'; path: string; mode: number }
+  | { kind: 'delete'; path: string; name: string }
+  | null
+
+function joinPath(parent: string, name: string): string {
+  if (parent === '/' || parent === '') {
+    return `/${name}`
+  }
+  return `${parent.replace(/\/+$/, '')}/${name}`
+}
+
+function parentPath(path: string): string | null {
+  if (path === '/' || path === '') {
+    return null
+  }
+  const trimmed = path.replace(/\/+$/, '')
+  const idx = trimmed.lastIndexOf('/')
+  if (idx <= 0) {
+    return '/'
+  }
+  return trimmed.slice(0, idx)
+}
+
+function formatBytes(n: number): string {
+  if (!n || n <= 0) {
+    return '—'
+  }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  let v = n
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function formatDate(ms: number): string {
+  if (!ms) {
+    return '—'
+  }
+  const d = new Date(ms)
+  const pad = (x: number): string => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function octalMode(mode: number): string {
+  return (mode & 0o777).toString(8).padStart(3, '0')
+}
+
+function typeIcon(entry: SftpEntry): string {
+  if (entry.type === 'directory') return '📁'
+  if (entry.type === 'symlink') return '🔗'
+  if (entry.type === 'file') return '📄'
+  return '❓'
+}
+
+export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactElement {
+  const [status, setStatus] = useState<SftpStatusState>('idle')
+  const [cwd, setCwd] = useState<string | null>(null)
+  const [statusReason, setStatusReason] = useState<string | undefined>()
+  const [path, setPath] = useState<string | null>(null)
+  const [entries, setEntries] = useState<SftpEntry[]>([])
+  const [loading, setLoading] = useState(false)
+  const [listError, setListError] = useState<string | null>(null)
+  const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [dialog, setDialog] = useState<SftpDialog>(null)
+  const [dialogInput, setDialogInput] = useState('')
+  const [dialogError, setDialogError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(() => new Map())
+
+  const requestedRef = useRef<string | null>(null)
+  const pathRef = useRef<string | null>(null)
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  pathRef.current = path
+
+  const showNotice = useCallback((msg: string): void => {
+    setNotice(msg)
+    if (noticeTimer.current) {
+      clearTimeout(noticeTimer.current)
+    }
+    noticeTimer.current = setTimeout(() => setNotice(null), 3500)
+  }, [])
+
+  const requestList = useCallback(
+    (target: string): void => {
+      requestedRef.current = target
+      setLoading(true)
+      setListError(null)
+      void window.wassh.sendPluginMessage(tabId, pluginId, {
+        type: 'list',
+        path: target
+      } satisfies SftpRendererMessage)
+    },
+    [tabId, pluginId]
+  )
+
+  const send = useCallback(
+    (payload: SftpRendererMessage): Promise<void> =>
+      window.wassh.sendPluginMessage(tabId, pluginId, payload),
+    [tabId, pluginId]
+  )
+
+  // On mount, request the latest status in case the connection event fired
+  // before this view mounted. The 'status: connected' handler drives the list.
+  useEffect(() => {
+    void send({ type: 'getStatus' })
+    return () => {
+      if (noticeTimer.current) {
+        clearTimeout(noticeTimer.current)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabId, pluginId])
+
+  useEffect(() => {
+    return window.wassh.onPluginMessage((ev) => {
+      if (ev.tabId !== tabId || ev.pluginId !== pluginId) {
+        return
+      }
+      const payload = ev.payload as SftpMainPayload | null
+      if (!payload || typeof payload !== 'object' || !('type' in payload)) {
+        return
+      }
+      switch (payload.type) {
+        case 'status': {
+          setStatus(payload.state)
+          setStatusReason(payload.reason)
+          if (payload.state === 'connected') {
+            if (payload.cwd) {
+              setCwd(payload.cwd)
+            }
+            if (pathRef.current === null) {
+              const start = payload.cwd ?? '/'
+              setPath(start)
+              requestList(start)
+            }
+          }
+          return
+        }
+        case 'listResult': {
+          setLoading(false)
+          if (requestedRef.current !== payload.path) {
+            return
+          }
+          setCwd(payload.cwd)
+          if (pathRef.current === null) {
+            setPath(payload.path)
+          }
+          if (payload.error) {
+            setListError(payload.error)
+            setEntries([])
+          } else {
+            setListError(null)
+            setEntries(payload.entries)
+            setSelectedPath((prev) =>
+              prev && payload.entries.some((e) => e.path === prev) ? prev : null
+            )
+          }
+          return
+        }
+        case 'opResult': {
+          if (payload.ok) {
+            setDialog(null)
+            setDialogError(null)
+            if (pathRef.current) {
+              requestList(pathRef.current)
+            }
+          } else {
+            setDialogError(payload.error ?? 'Operation failed')
+            showNotice(payload.error ?? 'Operation failed')
+          }
+          return
+        }
+        case 'transferProgress': {
+          setTransfers((prev) => {
+            const next = new Map(prev)
+            next.set(payload.remotePath, {
+              direction: payload.direction,
+              transferred: payload.transferredBytes,
+              total: payload.totalBytes
+            })
+            return next
+          })
+          return
+        }
+        case 'transferDone': {
+          setTransfers((prev) => {
+            const next = new Map(prev)
+            next.delete(payload.remotePath)
+            return next
+          })
+          if (payload.state !== 'done') {
+            if (payload.error) {
+              showNotice(payload.error)
+            } else if (payload.state === 'cancelled') {
+              showNotice('Transfer cancelled')
+            }
+          }
+          if (payload.state === 'done' && payload.direction === 'upload' && pathRef.current) {
+            requestList(pathRef.current)
+          }
+          return
+        }
+      }
+    })
+  }, [tabId, pluginId, requestList, showNotice])
+
+  const selected = entries.find((e) => e.path === selectedPath) ?? null
+  const parentDir = path ? parentPath(path) : null
+
+  const navigate = (target: string): void => {
+    setPath(target)
+    requestList(target)
+  }
+
+  const openEntry = (entry: SftpEntry): void => {
+    if (entry.type === 'directory') {
+      navigate(entry.path)
+    }
+  }
+
+  const submitDialog = async (): Promise<void> => {
+    if (!dialog) {
+      return
+    }
+    setDialogError(null)
+    try {
+      if (dialog.kind === 'mkdir') {
+        const name = dialogInput.trim()
+        if (!name) {
+          setDialogError('Name is required')
+          return
+        }
+        await send({ type: 'mkdir', path: joinPath(pathRef.current ?? '/', name) })
+      } else if (dialog.kind === 'rename') {
+        const name = dialogInput.trim()
+        if (!name) {
+          setDialogError('Name is required')
+          return
+        }
+        const parent = parentPath(dialog.path) ?? '/'
+        await send({ type: 'rename', oldPath: dialog.path, newPath: joinPath(parent, name) })
+      } else if (dialog.kind === 'chmod') {
+        const mode = parseInt(dialogInput.trim(), 8)
+        if (Number.isNaN(mode) || mode < 0 || mode > 0o7777) {
+          setDialogError('Enter a valid octal mode (e.g. 644 or 755)')
+          return
+        }
+        await send({ type: 'chmod', path: dialog.path, mode })
+      } else if (dialog.kind === 'delete') {
+        await send({ type: 'delete', path: dialog.path })
+      }
+    } catch (err) {
+      setDialogError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const openDialog = (d: SftpDialog): void => {
+    setDialogError(null)
+    setDialog(d)
+    if (d?.kind === 'mkdir') {
+      setDialogInput('')
+    } else if (d?.kind === 'rename') {
+      setDialogInput(d.name)
+    } else if (d?.kind === 'chmod') {
+      setDialogInput(octalMode(d.mode))
+    }
+  }
+
+  const renderDialog = (): ReactElement | null => {
+    if (!dialog) {
+      return null
+    }
+    return (
+      <div className="sftp-modal-backdrop" onMouseDown={() => setDialog(null)}>
+        <div className="sftp-modal" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="sftp-modal-title">
+            {dialog.kind === 'mkdir'
+              ? 'New folder'
+              : dialog.kind === 'rename'
+                ? 'Rename'
+                : dialog.kind === 'chmod'
+                  ? 'Change permissions'
+                  : 'Delete'}
+          </div>
+          {dialog.kind === 'delete' ? (
+            <div className="sftp-modal-body">
+              <p>
+                Delete <strong>{dialog.name}</strong>? This cannot be undone.
+              </p>
+              {dialogError && <p className="sftp-modal-error">{dialogError}</p>}
+            </div>
+          ) : (
+            <div className="sftp-modal-body">
+              {dialog.kind === 'chmod' && (
+                <p className="sftp-modal-hint">Octal mode, e.g. 644, 755, 700</p>
+              )}
+              <input
+                className="sftp-modal-input"
+                value={dialogInput}
+                onChange={(e) => setDialogInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    void submitDialog()
+                  }
+                  if (e.key === 'Escape') {
+                    setDialog(null)
+                  }
+                }}
+                autoFocus
+              />
+              {dialogError && <p className="sftp-modal-error">{dialogError}</p>}
+            </div>
+          )}
+          <div className="sftp-modal-actions">
+            <button type="button" className="sftp-btn" onClick={() => setDialog(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className={`sftp-btn sftp-btn-primary${dialog.kind === 'delete' ? ' sftp-btn-danger' : ''}`}
+              onClick={() => void submitDialog()}
+            >
+              {dialog.kind === 'delete' ? 'Delete' : 'OK'}
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const connected = status === 'connected'
+
+  return (
+    <div className="sftp-view">
+      <div className="sftp-statusbar">
+        <span className={`sftp-status-dot sftp-status-${status}`} />
+        <span className="sftp-status-text">
+          {status === 'connected'
+            ? `Connected — uploads go to ${cwd ?? '/'}`
+            : status === 'connecting'
+              ? 'Connecting SFTP…'
+              : status === 'error'
+                ? statusReason ?? 'SFTP error'
+                : 'SFTP not connected'}
+        </span>
+        {connected && (
+          <button
+            type="button"
+            className="sftp-btn sftp-btn-mini"
+            title="Re-resolve upload directory (session cwd → ~/Downloads → home)"
+            onClick={() => void send({ type: 'resetCwd' })}
+          >
+            ↺ Reset upload dir
+          </button>
+        )}
+      </div>
+
+      {transfers.size > 0 && (
+        <div className="sftp-transfers">
+          {Array.from(transfers.entries()).map(([remotePath, t]) => (
+            <div key={remotePath} className="sftp-transfer">
+              <div className="sftp-transfer-label">
+                <span>{t.direction === 'upload' ? '⬆ Upload' : '⬇ Download'}</span>
+                <span className="sftp-transfer-name" title={remotePath}>
+                  {remotePath}
+                </span>
+                <span className="sftp-transfer-amount">
+                  {formatBytes(t.transferred)}
+                  {t.total > 0 ? ` / ${formatBytes(t.total)}` : ''}
+                </span>
+              </div>
+              <div className="sftp-transfer-track">
+                <div
+                  className="sftp-transfer-fill"
+                  style={{ width: t.total > 0 ? `${Math.min(100, (t.transferred / t.total) * 100)}%` : '100%' }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="sftp-toolbar">
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || path === null}
+          title="Go to parent directory"
+          onClick={() => {
+            if (path) {
+              const p = parentPath(path)
+              if (p) {
+                navigate(p)
+              }
+            }
+          }}
+        >
+          ⬆ Up
+        </button>
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected}
+          title="Refresh listing"
+          onClick={() => {
+            if (path) {
+              requestList(path)
+            }
+          }}
+        >
+          ⟳ Refresh
+        </button>
+        <span className="sftp-toolbar-sep" />
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected}
+          title="Create a new folder here"
+          onClick={() => openDialog({ kind: 'mkdir' })}
+        >
+          + New folder
+        </button>
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected}
+          title="Upload files into the current folder"
+          onClick={() => void send({ type: 'uploadDialog', path: path ?? undefined })}
+        >
+          ⬆ Upload…
+        </button>
+        <span className="sftp-toolbar-sep" />
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || !selected}
+          title="Rename selected item"
+          onClick={() => {
+            if (selected) {
+              openDialog({ kind: 'rename', path: selected.path, name: selected.name })
+            }
+          }}
+        >
+          ✎ Rename
+        </button>
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || !selected}
+          title="Change permissions of selected item"
+          onClick={() => {
+            if (selected) {
+              openDialog({ kind: 'chmod', path: selected.path, mode: selected.mode })
+            }
+          }}
+        >
+          🔒 Permissions
+        </button>
+        <button
+          type="button"
+          className="sftp-btn sftp-btn-danger"
+          disabled={!connected || !selected}
+          title="Delete selected item"
+          onClick={() => {
+            if (selected) {
+              openDialog({ kind: 'delete', path: selected.path, name: selected.name })
+            }
+          }}
+        >
+          🗑 Delete
+        </button>
+        <span className="sftp-toolbar-sep" />
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || !selected || selected.type !== 'file'}
+          title="Download selected file"
+          onClick={() => {
+            if (selected) {
+              void send({ type: 'download', path: selected.path })
+            }
+          }}
+        >
+          ⬇ Download
+        </button>
+      </div>
+
+      <div className="sftp-pathbar" title={path ?? ''}>
+        <span className="sftp-pathbar-label">Path</span>
+        <button
+          type="button"
+          className="sftp-path-link"
+          onClick={() => {
+            if (path) {
+              navigate('/')
+            }
+          }}
+        >
+          /
+        </button>
+        {path && path !== '/' && (
+          <>
+            <span className="sftp-path-sep">›</span>
+            <span className="sftp-path-current">{path.replace(/^\/+/, '')}</span>
+          </>
+        )}
+      </div>
+
+      {notice && <div className="sftp-notice">{notice}</div>}
+
+      <div className="sftp-table-wrap">
+        <table className="sftp-table">
+          <thead>
+            <tr>
+              <th className="sftp-col-name">Name</th>
+              <th className="sftp-col-size">Size</th>
+              <th className="sftp-col-mode">Mode</th>
+              <th className="sftp-col-date">Modified</th>
+            </tr>
+          </thead>
+          <tbody>
+            {parentDir && (
+              <tr key=".." className="sftp-row dir" onClick={() => navigate(parentDir)}>
+                <td className="sftp-col-name">
+                  <span className="sftp-icon">📁</span>
+                  <span className="sftp-name">..</span>
+                </td>
+                <td className="sftp-col-size">—</td>
+                <td className="sftp-col-mode" />
+                <td className="sftp-col-date">—</td>
+              </tr>
+            )}
+            {entries.map((entry) => (
+              <tr
+                key={entry.path}
+                className={`sftp-row${entry.path === selectedPath ? ' selected' : ''}${entry.type === 'directory' ? ' dir' : ''}`}
+                onClick={() => setSelectedPath(entry.path)}
+                onDoubleClick={() => openEntry(entry)}
+              >
+                <td className="sftp-col-name">
+                  <span className="sftp-icon">{typeIcon(entry)}</span>
+                  <span className="sftp-name" title={entry.path}>
+                    {entry.name}
+                    {entry.type === 'symlink' && ' →'}
+                  </span>
+                  <span className="sftp-modesym" title={entry.modeSymbolic}>
+                    {entry.modeSymbolic}
+                  </span>
+                </td>
+                <td className="sftp-col-size">
+                  {entry.type === 'directory' ? '—' : formatBytes(entry.size)}
+                </td>
+                <td className="sftp-col-mode">{octalMode(entry.mode)}</td>
+                <td className="sftp-col-date">{formatDate(entry.mtime)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {loading && (
+          <div className="sftp-loading">
+            <span className="sftp-spinner" />
+            Loading…
+          </div>
+        )}
+        {!loading && listError && <div className="sftp-empty sftp-error">⚠ {listError}</div>}
+        {!loading && !listError && entries.length === 0 && (
+          <div className="sftp-empty">Empty folder</div>
+        )}
+      </div>
+
+      {renderDialog()}
+    </div>
+  )
+}

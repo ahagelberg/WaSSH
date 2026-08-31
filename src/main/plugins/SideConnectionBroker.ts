@@ -2,13 +2,14 @@ import { randomUUID } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { Socket, connect as netConnect } from 'net'
 import type { Duplex } from 'stream'
-import type { ClientChannel } from 'ssh2'
+import type { ClientChannel, SFTPWrapper } from 'ssh2'
 import type {
   SideConnectionClosedEvent,
   SideConnectionDataEvent,
   SideConnectionOpenRequest
 } from '../../shared/plugins'
 import type { ConnectionParams } from '../../shared/types'
+import { SftpSession } from './SftpSession'
 import type { PluginSessionHandle } from './types'
 
 interface OpenSideConnection {
@@ -28,9 +29,20 @@ interface OpenRawTcpStream {
   dispose: () => void
 }
 
+/** SFTP channel held open for a plugin on a tab's live SSH connection. */
+interface OpenSftpSession {
+  id: string
+  tabId: string
+  pluginId: string
+  wrapper: SFTPWrapper
+  session: SftpSession
+  dispose: () => void
+}
+
 export class SideConnectionBroker {
   private connections = new Map<string, OpenSideConnection>()
   private rawStreams = new Map<string, OpenRawTcpStream>()
+  private sftpSessions = new Map<string, OpenSftpSession>()
 
   constructor(
     private getSession: (tabId: string) => PluginSessionHandle | null,
@@ -99,6 +111,57 @@ export class SideConnectionBroker {
     }
     this.rawStreams.delete(streamId)
     entry.dispose()
+  }
+
+  /**
+   * Open an SFTP channel for a plugin on the tab's live SSH connection.
+   * Returns a promisified SftpSession wrapper bound to that channel.
+   */
+  async openSftp(tabId: string, pluginId: string): Promise<SftpSession> {
+    const session = this.getSession(tabId)
+    if (!session) {
+      throw new Error('Session is not connected')
+    }
+    if (!session.isSsh) {
+      throw new Error('SFTP requires an SSH session')
+    }
+    const wrapper = await session.openSftp()
+    const id = randomUUID()
+    const entry: OpenSftpSession = {
+      id,
+      tabId,
+      pluginId,
+      wrapper,
+      session: new SftpSession(wrapper),
+      dispose: () => {
+        try {
+          wrapper.end()
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    this.sftpSessions.set(id, entry)
+    return entry.session
+  }
+
+  /** Close every SFTP channel a plugin holds on a tab. */
+  closeSftp(tabId: string, pluginId: string): void {
+    for (const [id, entry] of Array.from(this.sftpSessions.entries())) {
+      if (entry.tabId === tabId && entry.pluginId === pluginId) {
+        this.sftpSessions.delete(id)
+        entry.dispose()
+      }
+    }
+  }
+
+  /** Run a quick capture command on the session (e.g. `pwd`). */
+  execCapture(tabId: string, command: string): Promise<string> {
+    const session = this.getSession(tabId)
+    if (!session) {
+      return Promise.reject(new Error('Session is not connected'))
+    }
+    return session.execCapture(command)
   }
 
   private send(channel: string, payload: unknown): void {
@@ -215,6 +278,16 @@ export class SideConnectionBroker {
         this.closeTcpStream(id)
       }
     }
+    this.closeSftp(tabId, pluginId)
+  }
+
+  private closeSftpForTab(tabId: string): void {
+    for (const [id, entry] of Array.from(this.sftpSessions.entries())) {
+      if (entry.tabId === tabId) {
+        this.sftpSessions.delete(id)
+        entry.dispose()
+      }
+    }
   }
 
   closeForTab(tabId: string): void {
@@ -228,6 +301,7 @@ export class SideConnectionBroker {
         this.closeTcpStream(id)
       }
     }
+    this.closeSftpForTab(tabId)
   }
 
   disposeAll(): void {
@@ -236,6 +310,10 @@ export class SideConnectionBroker {
     }
     for (const id of Array.from(this.rawStreams.keys())) {
       this.closeTcpStream(id)
+    }
+    for (const [id, entry] of Array.from(this.sftpSessions.entries())) {
+      this.sftpSessions.delete(id)
+      entry.dispose()
     }
   }
 

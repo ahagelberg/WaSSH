@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'crypto'
 import { EventEmitter } from 'events'
 import { readFileSync } from 'fs'
 import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
+import type { SFTPWrapper } from 'ssh2'
 import { Readable } from 'stream'
 import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, screenBusyFallbackMessage, type ScreenSessionConfig } from '../../shared/connection'
 import {
@@ -242,6 +243,72 @@ export class SshConnection extends EventEmitter {
           return
         }
         resolve(channel)
+      })
+    })
+  }
+
+  /**
+   * Open a new SFTP channel on the live connection.
+   * A separate channel from the interactive shell, so it coexists safely.
+   */
+  openSftp(): Promise<SFTPWrapper> {
+    const client = this.client
+    if (!client) {
+      return Promise.reject(new Error('SSH session is not connected'))
+    }
+    return new Promise((resolve, reject) => {
+      client.sftp((err, sftp) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        resolve(sftp)
+      })
+    })
+  }
+
+  /**
+   * Run a command and capture its trimmed stdout.
+   * Used for quick probes (e.g. `pwd`). Rejects on non-zero exit or errors.
+   */
+  execCapture(command: string): Promise<string> {
+    return this.execCommand(command).then((channel) => {
+      return new Promise<string>((resolve, reject) => {
+        let out = ''
+        let errOut = ''
+        let exitCode: number | null = null
+        let settled = false
+        const finish = (err?: Error): void => {
+          if (settled) {
+            return
+          }
+          settled = true
+          try {
+            channel.close()
+          } catch {
+            /* ignore */
+          }
+          if (err) {
+            reject(err)
+            return
+          }
+          if (exitCode !== null && exitCode !== 0) {
+            reject(new Error(errOut.trim() || `Command exited with code ${exitCode}`))
+            return
+          }
+          resolve(out.trim())
+        }
+        channel.on('data', (buf: Buffer) => {
+          out += buf.toString('utf8')
+        })
+        channel.stderr?.on('data', (buf: Buffer) => {
+          errOut += buf.toString('utf8')
+        })
+        channel.on('exit', (code: number | null) => {
+          exitCode = code
+        })
+        channel.on('close', () => finish())
+        channel.on('error', (err: Error) => finish(err))
       })
     })
   }

@@ -382,6 +382,8 @@ export interface HostProfile {
   screenSessionName: string
   /** What to do if the named screen session already has a display attached */
   screenBusyHandling: ScreenBusyHandling
+  /** User-defined labels for grouping / finding this host */
+  tags: string[]
 }
 
 /** Connection params for a tab (saved host and/or quick-connect / overrides) */

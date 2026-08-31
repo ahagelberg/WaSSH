@@ -9,7 +9,7 @@ import type {
   StreamDirection,
   StreamMode
 } from '../../shared/plugins'
-import { mergePluginSessionSettings, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR } from '../../shared/plugins'
+import { mergePluginSessionSettings, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import { BUILTIN_MANIFESTS } from './builtins/manifests'
@@ -17,9 +17,11 @@ import { macroPadMain } from './builtins/macroPad'
 import { mqttExplorerMain } from './builtins/mqttExplorer'
 import { scratchpadMain } from './builtins/scratchpad'
 import { serverMonitorMain } from './builtins/serverMonitor'
+import { sftpMain } from './builtins/sftp'
 import { loadExternalPlugins } from './externalLoader'
 import type { SessionDataPipeline } from './SessionDataPipeline'
 import type { SideConnectionBroker } from './SideConnectionBroker'
+import type { SftpSession } from './SftpSession'
 import type { StreamTransform } from './types'
 
 export interface PluginMainContext {
@@ -43,6 +45,13 @@ export interface PluginMainContext {
    * Not UTF-8 side-data — for protocols like MQTT.
    */
   openTcpStream: (host: string, port: number) => Promise<Duplex>
+  /**
+   * Open an SFTP channel on the live SSH connection and wrap it in a
+   * promisified SftpSession (throws when the session is not SSH).
+   */
+  openSftp: () => Promise<SftpSession>
+  /** Run a quick capture command (e.g. `pwd`) and return trimmed stdout. */
+  execCapture: (command: string) => Promise<string>
   registerStreamHandler: (
     mode: StreamMode,
     direction: StreamDirection,
@@ -56,7 +65,7 @@ export interface PluginMainContext {
 export interface PluginMainModule {
   onActivate: (ctx: PluginMainContext) => void | Promise<void>
   onDeactivate?: (ctx: PluginMainContext) => void | Promise<void>
-  onMessage?: (ctx: PluginMainContext, payload: unknown) => void
+  onMessage?: (ctx: PluginMainContext, payload: unknown) => void | Promise<void>
 }
 
 interface ActiveInstance {
@@ -89,6 +98,7 @@ export class PluginHost {
     this.modules.set(PLUGIN_ID_SCRATCHPAD, scratchpadMain)
     this.modules.set(PLUGIN_ID_MACRO_PAD, macroPadMain)
     this.modules.set(PLUGIN_ID_MQTT_EXPLORER, mqttExplorerMain)
+    this.modules.set(PLUGIN_ID_SFTP, sftpMain)
   }
 
   private send(channel: string, payload: unknown): void {
@@ -217,6 +227,8 @@ export class PluginHost {
         const { stream } = await this.broker.openTcpStream(tabId, pluginId, host, port)
         return stream
       },
+      openSftp: () => this.broker.openSftp(tabId, pluginId),
+      execCapture: (command) => this.broker.execCapture(tabId, command),
       registerStreamHandler: (mode, direction, handler) => {
         this.pipeline.register(tabId, { pluginId, mode, direction, handler })
         cleanups.push(() => this.pipeline.unregisterPlugin(tabId, pluginId))
@@ -308,7 +320,7 @@ export class PluginHost {
     if (!instance) {
       return
     }
-    instance.module.onMessage?.(instance.ctx, payload)
+    await instance.module.onMessage?.(instance.ctx, payload)
   }
 
   /** Forward broker side-data into plugin listeners (and renderer already gets IPC). */

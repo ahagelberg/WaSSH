@@ -167,6 +167,8 @@ export class SessionManager {
         isSsh: true,
         getSshClient: () => conn.getSshClient(),
         exec: (command) => conn.execCommand(command),
+        execCapture: (command) => conn.execCapture(command),
+        openSftp: () => conn.openSftp(),
         openExtraShell: () => conn.openExtraShell(),
         forwardOut: (host, port) => conn.forwardOut(host, port),
         openDuplicateClient: () => conn.openDuplicateClient(),
@@ -180,6 +182,12 @@ export class SessionManager {
       getSshClient: () => null,
       exec: async () => {
         throw new Error('SSH exec requires an SSH session')
+      },
+      execCapture: async () => {
+        throw new Error('SSH exec requires an SSH session')
+      },
+      openSftp: async () => {
+        throw new Error('SFTP requires an SSH session')
       },
       openExtraShell: async () => {
         throw new Error('SSH shell requires an SSH session')

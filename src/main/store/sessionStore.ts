@@ -83,6 +83,30 @@ function legacyReconnectModeDefault(): ReconnectMode {
   return DEFAULT_RECONNECT_MODE
 }
 
+function normalizeTags(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const seen = new Set<string>()
+  const tags: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') {
+      continue
+    }
+    const tag = item.trim()
+    if (!tag) {
+      continue
+    }
+    const key = tag.toLowerCase()
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    tags.push(tag)
+  }
+  return tags
+}
+
 function normalizeHost(
   raw: Partial<HostProfile> & { id: string },
   fallbackMode: ReconnectMode = DEFAULT_RECONNECT_MODE
@@ -103,7 +127,8 @@ function normalizeHost(
     ...tunnelConfigFrom(raw),
     pluginSettings: normalizeHostPluginSettings(raw.pluginSettings),
     reconnectMode: reconnectModeFrom(raw, fallbackMode),
-    ...screenConfigFrom(raw)
+    ...screenConfigFrom(raw),
+    tags: normalizeTags(raw.tags)
   }
 }
 
@@ -136,7 +161,10 @@ export class SessionStore {
       normalizeHost({ ...h, id: h.id ?? randomUUID() }, fallbackMode)
     )
     const needsWrite = rawList.some(
-      (h) => h.reconnectMode === undefined || h.openInScreen === undefined
+      (h) =>
+        h.reconnectMode === undefined ||
+        h.openInScreen === undefined ||
+        h.tags === undefined
     )
     if (needsWrite && hosts.length > 0) {
       writeJson(HOSTS_FILE, hosts)

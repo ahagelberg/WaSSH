@@ -129,6 +129,15 @@ export default function SessionsSidebar({
                         {hostSubtitle(host)}
                         {proxy ? ` · via ${hostDisplayName(proxy)}` : ''}
                       </div>
+                      {host.tags && host.tags.length > 0 ? (
+                        <div className="host-item-tags">
+                          {host.tags.map((tag) => (
+                            <span key={tag} className="host-tag">
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                     <div className={`host-item-menu${menuOpen ? ' open' : ''}`}>
                       <button
