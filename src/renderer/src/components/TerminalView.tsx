@@ -21,6 +21,7 @@ import {
   type TerminalSearchController
 } from '../terminalSearch'
 import TerminalSearchBar from './TerminalSearchBar'
+import { CommandTimer } from '../commandTimer'
 
 /** Debounce resize observer notifications */
 const RESIZE_DEBOUNCE_MS = 50
@@ -79,6 +80,15 @@ function xtermThemeFromHost(el: HTMLElement) {
   }
 }
 
+/** The user can submit a command only from a normal-buffer line that has content */
+function isCommandLine(term: Terminal): boolean {
+  if (term.buffer.active.type !== 'normal') {
+    return false
+  }
+  const line = term.buffer.active.getLine(term.buffer.active.cursorY)
+  return (line?.translateToString(true).trim().length ?? 0) > 0
+}
+
 function positionBellLine(host: HTMLElement, term: Terminal, lineEl: HTMLElement): void {
   const screen = host.querySelector('.xterm-screen')
   if (!(screen instanceof HTMLElement) || term.rows <= 0) {
@@ -132,11 +142,14 @@ export default function TerminalView({
   const bellModeRef = useRef(bellMode)
   const cursorStyleRef = useRef(cursorStyle)
   const cursorBlinkRef = useRef(cursorBlink)
+  const timerRef = useRef<CommandTimer | null>(null)
+  const commandTimerEnabledRef = useRef(settings.showCommandTimers)
   const bellTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   bellModeRef.current = bellMode
   cursorStyleRef.current = cursorStyle
   cursorBlinkRef.current = cursorBlink
+  commandTimerEnabledRef.current = settings.showCommandTimers
 
   useEffect(() => {
     const host = hostRef.current
@@ -179,8 +192,11 @@ export default function TerminalView({
     termRef.current = term
     fitRef.current = fit
     searchRef.current = search
+    const timer = new CommandTimer()
+    timerRef.current = timer
     registerWriter(tabId, (data) => {
-      term.write(data)
+      const writeData = commandTimerEnabledRef.current ? timer.process(data) : data
+      term.write(writeData)
       applyCursor()
     })
     registerSearch(tabId, {
@@ -206,7 +222,16 @@ export default function TerminalView({
       }
     })
 
-    const dataDisp = term.onData((data) => onData(tabId, data))
+    const dataDisp = term.onData((data) => {
+      if (
+        commandTimerEnabledRef.current &&
+        data.includes('\r') &&
+        isCommandLine(term)
+      ) {
+        timer.start()
+      }
+      onData(tabId, data)
+    })
     const cursorSeqDisp = term.parser.registerCsiHandler(
       { intermediates: DECSCUSR_INTERMEDIATE, final: DECSCUSR_FINAL },
       () => true
@@ -346,6 +371,7 @@ export default function TerminalView({
       termRef.current = null
       fitRef.current = null
       searchRef.current = null
+      timerRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId])

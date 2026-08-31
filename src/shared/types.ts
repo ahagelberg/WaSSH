@@ -456,6 +456,8 @@ export interface TabSnapshot {
 export interface AppSettings {
   reconnectOnStartup: boolean
   termType: string
+  /** Show how long each command took, right before the next prompt */
+  showCommandTimers: boolean
   sidebarCollapsed: boolean
   windowBounds: WindowBounds | null
   theme: AppTheme
@@ -499,6 +501,7 @@ export const DEFAULT_SESSION_STYLE_DEFAULTS: SessionStyleDefaults = {
 export const DEFAULT_SETTINGS: AppSettings = {
   reconnectOnStartup: true,
   termType: DEFAULT_TERM_TYPE,
+  showCommandTimers: false,
   sidebarCollapsed: false,
   windowBounds: null,
   theme: DEFAULT_THEME,
