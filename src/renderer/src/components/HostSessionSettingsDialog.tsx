@@ -19,6 +19,8 @@ import {
   RECONNECT_MODE_ALWAYS,
   RECONNECT_MODE_NONE,
   RECONNECT_MODE_ON_FOCUS,
+  REMOTE_SESSION_KIND_SCREEN,
+  REMOTE_SESSION_KIND_TMUX,
   SCREEN_BUSY_DO_NOT_ATTACH,
   SCREEN_BUSY_FORCE_DETACH,
   SCREEN_BUSY_SHARE,
@@ -55,6 +57,7 @@ import {
   type CursorStyle,
   type HostProfile,
   type ReconnectMode,
+  type RemoteSessionKind,
   type ScreenBusyHandling,
   type SerialDataBits,
   type SerialFlowControl,
@@ -640,10 +643,10 @@ export default function HostSessionSettingsDialog({
       <>
         <div className="settings-row">
           <div className="settings-row-label">
-            <strong>Open in screen</strong>
+            <strong>Open in remote session</strong>
             <span>
-              On connect, create or attach a named GNU screen session so work survives client
-              disconnects.
+              On connect, create or attach a named persistent session (GNU screen or tmux) so work
+              survives client disconnects.
             </span>
           </div>
           <input
@@ -665,8 +668,23 @@ export default function HostSessionSettingsDialog({
           <>
             <div className="settings-row">
               <div className="settings-row-label">
-                <strong>Screen session name</strong>
-                <span>Remote session name used with screen -S / attach.</span>
+                <strong>Session type</strong>
+                <span>Multiplexer used for the remote session.</span>
+              </div>
+              <select
+                value={form.remoteSessionKind}
+                onChange={(e) =>
+                  patch({ remoteSessionKind: e.target.value as RemoteSessionKind })
+                }
+              >
+                <option value={REMOTE_SESSION_KIND_SCREEN}>GNU Screen</option>
+                <option value={REMOTE_SESSION_KIND_TMUX}>tmux</option>
+              </select>
+            </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Session name</strong>
+                <span>Remote session name used with screen -S / tmux -s and attach.</span>
               </div>
               <input
                 value={form.screenSessionName}
@@ -678,8 +696,8 @@ export default function HostSessionSettingsDialog({
               <div className="settings-row-label">
                 <strong>Session busy handling</strong>
                 <span>
-                  When the named session already has another display attached: skip attach, share
-                  (-x), or force-detach the other display.
+                  When the named session already has another display attached: skip attach, share,
+                  or force-detach the other display.
                 </span>
               </div>
               <select
@@ -992,8 +1010,8 @@ export default function HostSessionSettingsDialog({
       })
       if (mode === 'editHost') {
         list.push({
-          id: 'screen',
-          title: 'Screen',
+          id: 'remoteSession',
+          title: 'Remote session',
           content: screenRows
         })
       }

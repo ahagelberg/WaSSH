@@ -4,7 +4,7 @@ import { readFileSync } from 'fs'
 import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import type { SFTPWrapper } from 'ssh2'
 import { Readable } from 'stream'
-import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, screenBusyFallbackMessage, type ScreenSessionConfig } from '../../shared/connection'
+import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, parseTmuxListForName, remoteSessionBusyFallbackMessage, type ScreenSessionConfig } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_RECONNECT_MODE,
@@ -15,13 +15,15 @@ import {
   HostKeyPrompt,
   RECONNECT_INITIAL_BACKOFF_MS,
   RECONNECT_MAX_BACKOFF_MS,
+  REMOTE_SESSION_KIND_TMUX,
   SCREEN_BUSY_DO_NOT_ATTACH,
   SCREEN_BUSY_FORCE_DETACH,
   SCREEN_BUSY_SHARE,
   SavePasswordDecision,
   SavePasswordPrompt,
   SessionStatus,
-  type ReconnectMode
+  type ReconnectMode,
+  type RemoteSessionKind
 } from '../../shared/types'
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore } from '../store/sessionStore'
@@ -40,11 +42,21 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-function screenAttachCommand(
+function remoteSessionAttachCommand(
+  kind: RemoteSessionKind,
   sessionName: string,
   busyHandling: ScreenSessionConfig['screenBusyHandling']
 ): string {
   const quoted = shellSingleQuote(sessionName)
+  if (kind === REMOTE_SESSION_KIND_TMUX) {
+    if (busyHandling === SCREEN_BUSY_SHARE) {
+      return `tmux new-session -A -s ${quoted}`
+    }
+    if (busyHandling === SCREEN_BUSY_FORCE_DETACH) {
+      return `tmux new-session -A -D -s ${quoted}`
+    }
+    return `tmux new-session -s ${quoted}`
+  }
   if (busyHandling === SCREEN_BUSY_SHARE) {
     return `screen -S ${quoted} -xR`
   }
@@ -850,7 +862,7 @@ export class SshConnection extends EventEmitter {
       void this.tunnels
         .start(client, tunnelOpts.tunnels, tunnelOpts.x11Forwarding)
         .then(async () => {
-          const screenPlan = await this.resolveScreenChannel(client)
+          const screenPlan = await this.resolveRemoteSessionChannel(client)
           this.openInteractiveChannel(
             client,
             pty,
@@ -963,49 +975,58 @@ export class SshConnection extends EventEmitter {
     })
   }
 
-  private async resolveScreenChannel(
+  private async resolveRemoteSessionChannel(
     client: Client
   ): Promise<{ command: string | null; statusMessage?: string }> {
     const screen = screenConfigFrom(this.connection)
     if (!screen.openInScreen) {
       return { command: null }
     }
+    const kind = screen.remoteSessionKind
 
     if (
       screen.screenBusyHandling === SCREEN_BUSY_SHARE ||
       screen.screenBusyHandling === SCREEN_BUSY_FORCE_DETACH
     ) {
       return {
-        command: screenAttachCommand(screen.screenSessionName, screen.screenBusyHandling)
+        command: remoteSessionAttachCommand(kind, screen.screenSessionName, screen.screenBusyHandling)
       }
     }
 
-    const presence = await this.probeScreenSession(client, screen.screenSessionName)
+    const presence = await this.probeRemoteSession(client, kind, screen.screenSessionName)
     if (presence === 'unavailable') {
       return { command: null }
     }
     if (presence === 'attached') {
       return {
         command: null,
-        statusMessage: screenBusyFallbackMessage(screen.screenSessionName)
+        statusMessage: remoteSessionBusyFallbackMessage(kind, screen.screenSessionName)
       }
     }
     if (presence === 'detached') {
+      if (kind === REMOTE_SESSION_KIND_TMUX) {
+        return {
+          command: `tmux attach-session -t ${shellSingleQuote(screen.screenSessionName)}`
+        }
+      }
       return {
         command: `screen -S ${shellSingleQuote(screen.screenSessionName)} -r`
       }
     }
     return {
-      command: screenAttachCommand(screen.screenSessionName, SCREEN_BUSY_DO_NOT_ATTACH)
+      command: remoteSessionAttachCommand(kind, screen.screenSessionName, SCREEN_BUSY_DO_NOT_ATTACH)
     }
   }
 
-  private probeScreenSession(
+  private probeRemoteSession(
     client: Client,
+    kind: RemoteSessionKind,
     sessionName: string
   ): Promise<'none' | 'detached' | 'attached' | 'unknown' | 'unavailable'> {
+    const listCommand =
+      kind === REMOTE_SESSION_KIND_TMUX ? 'tmux list-sessions' : 'screen -ls'
     return new Promise((resolve) => {
-      client.exec('screen -ls', (err, channel) => {
+      client.exec(listCommand, (err, channel) => {
         if (err) {
           resolve('unavailable')
           return
@@ -1032,6 +1053,10 @@ export class SshConnection extends EventEmitter {
             lower.includes('no such file or directory')
           ) {
             resolve('unavailable')
+            return
+          }
+          if (kind === REMOTE_SESSION_KIND_TMUX) {
+            resolve(parseTmuxListForName(output, sessionName))
             return
           }
           resolve(parseScreenListForName(output, sessionName))

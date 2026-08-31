@@ -243,11 +243,24 @@ export type ReconnectMode =
 /** Default for new hosts / quick connect */
 export const DEFAULT_RECONNECT_MODE: ReconnectMode = RECONNECT_MODE_ON_FOCUS
 
-/** Default GNU screen session name when “open in screen” is enabled */
+/** Default remote session name when “open in remote session” is enabled */
 export const DEFAULT_SCREEN_SESSION_NAME = 'WaSSH'
 
-/** Saved hosts: do not open in screen unless opted in */
+/** Saved hosts: do not open a remote session unless opted in */
 export const DEFAULT_OPEN_IN_SCREEN = false
+
+/** Remote session multiplexer: GNU screen */
+export const REMOTE_SESSION_KIND_SCREEN = 'screen'
+
+/** Remote session multiplexer: tmux */
+export const REMOTE_SESSION_KIND_TMUX = 'tmux'
+
+export type RemoteSessionKind =
+  | typeof REMOTE_SESSION_KIND_SCREEN
+  | typeof REMOTE_SESSION_KIND_TMUX
+
+/** Default multiplexer for new remote sessions */
+export const DEFAULT_REMOTE_SESSION_KIND: RemoteSessionKind = REMOTE_SESSION_KIND_SCREEN
 
 /** Busy session: skip attach and use a normal shell */
 export const SCREEN_BUSY_DO_NOT_ATTACH = 'doNotAttach'
@@ -376,12 +389,14 @@ export interface HostProfile {
   pluginSettings: Record<string, Record<string, unknown>>
   /** How to reconnect after a mid-session drop */
   reconnectMode: ReconnectMode
-  /** SSH: open a named GNU screen session on connect */
+  /** SSH: open a named remote session (GNU screen or tmux) on connect */
   openInScreen: boolean
-  /** GNU screen session name when openInScreen is set */
+  /** Remote session name when openInScreen is set */
   screenSessionName: string
-  /** What to do if the named screen session already has a display attached */
+  /** What to do if the named remote session already has a display attached */
   screenBusyHandling: ScreenBusyHandling
+  /** Multiplexer used for the remote session: GNU screen or tmux */
+  remoteSessionKind: RemoteSessionKind
   /** User-defined labels for grouping / finding this host */
   tags: string[]
 }
@@ -435,12 +450,14 @@ export interface ConnectionParams {
   pluginSettings: Record<string, Record<string, unknown>>
   /** How to reconnect after a mid-session drop */
   reconnectMode: ReconnectMode
-  /** SSH: open a named GNU screen session on connect (from saved host) */
+  /** SSH: open a named remote session (GNU screen or tmux) on connect (from saved host) */
   openInScreen: boolean
-  /** GNU screen session name when openInScreen is set */
+  /** Remote session name when openInScreen is set */
   screenSessionName: string
-  /** What to do if the named screen session already has a display attached */
+  /** What to do if the named remote session already has a display attached */
   screenBusyHandling: ScreenBusyHandling
+  /** Multiplexer used for the remote session: GNU screen or tmux */
+  remoteSessionKind: RemoteSessionKind
 }
 
 export interface TabSnapshot {

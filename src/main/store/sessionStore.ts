@@ -164,6 +164,7 @@ export class SessionStore {
       (h) =>
         h.reconnectMode === undefined ||
         h.openInScreen === undefined ||
+        h.remoteSessionKind === undefined ||
         h.tags === undefined
     )
     if (needsWrite && hosts.length > 0) {
@@ -222,7 +223,9 @@ export class TabStore {
     }))
     const needsWrite = rawTabs.some(
       (t) =>
-        t.connection?.reconnectMode === undefined || t.connection?.openInScreen === undefined
+        t.connection?.reconnectMode === undefined ||
+        t.connection?.openInScreen === undefined ||
+        t.connection?.remoteSessionKind === undefined
     )
     if (needsWrite && tabs.length > 0) {
       writeJson(TABS_FILE, tabs)

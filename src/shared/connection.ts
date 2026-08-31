@@ -25,6 +25,7 @@ import {
   DEFAULT_TELNET_PORT,
   DEFAULT_TUNNEL_LISTEN_HOST,
   DEFAULT_RECONNECT_MODE,
+  DEFAULT_REMOTE_SESSION_KIND,
   DEFAULT_SCREEN_BUSY_HANDLING,
   DEFAULT_SCREEN_SESSION_NAME,
   DEFAULT_OPEN_IN_SCREEN,
@@ -34,6 +35,8 @@ import {
   RECONNECT_MODE_ALWAYS,
   RECONNECT_MODE_NONE,
   RECONNECT_MODE_ON_FOCUS,
+  REMOTE_SESSION_KIND_SCREEN,
+  REMOTE_SESSION_KIND_TMUX,
   SCROLLBACK_LINES_MAX,
   SCROLLBACK_LINES_MIN,
   SCREEN_BUSY_DO_NOT_ATTACH,
@@ -68,6 +71,7 @@ import {
   type CursorStyle,
   type HostProfile,
   type ReconnectMode,
+  type RemoteSessionKind,
   type ScreenBusyHandling,
   type SerialConfig,
   type SerialDataBits,
@@ -529,6 +533,18 @@ export interface ScreenSessionConfig {
   openInScreen: boolean
   screenSessionName: string
   screenBusyHandling: ScreenBusyHandling
+  remoteSessionKind: RemoteSessionKind
+}
+
+export function remoteSessionKindFrom(
+  src: Partial<Pick<ConnectionParams, 'remoteSessionKind'>> | null | undefined,
+  fallback: RemoteSessionKind = DEFAULT_REMOTE_SESSION_KIND
+): RemoteSessionKind {
+  const value = src?.remoteSessionKind
+  if (value === REMOTE_SESSION_KIND_SCREEN || value === REMOTE_SESSION_KIND_TMUX) {
+    return value
+  }
+  return fallback
 }
 
 export function screenBusyHandlingFrom(
@@ -553,7 +569,8 @@ export function screenConfigFrom(
   return {
     openInScreen: src?.openInScreen ?? DEFAULT_OPEN_IN_SCREEN,
     screenSessionName: name || DEFAULT_SCREEN_SESSION_NAME,
-    screenBusyHandling: screenBusyHandlingFrom(src)
+    screenBusyHandling: screenBusyHandlingFrom(src),
+    remoteSessionKind: remoteSessionKindFrom(src)
   }
 }
 
@@ -583,8 +600,33 @@ export function parseScreenListForName(
   return found
 }
 
-export function screenBusyFallbackMessage(sessionName: string): string {
-  return `Screen session "${sessionName}" is busy; opened a normal shell instead.`
+/** Presence of a named session in `tmux list-sessions` output (`name: …` lines) */
+export function parseTmuxListForName(
+  output: string,
+  sessionName: string
+): ScreenSessionPresence {
+  const escaped = sessionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(String.raw`^\s*${escaped}:`, 'gm')
+  let found: ScreenSessionPresence = 'none'
+  let match: RegExpExecArray | null
+  while ((match = re.exec(output)) !== null) {
+    const lineEnd = output.indexOf('\n', match.index)
+    const line =
+      lineEnd === -1 ? output.slice(match.index) : output.slice(match.index, lineEnd)
+    if (line.includes('(attached)')) {
+      return 'attached'
+    }
+    found = 'detached'
+  }
+  return found
+}
+
+export function remoteSessionBusyFallbackMessage(
+  kind: RemoteSessionKind,
+  sessionName: string
+): string {
+  const label = kind === REMOTE_SESSION_KIND_TMUX ? 'tmux' : 'Screen'
+  return `${label} session "${sessionName}" is busy; opened a normal shell instead.`
 }
 
 function serialParityAbbrev(parity: SerialParity): string {
