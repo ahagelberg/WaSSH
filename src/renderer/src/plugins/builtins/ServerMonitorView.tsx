@@ -558,11 +558,13 @@ function ProcessTable({
 
 function NetworkPanel({
   ifaces,
+  showGauges,
   showSparks,
   rxHistory,
   txHistory
 }: {
   ifaces: ServerMonitorNetIface[]
+  showGauges: boolean
   showSparks: boolean
   rxHistory: number[]
   txHistory: number[]
@@ -599,8 +601,12 @@ function NetworkPanel({
       ) : (
         <>
           <div className="monitor-net-totals">
-            <RateBar label="↓ RX" rate={totals.rxRate} maxRate={capacity} tone="rx" />
-            <RateBar label="↑ TX" rate={totals.txRate} maxRate={capacity} tone="tx" />
+            {showGauges ? (
+              <>
+                <RateBar label="↓ RX" rate={totals.rxRate} maxRate={capacity} tone="rx" />
+                <RateBar label="↑ TX" rate={totals.txRate} maxRate={capacity} tone="tx" />
+              </>
+            ) : null}
             <div className="monitor-net-total-bytes">
               <span>Total RX {formatBytes(totals.rxBytes)}</span>
               <span>Total TX {formatBytes(totals.txBytes)}</span>
@@ -924,6 +930,7 @@ export default function ServerMonitorView({
           {showNetwork ? (
             <NetworkPanel
               ifaces={snapshot?.network ?? []}
+              showGauges={showGauges}
               showSparks={showSparks}
               rxHistory={netRxHistory}
               txHistory={netTxHistory}
