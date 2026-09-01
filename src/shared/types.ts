@@ -8,6 +8,8 @@ import type {
 } from './plugins'
 import { DEFAULT_ENABLED_PLUGINS } from './plugins'
 import type { TabPluginLayout } from './pluginLayout'
+import type { HostGroup, HostsOrganization } from './hostOrganization'
+export type { HostGroup, HostsOrganization } from './hostOrganization'
 
 /** Default SSH port */
 export const DEFAULT_SSH_PORT = 22
@@ -570,6 +572,8 @@ export interface WasshApi {
   getSettings: () => Promise<AppSettings>
   setSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
   listHosts: () => Promise<HostProfile[]>
+  getHostsOrganization: () => Promise<HostsOrganization>
+  saveHostsOrganization: (org: HostsOrganization) => Promise<HostsOrganization>
   saveHost: (host: HostProfile) => Promise<HostProfile>
   deleteHost: (id: string) => Promise<void>
   getTabSnapshot: () => Promise<TabSnapshot[]>

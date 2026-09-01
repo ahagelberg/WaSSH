@@ -10,7 +10,8 @@ import type {
   SavePasswordPrompt,
   SessionStatusEvent,
   TabSnapshot,
-  WasshApi
+  WasshApi,
+  type HostsOrganization
 } from '../shared/types'
 import type {
   PluginActiveStateEvent,
@@ -36,6 +37,9 @@ const api: WasshApi = {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (partial: Partial<AppSettings>) => ipcRenderer.invoke('settings:set', partial),
   listHosts: () => ipcRenderer.invoke('hosts:list'),
+  getHostsOrganization: () => ipcRenderer.invoke('hosts:getOrganization'),
+  saveHostsOrganization: (org: HostsOrganization) =>
+    ipcRenderer.invoke('hosts:saveOrganization', org),
   saveHost: (host: HostProfile) => ipcRenderer.invoke('hosts:save', host),
   deleteHost: (id: string) => ipcRenderer.invoke('hosts:delete', id),
   getTabSnapshot: () => ipcRenderer.invoke('tabs:get'),

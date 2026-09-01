@@ -19,6 +19,13 @@ import {
 import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 import { normalizeHostPluginSettings } from '../../shared/plugins'
+import {
+  appendHostToUngrouped,
+  normalizeHostsOrganization,
+  reconcileOrganization,
+  removeHostFromOrganization,
+  type HostsOrganization
+} from '../../shared/hostOrganization'
 
 const HOSTS_FILE = 'hosts.json'
 const PREVIOUS_HOSTS_FILE = 'sessions.json'
@@ -132,11 +139,26 @@ function normalizeHost(
   }
 }
 
-function readHostsFile(): Partial<HostProfile>[] {
+interface HostsDocument {
+  groups: HostsOrganization['groups']
+  ungroupedHostIds: string[]
+  ungroupedCollapsed: boolean
+  hosts: Partial<HostProfile>[]
+}
+
+function isHostsArray(raw: unknown): raw is Partial<HostProfile>[] {
+  return Array.isArray(raw)
+}
+
+function isHostsDocument(raw: unknown): raw is HostsDocument {
+  return Boolean(raw && typeof raw === 'object' && !Array.isArray(raw) && 'hosts' in raw)
+}
+
+function readRawHostsFile(): unknown {
   const dir = dataDir()
   const current = join(dir, HOSTS_FILE)
   if (existsSync(current)) {
-    return readJson<Partial<HostProfile>[]>(HOSTS_FILE, [])
+    return readJson<unknown>(HOSTS_FILE, [])
   }
   const previous = join(dir, PREVIOUS_HOSTS_FILE)
   if (!existsSync(previous)) {
@@ -147,6 +169,88 @@ function readHostsFile(): Partial<HostProfile>[] {
   return hosts
 }
 
+function loadHostsDocument(): { doc: HostsDocument; needsWrite: boolean } {
+  const raw = readRawHostsFile()
+  const fallbackMode = legacyReconnectModeDefault()
+
+  if (isHostsArray(raw)) {
+    const hosts = raw.map((h) => ({ ...h, id: h.id ?? randomUUID() }))
+    const doc: HostsDocument = {
+      groups: [],
+      ungroupedHostIds: hosts.map((h) => h.id!).filter(Boolean),
+      ungroupedCollapsed: false,
+      hosts
+    }
+    return { doc, needsWrite: true }
+  }
+
+  if (isHostsDocument(raw)) {
+    const hosts = Array.isArray(raw.hosts) ? raw.hosts : []
+    const org = normalizeHostsOrganization({
+      groups: raw.groups,
+      ungroupedHostIds: raw.ungroupedHostIds,
+      ungroupedCollapsed: raw.ungroupedCollapsed
+    })
+    const doc: HostsDocument = {
+      groups: org.groups,
+      ungroupedHostIds: org.ungroupedHostIds,
+      ungroupedCollapsed: org.ungroupedCollapsed,
+      hosts
+    }
+    const needsHostMigration = hosts.some(
+      (h) =>
+        h.reconnectMode === undefined ||
+        h.openInScreen === undefined ||
+        h.remoteSessionKind === undefined ||
+        h.tags === undefined
+    )
+    return { doc, needsWrite: needsHostMigration }
+  }
+
+  return {
+    doc: {
+      groups: [],
+      ungroupedHostIds: [],
+      ungroupedCollapsed: false,
+      hosts: []
+    },
+    needsWrite: false
+  }
+}
+
+function writeHostsDocument(doc: HostsDocument): void {
+  writeJson(HOSTS_FILE, doc)
+}
+
+function normalizedDocument(): { doc: HostsDocument; hosts: HostProfile[] } {
+  const fallbackMode = legacyReconnectModeDefault()
+  const { doc: rawDoc, needsWrite } = loadHostsDocument()
+  const hosts = rawDoc.hosts.map((h) =>
+    normalizeHost({ ...h, id: h.id ?? randomUUID() }, fallbackMode)
+  )
+  const hostIds = hosts.map((h) => h.id)
+  const org = reconcileOrganization(
+    normalizeHostsOrganization({
+      groups: rawDoc.groups,
+      ungroupedHostIds: rawDoc.ungroupedHostIds,
+      ungroupedCollapsed: rawDoc.ungroupedCollapsed
+    }),
+    hostIds
+  )
+  const doc: HostsDocument = {
+    ...org,
+    hosts
+  }
+  const reconciledChanged =
+    org.groups.length !== rawDoc.groups.length ||
+    org.ungroupedHostIds.join(',') !== rawDoc.ungroupedHostIds.join(',') ||
+    org.groups.some((g, i) => g.hostIds.join(',') !== rawDoc.groups[i]?.hostIds.join(','))
+  if (needsWrite || reconciledChanged) {
+    writeHostsDocument(doc)
+  }
+  return { doc, hosts }
+}
+
 export class SessionStore {
   /** Persist reconnectMode onto hosts/tabs that predate the per-host setting */
   migrateReconnectModes(): void {
@@ -155,42 +259,63 @@ export class SessionStore {
   }
 
   listHosts(): HostProfile[] {
-    const fallbackMode = legacyReconnectModeDefault()
-    const rawList = readHostsFile()
-    const hosts = rawList.map((h) =>
-      normalizeHost({ ...h, id: h.id ?? randomUUID() }, fallbackMode)
-    )
-    const needsWrite = rawList.some(
-      (h) =>
-        h.reconnectMode === undefined ||
-        h.openInScreen === undefined ||
-        h.remoteSessionKind === undefined ||
-        h.tags === undefined
-    )
-    if (needsWrite && hosts.length > 0) {
-      writeJson(HOSTS_FILE, hosts)
+    return normalizedDocument().hosts
+  }
+
+  getOrganization(): HostsOrganization {
+    const { doc } = normalizedDocument()
+    return {
+      groups: doc.groups,
+      ungroupedHostIds: doc.ungroupedHostIds,
+      ungroupedCollapsed: doc.ungroupedCollapsed
     }
-    return hosts
+  }
+
+  saveOrganization(org: HostsOrganization): HostsOrganization {
+    const { doc, hosts } = normalizedDocument()
+    const nextOrg = reconcileOrganization(normalizeHostsOrganization(org), hosts.map((h) => h.id))
+    writeHostsDocument({
+      ...nextOrg,
+      hosts
+    })
+    return nextOrg
   }
 
   saveHost(host: HostProfile): HostProfile {
+    const { doc, hosts } = normalizedDocument()
     const next = normalizeHost({ ...host, id: host.id })
-    const hosts = this.listHosts()
     const idx = hosts.findIndex((h) => h.id === next.id)
+    let org: HostsOrganization = {
+      groups: doc.groups,
+      ungroupedHostIds: doc.ungroupedHostIds,
+      ungroupedCollapsed: doc.ungroupedCollapsed
+    }
     if (idx >= 0) {
       hosts[idx] = next
     } else {
       hosts.push(next)
+      org = appendHostToUngrouped(org, next.id)
     }
-    writeJson(HOSTS_FILE, hosts)
+    org = reconcileOrganization(org, hosts.map((h) => h.id))
+    writeHostsDocument({ ...org, hosts })
     return next
   }
 
   deleteHost(id: string): void {
-    writeJson(
-      HOSTS_FILE,
-      this.listHosts().filter((h) => h.id !== id)
+    const { doc, hosts } = normalizedDocument()
+    const nextHosts = hosts.filter((h) => h.id !== id)
+    const org = reconcileOrganization(
+      removeHostFromOrganization(
+        {
+          groups: doc.groups,
+          ungroupedHostIds: doc.ungroupedHostIds,
+          ungroupedCollapsed: doc.ungroupedCollapsed
+        },
+        id
+      ),
+      nextHosts.map((h) => h.id)
     )
+    writeHostsDocument({ ...org, hosts: nextHosts })
   }
 
   getHost(id: string): HostProfile | undefined {

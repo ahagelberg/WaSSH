@@ -8,7 +8,15 @@
   --radius: 4px;
   --gap: 8px;
   --pad: 12px;
-  --host-gear-size: 24px;
+  --host-item-padding-y: 4px;
+  --host-item-padding-x: 6px;
+  --host-list-gap: 2px;
+  --host-group-gap: 6px;
+  --host-group-card-radius: 8px;
+  --host-group-header-height: 28px;
+  --host-drop-indicator-height: 2px;
+  --host-drag-threshold: 4px;
+  --host-drag-ghost-z: 101;
   --host-menu-min-width: 120px;
   --host-menu-z: 100;
   --tab-color-bar-width: 4px;
@@ -176,6 +184,7 @@ textarea:focus {
 
 .sidebar.collapsed .sidebar-title,
 .sidebar.collapsed .host-list,
+.sidebar.collapsed .sidebar-footer,
 .sidebar.collapsed .quick-connect {
   display: none;
 }
@@ -184,21 +193,180 @@ textarea:focus {
   flex: 1;
   overflow: auto;
   padding: var(--gap);
+  display: flex;
+  flex-direction: column;
+  gap: var(--host-group-gap);
+}
+
+.host-list.is-dragging-host .host-item:hover,
+.host-list.is-dragging-group .host-group:hover {
+  border-color: transparent;
+}
+
+.host-group {
+  padding: 6px 8px;
+  border-radius: var(--host-group-card-radius);
+  background: var(--bg-input);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  min-width: 0;
+}
+
+.host-group.is-drop-target {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.host-group-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: var(--host-group-header-height);
+  margin-bottom: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.host-group.collapsed .host-group-header {
+  margin-bottom: 0;
+}
+
+.host-group-header.is-dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+
+.host-group-collapse {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.host-group-collapse:hover {
+  border: none;
+  color: var(--text);
+}
+
+.host-group-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.host-group-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 4px;
+}
+
+.host-group-count {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.host-group-hosts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--host-list-gap);
+}
+
+.host-group.collapsed .host-group-hosts {
+  display: none;
 }
 
 .host-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--gap);
-  padding: 8px;
+  display: block;
+  padding: var(--host-item-padding-y) var(--host-item-padding-x);
   border-radius: var(--radius);
   border: 1px solid transparent;
+  position: relative;
 }
 
 .host-item:hover {
   background: var(--bg-panel-2);
   border-color: var(--border);
+}
+
+.host-item.dragging {
+  opacity: 0.35;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.host-list.is-dragging-host .host-item.dragging:hover {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.host-drag-ghost {
+  position: fixed;
+  z-index: var(--host-drag-ghost-z);
+  pointer-events: none;
+  padding: var(--host-item-padding-y) var(--host-item-padding-x);
+  min-width: 140px;
+  max-width: calc(var(--sidebar-width) - var(--pad) * 2);
+  background: var(--bg-panel);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.host-drag-ghost-name {
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.host-drag-ghost-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.host-item.drop-before::before,
+.host-item.drop-after::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: var(--host-drop-indicator-height);
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.host-item.drop-before::before {
+  top: calc(-1 * var(--host-drop-indicator-height) / 2);
+}
+
+.host-item.drop-after::after {
+  bottom: calc(-1 * var(--host-drop-indicator-height) / 2);
 }
 
 .host-item-main {
@@ -207,8 +375,17 @@ textarea:focus {
   cursor: pointer;
 }
 
+.host-list.is-dragging-host .host-item-main {
+  cursor: grab;
+}
+
+.host-list.is-dragging-host .host-item.dragging .host-item-main {
+  cursor: grabbing;
+}
+
 .host-item-name {
   font-weight: 600;
+  line-height: 1.25;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -217,6 +394,7 @@ textarea:focus {
 .host-item-meta {
   color: var(--text-muted);
   font-size: 11px;
+  line-height: 1.2;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -225,8 +403,8 @@ textarea:focus {
 .host-item-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 4px;
+  gap: 3px;
+  margin-top: 2px;
 }
 
 .host-tag {
@@ -236,24 +414,6 @@ textarea:focus {
   border-radius: 999px;
   font-size: 10px;
   color: var(--text-muted);
-}
-
-.host-item-menu {
-  position: relative;
-  flex-shrink: 0;
-}
-
-.host-item-gear {
-  width: var(--host-gear-size);
-  height: var(--host-gear-size);
-  padding: 0;
-  font-size: 14px;
-  line-height: 1;
-}
-
-.host-item-menu.open .host-item-gear {
-  border-color: var(--accent);
-  color: var(--accent);
 }
 
 .host-context-menu,
@@ -297,6 +457,23 @@ textarea:focus {
 
 .host-context-menu button.danger:hover {
   color: var(--danger);
+}
+
+.host-list-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.sidebar-footer {
+  border-top: 1px solid var(--border);
+  padding: var(--pad);
+  display: flex;
+  gap: var(--gap);
+}
+
+.sidebar-footer .primary {
+  flex: 1;
 }
 
 .quick-connect {

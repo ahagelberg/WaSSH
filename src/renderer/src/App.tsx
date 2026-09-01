@@ -9,6 +9,7 @@ import {
   DEFAULT_THEME,
   HostKeyPrompt,
   HostProfile,
+  HostsOrganization,
   SavePasswordPrompt,
   SessionStatus,
   TAB_SNAPSHOT_DEBOUNCE_MS,
@@ -51,7 +52,10 @@ import {
   removePluginFromLayout,
   type TabPluginLayout
 } from '@shared/pluginLayout'
-import PluginToolbar from './plugins/PluginToolbar'
+import {
+  DEFAULT_HOSTS_ORGANIZATION,
+  normalizeHostsOrganization
+} from '@shared/hostOrganization'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
 /** Closed session settings retained for Ctrl+Shift+T reopen */
@@ -145,6 +149,9 @@ function emptyHost(): HostProfile {
 export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS)
   const [hosts, setHosts] = useState<HostProfile[]>([])
+  const [hostsOrganization, setHostsOrganization] = useState<HostsOrganization>(
+    DEFAULT_HOSTS_ORGANIZATION
+  )
   const [tabs, setTabs] = useState<TabState[]>([])
   const [activeTabId, setActiveTabId] = useState<string | null>(null)
   const [showOptions, setShowOptions] = useState(false)
@@ -210,7 +217,10 @@ export default function App() {
   }, [activeTabId])
 
   const refreshHosts = useCallback(async () => {
-    const list = await window.wassh.listHosts()
+    const [list, org] = await Promise.all([
+      window.wassh.listHosts(),
+      window.wassh.getHostsOrganization()
+    ])
     setHosts(
       list.map((h) => ({
         ...h,
@@ -222,6 +232,14 @@ export default function App() {
         ...screenConfigFrom(h)
       }))
     )
+    setHostsOrganization(normalizeHostsOrganization(org))
+  }, [])
+
+  const saveHostsOrganization = useCallback(async (org: HostsOrganization) => {
+    const next = normalizeHostsOrganization(org)
+    setHostsOrganization(next)
+    const saved = await window.wassh.saveHostsOrganization(next)
+    setHostsOrganization(normalizeHostsOrganization(saved))
   }, [])
 
   const refreshPlugins = useCallback(async () => {
@@ -994,6 +1012,7 @@ export default function App() {
       <div className="sidebar-column">
         <SessionsSidebar
           hosts={hosts}
+          organization={hostsOrganization}
           collapsed={settings.sidebarCollapsed}
           onToggleCollapse={() => updateSettings({ sidebarCollapsed: !settings.sidebarCollapsed })}
           onConnect={(host) => openTab(hostToConnection(host))}
@@ -1002,6 +1021,9 @@ export default function App() {
             void window.wassh.deleteHost(host.id).then(refreshHosts)
           }}
           onNewHost={() => setHostEditor({ mode: 'editHost', initial: emptyHost(), connected: false })}
+          onSaveOrganization={(org) => {
+            void saveHostsOrganization(org)
+          }}
         />
         {!settings.sidebarCollapsed ? <QuickConnect onConnect={(c) => openTab(c)} /> : null}
       </div>

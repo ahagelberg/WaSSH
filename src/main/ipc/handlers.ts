@@ -7,7 +7,8 @@ import {
   HostProfile,
   SavePasswordDecision,
   TabSnapshot,
-  THEME_WINDOW_BACKGROUND
+  THEME_WINDOW_BACKGROUND,
+  type HostsOrganization
 } from '../../shared/types'
 import { CredentialVault } from '../store/credentialVault'
 import {
@@ -52,6 +53,10 @@ export function registerIpc(
   })
 
   ipcMain.handle('hosts:list', () => sessionStore.listHosts())
+  ipcMain.handle('hosts:getOrganization', () => sessionStore.getOrganization())
+  ipcMain.handle('hosts:saveOrganization', (_e, org: HostsOrganization) =>
+    sessionStore.saveOrganization(org)
+  )
   ipcMain.handle('hosts:save', (_e, host: HostProfile) => sessionStore.saveHost(host))
   ipcMain.handle('hosts:delete', (_e, id: string) => {
     sessionStore.deleteHost(id)
