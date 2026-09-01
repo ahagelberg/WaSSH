@@ -37,7 +37,6 @@ function optionsPayload(draft: AppSettings): Partial<AppSettings> {
     reconnectOnStartup: draft.reconnectOnStartup,
     termType: draft.termType,
     theme: draft.theme,
-    showCommandTimers: draft.showCommandTimers,
     enabledPlugins: draft.enabledPlugins,
     pluginSettings: draft.pluginSettings,
     sessionStyleDefaults: sessionStyleDefaultsFrom(draft.sessionStyleDefaults)
@@ -229,33 +228,17 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
         id: 'terminal',
         title: 'Terminal',
         content: (
-          <>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <strong>TERM</strong>
-                <span>PTY terminal type sent to the remote host.</span>
-              </div>
-              <input
-                type="text"
-                value={draft.termType}
-                onChange={(e) => patch({ termType: e.target.value })}
-              />
+          <div className="settings-row">
+            <div className="settings-row-label">
+              <strong>TERM</strong>
+              <span>PTY terminal type sent to the remote host.</span>
             </div>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <strong>Show command timers</strong>
-                <span>
-                  Show how long each command took, as a small timer right before the
-                  next prompt.
-                </span>
-              </div>
-              <input
-                type="checkbox"
-                checked={draft.showCommandTimers}
-                onChange={(e) => patch({ showCommandTimers: e.target.checked })}
-              />
-            </div>
-          </>
+            <input
+              type="text"
+              value={draft.termType}
+              onChange={(e) => patch({ termType: e.target.value })}
+            />
+          </div>
         )
       },
       {

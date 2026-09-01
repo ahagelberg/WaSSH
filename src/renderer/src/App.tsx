@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AppSettings,
+  BUNDLED_FONT_FAMILIES,
   ConnectionParams,
   DEFAULT_SETTINGS,
   DEFAULT_TERM_COLS,
@@ -37,7 +38,6 @@ import type { TerminalSearchController } from './terminalSearch'
 import HostSessionSettingsDialog, {
   type HostSessionMode
 } from './components/HostSessionSettingsDialog'
-import CommandHistoryPopup from './components/CommandHistoryPopup'
 import {
   mergePluginSettings,
   PLUGIN_ID_SFTP,
@@ -164,9 +164,18 @@ export default function App() {
   const [saveAsHostName, setSaveAsHostName] = useState('')
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const [paletteOpen, setPaletteOpen] = useState(false)
-  const [historyOpen, setHistoryOpen] = useState(false)
-  const [historyFilter, setHistoryFilter] = useState('')
-  const [historyCommands, setHistoryCommands] = useState<string[]>([])
+  const [paletteQuery, setPaletteQuery] = useState('')
+  const [paletteIndex, setPaletteIndex] = useState(0)
+  const [paletteArgMode, setPaletteArgMode] = useState(false)
+  const [paletteArgCommand, setPaletteArgCommand] = useState<{
+    id: string
+    title: string
+    argOptions?: { value: string; label: string }[]
+  } | null>(null)
+  const [paletteArgValue, setPaletteArgValue] = useState('')
+  const [paletteArgIndex, setPaletteArgIndex] = useState(0)
+  /** Bumped to move focus back into the terminal after an overlay closes */
+  const [termFocusNonce, setTermFocusNonce] = useState(0)
 
   const writers = useRef<Map<string, (data: string) => void>>(new Map())
   const searchControllers = useRef<Map<string, TerminalSearchController>>(new Map())
@@ -182,8 +191,7 @@ export default function App() {
   const activeRef = useRef(activeTabId)
   const settingsRef = useRef(settings)
   const restoredRef = useRef(false)
-  const historyOpenRef = useRef(historyOpen)
-  const commandBuffers = useRef<Map<string, string>>(new Map())
+  const paletteRef = useRef<HTMLDivElement>(null)
 
   tabsRef.current = tabs
   hostsRef.current = hosts
@@ -191,7 +199,6 @@ export default function App() {
   settingsRef.current = settings
   findQueryRef.current = findQuery
   findCaseRef.current = findCaseSensitive
-  historyOpenRef.current = historyOpen
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme || DEFAULT_THEME
@@ -341,10 +348,6 @@ export default function App() {
     })()
   }, [refreshHosts, refreshPlugins, connectTab])
 
-  useEffect(() => {
-    void window.wassh.getCommandHistory().then(setHistoryCommands)
-  }, [])
-
   const closeTab = useCallback((id: string): void => {
     const list = tabsRef.current
     const idx = list.findIndex((t) => t.id === id)
@@ -417,36 +420,6 @@ export default function App() {
 
   const onTermData = useCallback((tabId: string, data: string) => {
     void window.wassh.write(tabId, data)
-
-    const prev = commandBuffers.current.get(tabId) ?? ''
-    const combined = prev + data
-    const parts = combined.split(/\r?\n/)
-    if (parts.length > 1) {
-      const completed = parts[0].trim()
-      if (completed) {
-        void window.wassh.appendCommandHistory(completed)
-        setHistoryCommands((prevCmds) =>
-          [completed, ...prevCmds.filter((c) => c !== completed)].slice(0, 500)
-        )
-      }
-      commandBuffers.current.set(tabId, parts[parts.length - 1])
-    } else {
-      commandBuffers.current.set(tabId, combined)
-    }
-
-    const s = settingsRef.current
-    const cur = commandBuffers.current.get(tabId) ?? ''
-    if (
-      s.autoCommandHistory &&
-      !historyOpenRef.current &&
-      parts.length === 1 &&
-      cur.trim().length > 0 &&
-      !data.includes('\x1b') &&
-      !/\r|\n/.test(data)
-    ) {
-      setHistoryFilter(cur)
-      setHistoryOpen(true)
-    }
   }, [])
 
   useEffect(() => {
@@ -804,20 +777,30 @@ export default function App() {
     }
   }
 
-  const closeHistory = useCallback(() => {
-    setHistoryOpen(false)
+  const closePalette = useCallback(() => {
+    setPaletteOpen(false)
+    setTermFocusNonce((n) => n + 1)
   }, [])
 
-  const selectHistoryCommand = useCallback(
-    (command: string) => {
-      if (activeTabId) {
-        void window.wassh.write(activeTabId, command + '\r')
-      }
-      commandBuffers.current.set(activeTabId ?? '', '')
-      setHistoryOpen(false)
-    },
-    [activeTabId]
+  const openPalette = useCallback(() => {
+    setPaletteQuery('')
+    setPaletteIndex(0)
+    setPaletteArgMode(false)
+    setPaletteArgCommand(null)
+    setPaletteArgValue('')
+    setPaletteOpen(true)
+  }, [])
+
+  const pluginArgOptions = plugins.map((p) => ({ value: p.id, label: p.name }))
+  const activePluginArgOptions = (
+    activeTabId
+      ? (tabs.find((t) => t.id === activeTabId)?.activePluginIds ?? [])
+          .map((id) => plugins.find((p) => p.id === id))
+          .filter((p): p is PluginListItem => Boolean(p))
+          .map((p) => ({ value: p.id, label: p.name }))
+      : []
   )
+  const fontArgOptions = BUNDLED_FONT_FAMILIES.map((f) => ({ value: f, label: f }))
 
   const paletteCommands = [
     { id: 'open-settings', title: 'Open Settings' },
@@ -830,15 +813,65 @@ export default function App() {
     { id: 'open-find', title: 'Open Find in Terminal' },
     { id: 'about', title: 'About' },
     { id: 'run-command', title: 'Run Command in Current Terminal', needsArgument: true },
-    { id: 'activate-plugin', title: 'Activate Plugin', needsArgument: true },
-    { id: 'deactivate-plugin', title: 'Deactivate Plugin', needsArgument: true },
-    { id: 'toggle-plugin', title: 'Toggle Plugin', needsArgument: true },
+    {
+      id: 'activate-plugin',
+      title: 'Activate Plugin',
+      needsArgument: true,
+      argOptions: pluginArgOptions
+    },
+    {
+      id: 'deactivate-plugin',
+      title: 'Deactivate Plugin',
+      needsArgument: true,
+      argOptions: activePluginArgOptions
+    },
+    {
+      id: 'toggle-plugin',
+      title: 'Toggle Plugin',
+      needsArgument: true,
+      argOptions: pluginArgOptions
+    },
     { id: 'set-font-size', title: 'Set Font Size', needsArgument: true },
-    { id: 'set-font-family', title: 'Set Font Family', needsArgument: true },
+    {
+      id: 'set-font-family',
+      title: 'Set Font Family',
+      needsArgument: true,
+      argOptions: fontArgOptions
+    },
     { id: 'set-term-background', title: 'Set Terminal Background Color', needsArgument: true },
     { id: 'set-term-foreground', title: 'Set Terminal Foreground Color', needsArgument: true },
     { id: 'set-tab-accent', title: 'Set Tab Accent Color', needsArgument: true }
   ]
+
+  const filteredPaletteCommands = paletteCommands.filter((cmd) => {
+    const q = paletteQuery.trim().toLowerCase()
+    if (!q) return true
+    const title = cmd.title.toLowerCase()
+    if (title.includes(q)) return true
+    let i = 0
+    for (const ch of title) {
+      if (ch === q[i]) i++
+      if (i === q.length) return true
+    }
+    return false
+  })
+
+  useEffect(() => {
+    setPaletteIndex(0)
+  }, [paletteQuery])
+
+  const filteredArgOptions = (paletteArgCommand?.argOptions ?? []).filter((opt) => {
+    const q = paletteArgValue.trim().toLowerCase()
+    if (!q) return true
+    return (
+      opt.label.toLowerCase().includes(q) ||
+      opt.value.toLowerCase().includes(q)
+    )
+  })
+
+  useEffect(() => {
+    setPaletteArgIndex(0)
+  }, [paletteArgValue, paletteArgCommand])
 
   const executeCommand = useCallback(
     async (commandId: string, rawArgs: string) => {
@@ -944,26 +977,17 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
         e.preventDefault()
-        setHistoryOpen(false)
-        setPaletteOpen(true)
-        return
-      }
-      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'h') {
-        e.preventDefault()
-        setPaletteOpen(false)
-        setHistoryFilter(commandBuffers.current.get(activeRef.current ?? '') ?? '')
-        setHistoryOpen(true)
+        openPalette()
         return
       }
       if (e.key === 'F1') {
         e.preventDefault()
-        setHistoryOpen(false)
-        setPaletteOpen(true)
+        openPalette()
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [])
+  }, [openPalette])
 
   return (
     <div className={`app-shell${settings.sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
@@ -1136,15 +1160,6 @@ export default function App() {
             </div>
           ) : null}
 
-          {historyOpen ? (
-            <CommandHistoryPopup
-              commands={historyCommands}
-              initialFilter={historyFilter}
-              onClose={closeHistory}
-              onSelect={selectHistoryCommand}
-            />
-          ) : null}
-
           {tabs.length === 0 ? (
             <div className="empty-state">
               <div>
@@ -1199,6 +1214,7 @@ export default function App() {
                         findCaseSensitive={findCaseSensitive}
                         findFocusNonce={findFocusNonce}
                         findFound={findFound}
+                        focusNonce={termFocusNonce}
                         onFindQueryChange={(q) => {
                           setFindQuery(q)
                           setFindFound(null)
@@ -1248,27 +1264,145 @@ export default function App() {
       {paletteOpen ? (
         <div
           className="command-palette-overlay"
-          onClick={() => setPaletteOpen(false)}
+          onClick={closePalette}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              if (paletteArgMode) {
+                setPaletteArgMode(false)
+                setPaletteArgCommand(null)
+                setPaletteArgValue('')
+              } else {
+                closePalette()
+              }
+              return
+            }
+            if (e.key === 'ArrowDown') {
+              e.preventDefault()
+              if (paletteArgMode) {
+                if (filteredArgOptions.length > 0) {
+                  setPaletteArgIndex((i) => Math.min(i + 1, filteredArgOptions.length - 1))
+                }
+              } else if (filteredPaletteCommands.length > 0) {
+                setPaletteIndex((i) => Math.min(i + 1, filteredPaletteCommands.length - 1))
+              }
+              return
+            }
+            if (e.key === 'ArrowUp') {
+              e.preventDefault()
+              if (paletteArgMode) {
+                setPaletteArgIndex((i) => Math.max(i - 1, 0))
+              } else {
+                setPaletteIndex((i) => Math.max(i - 1, 0))
+              }
+              return
+            }
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              if (paletteArgMode) {
+                if (paletteArgCommand) {
+                  if (paletteArgCommand.argOptions) {
+                    const opt = filteredArgOptions[paletteArgIndex]
+                    if (opt) {
+                      executeCommand(paletteArgCommand.id, opt.value)
+                    }
+                  } else {
+                    executeCommand(paletteArgCommand.id, paletteArgValue)
+                  }
+                }
+                return
+              }
+              const cmd = filteredPaletteCommands[paletteIndex]
+              if (cmd) {
+                if (cmd.needsArgument) {
+                  setPaletteArgCommand({ id: cmd.id, title: cmd.title, argOptions: cmd.argOptions })
+                  setPaletteArgValue('')
+                  setPaletteArgMode(true)
+                } else {
+                  executeCommand(cmd.id, '')
+                }
+              }
+            }
+          }}
         >
-          <div className="command-palette" onClick={(e) => e.stopPropagation()}>
-            <div className="command-palette-search">
+          <div
+            className="command-palette"
+            ref={paletteRef}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => {
+              if (!paletteRef.current?.contains(e.relatedTarget as Node)) {
+                closePalette()
+              }
+            }}
+          >
+            <div className={paletteArgMode ? 'command-palette-arg-form' : 'command-palette-search'}>
+              {paletteArgMode && paletteArgCommand ? (
+                <span className="command-palette-arg-label">{paletteArgCommand.title}</span>
+              ) : null}
               <input
-                className="command-palette-input"
-                placeholder="Type a command…"
+                className={paletteArgMode ? 'command-palette-arg-input' : 'command-palette-input'}
+                placeholder={
+                  paletteArgMode
+                    ? paletteArgCommand?.argOptions
+                      ? 'Filter…'
+                      : 'Enter value…'
+                    : 'Type a command…'
+                }
                 autoFocus
+                value={paletteArgMode ? paletteArgValue : paletteQuery}
+                onChange={(e) => {
+                  if (paletteArgMode) setPaletteArgValue(e.target.value)
+                  else setPaletteQuery(e.target.value)
+                }}
               />
             </div>
-            <div className="command-palette-list">
-              {paletteCommands.map((cmd) => (
-                <div
-                  key={cmd.id}
-                  className="command-palette-item"
-                  onClick={() => executeCommand(cmd.id, '')}
-                >
-                  {cmd.title}
+            {paletteArgMode ? (
+              paletteArgCommand?.argOptions ? (
+                <div className="command-palette-list">
+                  {filteredArgOptions.map((opt, idx) => (
+                    <div
+                      key={opt.value}
+                      className={`command-palette-item${idx === paletteArgIndex ? ' selected' : ''}`}
+                      onMouseEnter={() => setPaletteArgIndex(idx)}
+                      onClick={() => executeCommand(paletteArgCommand.id, opt.value)}
+                    >
+                      {opt.label}
+                    </div>
+                  ))}
+                  {filteredArgOptions.length === 0 ? (
+                    <div className="command-palette-empty">No matching options</div>
+                  ) : null}
                 </div>
-              ))}
-            </div>
+              ) : null
+            ) : (
+              <div className="command-palette-list">
+                {filteredPaletteCommands.map((cmd, idx) => (
+                  <div
+                    key={cmd.id}
+                    className={`command-palette-item${idx === paletteIndex ? ' selected' : ''}`}
+                    onMouseEnter={() => setPaletteIndex(idx)}
+                    onClick={() => {
+                      if (cmd.needsArgument) {
+                        setPaletteArgCommand({ id: cmd.id, title: cmd.title, argOptions: cmd.argOptions })
+                        setPaletteArgValue('')
+                        setPaletteArgMode(true)
+                      } else {
+                        executeCommand(cmd.id, '')
+                      }
+                    }}
+                  >
+                    {cmd.title}
+                    {cmd.needsArgument ? (
+                      <span className="command-palette-requires-arg">…</span>
+                    ) : null}
+                  </div>
+                ))}
+                {filteredPaletteCommands.length === 0 ? (
+                  <div className="command-palette-empty">No matching commands</div>
+                ) : null}
+              </div>
+            )}
           </div>
         </div>
       ) : null}

@@ -21,7 +21,6 @@ import {
   type TerminalSearchController
 } from '../terminalSearch'
 import TerminalSearchBar from './TerminalSearchBar'
-import { CommandTimer } from '../commandTimer'
 
 /** Debounce resize observer notifications */
 const RESIZE_DEBOUNCE_MS = 50
@@ -53,6 +52,8 @@ interface Props {
   findCaseSensitive: boolean
   findFocusNonce: number
   findFound: boolean | null
+  /** Bump to request terminal focus (e.g. after an overlay closes) */
+  focusNonce: number
   onFindQueryChange: (query: string) => void
   onFindCaseSensitiveChange: (value: boolean) => void
   onFindPrevious: () => void
@@ -78,15 +79,6 @@ function xtermThemeFromHost(el: HTMLElement) {
     cursor: styles.color,
     selectionBackground: selection
   }
-}
-
-/** The user can submit a command only from a normal-buffer line that has content */
-function isCommandLine(term: Terminal): boolean {
-  if (term.buffer.active.type !== 'normal') {
-    return false
-  }
-  const line = term.buffer.active.getLine(term.buffer.active.cursorY)
-  return (line?.translateToString(true).trim().length ?? 0) > 0
 }
 
 function positionBellLine(host: HTMLElement, term: Terminal, lineEl: HTMLElement): void {
@@ -120,6 +112,7 @@ export default function TerminalView({
   findCaseSensitive,
   findFocusNonce,
   findFound,
+  focusNonce,
   onFindQueryChange,
   onFindCaseSensitiveChange,
   onFindPrevious,
@@ -142,14 +135,11 @@ export default function TerminalView({
   const bellModeRef = useRef(bellMode)
   const cursorStyleRef = useRef(cursorStyle)
   const cursorBlinkRef = useRef(cursorBlink)
-  const timerRef = useRef<CommandTimer | null>(null)
-  const commandTimerEnabledRef = useRef(settings.showCommandTimers)
   const bellTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   bellModeRef.current = bellMode
   cursorStyleRef.current = cursorStyle
   cursorBlinkRef.current = cursorBlink
-  commandTimerEnabledRef.current = settings.showCommandTimers
 
   useEffect(() => {
     const host = hostRef.current
@@ -192,11 +182,8 @@ export default function TerminalView({
     termRef.current = term
     fitRef.current = fit
     searchRef.current = search
-    const timer = new CommandTimer()
-    timerRef.current = timer
     registerWriter(tabId, (data) => {
-      const writeData = commandTimerEnabledRef.current ? timer.process(data) : data
-      term.write(writeData)
+      term.write(data)
       applyCursor()
     })
     registerSearch(tabId, {
@@ -222,16 +209,7 @@ export default function TerminalView({
       }
     })
 
-    const dataDisp = term.onData((data) => {
-      if (
-        commandTimerEnabledRef.current &&
-        data.includes('\r') &&
-        isCommandLine(term)
-      ) {
-        timer.start()
-      }
-      onData(tabId, data)
-    })
+    const dataDisp = term.onData((data) => onData(tabId, data))
     const cursorSeqDisp = term.parser.registerCsiHandler(
       { intermediates: DECSCUSR_INTERMEDIATE, final: DECSCUSR_FINAL },
       () => true
@@ -371,7 +349,6 @@ export default function TerminalView({
       termRef.current = null
       fitRef.current = null
       searchRef.current = null
-      timerRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId])
@@ -422,6 +399,17 @@ export default function TerminalView({
     })
     return () => cancelAnimationFrame(frame)
   }, [active, tabId, onResize])
+
+  useEffect(() => {
+    if (!active) {
+      return
+    }
+    // Defer past the overlay that released focus so xterm can accept it.
+    const frame = requestAnimationFrame(() => {
+      termRef.current?.focus()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [focusNonce, active])
 
   const [dragActive, setDragActive] = useState(false)
   const dragDepthRef = useRef(0)
