@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import type { HostProfile, HostsOrganization } from '@shared/types'
-import { hostDisplayName, hostSubtitle } from '@shared/connection'
+import { hostDisplayName, hostSubtitle, resolveSessionStyle, type SessionStyle } from '@shared/connection'
+import { sessionAccentStyle } from '../sessionStyleCss'
 import {
   UNGROUPED_SECTION_ID,
   deleteNamedGroup,
@@ -13,6 +14,7 @@ import {
 interface Props {
   hosts: HostProfile[]
   organization: HostsOrganization
+  styleDefaults: SessionStyle
   collapsed: boolean
   onToggleCollapse: () => void
   onConnect: (host: HostProfile) => void
@@ -185,6 +187,7 @@ function hostDropClass(hint: HostDropHint | null, sectionId: string, hostId: str
 export default function SessionsSidebar({
   hosts,
   organization,
+  styleDefaults,
   collapsed,
   onToggleCollapse,
   onConnect,
@@ -434,11 +437,14 @@ export default function SessionsSidebar({
   const renderHostRow = (host: HostProfile, sectionId: string): ReactElement => {
     const proxy = host.proxyHostId ? hostById.get(host.proxyHostId) : null
     const dropClass = hostDropClass(hostDropHint, sectionId, host.id)
+    const tabColor = resolveSessionStyle(host, styleDefaults).tabColor
     return (
       <div
         key={host.id}
         className={`host-item${draggingHostId === host.id ? ' dragging' : ''}${dropClass}`}
         data-host-id={host.id}
+        data-tab-color={tabColor || undefined}
+        style={sessionAccentStyle(tabColor)}
         onContextMenu={(e) => {
           e.preventDefault()
           e.stopPropagation()
@@ -737,7 +743,11 @@ export default function SessionsSidebar({
             <div
               className="host-drag-ghost"
               aria-hidden="true"
+              data-tab-color={
+                resolveSessionStyle(ghostHost, styleDefaults).tabColor || undefined
+              }
               style={{
+                ...sessionAccentStyle(resolveSessionStyle(ghostHost, styleDefaults).tabColor),
                 left: hostDragGhost.x + HOST_DRAG_GHOST_OFFSET_X_PX,
                 top: hostDragGhost.y + HOST_DRAG_GHOST_OFFSET_Y_PX
               }}

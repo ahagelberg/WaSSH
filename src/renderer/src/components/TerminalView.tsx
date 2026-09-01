@@ -16,10 +16,7 @@ import {
   type CursorStyle
 } from '@shared/types'
 import { terminalFontStack } from '@shared/connection'
-import {
-  toXtermSearchOptions,
-  type TerminalSearchController
-} from '../terminalSearch'
+import { sessionTerminalStyle } from '../sessionStyleCss'
 import TerminalSearchBar from './TerminalSearchBar'
 
 /** Debounce resize observer notifications */
@@ -462,6 +459,7 @@ export default function TerminalView({
       ref={hostRef}
       data-term-bg={termBackground || undefined}
       data-term-fg={termForeground || undefined}
+      style={sessionTerminalStyle(termBackground, termForeground)}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}

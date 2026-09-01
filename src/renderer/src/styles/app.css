@@ -10,6 +10,7 @@
   --pad: 12px;
   --host-item-padding-y: 4px;
   --host-item-padding-x: 6px;
+  --host-item-accent-gap: 6px;
   --host-list-gap: 2px;
   --host-group-gap: 6px;
   --host-group-card-radius: 8px;
@@ -295,11 +296,39 @@ textarea:focus {
 }
 
 .host-item {
-  display: block;
+  display: flex;
+  align-items: stretch;
+  gap: var(--host-item-accent-gap);
   padding: var(--host-item-padding-y) var(--host-item-padding-x);
   border-radius: var(--radius);
   border: 1px solid transparent;
   position: relative;
+}
+
+.host-item[data-tab-color]::before {
+  content: '';
+  width: var(--tab-color-bar-width);
+  flex-shrink: 0;
+  margin: 2px 0;
+  border-radius: 2px;
+  background-color: var(--tab-accent-color);
+}
+
+.host-item[data-tab-color] {
+  background-color: color-mix(
+    in srgb,
+    var(--tab-accent-color) 12%,
+    transparent
+  );
+}
+
+.host-item[data-tab-color]:hover {
+  background-color: color-mix(
+    in srgb,
+    var(--tab-accent-color) 16%,
+    var(--bg-panel-2)
+  );
+  border-color: var(--border);
 }
 
 .host-item:hover {
@@ -330,6 +359,15 @@ textarea:focus {
   border: 1px solid var(--accent);
   border-radius: var(--radius);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.host-drag-ghost[data-tab-color] {
+  border-color: var(--tab-accent-color);
+  background-color: color-mix(
+    in srgb,
+    var(--tab-accent-color) 14%,
+    var(--bg-panel)
+  );
 }
 
 .host-drag-ghost-name {

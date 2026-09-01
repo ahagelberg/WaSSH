@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { SessionStatus } from '@shared/types'
+import { sessionAccentStyle } from '../sessionStyleCss'
 
 /** Drop before the tab if the pointer is left of this fraction of its width */
 const TAB_DROP_BEFORE_RATIO = 0.5
@@ -226,6 +227,7 @@ export default function TabBar({
           data-tab-id={tab.id}
           className={`tab${tab.active && draggingId !== tab.id ? ' active' : ''}${draggingId === tab.id ? ' dragging' : ''}`}
           data-tab-color={tab.tabColor || undefined}
+          style={sessionAccentStyle(tab.tabColor)}
           onMouseDown={(e) => {
             // Don't move focus into the tab bar — TerminalView refocuses the active pane.
             // HTML5 drag cannot start after preventDefault, so reorder uses pointer events.

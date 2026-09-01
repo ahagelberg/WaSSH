@@ -56,6 +56,8 @@ import {
   DEFAULT_HOSTS_ORGANIZATION,
   normalizeHostsOrganization
 } from '@shared/hostOrganization'
+import { sessionAccentStyle, sessionTerminalStyle } from './sessionStyleCss'
+import PluginToolbar from './plugins/PluginToolbar'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
 /** Closed session settings retained for Ctrl+Shift+T reopen */
@@ -313,18 +315,19 @@ export default function App() {
   const openTab = useCallback(
     (connection: ConnectionParams, existingId?: string) => {
       const id = existingId || crypto.randomUUID()
+      const nextConnection = structuredClone(connection)
       setTabs((prev) => [
         ...prev,
         {
           id,
-          connection,
+          connection: nextConnection,
           status: 'connecting' as SessionStatus,
           activePluginIds: [],
           pluginLayout: emptyTabPluginLayout()
         }
       ])
       setActiveTabId(id)
-      void connectTab(id, connection)
+      void connectTab(id, nextConnection)
       return id
     },
     [connectTab]
@@ -394,10 +397,11 @@ export default function App() {
     if (!entry) return
     const id = crypto.randomUUID()
     const restoreIds = entry.activePluginIds.slice()
+    const connection = structuredClone(entry.connection)
     setTabs((prev) => {
       const tab: TabState = {
         id,
-        connection: entry.connection,
+        connection,
         status: 'connecting',
         activePluginIds: restoreIds,
         pluginLayout: normalizeTabPluginLayout(entry.pluginLayout)
@@ -410,7 +414,7 @@ export default function App() {
     setActiveTabId(id)
     void (async () => {
       if (restoreIds.length > 0) await window.wassh.queuePluginRestore(id, restoreIds)
-      await connectTab(id, entry.connection)
+      await connectTab(id, connection)
     })()
   }, [connectTab])
 
@@ -769,30 +773,6 @@ export default function App() {
     }
     await window.wassh.saveHost(host)
     await refreshHosts()
-    setTabs((prev) =>
-      prev.map((t) =>
-        t.connection.hostId === host.id
-          ? {
-              ...t,
-              connection: {
-                ...t.connection,
-                pluginSettings: host.pluginSettings,
-                reconnectMode: host.reconnectMode,
-                ...screenConfigFrom(host)
-              }
-            }
-          : t
-      )
-    )
-    for (const t of tabsRef.current) {
-      if (t.connection.hostId === host.id) {
-        void window.wassh.updateConnection(t.id, {
-          pluginSettings: host.pluginSettings,
-          reconnectMode: host.reconnectMode,
-          ...screenConfigFrom(host)
-        })
-      }
-    }
   }
 
   const closePalette = useCallback(() => {
@@ -1013,6 +993,7 @@ export default function App() {
         <SessionsSidebar
           hosts={hosts}
           organization={hostsOrganization}
+          styleDefaults={styleDefaults}
           collapsed={settings.sidebarCollapsed}
           onToggleCollapse={() => updateSettings({ sidebarCollapsed: !settings.sidebarCollapsed })}
           onConnect={(host) => openTab(hostToConnection(host))}
@@ -1081,6 +1062,11 @@ export default function App() {
         <div
           className="terminal-area"
           data-term-bg={activeStyle?.termBackground || undefined}
+          style={
+            activeStyle
+              ? sessionTerminalStyle(activeStyle.termBackground, activeStyle.termForeground)
+              : undefined
+          }
         >
           {activeTab?.hostKeyPrompt ? (
             <div className="inline-banner warn">
@@ -1462,10 +1448,7 @@ export default function App() {
                         hostId: host.id,
                         passwordVaultId: host.passwordVaultId || t.connection.passwordVaultId,
                         passphraseVaultId:
-                          host.passphraseVaultId || t.connection.passphraseVaultId,
-                        pluginSettings: host.pluginSettings,
-                        reconnectMode: host.reconnectMode,
-                        ...screenConfigFrom(host)
+                          host.passphraseVaultId || t.connection.passphraseVaultId
                       }
                     }
                   : t
