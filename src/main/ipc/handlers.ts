@@ -1,4 +1,6 @@
-import { BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { join } from 'path'
 import {
   AppSettings,
   AppTheme,
@@ -27,6 +29,42 @@ export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): vo
   if (win && !win.isDestroyed()) {
     win.setBackgroundColor(THEME_WINDOW_BACKGROUND[theme])
   }
+}
+
+const COMMAND_HISTORY_LIMIT = 500
+
+function commandHistoryFilePath(): string {
+  return join(app.getPath('userData'), 'command-history.json')
+}
+
+function readCommandHistory(): string[] {
+  const file = commandHistoryFilePath()
+  if (!existsSync(file)) {
+    return []
+  }
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    if (Array.isArray(raw)) {
+      return raw.filter((x): x is string => typeof x === 'string').slice(-COMMAND_HISTORY_LIMIT)
+    }
+  } catch {
+    // ignore corrupt file
+  }
+  return []
+}
+
+function appendCommandHistory(command: string): void {
+  const trimmed = command.trim()
+  if (!trimmed) {
+    return
+  }
+  const history = readCommandHistory()
+  const next = [trimmed, ...history.filter((c) => c !== trimmed)].slice(0, COMMAND_HISTORY_LIMIT)
+  const dir = app.getPath('userData')
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+  }
+  writeFileSync(commandHistoryFilePath(), JSON.stringify(next), 'utf8')
 }
 
 export function registerIpc(
@@ -147,5 +185,10 @@ export function registerIpc(
   ipcMain.handle('plugins:getData', (_e, pluginId: string) => pluginData.get(pluginId))
   ipcMain.handle('plugins:setData', (_e, pluginId: string, data: unknown) => {
     pluginData.set(pluginId, data)
+  })
+
+  ipcMain.handle('commandHistory:get', () => readCommandHistory())
+  ipcMain.handle('commandHistory:append', (_e, command: string) => {
+    appendCommandHistory(command)
   })
 }

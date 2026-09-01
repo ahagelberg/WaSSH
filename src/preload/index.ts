@@ -68,6 +68,10 @@ const api: WasshApi = {
     ipcRenderer.invoke('plugins:queueRestore', tabId, activePluginIds),
   getPluginData: (pluginId) => ipcRenderer.invoke('plugins:getData', pluginId),
   setPluginData: (pluginId, data) => ipcRenderer.invoke('plugins:setData', pluginId, data),
+  getCommandPaletteData: () => ipcRenderer.invoke('commandPalette:get'),
+  setCommandPaletteData: (data) => ipcRenderer.invoke('commandPalette:set', data),
+  getCommandHistory: () => ipcRenderer.invoke('commandHistory:get'),
+  appendCommandHistory: (command: string) => ipcRenderer.invoke('commandHistory:append', command),
   onSessionData: (cb) =>
     on('session:data', (tabId, data) => cb(tabId as string, data as string)),
   onSessionStatus: (cb) =>

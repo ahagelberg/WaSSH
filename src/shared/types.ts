@@ -488,6 +488,8 @@ export interface AppSettings {
   pluginPanelOrder: string[]
   /** Defaults for new hosts / quick connect; hosts with “use default” inherit these */
   sessionStyleDefaults: SessionStyleDefaults
+  /** Show the command history popup automatically while typing at a shell prompt */
+  autoCommandHistory: boolean
 }
 
 /** App-level appearance defaults (concrete values; colors may be theme-unset) */
@@ -526,7 +528,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pluginSettings: {},
   pluginPanelPlacements: {},
   pluginPanelOrder: [],
-  sessionStyleDefaults: { ...DEFAULT_SESSION_STYLE_DEFAULTS }
+  sessionStyleDefaults: { ...DEFAULT_SESSION_STYLE_DEFAULTS },
+  autoCommandHistory: true
 }
 
 export interface KnownHostEntry {
@@ -569,6 +572,11 @@ export interface ConnectRequest {
 export type HostKeyDecision = 'accept' | 'reject'
 export type SavePasswordDecision = 'save' | 'skip' | 'save_as_host'
 
+export interface CommandHistoryData {
+  /** Most recent first */
+  commands: string[]
+}
+
 export interface WasshApi {
   getSettings: () => Promise<AppSettings>
   setSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
@@ -605,6 +613,14 @@ export interface WasshApi {
   getPluginData: (pluginId: string) => Promise<unknown>
   /** Write plugin-owned JSON to userData/plugin-<id>.json */
   setPluginData: (pluginId: string, data: unknown) => Promise<void>
+  /** Read command palette history from userData/command-palette.json */
+  getCommandPaletteData: () => Promise<{ recentCommandIds: string[]; lastArgByCommand: Record<string, string> }>
+  /** Write command palette history to userData/command-palette.json */
+  setCommandPaletteData: (data: { recentCommandIds: string[]; lastArgByCommand: Record<string, string> }) => Promise<{ recentCommandIds: string[]; lastArgByCommand: Record<string, string> }>
+  /** Read terminal command history from userData/command-history.json */
+  getCommandHistory: () => Promise<string[]>
+  /** Append a terminal command to the persisted command history */
+  appendCommandHistory: (command: string) => Promise<void>
   onSessionData: (cb: (tabId: string, data: string) => void) => () => void
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void
   onCycleTab: (cb: (delta: number) => void) => () => void

@@ -37,6 +37,7 @@ import type { TerminalSearchController } from './terminalSearch'
 import HostSessionSettingsDialog, {
   type HostSessionMode
 } from './components/HostSessionSettingsDialog'
+import CommandHistoryPopup from './components/CommandHistoryPopup'
 import {
   mergePluginSettings,
   PLUGIN_ID_SFTP,
@@ -112,12 +113,8 @@ function cloneClosedSession(tab: TabState, insertIndex: number): ClosedSession {
 
 function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
   return tabs.slice().sort((a, b) => {
-    if (a.id < b.id) {
-      return -1
-    }
-    if (a.id > b.id) {
-      return 1
-    }
+    if (a.id < b.id) return -1
+    if (a.id > b.id) return 1
     return 0
   })
 }
@@ -166,6 +163,11 @@ export default function App() {
   } | null>(null)
   const [saveAsHostName, setSaveAsHostName] = useState('')
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyFilter, setHistoryFilter] = useState('')
+  const [historyCommands, setHistoryCommands] = useState<string[]>([])
+
   const writers = useRef<Map<string, (data: string) => void>>(new Map())
   const searchControllers = useRef<Map<string, TerminalSearchController>>(new Map())
   const closedSessionsRef = useRef<ClosedSession[]>([])
@@ -180,6 +182,8 @@ export default function App() {
   const activeRef = useRef(activeTabId)
   const settingsRef = useRef(settings)
   const restoredRef = useRef(false)
+  const historyOpenRef = useRef(historyOpen)
+  const commandBuffers = useRef<Map<string, string>>(new Map())
 
   tabsRef.current = tabs
   hostsRef.current = hosts
@@ -187,6 +191,7 @@ export default function App() {
   settingsRef.current = settings
   findQueryRef.current = findQuery
   findCaseRef.current = findCaseSensitive
+  historyOpenRef.current = historyOpen
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme || DEFAULT_THEME
@@ -257,9 +262,7 @@ export default function App() {
   const reconnectTab = useCallback(
     async (id: string): Promise<void> => {
       const tab = tabsRef.current.find((t) => t.id === id)
-      if (!tab) {
-        return
-      }
+      if (!tab) return
       const restoreIds = tab.activePluginIds.slice()
       await window.wassh.disconnect(id)
       if (restoreIds.length > 0) {
@@ -272,9 +275,7 @@ export default function App() {
 
   const openSessionSettings = useCallback((id: string): void => {
     const tab = tabsRef.current.find((t) => t.id === id)
-    if (!tab) {
-      return
-    }
+    if (!tab) return
     setActiveTabId(id)
     setHostEditor({
       mode: 'editOpenSession',
@@ -310,17 +311,11 @@ export default function App() {
       setSettings(s)
       await refreshHosts()
       await refreshPlugins()
-      if (restoredRef.current) {
-        return
-      }
+      if (restoredRef.current) return
       restoredRef.current = true
-      if (!s.reconnectOnStartup) {
-        return
-      }
+      if (!s.reconnectOnStartup) return
       const snapshot = await window.wassh.getTabSnapshot()
-      if (snapshot.length === 0) {
-        return
-      }
+      if (snapshot.length === 0) return
       const restored: TabState[] = snapshot.map((t) => ({
         id: t.id,
         connection: {
@@ -340,13 +335,15 @@ export default function App() {
       setActiveTabId(active)
       for (const t of restored) {
         const ids = t.activePluginIds
-        if (ids.length > 0) {
-          await window.wassh.queuePluginRestore(t.id, ids)
-        }
+        if (ids.length > 0) await window.wassh.queuePluginRestore(t.id, ids)
         void connectTab(t.id, t.connection)
       }
     })()
   }, [refreshHosts, refreshPlugins, connectTab])
+
+  useEffect(() => {
+    void window.wassh.getCommandHistory().then(setHistoryCommands)
+  }, [])
 
   const closeTab = useCallback((id: string): void => {
     const list = tabsRef.current
@@ -373,9 +370,7 @@ export default function App() {
     const stack = pruneClosedSessions(closedSessionsRef.current)
     const entry = stack.pop()
     closedSessionsRef.current = stack
-    if (!entry) {
-      return
-    }
+    if (!entry) return
     const id = crypto.randomUUID()
     const restoreIds = entry.activePluginIds.slice()
     setTabs((prev) => {
@@ -393,9 +388,7 @@ export default function App() {
     })
     setActiveTabId(id)
     void (async () => {
-      if (restoreIds.length > 0) {
-        await window.wassh.queuePluginRestore(id, restoreIds)
-      }
+      if (restoreIds.length > 0) await window.wassh.queuePluginRestore(id, restoreIds)
       await connectTab(id, entry.connection)
     })()
   }, [connectTab])
@@ -415,13 +408,45 @@ export default function App() {
 
   const cycleTab = useCallback((delta: number): void => {
     const list = tabsRef.current
-    if (list.length === 0) {
-      return
-    }
+    if (list.length === 0) return
     const idx = list.findIndex((t) => t.id === activeRef.current)
     const from = idx < 0 ? 0 : idx
     const nextIndex = (from + delta + list.length) % list.length
     setActiveTabId(list[nextIndex].id)
+  }, [])
+
+  const onTermData = useCallback((tabId: string, data: string) => {
+    void window.wassh.write(tabId, data)
+
+    const prev = commandBuffers.current.get(tabId) ?? ''
+    const combined = prev + data
+    const parts = combined.split(/\r?\n/)
+    if (parts.length > 1) {
+      const completed = parts[0].trim()
+      if (completed) {
+        void window.wassh.appendCommandHistory(completed)
+        setHistoryCommands((prevCmds) =>
+          [completed, ...prevCmds.filter((c) => c !== completed)].slice(0, 500)
+        )
+      }
+      commandBuffers.current.set(tabId, parts[parts.length - 1])
+    } else {
+      commandBuffers.current.set(tabId, combined)
+    }
+
+    const s = settingsRef.current
+    const cur = commandBuffers.current.get(tabId) ?? ''
+    if (
+      s.autoCommandHistory &&
+      !historyOpenRef.current &&
+      parts.length === 1 &&
+      cur.trim().length > 0 &&
+      !data.includes('\x1b') &&
+      !/\r|\n/.test(data)
+    ) {
+      setHistoryFilter(cur)
+      setHistoryOpen(true)
+    }
   }, [])
 
   useEffect(() => {
@@ -433,9 +458,7 @@ export default function App() {
         closeTab(ev.tabId)
         sftpReadyRef.current.delete(ev.tabId)
         setDropUploads((prev) => {
-          if (!(ev.tabId in prev)) {
-            return prev
-          }
+          if (!(ev.tabId in prev)) return prev
           const next = { ...prev }
           delete next[ev.tabId]
           return next
@@ -444,9 +467,7 @@ export default function App() {
       }
       setTabs((prev) =>
         prev.map((t) =>
-          t.id === ev.tabId
-            ? { ...t, status: ev.status, statusMessage: ev.message }
-            : t
+          t.id === ev.tabId ? { ...t, status: ev.status, statusMessage: ev.message } : t
         )
       )
       if (ev.status === 'connected') {
@@ -470,9 +491,7 @@ export default function App() {
     const offCycle = window.wassh.onCycleTab(cycleTab)
     const offCloseActive = window.wassh.onCloseActiveTab(() => {
       const id = activeRef.current
-      if (id) {
-        closeTab(id)
-      }
+      if (id) closeTab(id)
     })
     const offReopenClosed = window.wassh.onReopenClosedTab(() => {
       reopenLastClosedSession()
@@ -489,33 +508,22 @@ export default function App() {
     })
     const offReconnectActive = window.wassh.onReconnectActive(() => {
       const id = activeRef.current
-      if (id) {
-        void reconnectTab(id)
-      }
+      if (id) void reconnectTab(id)
     })
     const offReconnectAll = window.wassh.onReconnectAll(() => {
-      for (const tab of tabsRef.current) {
-        void reconnectTab(tab.id)
-      }
+      for (const tab of tabsRef.current) void reconnectTab(tab.id)
     })
     const offSessionSettings = window.wassh.onOpenSessionSettings(() => {
       const id = activeRef.current
-      if (id) {
-        openSessionSettings(id)
-      }
+      if (id) openSessionSettings(id)
     })
     const offPluginActive = window.wassh.onPluginActive((ev) => {
       setTabs((prev) =>
         prev.map((t) => {
-          if (t.id !== ev.tabId) {
-            return t
-          }
+          if (t.id !== ev.tabId) return t
           const set = new Set(t.activePluginIds)
-          if (ev.active) {
-            set.add(ev.pluginId)
-          } else {
-            set.delete(ev.pluginId)
-          }
+          if (ev.active) set.add(ev.pluginId)
+          else set.delete(ev.pluginId)
           return { ...t, activePluginIds: Array.from(set) }
         })
       )
@@ -525,18 +533,11 @@ export default function App() {
       }
     })
     const offPluginMessage = window.wassh.onPluginMessage((ev) => {
-      if (ev.pluginId !== PLUGIN_ID_SFTP) {
-        return
-      }
+      if (ev.pluginId !== PLUGIN_ID_SFTP) return
       const payload = ev.payload as SftpStatusPayload
-      if (payload.type !== 'status') {
-        return
-      }
-      if (payload.state === 'connected') {
-        sftpReadyRef.current.add(ev.tabId)
-      } else {
-        sftpReadyRef.current.delete(ev.tabId)
-      }
+      if (payload.type !== 'status') return
+      if (payload.state === 'connected') sftpReadyRef.current.add(ev.tabId)
+      else sftpReadyRef.current.delete(ev.tabId)
       setSftpReadyTick((n) => n + 1)
     })
     return () => {
@@ -576,13 +577,9 @@ export default function App() {
       const hostPartial: Record<string, unknown> = {}
       const appPartial: Record<string, unknown> = {}
       for (const [key, value] of Object.entries(partial)) {
-        if (hostKeys.has(key)) {
-          hostPartial[key] = value
-        } else if (appKeys.has(key)) {
-          appPartial[key] = value
-        } else {
-          hostPartial[key] = value
-        }
+        if (hostKeys.has(key)) hostPartial[key] = value
+        else if (appKeys.has(key)) appPartial[key] = value
+        else hostPartial[key] = value
       }
 
       if (Object.keys(appPartial).length > 0) {
@@ -598,14 +595,10 @@ export default function App() {
         void window.wassh.setSettings({ pluginSettings: nextSettings }).then(setSettings)
       }
 
-      if (Object.keys(hostPartial).length === 0) {
-        return
-      }
+      if (Object.keys(hostPartial).length === 0) return
 
       const tab = tabsRef.current.find((t) => t.id === tabId)
-      if (!tab) {
-        return
-      }
+      if (!tab) return
       const hostId = tab.connection.hostId
       const nextPluginValues = {
         ...mergePluginSettings(hostSchema, tab.connection.pluginSettings?.[pluginId]),
@@ -637,13 +630,9 @@ export default function App() {
         }
       }
 
-      if (!hostId) {
-        return
-      }
+      if (!hostId) return
       const host = hostsRef.current.find((h) => h.id === hostId)
-      if (!host) {
-        return
-      }
+      if (!host) return
       const nextHost: HostProfile = {
         ...host,
         pluginSettings: {
@@ -682,9 +671,7 @@ export default function App() {
 
   const uploadDroppedFiles = useCallback(async (tabId: string, files: File[]) => {
     for (const file of files) {
-      if (!sftpReadyRef.current.has(tabId) || file.size === 0) {
-        continue
-      }
+      if (!sftpReadyRef.current.has(tabId) || file.size === 0) continue
       setDropUploads((prev) => ({
         ...prev,
         [tabId]: { name: file.name, transferredBytes: 0, totalBytes: file.size }
@@ -702,9 +689,7 @@ export default function App() {
           offset = end
           setDropUploads((prev) => {
             const cur = prev[tabId]
-            if (!cur) {
-              return prev
-            }
+            if (!cur) return prev
             return { ...prev, [tabId]: { ...cur, transferredBytes: offset } }
           })
         }
@@ -713,9 +698,7 @@ export default function App() {
         void send({ type: 'cancel' })
       } finally {
         setDropUploads((prev) => {
-          if (!(tabId in prev)) {
-            return prev
-          }
+          if (!(tabId in prev)) return prev
           const next = { ...prev }
           delete next[tabId]
           return next
@@ -727,9 +710,7 @@ export default function App() {
   const styleDefaults = sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
-  const activeStyle = activeTab
-    ? resolveSessionStyle(activeTab.connection, styleDefaults)
-    : null
+  const activeStyle = activeTab ? resolveSessionStyle(activeTab.connection, styleDefaults) : null
 
   const registerWriter = useCallback((tabId: string, write: (data: string) => void) => {
     writers.current.set(tabId, write)
@@ -772,13 +753,7 @@ export default function App() {
     setFindFound(null)
     lastFindQueryRef.current = ''
     const id = activeRef.current
-    if (id) {
-      searchControllers.current.get(id)?.clear()
-    }
-  }, [])
-
-  const onTermData = useCallback((tabId: string, data: string) => {
-    void window.wassh.write(tabId, data)
+    if (id) searchControllers.current.get(id)?.clear()
   }, [])
 
   const onTermResize = useCallback((tabId: string, cols: number, rows: number) => {
@@ -794,9 +769,7 @@ export default function App() {
       const vid = host.passwordVaultId || `pwd-${host.id}`
       await window.wassh.setSecret(vid, password)
       host.passwordVaultId = vid
-      if (host.authMethod === 'none') {
-        host.authMethod = 'password'
-      }
+      if (host.authMethod === 'none') host.authMethod = 'password'
     }
     if (passphrase) {
       const vid = host.passphraseVaultId || `pp-${host.id}`
@@ -831,25 +804,180 @@ export default function App() {
     }
   }
 
+  const closeHistory = useCallback(() => {
+    setHistoryOpen(false)
+  }, [])
+
+  const selectHistoryCommand = useCallback(
+    (command: string) => {
+      if (activeTabId) {
+        void window.wassh.write(activeTabId, command + '\r')
+      }
+      commandBuffers.current.set(activeTabId ?? '', '')
+      setHistoryOpen(false)
+    },
+    [activeTabId]
+  )
+
+  const paletteCommands = [
+    { id: 'open-settings', title: 'Open Settings' },
+    { id: 'toggle-theme', title: 'Toggle Dark/Light Theme' },
+    { id: 'new-host', title: 'New Host' },
+    { id: 'quick-connect', title: 'Quick Connect' },
+    { id: 'reconnect-active', title: 'Reconnect Active Tab' },
+    { id: 'close-active', title: 'Close Active Tab' },
+    { id: 'reopen-last-closed', title: 'Reopen Last Closed Tab' },
+    { id: 'open-find', title: 'Open Find in Terminal' },
+    { id: 'about', title: 'About' },
+    { id: 'run-command', title: 'Run Command in Current Terminal', needsArgument: true },
+    { id: 'activate-plugin', title: 'Activate Plugin', needsArgument: true },
+    { id: 'deactivate-plugin', title: 'Deactivate Plugin', needsArgument: true },
+    { id: 'toggle-plugin', title: 'Toggle Plugin', needsArgument: true },
+    { id: 'set-font-size', title: 'Set Font Size', needsArgument: true },
+    { id: 'set-font-family', title: 'Set Font Family', needsArgument: true },
+    { id: 'set-term-background', title: 'Set Terminal Background Color', needsArgument: true },
+    { id: 'set-term-foreground', title: 'Set Terminal Foreground Color', needsArgument: true },
+    { id: 'set-tab-accent', title: 'Set Tab Accent Color', needsArgument: true }
+  ]
+
+  const executeCommand = useCallback(
+    async (commandId: string, rawArgs: string) => {
+      const args = rawArgs.trim()
+      switch (commandId) {
+        case 'open-settings':
+          setShowOptions(true)
+          break
+        case 'toggle-theme':
+          updateSettings({ theme: settings.theme === 'dark' ? 'light' : 'dark' })
+          break
+        case 'new-host':
+          setHostEditor({ mode: 'editHost', initial: emptyHost(), connected: false })
+          break
+        case 'quick-connect':
+          updateSettings({ sidebarCollapsed: false })
+          break
+        case 'reconnect-active':
+          if (activeTabId) void reconnectTab(activeTabId)
+          break
+        case 'close-active':
+          if (activeTabId) closeTab(activeTabId)
+          break
+        case 'reopen-last-closed':
+          reopenLastClosedSession()
+          break
+        case 'open-find':
+          setShowFind(true)
+          setFindFocusNonce((n) => n + 1)
+          break
+        case 'about':
+          setShowAbout(true)
+          break
+        case 'run-command':
+          if (activeTabId && args) void window.wassh.write(activeTabId, args + '\r')
+          break
+        case 'activate-plugin':
+          if (activeTabId && args) await window.wassh.activatePlugin(activeTabId, args)
+          break
+        case 'deactivate-plugin':
+          if (activeTabId && args) {
+            setTabs((prev) =>
+              prev.map((t) =>
+                t.id === activeTabId
+                  ? { ...t, pluginLayout: removePluginFromLayout(t.pluginLayout, args) }
+                  : t
+              )
+            )
+            await window.wassh.deactivatePlugin(activeTabId, args)
+          }
+          break
+        case 'toggle-plugin':
+          if (activeTabId && args) {
+            const tab = tabsRef.current.find((t) => t.id === activeTabId)
+            const currentlyActive = tab?.activePluginIds.includes(args) ?? false
+            await togglePlugin(activeTabId, args, !currentlyActive)
+          }
+          break
+        case 'set-font-size': {
+          const size = Number.parseInt(args, 10)
+          if (!Number.isNaN(size) && size >= 8 && size <= 48) {
+            updateSettings({
+              sessionStyleDefaults: { ...settings.sessionStyleDefaults, fontSizePx: size }
+            })
+          }
+          break
+        }
+        case 'set-font-family':
+          if (args) {
+            updateSettings({
+              sessionStyleDefaults: { ...settings.sessionStyleDefaults, fontFamily: args }
+            })
+          }
+          break
+        case 'set-term-background':
+          if (/^#[0-9A-Fa-f]{6}$/.test(args)) {
+            updateSettings({
+              sessionStyleDefaults: { ...settings.sessionStyleDefaults, termBackground: args }
+            })
+          }
+          break
+        case 'set-term-foreground':
+          if (/^#[0-9A-Fa-f]{6}$/.test(args)) {
+            updateSettings({
+              sessionStyleDefaults: { ...settings.sessionStyleDefaults, termForeground: args }
+            })
+          }
+          break
+        case 'set-tab-accent':
+          if (/^#[0-9A-Fa-f]{6}$/.test(args)) {
+            updateSettings({
+              sessionStyleDefaults: { ...settings.sessionStyleDefaults, tabColor: args }
+            })
+          }
+          break
+      }
+      setPaletteOpen(false)
+    },
+    [settings, activeTabId, updateSettings, reconnectTab, closeTab, reopenLastClosedSession, togglePlugin]
+  )
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
+        e.preventDefault()
+        setHistoryOpen(false)
+        setPaletteOpen(true)
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'h') {
+        e.preventDefault()
+        setPaletteOpen(false)
+        setHistoryFilter(commandBuffers.current.get(activeRef.current ?? '') ?? '')
+        setHistoryOpen(true)
+        return
+      }
+      if (e.key === 'F1') {
+        e.preventDefault()
+        setHistoryOpen(false)
+        setPaletteOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
   return (
     <div className={`app-shell${settings.sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
       <div className="sidebar-column">
         <SessionsSidebar
           hosts={hosts}
           collapsed={settings.sidebarCollapsed}
-          onToggleCollapse={() =>
-            updateSettings({ sidebarCollapsed: !settings.sidebarCollapsed })
-          }
+          onToggleCollapse={() => updateSettings({ sidebarCollapsed: !settings.sidebarCollapsed })}
           onConnect={(host) => openTab(hostToConnection(host))}
-          onEdit={(host) =>
-            setHostEditor({ mode: 'editHost', initial: host, connected: false })
-          }
+          onEdit={(host) => setHostEditor({ mode: 'editHost', initial: host, connected: false })}
           onDelete={(host) => {
             void window.wassh.deleteHost(host.id).then(refreshHosts)
           }}
-          onNewHost={() =>
-            setHostEditor({ mode: 'editHost', initial: emptyHost(), connected: false })
-          }
+          onNewHost={() => setHostEditor({ mode: 'editHost', initial: emptyHost(), connected: false })}
         />
         {!settings.sidebarCollapsed ? <QuickConnect onConnect={(c) => openTab(c)} /> : null}
       </div>
@@ -859,13 +987,14 @@ export default function App() {
           tabs={tabs.map((t) => {
             const style = resolveSessionStyle(t.connection, styleDefaults)
             return {
-            id: t.id,
-            title: sessionTitle(t.connection),
-            status: t.status,
-            active: t.id === activeTabId,
-            tabColor: style.tabColor,
-            canSaveAsHost: !t.connection.hostId
-          }})}
+              id: t.id,
+              title: sessionTitle(t.connection),
+              status: t.status,
+              active: t.id === activeTabId,
+              tabColor: style.tabColor,
+              canSaveAsHost: !t.connection.hostId
+            }
+          })}
           onSelect={setActiveTabId}
           onClose={closeTab}
           onReorder={reorderTabs}
@@ -875,9 +1004,7 @@ export default function App() {
           onConfigure={openSessionSettings}
           onSaveAsHost={(id) => {
             const tab = tabsRef.current.find((t) => t.id === id)
-            if (!tab) {
-              return
-            }
+            if (!tab) return
             setActiveTabId(id)
             setHostEditor({
               mode: 'editHost',
@@ -899,9 +1026,7 @@ export default function App() {
             activePluginIds={activeTab?.activePluginIds ?? []}
             disabled={!activeTabId}
             onToggle={(pluginId, nextActive) => {
-              if (!activeTabId) {
-                return
-              }
+              if (!activeTabId) return
               void togglePlugin(activeTabId, pluginId, nextActive)
             }}
           />
@@ -927,9 +1052,7 @@ export default function App() {
                   const tabId = activeTab.id
                   void window.wassh.respondHostKey(tabId, 'accept')
                   setTabs((prev) =>
-                    prev.map((t) =>
-                      t.id === tabId ? { ...t, hostKeyPrompt: undefined } : t
-                    )
+                    prev.map((t) => (t.id === tabId ? { ...t, hostKeyPrompt: undefined } : t))
                   )
                 }}
               >
@@ -942,9 +1065,7 @@ export default function App() {
                   const tabId = activeTab.id
                   void window.wassh.respondHostKey(tabId, 'reject')
                   setTabs((prev) =>
-                    prev.map((t) =>
-                      t.id === tabId ? { ...t, hostKeyPrompt: undefined } : t
-                    )
+                    prev.map((t) => (t.id === tabId ? { ...t, hostKeyPrompt: undefined } : t))
                   )
                 }}
               >
@@ -1015,6 +1136,15 @@ export default function App() {
             </div>
           ) : null}
 
+          {historyOpen ? (
+            <CommandHistoryPopup
+              commands={historyCommands}
+              initialFilter={historyFilter}
+              onClose={closeHistory}
+              onSelect={selectHistoryCommand}
+            />
+          ) : null}
+
           {tabs.length === 0 ? (
             <div className="empty-state">
               <div>
@@ -1026,94 +1156,122 @@ export default function App() {
             <div className="terminal-stack">
               {tabsByStablePaneOrder(tabs).map((t) => {
                 const style = resolveSessionStyle(t.connection, styleDefaults)
-                const dropEnabled = sftpReadyRef.current.has(t.id)
                 const dropUpload = dropUploads[t.id]
                 const dropPct =
                   dropUpload && dropUpload.totalBytes > 0
                     ? Math.min(100, (dropUpload.transferredBytes / dropUpload.totalBytes) * 100)
                     : 0
                 return (
-                <div
-                  key={t.id}
-                  className={`terminal-pane${t.id === activeTabId ? ' active' : ''}`}
-                >
-                  <PluginSessionFrame
-                    tabId={t.id}
-                    active={t.id === activeTabId}
-                    plugins={plugins}
-                    activePluginIds={t.activePluginIds}
-                    layout={t.pluginLayout}
-                    settings={settings}
-                    hostPluginSettings={t.connection.pluginSettings ?? {}}
-                    onPluginSettingsPatch={(pluginId, partial) =>
-                      onPluginSettingsPatch(t.id, pluginId, partial)
-                    }
-                    onLayoutChange={(pluginLayout) => onPanelLayoutChange(t.id, pluginLayout)}
-                    onDeactivatePlugin={(pluginId) => {
-                      void togglePlugin(t.id, pluginId, false)
-                    }}
+                  <div
+                    key={t.id}
+                    className={`terminal-pane${t.id === activeTabId ? ' active' : ''}`}
                   >
-                    <TerminalView
+                    <PluginSessionFrame
                       tabId={t.id}
                       active={t.id === activeTabId}
+                      plugins={plugins}
+                      activePluginIds={t.activePluginIds}
+                      layout={t.pluginLayout}
                       settings={settings}
-                      fontSizePx={style.fontSizePx}
-                      fontFamily={style.fontFamily}
-                      scrollbackLines={style.scrollbackLines}
-                      bellMode={style.bellMode}
-                      cursorStyle={style.cursorStyle}
-                      cursorBlink={style.cursorBlink}
-                      termBackground={style.termBackground}
-                      termForeground={style.termForeground}
-                      findOpen={showFind}
-                      findQuery={findQuery}
-                      findCaseSensitive={findCaseSensitive}
-                      findFocusNonce={findFocusNonce}
-                      findFound={findFound}
-                      onFindQueryChange={(q) => {
-                        setFindQuery(q)
-                        setFindFound(null)
+                      hostPluginSettings={t.connection.pluginSettings ?? {}}
+                      onPluginSettingsPatch={(pluginId, partial) =>
+                        onPluginSettingsPatch(t.id, pluginId, partial)
+                      }
+                      onLayoutChange={(pluginLayout) => onPanelLayoutChange(t.id, pluginLayout)}
+                      onDeactivatePlugin={(pluginId) => {
+                        void togglePlugin(t.id, pluginId, false)
                       }}
-                      onFindCaseSensitiveChange={(v) => {
-                        setFindCaseSensitive(v)
-                        lastFindQueryRef.current = ''
-                        setFindFound(null)
-                      }}
-                      onFindPrevious={() => runFind('previous')}
-                      onFindNext={() => runFind('next')}
-                      onFindClose={closeFind}
-                      onData={onTermData}
-                      onResize={onTermResize}
-                      registerWriter={registerWriter}
-                      unregisterWriter={unregisterWriter}
-                      registerSearch={registerSearch}
-                      unregisterSearch={unregisterSearch}
-                      dropEnabled={dropEnabled}
-                      onDropFiles={(tabId, files) => {
-                        void uploadDroppedFiles(tabId, files)
-                      }}
-                    />
-                  </PluginSessionFrame>
-                  {dropUpload ? (
-                    <div className="drop-upload-banner">
-                      <div className="drop-upload-row">
-                        <span className="drop-upload-name">⬆ {dropUpload.name}</span>
-                        <span className="drop-upload-meta">
-                          {formatBytes(dropUpload.transferredBytes)} /{' '}
-                          {formatBytes(dropUpload.totalBytes)}
-                        </span>
+                    >
+                      <TerminalView
+                        tabId={t.id}
+                        active={t.id === activeTabId}
+                        settings={settings}
+                        fontSizePx={style.fontSizePx}
+                        fontFamily={style.fontFamily}
+                        scrollbackLines={style.scrollbackLines}
+                        bellMode={style.bellMode}
+                        cursorStyle={style.cursorStyle}
+                        cursorBlink={style.cursorBlink}
+                        termBackground={style.termBackground}
+                        termForeground={style.termForeground}
+                        findOpen={showFind}
+                        findQuery={findQuery}
+                        findCaseSensitive={findCaseSensitive}
+                        findFocusNonce={findFocusNonce}
+                        findFound={findFound}
+                        onFindQueryChange={(q) => {
+                          setFindQuery(q)
+                          setFindFound(null)
+                        }}
+                        onFindCaseSensitiveChange={(v) => {
+                          setFindCaseSensitive(v)
+                          lastFindQueryRef.current = ''
+                          setFindFound(null)
+                        }}
+                        onFindPrevious={() => runFind('previous')}
+                        onFindNext={() => runFind('next')}
+                        onFindClose={closeFind}
+                        onData={onTermData}
+                        onResize={onTermResize}
+                        registerWriter={registerWriter}
+                        unregisterWriter={unregisterWriter}
+                        registerSearch={registerSearch}
+                        unregisterSearch={unregisterSearch}
+                        dropEnabled={sftpReadyRef.current.has(t.id)}
+                        onDropFiles={(tabId, files) => {
+                          void uploadDroppedFiles(tabId, files)
+                        }}
+                      />
+                    </PluginSessionFrame>
+                    {dropUpload ? (
+                      <div className="drop-upload-banner">
+                        <div className="drop-upload-row">
+                          <span className="drop-upload-name">⬆ {dropUpload.name}</span>
+                          <span className="drop-upload-meta">
+                            {formatBytes(dropUpload.transferredBytes)} /{' '}
+                            {formatBytes(dropUpload.totalBytes)}
+                          </span>
+                        </div>
+                        <div className="drop-upload-track">
+                          <div className="drop-upload-fill" style={{ width: `${dropPct}%` }} />
+                        </div>
                       </div>
-                      <div className="drop-upload-track">
-                        <div className="drop-upload-fill" style={{ width: `${dropPct}%` }} />
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              )})}
+                    ) : null}
+                  </div>
+                )
+              })}
             </div>
           )}
         </div>
       </div>
+
+      {paletteOpen ? (
+        <div
+          className="command-palette-overlay"
+          onClick={() => setPaletteOpen(false)}
+        >
+          <div className="command-palette" onClick={(e) => e.stopPropagation()}>
+            <div className="command-palette-search">
+              <input
+                className="command-palette-input"
+                placeholder="Type a command…"
+                autoFocus
+              />
+            </div>
+            <div className="command-palette-list">
+              {paletteCommands.map((cmd) => (
+                <div
+                  key={cmd.id}
+                  className="command-palette-item"
+                  onClick={() => executeCommand(cmd.id, '')}
+                >
+                  {cmd.title}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {showOptions ? (
         <OptionsDialog
@@ -1137,9 +1295,7 @@ export default function App() {
           onSaveHost={(host, password, passphrase) => {
             const linkTabId = hostEditor.linkTabId
             void saveHost(host, password, passphrase)
-            if (!linkTabId) {
-              return
-            }
+            if (!linkTabId) return
             setTabs((prev) =>
               prev.map((t) =>
                 t.id === linkTabId && !t.connection.hostId
@@ -1162,9 +1318,7 @@ export default function App() {
           }}
           onSaveSession={(connection) => {
             const tabId = hostEditor.linkTabId
-            if (!tabId) {
-              return
-            }
+            if (!tabId) return
             setTabs((prev) =>
               prev.map((t) => (t.id === tabId ? { ...t, connection } : t))
             )
