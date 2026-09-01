@@ -6,3 +6,4 @@ release
 .vscode/
 *.tsbuildinfo
 out/
+.aider*
