@@ -471,13 +471,13 @@ textarea:focus {
   flex-shrink: 0;
   margin: 6px 0;
   border-radius: 2px;
-  background-color: attr(data-tab-color type(<color>));
+  background-color: var(--tab-accent-color);
 }
 
 .tab[data-tab-color] {
   background-color: color-mix(
     in srgb,
-    attr(data-tab-color type(<color>)) 12%,
+    var(--tab-accent-color) 12%,
     transparent
   );
 }
@@ -493,7 +493,7 @@ textarea:focus {
 .tab.active[data-tab-color] {
   background-color: color-mix(
     in srgb,
-    attr(data-tab-color type(<color>)) 22%,
+    var(--tab-accent-color) 22%,
     var(--bg-app)
   );
 }
@@ -552,7 +552,7 @@ textarea:focus {
 }
 
 .terminal-area[data-term-bg] {
-  background-color: attr(data-term-bg type(<color>));
+  background-color: var(--term-bg-color);
 }
 
 .terminal-stack {
@@ -585,11 +585,11 @@ textarea:focus {
 }
 
 .terminal-host[data-term-bg] {
-  background-color: attr(data-term-bg type(<color>));
+  background-color: var(--term-bg-color);
 }
 
 .terminal-host[data-term-fg] {
-  color: attr(data-term-fg type(<color>));
+  color: var(--term-fg-color);
 }
 
 .terminal-host[data-bell-flash='window'] {
