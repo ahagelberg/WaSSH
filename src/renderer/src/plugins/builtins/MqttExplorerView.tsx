@@ -600,6 +600,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
       treeContainerRef.current.querySelectorAll<HTMLElement>('[data-mqtt-path]')
     )) {
       if (el.dataset.mqttPath === selectedPath) {
+        el.focus({ preventScroll: true })
         el.scrollIntoView({ block: 'nearest' })
         break
       }

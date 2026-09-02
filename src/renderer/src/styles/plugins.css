@@ -35,6 +35,9 @@
   --mqtt-blink-bg: color-mix(in srgb, var(--accent) 35%, transparent);
   --mqtt-history-max-height: 180px;
   --mqtt-pane-min-width: 100px;
+  /* Selection marker ring for the focused topic row (mirrors the native
+     focus ring, which only paints for keyboard interaction). */
+  --mqtt-selection-ring: color-mix(in srgb, var(--text) 78%, transparent);
 }
 
 .plugin-toolbar {
@@ -1533,6 +1536,15 @@
 
 .mqtt-tree-row.selected {
   background: color-mix(in srgb, var(--accent) 18%, var(--bg-input));
+  /* Explicit marker ring so the current topic is visible for mouse and
+     keyboard selection alike (native focus rings ignore mouse clicks). */
+  box-shadow: inset 0 0 0 1px var(--mqtt-selection-ring);
+}
+
+/* The row keeps DOM focus during keyboard navigation; drop the native ring
+   there so it does not stack on top of the marker above. */
+.mqtt-tree-row.selected:focus-visible {
+  outline: none;
 }
 
 .mqtt-tree-row.blink {
