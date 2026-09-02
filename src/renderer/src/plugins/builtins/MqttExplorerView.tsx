@@ -23,6 +23,9 @@ const MQTT_SPLIT_MAX_RATIO = 0.75
 /** QoS used when clearing topics via empty retained publish */
 const MQTT_DELETE_QOS = 0 as const
 
+/** Prefix for JSON payload validation errors (also used to mark the textarea) */
+const JSON_ERROR_PREFIX = 'Invalid JSON'
+
 function clampSplitRatio(ratio: number): number {
   return Math.min(MQTT_SPLIT_MAX_RATIO, Math.max(MQTT_SPLIT_MIN_RATIO, ratio))
 }
@@ -369,6 +372,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
   const splitRef = useRef<HTMLDivElement>(null)
   const splitterLastX = useRef(0)
   const treeContainerRef = useRef<HTMLDivElement>(null)
+  const publishErrorRef = useRef<HTMLDivElement>(null)
   const expandedRef = useRef(expanded)
   expandedRef.current = expanded
 
@@ -461,6 +465,13 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
     }
   }, [selectedPath])
 
+  useEffect(() => {
+    if (publishError === null || !publishErrorRef.current) {
+      return
+    }
+    publishErrorRef.current.scrollIntoView({ block: 'nearest' })
+  }, [publishError])
+
   const selectedNode = selectedPath !== null ? findNode(root, selectedPath) : null
 
   const toggleExpand = (path: string): void => {
@@ -500,25 +511,39 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
         return
       }
       payloadBase64 = fileBase64
-    } else if (publishMode === 'json') {
+    } else {
+      let text = publishText
+      if (publishMode === 'json') {
+        try {
+          text = JSON.stringify(JSON.parse(publishText) as unknown)
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : 'parse failed'
+          setPublishError(`${JSON_ERROR_PREFIX} — ${detail}`)
+          return
+        }
+      }
       try {
-        JSON.parse(publishText)
-      } catch {
-        setPublishError('Invalid JSON')
+        payloadBase64 = textToBase64(text)
+      } catch (err) {
+        setPublishError(err instanceof Error ? err.message : 'Failed to encode payload')
         return
       }
-      payloadBase64 = textToBase64(publishText)
-    } else {
-      payloadBase64 = textToBase64(publishText)
     }
 
-    await window.wassh.sendPluginMessage(tabId, pluginId, {
-      type: 'publish',
-      topic,
-      payloadBase64,
-      qos: publishQos,
-      retain: publishRetain
-    })
+    try {
+      const result = await window.wassh.sendPluginMessage(tabId, pluginId, {
+        type: 'publish',
+        topic,
+        payloadBase64,
+        qos: publishQos,
+        retain: publishRetain
+      })
+      if (typeof result === 'string' && result.length > 0) {
+        setPublishError(result)
+      }
+    } catch (err) {
+      setPublishError(err instanceof Error ? err.message : String(err))
+    }
   }
 
   const handleDelete = async (): Promise<void> => {

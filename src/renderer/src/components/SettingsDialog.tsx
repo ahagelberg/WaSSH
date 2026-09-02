@@ -23,21 +23,28 @@ const DIALOG_DISMISS_KEY = 'Escape'
 export default function SettingsDialog({ title, sections, onClose, footer }: Props) {
   const [activeId, setActiveId] = useState(sections[0]?.id ?? '')
   const contentRef = useRef<HTMLDivElement>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
   const sectionRefs = useRef<Record<string, HTMLElement | null>>({})
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useEffect(() => {
+    // Pull focus out of the terminal / other surfaces so ESC targets this dialog.
+    dialogRef.current?.focus({ preventScroll: true })
+
     const onKeyDown = (e: KeyboardEvent): void => {
       if (e.key !== DIALOG_DISMISS_KEY) {
         return
       }
       e.preventDefault()
-      onClose()
+      e.stopImmediatePropagation()
+      onCloseRef.current()
     }
     // Capture phase: fire before any focused element / inner handler can
-    // swallow Escape, so the dialog always cancels on ESC.
+    // swallow Escape, so the dialog always cancels on ESC (same as Cancel).
     window.addEventListener('keydown', onKeyDown, true)
     return () => window.removeEventListener('keydown', onKeyDown, true)
-  }, [onClose])
+  }, [])
 
   const updateActiveSection = useCallback((): void => {
     const root = contentRef.current
@@ -92,7 +99,13 @@ export default function SettingsDialog({ title, sections, onClose, footer }: Pro
 
   return (
     <div className="settings-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="settings-dialog" role="dialog" aria-modal="true">
+      <div
+        ref={dialogRef}
+        className="settings-dialog"
+        role="dialog"
+        aria-modal="true"
+        tabIndex={-1}
+      >
         <div className="settings-dialog-header">
           <h2>{title}</h2>
           <button type="button" onClick={onClose} aria-label="Close">

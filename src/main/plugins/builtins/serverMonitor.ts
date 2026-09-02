@@ -1,7 +1,9 @@
-import type { PluginMainModule } from '../PluginHost'
+import type { PluginMainContext, PluginMainModule } from '../PluginHost'
 import type {
   ServerMonitorNetIface,
   ServerMonitorProcess,
+  ServerMonitorProcessSignal,
+  ServerMonitorProcessSort,
   ServerMonitorSnapshot,
   ServerMonitorTemp
 } from '../../../shared/plugins'
@@ -12,38 +14,24 @@ import {
   SERVER_MONITOR_LOOPBACK_IFACE,
   SERVER_MONITOR_MEGABIT_BITS,
   SERVER_MONITOR_MIN_INTERVAL_MS,
+  SERVER_MONITOR_PROCESS_SORT_DEFAULT,
+  SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
+  SERVER_MONITOR_PROCESS_SORT_KEYS,
   SERVER_MONITOR_TEMP_MILLI_PER_C,
   SERVER_MONITOR_TOP_PROCESS_COUNT
 } from '../../../shared/plugins'
 
-/**
- * Machine-readable remote sample (Linux). CPU %, disk IO, and net rates need consecutive samples.
- * Process list is CPU-sorted; count matches SERVER_MONITOR_TOP_PROCESS_COUNT.
- */
-const MONITOR_COMMAND = [
-  "echo '===META==='",
-  '(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)',
-  "(cat /proc/uptime 2>/dev/null | awk '{print $1}' || echo 0)",
-  '(cat /proc/loadavg 2>/dev/null || echo 0 0 0 0/0 0)',
-  '(uname -srm 2>/dev/null || echo unknown)',
-  '(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)',
-  "echo '===CPU==='",
-  "(grep -E '^cpu' /proc/stat 2>/dev/null || echo cpu 0 0 0 0 0 0 0 0)",
-  "echo '===MEM==='",
-  "grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null || true",
-  "echo '===DISK==='",
-  '(df -B1 / 2>/dev/null | tail -n 1 || echo)',
-  "echo '===DISKIO==='",
-  '(cat /proc/diskstats 2>/dev/null || true)',
-  "echo '===NET==='",
-  '(cat /proc/net/dev 2>/dev/null || true)',
-  "echo '===NETSPEED==='",
-  'for i in /sys/class/net/*; do [ -d "$i" ] || continue; n=$(basename "$i"); [ "$n" = lo ] && continue; s=$(cat "$i/speed" 2>/dev/null || echo -1); echo "$n $s"; done 2>/dev/null || true',
-  "echo '===TEMP==='",
-  'for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] || continue; t=$(cat "$z/type" 2>/dev/null || echo zone); v=$(cat "$z/temp" 2>/dev/null || continue); echo "$t $v"; done 2>/dev/null || true',
-  "echo '===PROCS==='",
-  `(ps -eo pid=,user:16=,state=,ni=,nlwp=,pcpu=,pmem=,rss=,args= --sort=-pcpu 2>/dev/null | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT} || true)`
-].join('; ')
+/** `ps --sort=` field for each UI column */
+const PS_SORT_FIELD: Record<ServerMonitorProcessSort, string> = {
+  pid: 'pid',
+  user: 'user',
+  state: 'state',
+  nice: 'nice',
+  threads: 'nlwp',
+  cpu: 'pcpu',
+  mem: 'pmem',
+  command: 'args'
+}
 
 /** Max wait for one exec sample (ms) */
 const EXEC_WAIT_MS = 10000
@@ -53,6 +41,9 @@ const MS_PER_SEC = 1000
 
 /** Whole-disk names in diskstats (skip partitions to avoid double-count) */
 const WHOLE_DISK_RE = /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+)$/
+
+/** Marker prefix for kill exit status in execCapture output */
+const KILL_EXIT_MARKER = '__EC:'
 
 interface CpuJiffies {
   idle: number
@@ -70,12 +61,78 @@ interface DiskIoCounters {
   writeBytes: number
 }
 
+interface MonitorSessionState {
+  stopped: boolean
+  busy: boolean
+  processSort: ServerMonitorProcessSort
+  processSortDesc: boolean
+  prevCpu: CpuJiffies | null
+  prevCores: CpuJiffies[]
+  prevNet: NetCounters | null
+  prevDiskIo: DiskIoCounters | null
+  timer: ReturnType<typeof setInterval> | null
+  intervalMs: number
+  poll: () => Promise<void>
+}
+
+interface RendererMessage {
+  type: 'setProcessSort' | 'signalProcess' | 'refresh'
+  sort?: ServerMonitorProcessSort
+  descending?: boolean
+  pid?: number
+  signal?: ServerMonitorProcessSignal
+}
+
+const sessionStates = new Map<string, MonitorSessionState>()
+
+function instanceKey(ctx: PluginMainContext): string {
+  return `${ctx.tabId}:${ctx.pluginId}`
+}
+
 function parseInterval(settings: Record<string, unknown>): number {
   const n = Number(settings.intervalMs)
   if (!Number.isFinite(n)) {
     return SERVER_MONITOR_DEFAULT_INTERVAL_MS
   }
   return Math.max(SERVER_MONITOR_MIN_INTERVAL_MS, Math.floor(n))
+}
+
+/** Map UI sort to `ps --sort=` key (leading - = descending). */
+function psSortKey(sort: ServerMonitorProcessSort, descending: boolean): string {
+  const field = PS_SORT_FIELD[sort]
+  return descending ? `-${field}` : field
+}
+
+/**
+ * Machine-readable remote sample (Linux). CPU %, disk IO, and net rates need consecutive samples.
+ * Process list uses remote `ps --sort` for the active column so the sample is a true top-N.
+ */
+function buildMonitorCommand(sort: ServerMonitorProcessSort, descending: boolean): string {
+  const procSort = psSortKey(sort, descending)
+  return [
+    "echo '===META==='",
+    '(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)',
+    "(cat /proc/uptime 2>/dev/null | awk '{print $1}' || echo 0)",
+    '(cat /proc/loadavg 2>/dev/null || echo 0 0 0 0/0 0)',
+    '(uname -srm 2>/dev/null || echo unknown)',
+    '(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)',
+    "echo '===CPU==='",
+    "(grep -E '^cpu' /proc/stat 2>/dev/null || echo cpu 0 0 0 0 0 0 0 0)",
+    "echo '===MEM==='",
+    "grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null || true",
+    "echo '===DISK==='",
+    '(df -B1 / 2>/dev/null | tail -n 1 || echo)',
+    "echo '===DISKIO==='",
+    '(cat /proc/diskstats 2>/dev/null || true)',
+    "echo '===NET==='",
+    '(cat /proc/net/dev 2>/dev/null || true)',
+    "echo '===NETSPEED==='",
+    'for i in /sys/class/net/*; do [ -d "$i" ] || continue; n=$(basename "$i"); [ "$n" = lo ] && continue; s=$(cat "$i/speed" 2>/dev/null || echo -1); echo "$n $s"; done 2>/dev/null || true',
+    "echo '===TEMP==='",
+    'for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] || continue; t=$(cat "$z/type" 2>/dev/null || echo zone); v=$(cat "$z/temp" 2>/dev/null || continue); echo "$t $v"; done 2>/dev/null || true',
+    "echo '===PROCS==='",
+    `(ps -eo pid=,user:16=,state=,ni=,nlwp=,pcpu=,pmem=,rss=,args= --sort=${procSort} 2>/dev/null | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT} || true)`
+  ].join('; ')
 }
 
 function section(raw: string, name: string): string {
@@ -438,25 +495,100 @@ function parseSample(
   }
 }
 
+function isValidPid(pid: unknown): pid is number {
+  return typeof pid === 'number' && Number.isInteger(pid) && pid > 0
+}
+
+function isProcessSort(value: unknown): value is ServerMonitorProcessSort {
+  return (
+    typeof value === 'string' &&
+    (SERVER_MONITOR_PROCESS_SORT_KEYS as string[]).includes(value)
+  )
+}
+
+function isProcessSignal(value: unknown): value is ServerMonitorProcessSignal {
+  return value === 'TERM' || value === 'KILL'
+}
+
+function isRendererMessage(payload: unknown): payload is RendererMessage {
+  if (!payload || typeof payload !== 'object') {
+    return false
+  }
+  const type = (payload as { type?: unknown }).type
+  return type === 'setProcessSort' || type === 'signalProcess' || type === 'refresh'
+}
+
+async function signalRemoteProcess(
+  ctx: PluginMainContext,
+  pid: number,
+  signal: ServerMonitorProcessSignal
+): Promise<{ ok: boolean; error?: string }> {
+  const sig = signal === 'KILL' ? 'KILL' : 'TERM'
+  try {
+    const out = await ctx.execCapture(
+      `kill -s ${sig} ${pid} 2>&1; printf '\\n${KILL_EXIT_MARKER}%s\\n' $?`
+    )
+    const marker = `${KILL_EXIT_MARKER}`
+    const idx = out.lastIndexOf(marker)
+    const codeRaw = idx >= 0 ? out.slice(idx + marker.length).trim() : ''
+    const code = Number(codeRaw)
+    if (code === 0) {
+      return { ok: true }
+    }
+    const stderr = (idx >= 0 ? out.slice(0, idx) : out).trim()
+    if (stderr) {
+      return { ok: false, error: stderr }
+    }
+    if (code === 1) {
+      return { ok: false, error: 'Permission denied or no such process' }
+    }
+    return { ok: false, error: `kill failed (exit ${Number.isFinite(code) ? code : '?'})` }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+function armTimer(ctx: PluginMainContext, state: MonitorSessionState): void {
+  if (state.timer) {
+    clearInterval(state.timer)
+    state.timer = null
+  }
+  state.timer = setInterval(() => {
+    const nextInterval = parseInterval(ctx.getSettings())
+    if (nextInterval !== state.intervalMs) {
+      state.intervalMs = nextInterval
+      armTimer(ctx, state)
+      return
+    }
+    void state.poll()
+  }, state.intervalMs)
+}
+
 export const serverMonitorMain: PluginMainModule = {
   async onActivate(ctx) {
-    let timer: ReturnType<typeof setInterval> | null = null
-    let busy = false
-    let stopped = false
-    let prevCpu: CpuJiffies | null = null
-    let prevCores: CpuJiffies[] = []
-    let prevNet: NetCounters | null = null
-    let prevDiskIo: DiskIoCounters | null = null
+    const state: MonitorSessionState = {
+      stopped: false,
+      busy: false,
+      processSort: SERVER_MONITOR_PROCESS_SORT_DEFAULT,
+      processSortDesc: SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
+      prevCpu: null,
+      prevCores: [],
+      prevNet: null,
+      prevDiskIo: null,
+      timer: null,
+      intervalMs: parseInterval(ctx.getSettings()),
+      poll: async () => undefined
+    }
 
-    const poll = async (): Promise<void> => {
-      if (busy || stopped) {
+    state.poll = async (): Promise<void> => {
+      if (state.busy || state.stopped) {
         return
       }
-      busy = true
+      state.busy = true
       try {
         const connectionId = await ctx.openSideConnection({
           kind: 'ssh-exec',
-          command: MONITOR_COMMAND
+          command: buildMonitorCommand(state.processSort, state.processSortDesc)
         })
         let buf = ''
         const offData = ctx.onSideData(connectionId, (chunk) => {
@@ -475,13 +607,19 @@ export const serverMonitorMain: PluginMainModule = {
           }, EXEC_WAIT_MS)
         })
         offData()
-        const parsed = parseSample(buf, prevCpu, prevCores, prevNet, prevDiskIo)
+        const parsed = parseSample(
+          buf,
+          state.prevCpu,
+          state.prevCores,
+          state.prevNet,
+          state.prevDiskIo
+        )
         if (parsed.cpu) {
-          prevCpu = parsed.cpu
+          state.prevCpu = parsed.cpu
         }
-        prevCores = parsed.cores
-        prevNet = parsed.net
-        prevDiskIo = parsed.diskIo
+        state.prevCores = parsed.cores
+        state.prevNet = parsed.net
+        state.prevDiskIo = parsed.diskIo
         ctx.sendToRenderer({
           type: 'stats',
           snapshot: parsed.snapshot
@@ -493,35 +631,63 @@ export const serverMonitorMain: PluginMainModule = {
           snapshot: emptySnapshot({ error: message })
         })
       } finally {
-        busy = false
+        state.busy = false
       }
     }
 
-    void poll()
-    let intervalMs = parseInterval(ctx.getSettings())
-    const armTimer = (): void => {
-      timer = setInterval(() => {
-        const nextInterval = parseInterval(ctx.getSettings())
-        if (nextInterval !== intervalMs) {
-          intervalMs = nextInterval
-          if (timer) {
-            clearInterval(timer)
-            timer = null
-          }
-          armTimer()
-          return
-        }
-        void poll()
-      }, intervalMs)
-    }
-    armTimer()
-
+    sessionStates.set(instanceKey(ctx), state)
     ctx.onDeactivateCleanup(() => {
-      stopped = true
-      if (timer) {
-        clearInterval(timer)
-        timer = null
+      state.stopped = true
+      if (state.timer) {
+        clearInterval(state.timer)
+        state.timer = null
       }
+      sessionStates.delete(instanceKey(ctx))
     })
+
+    void state.poll()
+    armTimer(ctx, state)
+  },
+
+  async onMessage(ctx, payload) {
+    if (!isRendererMessage(payload)) {
+      return undefined
+    }
+    const state = sessionStates.get(instanceKey(ctx))
+    if (!state || state.stopped) {
+      return undefined
+    }
+
+    if (payload.type === 'refresh') {
+      void state.poll()
+      return { ok: true }
+    }
+
+    if (payload.type === 'setProcessSort') {
+      if (!isProcessSort(payload.sort)) {
+        return { ok: false, error: 'Invalid sort' }
+      }
+      const descending =
+        typeof payload.descending === 'boolean'
+          ? payload.descending
+          : SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT
+      state.processSort = payload.sort
+      state.processSortDesc = descending
+      void state.poll()
+      return { ok: true }
+    }
+
+    if (payload.type === 'signalProcess') {
+      if (!isValidPid(payload.pid) || !isProcessSignal(payload.signal)) {
+        return { ok: false, error: 'Invalid pid or signal' }
+      }
+      const result = await signalRemoteProcess(ctx, payload.pid, payload.signal)
+      if (result.ok) {
+        void state.poll()
+      }
+      return result
+    }
+
+    return undefined
   }
 }

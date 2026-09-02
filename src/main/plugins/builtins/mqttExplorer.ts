@@ -326,17 +326,43 @@ export const mqttExplorerMain: PluginMainModule = {
     if (payload.type === 'publish') {
       const client = state.client
       if (!client?.connected) {
-        return
+        return 'Not connected'
       }
       const topic = payload.topic.trim()
       if (!topic) {
-        return
+        return 'Topic is required'
       }
-      const buf = Buffer.from(payload.payloadBase64, 'base64')
+      if (typeof payload.payloadBase64 !== 'string') {
+        return 'Invalid payload'
+      }
       const qos = payload.qos === 1 || payload.qos === 2 ? payload.qos : 0
-      client.publish(topic, buf, { qos, retain: Boolean(payload.retain) })
+      return publishMqtt(client, topic, payload.payloadBase64, qos, Boolean(payload.retain))
     }
   }
+}
+
+function publishMqtt(
+  client: MqttClient,
+  topic: string,
+  payloadBase64: string,
+  qos: 0 | 1 | 2,
+  retain: boolean
+): Promise<string | undefined> {
+  let buf: Buffer
+  try {
+    buf = Buffer.from(payloadBase64, 'base64')
+  } catch (err) {
+    return Promise.resolve(err instanceof Error ? err.message : 'Invalid payload')
+  }
+  return new Promise((resolve) => {
+    try {
+      client.publish(topic, buf, { qos, retain }, (err) => {
+        resolve(err ? err.message || 'Publish failed' : undefined)
+      })
+    } catch (err) {
+      resolve(err instanceof Error ? err.message : 'Publish failed')
+    }
+  })
 }
 
 function instanceKey(ctx: PluginMainContext): string {

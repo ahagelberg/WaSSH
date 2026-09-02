@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, type ReactElement } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactElement } from 'react'
 import type {
   ServerMonitorNetIface,
   ServerMonitorProcess,
+  ServerMonitorProcessSignal,
   ServerMonitorProcessSort,
   ServerMonitorSnapshot,
   ServerMonitorTemp
@@ -10,6 +11,8 @@ import {
   BITS_PER_BYTE,
   BYTES_PER_KIB,
   SERVER_MONITOR_MEGABIT_BITS,
+  SERVER_MONITOR_PROCESS_SORT_DEFAULT,
+  SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
   SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
   SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
   SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
@@ -47,6 +50,15 @@ const RATE_BAR_MIN_PCT = 2
 /** Em-dash placeholder for missing samples */
 const MISSING = '—'
 
+/** How long process action status stays visible (ms) */
+const PROC_STATUS_MS = 4000
+
+/** Edge padding when clamping the process context menu */
+const CONTEXT_MENU_EDGE_PAD = 4
+
+/** Max command chars shown in process action status */
+const PROC_STATUS_CMD_MAX = 40
+
 type GaugeTone = 'cpu' | 'mem' | 'disk' | 'swap' | 'net'
 type SparkTone = GaugeTone
 
@@ -62,6 +74,27 @@ const SECTION_TOGGLES: Array<{
   { key: 'showProcesses', label: 'Procs', fallback: SERVER_MONITOR_SHOW_PROCESSES_DEFAULT },
   { key: 'showNetwork', label: 'Net', fallback: SERVER_MONITOR_SHOW_NETWORK_DEFAULT }
 ]
+
+/** Process table columns (header click sorts remotely) */
+const PROCESS_COLUMNS: Array<{
+  key: ServerMonitorProcessSort
+  label: string
+  numeric: boolean
+}> = [
+  { key: 'pid', label: 'PID', numeric: true },
+  { key: 'user', label: 'User', numeric: false },
+  { key: 'state', label: 'S', numeric: false },
+  { key: 'nice', label: 'NI', numeric: true },
+  { key: 'threads', label: 'THR', numeric: true },
+  { key: 'cpu', label: 'CPU', numeric: true },
+  { key: 'mem', label: 'Mem', numeric: true },
+  { key: 'command', label: 'Command', numeric: false }
+]
+
+/** First-click direction when switching to a column */
+function defaultDescending(sort: ServerMonitorProcessSort): boolean {
+  return sort === 'cpu' || sort === 'mem' || sort === 'threads' || sort === 'nice'
+}
 
 function settingBool(
   settings: Record<string, unknown>,
@@ -181,12 +214,42 @@ function historyMax(values: number[]): number {
   return max
 }
 
+function processSortValue(row: ServerMonitorProcess, sort: ServerMonitorProcessSort): string | number {
+  switch (sort) {
+    case 'pid':
+      return row.pid
+    case 'user':
+      return row.user.toLowerCase()
+    case 'state':
+      return row.state.toLowerCase()
+    case 'nice':
+      return row.nice
+    case 'threads':
+      return row.threads
+    case 'cpu':
+      return row.cpuPercent
+    case 'mem':
+      return row.memPercent
+    case 'command':
+      return row.command.toLowerCase()
+  }
+}
+
+/** Client reorder while waiting for the next remote sample */
 function sortProcesses(
   rows: ServerMonitorProcess[],
-  sort: ServerMonitorProcessSort
+  sort: ServerMonitorProcessSort,
+  descending: boolean
 ): ServerMonitorProcess[] {
-  const key = sort === 'mem' ? 'memPercent' : 'cpuPercent'
-  return rows.slice().sort((a, b) => b[key] - a[key])
+  const dir = descending ? -1 : 1
+  return rows.slice().sort((a, b) => {
+    const av = processSortValue(a, sort)
+    const bv = processSortValue(b, sort)
+    if (typeof av === 'number' && typeof bv === 'number') {
+      return (av - bv) * dir
+    }
+    return String(av).localeCompare(String(bv)) * dir
+  })
 }
 
 function netTotals(ifaces: ServerMonitorNetIface[]): {
@@ -490,31 +553,84 @@ function RateBar({
 function ProcessTable({
   rows,
   sort,
-  onSort
+  descending,
+  onSort,
+  onSignal,
+  status,
+  statusError
 }: {
   rows: ServerMonitorProcess[]
   sort: ServerMonitorProcessSort
+  descending: boolean
   onSort: (sort: ServerMonitorProcessSort) => void
+  onSignal: (pid: number, signal: ServerMonitorProcessSignal, command: string) => void
+  status: string | null
+  statusError: boolean
 }): ReactElement {
-  const sorted = sortProcesses(rows, sort)
+  const [contextMenu, setContextMenu] = useState<{
+    x: number
+    y: number
+    process: ServerMonitorProcess
+  } | null>(null)
+  const contextMenuRef = useRef<HTMLDivElement>(null)
+  const sorted = sortProcesses(rows, sort, descending)
+
+  useEffect(() => {
+    if (!contextMenu) {
+      return
+    }
+    const onMouseDown = (e: MouseEvent): void => {
+      if (contextMenuRef.current && contextMenuRef.current.contains(e.target as Node)) {
+        return
+      }
+      setContextMenu(null)
+    }
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        setContextMenu(null)
+      }
+    }
+    const onBlur = (): void => setContextMenu(null)
+    window.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('blur', onBlur)
+    }
+  }, [contextMenu])
+
+  useLayoutEffect(() => {
+    const el = contextMenuRef.current
+    if (!contextMenu || !el) {
+      return
+    }
+    const rect = el.getBoundingClientRect()
+    let x = contextMenu.x
+    let y = contextMenu.y
+    if (x + rect.width > window.innerWidth - CONTEXT_MENU_EDGE_PAD) {
+      x = Math.max(CONTEXT_MENU_EDGE_PAD, window.innerWidth - rect.width - CONTEXT_MENU_EDGE_PAD)
+    }
+    if (y + rect.height > window.innerHeight - CONTEXT_MENU_EDGE_PAD) {
+      y = Math.max(CONTEXT_MENU_EDGE_PAD, window.innerHeight - rect.height - CONTEXT_MENU_EDGE_PAD)
+    }
+    el.style.left = `${x}px`
+    el.style.top = `${y}px`
+  }, [contextMenu])
+
   return (
     <div className="monitor-section monitor-processes">
       <div className="monitor-section-head">
         <div className="monitor-section-title">Processes</div>
-        <div className="monitor-sort" role="group" aria-label="Sort processes">
-          {(['cpu', 'mem'] as ServerMonitorProcessSort[]).map((key) => (
-            <button
-              key={key}
-              type="button"
-              className={`monitor-sort-btn${sort === key ? ' active' : ''}`}
-              aria-pressed={sort === key}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => onSort(key)}
-            >
-              {key.toUpperCase()}
-            </button>
-          ))}
-        </div>
+        {status ? (
+          <div
+            className={`monitor-proc-status${statusError ? ' monitor-proc-status-error' : ''}`}
+            role="status"
+          >
+            {status}
+          </div>
+        ) : null}
       </div>
       {sorted.length === 0 ? (
         <div className="monitor-section-empty">No process data</div>
@@ -522,36 +638,96 @@ function ProcessTable({
         <table className="monitor-table">
           <thead>
             <tr>
-              <th scope="col">PID</th>
-              <th scope="col">User</th>
-              <th scope="col">S</th>
-              <th scope="col">NI</th>
-              <th scope="col">THR</th>
-              <th scope="col">CPU</th>
-              <th scope="col">Mem</th>
-              <th scope="col">Command</th>
+              {PROCESS_COLUMNS.map((col) => {
+                const active = sort === col.key
+                const ariaSort = active
+                  ? descending
+                    ? 'descending'
+                    : 'ascending'
+                  : 'none'
+                return (
+                  <th key={col.key} scope="col" aria-sort={ariaSort}>
+                    <button
+                      type="button"
+                      className={`monitor-th-btn${active ? ' active' : ''}${col.numeric ? ' monitor-th-num' : ''}`}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => onSort(col.key)}
+                    >
+                      <span>{col.label}</span>
+                      {active ? (
+                        <span className="monitor-th-dir" aria-hidden="true">
+                          {descending ? '▼' : '▲'}
+                        </span>
+                      ) : null}
+                    </button>
+                  </th>
+                )
+              })}
             </tr>
           </thead>
           <tbody>
-            {sorted.map((p) => (
-              <tr key={`${p.pid}-${p.command}`}>
-                <td className="monitor-num">{p.pid}</td>
-                <td className="monitor-user" title={p.user}>
-                  {p.user}
-                </td>
-                <td className="monitor-num monitor-state">{p.state}</td>
-                <td className="monitor-num">{p.nice}</td>
-                <td className="monitor-num">{p.threads}</td>
-                <td className="monitor-num">{formatPercent(p.cpuPercent)}%</td>
-                <td className="monitor-num">{formatPercent(p.memPercent)}%</td>
-                <td className="monitor-cmd" title={p.command}>
-                  {p.command}
-                </td>
-              </tr>
-            ))}
+            {sorted.map((p) => {
+              const menuOpen = contextMenu?.process.pid === p.pid
+              return (
+                <tr
+                  key={`${p.pid}-${p.command}`}
+                  className={menuOpen ? 'monitor-row-menu' : undefined}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    setContextMenu({ x: e.clientX, y: e.clientY, process: p })
+                  }}
+                >
+                  <td className="monitor-num">{p.pid}</td>
+                  <td className="monitor-user" title={p.user}>
+                    {p.user}
+                  </td>
+                  <td className="monitor-num monitor-state">{p.state}</td>
+                  <td className="monitor-num">{p.nice}</td>
+                  <td className="monitor-num">{p.threads}</td>
+                  <td className="monitor-num">{formatPercent(p.cpuPercent)}%</td>
+                  <td className="monitor-num">{formatPercent(p.memPercent)}%</td>
+                  <td className="monitor-cmd" title={p.command}>
+                    {p.command}
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       )}
+      {contextMenu ? (
+        <div
+          ref={contextMenuRef}
+          className="monitor-context-menu"
+          role="menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            type="button"
+            className="monitor-context-item"
+            role="menuitem"
+            onClick={() => {
+              const { process } = contextMenu
+              setContextMenu(null)
+              onSignal(process.pid, 'TERM', process.command)
+            }}
+          >
+            Terminate (SIGTERM)
+          </button>
+          <button
+            type="button"
+            className="monitor-context-item danger"
+            role="menuitem"
+            onClick={() => {
+              const { process } = contextMenu
+              setContextMenu(null)
+              onSignal(process.pid, 'KILL', process.command)
+            }}
+          >
+            Kill (SIGKILL)
+          </button>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -770,8 +946,14 @@ export default function ServerMonitorView({
   const [diskWriteHistory, setDiskWriteHistory] = useState<number[]>([])
   const [netRxHistory, setNetRxHistory] = useState<number[]>([])
   const [netTxHistory, setNetTxHistory] = useState<number[]>([])
-  const [procSort, setProcSort] = useState<ServerMonitorProcessSort>('cpu')
+  const [procSort, setProcSort] = useState<ServerMonitorProcessSort>(
+    SERVER_MONITOR_PROCESS_SORT_DEFAULT
+  )
+  const [procSortDesc, setProcSortDesc] = useState(SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT)
+  const [procStatus, setProcStatus] = useState<string | null>(null)
+  const [procStatusError, setProcStatusError] = useState(false)
   const lastAt = useRef(0)
+  const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const showGauges = settingBool(settings, 'showGauges', SERVER_MONITOR_SHOW_GAUGES_DEFAULT)
   const showSparks = settingBool(settings, 'showSparks', SERVER_MONITOR_SHOW_SPARKS_DEFAULT)
@@ -783,6 +965,27 @@ export default function ServerMonitorView({
   )
   const showNetwork = settingBool(settings, 'showNetwork', SERVER_MONITOR_SHOW_NETWORK_DEFAULT)
   const showDiskPanel = showGauges || showSparks || showStatus
+
+  const showProcStatus = (message: string, isError: boolean): void => {
+    setProcStatus(message)
+    setProcStatusError(isError)
+    if (statusTimer.current) {
+      clearTimeout(statusTimer.current)
+    }
+    statusTimer.current = setTimeout(() => {
+      setProcStatus(null)
+      setProcStatusError(false)
+      statusTimer.current = null
+    }, PROC_STATUS_MS)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (statusTimer.current) {
+        clearTimeout(statusTimer.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     return window.wassh.onPluginMessage((ev) => {
@@ -825,6 +1028,46 @@ export default function ServerMonitorView({
       }
     })
   }, [tabId, pluginId])
+
+  const handleProcSort = (key: ServerMonitorProcessSort): void => {
+    let nextDesc: boolean
+    if (key === procSort) {
+      nextDesc = !procSortDesc
+    } else {
+      nextDesc = defaultDescending(key)
+    }
+    setProcSort(key)
+    setProcSortDesc(nextDesc)
+    void window.wassh.sendPluginMessage(tabId, pluginId, {
+      type: 'setProcessSort',
+      sort: key,
+      descending: nextDesc
+    })
+  }
+
+  const handleProcSignal = (
+    pid: number,
+    signal: ServerMonitorProcessSignal,
+    command: string
+  ): void => {
+    const label = signal === 'KILL' ? 'SIGKILL' : 'SIGTERM'
+    const shortCmd =
+      command.length > PROC_STATUS_CMD_MAX
+        ? `${command.slice(0, PROC_STATUS_CMD_MAX)}…`
+        : command
+    void (async () => {
+      const result = (await window.wassh.sendPluginMessage(tabId, pluginId, {
+        type: 'signalProcess',
+        pid,
+        signal
+      })) as { ok?: boolean; error?: string } | undefined
+      if (result?.ok) {
+        showProcStatus(`${label} → ${pid} ${shortCmd}`, false)
+        return
+      }
+      showProcStatus(result?.error || `Failed to send ${label} to ${pid}`, true)
+    })()
+  }
 
   const memPct = snapshot ? ratioPercent(snapshot.memUsedBytes, snapshot.memTotalBytes) : null
   const swapPct = snapshot ? ratioPercent(snapshot.swapUsedBytes, snapshot.swapTotalBytes) : null
@@ -994,7 +1237,11 @@ export default function ServerMonitorView({
             <ProcessTable
               rows={snapshot?.processes ?? []}
               sort={procSort}
-              onSort={setProcSort}
+              descending={procSortDesc}
+              onSort={handleProcSort}
+              onSignal={handleProcSignal}
+              status={procStatus}
+              statusError={procStatusError}
             />
           ) : null}
         </div>

@@ -822,26 +822,104 @@
   margin-bottom: 0;
 }
 
-.monitor-sort {
-  display: flex;
-  gap: 4px;
-}
-
-.monitor-sort-btn {
-  height: var(--monitor-toggle-height);
-  padding: 0 7px;
+.monitor-proc-status {
   font-size: 10px;
-  letter-spacing: 0.04em;
   color: var(--text-muted);
-  background: transparent;
-  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
-  border-radius: 999px;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 70%;
 }
 
-.monitor-sort-btn.active {
+.monitor-proc-status-error {
+  color: var(--danger);
+}
+
+.monitor-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 0 6px 4px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  white-space: nowrap;
+}
+
+.monitor-th-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.monitor-th-btn:hover {
   color: var(--text);
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.monitor-th-btn.active {
+  color: var(--text);
+}
+
+.monitor-th-btn.monitor-th-num {
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-th-dir {
+  font-size: 8px;
+  opacity: 0.75;
+}
+
+.monitor-table tbody tr.monitor-row-menu {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.monitor-table tbody tr:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.monitor-context-menu {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 168px;
+  padding: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.monitor-context-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+}
+
+.monitor-context-item:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.monitor-context-item.danger {
+  color: var(--danger);
 }
 
 .monitor-net-totals {
@@ -962,15 +1040,6 @@
   border-collapse: collapse;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-}
-
-.monitor-table th {
-  text-align: left;
-  font-weight: 600;
-  color: var(--text-muted);
-  padding: 2px 6px 4px 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-  white-space: nowrap;
 }
 
 .monitor-table td {

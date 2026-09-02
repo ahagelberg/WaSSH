@@ -190,10 +190,39 @@ export const SERVER_MONITOR_SHOW_STATUS_DEFAULT = true
 export const SERVER_MONITOR_SHOW_PROCESSES_DEFAULT = true
 export const SERVER_MONITOR_SHOW_NETWORK_DEFAULT = true
 
-/** Client-side process table sort */
-export type ServerMonitorProcessSort = 'cpu' | 'mem'
+/** Process table sort column (remote `ps --sort`) */
+export type ServerMonitorProcessSort =
+  | 'pid'
+  | 'user'
+  | 'state'
+  | 'nice'
+  | 'threads'
+  | 'cpu'
+  | 'mem'
+  | 'command'
 
-/** One row from remote `ps` (CPU-sorted from host) */
+/** Default process list sort column */
+export const SERVER_MONITOR_PROCESS_SORT_DEFAULT: ServerMonitorProcessSort = 'cpu'
+
+/** Default direction for CPU sort (highest first) */
+export const SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT = true
+
+/** Signals the monitor can send to a remote process */
+export type ServerMonitorProcessSignal = 'TERM' | 'KILL'
+
+/** Valid process sort columns (for message validation) */
+export const SERVER_MONITOR_PROCESS_SORT_KEYS: ServerMonitorProcessSort[] = [
+  'pid',
+  'user',
+  'state',
+  'nice',
+  'threads',
+  'cpu',
+  'mem',
+  'command'
+]
+
+/** One row from remote `ps` */
 export interface ServerMonitorProcess {
   pid: number
   user: string
