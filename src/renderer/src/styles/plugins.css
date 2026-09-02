@@ -406,11 +406,6 @@
   gap: var(--gap);
 }
 
-.plugin-panel-header {
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
 .plugin-server-monitor {
   position: relative;
   gap: 0;

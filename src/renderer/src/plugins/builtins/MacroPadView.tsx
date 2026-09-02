@@ -79,7 +79,6 @@ export default function MacroPadView({
         e.preventDefault()
       }}
     >
-      <div className="plugin-panel-header">Macros</div>
       <div className="plugin-macro-grid">
         {buttons.map((btn) => (
           <button

@@ -68,7 +68,6 @@ export default function ScratchpadView(_props: PluginViewProps) {
 
   return (
     <div className="plugin-panel plugin-scratchpad">
-      <div className="plugin-panel-header">Scratchpad</div>
       <textarea
         className="plugin-scratchpad-input"
         value={content}
