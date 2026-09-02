@@ -611,9 +611,14 @@ export type AiAgentToolOutcome = 'ok' | 'denied' | 'error' | 'timeout' | 'cancel
 
 export interface AiAgentConversationUserMsg {
   role: 'user'
+  /** User-typed text shown in the transcript */
   text: string
+  /** Full text sent to the model (includes attachments / terminal); falls back to text */
+  modelText?: string
   /** Whether recent terminal output was attached to this message */
   usedTerminalContext: boolean
+  /** Local file names attached to this message */
+  attachedFiles?: string[]
 }
 
 export interface AiAgentConversationAssistantMsg {
@@ -717,13 +722,41 @@ export interface AiAgentToastPayload {
   text: string
 }
 
+/** Max local files attached to one chat turn */
+export const AI_AGENT_MAX_ATTACHMENTS = 8
+
+/** Bytes read from each attached file before truncation */
+export const AI_AGENT_MAX_ATTACHMENT_BYTES = 200_000
+
+/** Characters kept from each text attachment after decode */
+export const AI_AGENT_MAX_ATTACHMENT_CHARS = 100_000
+
+/** One local file included with a chat turn (contents already read in the renderer) */
+export interface AiAgentChatAttachment {
+  name: string
+  mimeType?: string
+  /** Present when the file was treated as text */
+  text?: string
+  /** True when contents were truncated to size limits */
+  truncated: boolean
+  /** True when the file looked binary and text was omitted */
+  binary: boolean
+}
+
 export type AiAgentApprovalDecision = 'allow' | 'deny' | 'allowAlways' | 'denyAlways'
 
 /** Renderer → main */
 export type AiAgentRendererMessage =
   | { type: 'sync' }
   | { type: 'probe' }
-  | { type: 'chat'; providerId: string; model: string; text: string; attachTerminal?: boolean }
+  | {
+      type: 'chat'
+      providerId: string
+      model: string
+      text: string
+      attachTerminal?: boolean
+      attachments?: AiAgentChatAttachment[]
+    }
   | { type: 'stop' }
   | { type: 'resume' }
   | { type: 'discardPaused' }

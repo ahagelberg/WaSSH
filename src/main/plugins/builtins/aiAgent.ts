@@ -12,6 +12,7 @@ import {
   AI_AGENT_TITLE_MAX_CHARS,
   aiAgentVaultId,
   type AiAgentApprovalRequest,
+  type AiAgentChatAttachment,
   type AiAgentConversation,
   type AiAgentConversationMsg,
   type AiAgentConversationSummary,
@@ -594,7 +595,7 @@ function toApiMessages(conversation: AiAgentConversation): ApiMessage[] {
   const out: ApiMessage[] = []
   for (const msg of conversation.messages) {
     if (msg.role === 'user') {
-      out.push({ role: 'user', content: msg.text })
+      out.push({ role: 'user', content: msg.modelText ?? msg.text })
       continue
     }
     if (msg.role === 'assistant') {
@@ -1179,12 +1180,34 @@ function hostForCtx(ctx: PluginMainContext): HostState | null {
   return hosts.get(tab.hostKey) ?? null
 }
 
-function chatMessageWithTerminal(tab: TabRuntime, text: string, attachTerminal: boolean): string {
-  if (!attachTerminal || !tab.terminalTail) {
-    return text
+function formatAttachmentForModel(attachment: AiAgentChatAttachment): string {
+  if (attachment.binary || attachment.text == null) {
+    return `--- file: ${attachment.name} (binary, content omitted) ---`
   }
-  const tail = tab.terminalTail.slice(-TERMINAL_CONTEXT_EXCERPT_CHARS)
-  return `${text}${TERMINAL_CONTEXT_MARKER}\n${tail}`
+  const body = attachment.truncated
+    ? `${attachment.text}\n…[truncated]`
+    : attachment.text
+  return `--- file: ${attachment.name} ---\n${body}\n--- end file: ${attachment.name} ---`
+}
+
+function chatMessageWithContext(
+  tab: TabRuntime,
+  text: string,
+  attachTerminal: boolean,
+  attachments: AiAgentChatAttachment[] | undefined
+): string {
+  const parts: string[] = []
+  if (text) {
+    parts.push(text)
+  }
+  if (attachments && attachments.length > 0) {
+    parts.push(attachments.map(formatAttachmentForModel).join('\n\n'))
+  }
+  if (attachTerminal && tab.terminalTail) {
+    const tail = tab.terminalTail.slice(-TERMINAL_CONTEXT_EXCERPT_CHARS)
+    parts.push(`${TERMINAL_CONTEXT_MARKER.trim()}\n${tail}`)
+  }
+  return parts.join('\n\n')
 }
 
 async function handleRendererMessage(
@@ -1370,8 +1393,24 @@ async function handleRendererMessage(
     pruneUnresolvedTail(host.conversation)
     host.conversation.activeProviderId = payload.providerId
     host.conversation.activeModel = payload.model
-    const text = chatMessageWithTerminal(tab, payload.text.trim(), payload.attachTerminal === true)
-    host.conversation.messages.push({ role: 'user', text, usedTerminalContext: payload.attachTerminal === true })
+    const displayText = payload.text.trim()
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : []
+    const modelText = chatMessageWithContext(
+      tab,
+      displayText,
+      payload.attachTerminal === true,
+      attachments
+    )
+    if (!modelText) {
+      return
+    }
+    host.conversation.messages.push({
+      role: 'user',
+      text: displayText || (attachments.length > 0 ? '(attached files)' : ''),
+      modelText,
+      usedTerminalContext: payload.attachTerminal === true,
+      attachedFiles: attachments.map((a) => a.name)
+    })
     persistConversation(host)
     void runLoop(host, tab)
     return

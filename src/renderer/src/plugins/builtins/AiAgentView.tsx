@@ -1,14 +1,24 @@
-import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
+import {
+  useEffect,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type ReactElement
+} from 'react'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
   AI_AGENT_DEFAULT_CHAT_TITLE,
   AI_AGENT_DEFAULT_PROVIDERS,
+  AI_AGENT_MAX_ATTACHMENT_BYTES,
+  AI_AGENT_MAX_ATTACHMENT_CHARS,
+  AI_AGENT_MAX_ATTACHMENTS,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
   aiAgentVaultId,
   type AiAgentApprovalDecision,
+  type AiAgentChatAttachment,
   type AiAgentConversation,
   type AiAgentConversationSummary,
   type AiAgentConversationToolMsg,
@@ -24,10 +34,14 @@ const STREAM_PLACEHOLDER_LIMIT = 1_000_000
 /** Max characters shown in the queued-message preview strip */
 const QUEUE_PREVIEW_MAX_CHARS = 120
 
+/** Null bytes in the first N bytes → treat file as binary */
+const BINARY_PROBE_BYTES = 8_000
+
 interface QueuedMessage {
   id: string
   text: string
   attachTerminal: boolean
+  attachments: AiAgentChatAttachment[]
   providerId: string
   model: string
 }
@@ -180,6 +194,73 @@ function formatChatTime(ts: number): string {
   }
 }
 
+function isFileDrag(e: ReactDragEvent<HTMLElement>): boolean {
+  return Array.from(e.dataTransfer.types).includes('Files')
+}
+
+function collectDroppedFiles(dt: DataTransfer | null): File[] {
+  if (!dt) {
+    return []
+  }
+  const items = dt.items
+  if (items && items.length > 0) {
+    const files: File[] = []
+    for (const item of Array.from(items)) {
+      if (item.kind !== 'file') {
+        continue
+      }
+      const entry = item.webkitGetAsEntry?.()
+      if (entry?.isDirectory) {
+        continue
+      }
+      const file = item.getAsFile()
+      if (file) {
+        files.push(file)
+      }
+    }
+    return files
+  }
+  return Array.from(dt.files)
+}
+
+function looksBinary(bytes: Uint8Array): boolean {
+  const n = Math.min(bytes.length, BINARY_PROBE_BYTES)
+  for (let i = 0; i < n; i += 1) {
+    if (bytes[i] === 0) {
+      return true
+    }
+  }
+  return false
+}
+
+async function readAttachment(file: File): Promise<AiAgentChatAttachment> {
+  const truncatedByBytes = file.size > AI_AGENT_MAX_ATTACHMENT_BYTES
+  const blob = truncatedByBytes ? file.slice(0, AI_AGENT_MAX_ATTACHMENT_BYTES) : file
+  const buffer = await blob.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  if (looksBinary(bytes)) {
+    return {
+      name: file.name,
+      mimeType: file.type || undefined,
+      truncated: truncatedByBytes,
+      binary: true
+    }
+  }
+  let text = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+  let truncated = truncatedByBytes
+  if (text.length > AI_AGENT_MAX_ATTACHMENT_CHARS) {
+    text = text.slice(0, AI_AGENT_MAX_ATTACHMENT_CHARS)
+    truncated = true
+  }
+  return {
+    name: file.name,
+    mimeType: file.type || undefined,
+    text,
+    truncated,
+    binary: false
+  }
+}
+
 export default function AiAgentView({
   tabId,
   pluginId,
@@ -190,6 +271,8 @@ export default function AiAgentView({
   const [stream, setStream] = useState('')
   const [input, setInput] = useState('')
   const [attach, setAttach] = useState(false)
+  const [attachments, setAttachments] = useState<AiAgentChatAttachment[]>([])
+  const [dropActive, setDropActive] = useState(false)
   const [gearOpen, setGearOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [drafts, setDrafts] = useState<DraftProvider[]>([])
@@ -201,6 +284,8 @@ export default function AiAgentView({
   const [sudoPassword, setSudoPassword] = useState('')
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sudoInputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const dragDepthRef = useRef(0)
   /** After force-send: wait for stop to settle, then drain the queue */
   const forceAfterStopRef = useRef(false)
   /** Prevents double-drain of the same queued message (Strict Mode / duplicate effects) */
@@ -288,7 +373,8 @@ export default function AiAgentView({
       providerId: msg.providerId,
       model: msg.model,
       text: msg.text,
-      attachTerminal: msg.attachTerminal
+      attachTerminal: msg.attachTerminal,
+      attachments: msg.attachments.length > 0 ? msg.attachments : undefined
     })
   }
 
@@ -314,8 +400,8 @@ export default function AiAgentView({
     dispatchChat(msg)
   }, [view.runPhase, queued, tabId, pluginId])
 
-  const validateOutgoing = (text: string): boolean => {
-    if (!text) {
+  const validateOutgoing = (text: string, fileCount: number): boolean => {
+    if (!text && fileCount === 0) {
       return false
     }
     if (providers.length === 0) {
@@ -336,17 +422,44 @@ export default function AiAgentView({
     return true
   }
 
-  const buildQueued = (text: string, attachTerminal: boolean): QueuedMessage | null => {
-    if (!activeProvider || !validateOutgoing(text)) {
+  const buildQueued = (
+    text: string,
+    attachTerminal: boolean,
+    files: AiAgentChatAttachment[]
+  ): QueuedMessage | null => {
+    if (!activeProvider || !validateOutgoing(text, files.length)) {
       return null
     }
     return {
       id: crypto.randomUUID(),
       text,
       attachTerminal,
+      attachments: files,
       providerId: activeProvider.id,
       model: activeModel
     }
+  }
+
+  const clearComposerAttachments = (): void => {
+    setAttachments([])
+    setAttach(false)
+  }
+
+  const addFiles = async (files: File[]): Promise<void> => {
+    if (files.length === 0) {
+      return
+    }
+    const room = AI_AGENT_MAX_ATTACHMENTS - attachments.length
+    if (room <= 0) {
+      showToast('info', `At most ${AI_AGENT_MAX_ATTACHMENTS} files can be attached.`)
+      return
+    }
+    const take = files.slice(0, room)
+    if (files.length > room) {
+      showToast('info', `Only ${AI_AGENT_MAX_ATTACHMENTS} files can be attached; extras skipped.`)
+    }
+    const read = await Promise.all(take.map((f) => readAttachment(f)))
+    setAttachments((prev) => [...prev, ...read])
   }
 
   const selectProvider = (providerId: string): void => {
@@ -394,9 +507,10 @@ export default function AiAgentView({
     if (busy) {
       if (queued) {
         // Enter again: stop the current run and send as soon as it settles
-        const next = text
-          ? buildQueued(text, attach)
-          : queued
+        const next =
+          text || attachments.length > 0
+            ? buildQueued(text, attach, attachments)
+            : queued
         if (!next) {
           return
         }
@@ -404,25 +518,26 @@ export default function AiAgentView({
         drainedQueueIdRef.current = null
         setQueued(next)
         setInput('')
-        setAttach(false)
+        clearComposerAttachments()
         send({ type: 'stop' })
         return
       }
-      if (!text) {
+      if (!text && attachments.length === 0) {
         return
       }
-      const next = buildQueued(text, attach)
+      const next = buildQueued(text, attach, attachments)
       if (!next) {
         return
       }
       drainedQueueIdRef.current = null
       setQueued(next)
       setInput('')
-      setAttach(false)
+      clearComposerAttachments()
       return
     }
 
-    const toSend = text ? buildQueued(text, attach) : queued
+    const toSend =
+      text || attachments.length > 0 ? buildQueued(text, attach, attachments) : queued
     if (!toSend) {
       return
     }
@@ -430,7 +545,7 @@ export default function AiAgentView({
     drainedQueueIdRef.current = toSend.id
     setQueued(null)
     setInput('')
-    setAttach(false)
+    clearComposerAttachments()
     dispatchChat(toSend)
   }
 
@@ -581,6 +696,14 @@ export default function AiAgentView({
       messageRows.push(
         <div key={i} className="ai-agent-msg ai-agent-user">
           <div className="ai-agent-msg-meta">
+            {msg.attachedFiles && msg.attachedFiles.length > 0 ? (
+              <span
+                className="ai-agent-ctx-tag"
+                title={msg.attachedFiles.join(', ')}
+              >
+                +{msg.attachedFiles.length} file{msg.attachedFiles.length === 1 ? '' : 's'}
+              </span>
+            ) : null}
             {msg.usedTerminalContext ? (
               <span className="ai-agent-ctx-tag" title="Recent terminal output was attached">
                 +terminal
@@ -1088,7 +1211,7 @@ export default function AiAgentView({
               <span className="ai-agent-queue-text" title={queued.text}>
                 {queued.text.length > QUEUE_PREVIEW_MAX_CHARS
                   ? `${queued.text.slice(0, QUEUE_PREVIEW_MAX_CHARS)}…`
-                  : queued.text}
+                  : queued.text || '(attached files)'}
               </span>
               <span className="ai-agent-queue-hint">
                 {busy ? 'Enter again to send now' : 'Press Enter to send'}
@@ -1099,55 +1222,157 @@ export default function AiAgentView({
             </div>
           ) : null}
 
-          <div className={`ai-agent-phase-bar ${phaseClass}`}>
-            {PHASE_LABELS[view.runPhase] ?? view.runPhase}
-          </div>
-
-          <div className="ai-agent-inputbar">
-            <button
-              type="button"
-              className={`ai-agent-attach${attach ? ' active' : ''}`}
-              title="Attach recent terminal output to the next message"
-              onClick={() => setAttach((prev) => !prev)}
-            >
-              ⌁
-            </button>
-            <textarea
-              className="ai-agent-input"
-              value={input}
-              placeholder={
-                busy
-                  ? queued
-                    ? 'Enter again to send queued message now…'
-                    : 'Queue a follow-up… (Enter to queue)'
-                  : 'Message the agent… (Shift+Enter for newline)'
+          <div
+            className={`ai-agent-composer${dropActive ? ' drop-active' : ''}`}
+            onDragEnter={(e) => {
+              if (!isFileDrag(e)) {
+                return
               }
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleSend()
+              e.preventDefault()
+              e.stopPropagation()
+              dragDepthRef.current += 1
+              setDropActive(true)
+            }}
+            onDragLeave={(e) => {
+              if (!isFileDrag(e)) {
+                return
+              }
+              e.preventDefault()
+              e.stopPropagation()
+              dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+              if (dragDepthRef.current === 0) {
+                setDropActive(false)
+              }
+            }}
+            onDragOver={(e) => {
+              if (!isFileDrag(e)) {
+                return
+              }
+              e.preventDefault()
+              e.stopPropagation()
+              e.dataTransfer.dropEffect = 'copy'
+            }}
+            onDrop={(e) => {
+              if (!isFileDrag(e)) {
+                return
+              }
+              e.preventDefault()
+              e.stopPropagation()
+              dragDepthRef.current = 0
+              setDropActive(false)
+              void addFiles(collectDroppedFiles(e.dataTransfer))
+            }}
+          >
+            {dropActive ? (
+              <div className="ai-agent-drop-hint">
+                <div className="ai-agent-drop-box">Drop files to attach</div>
+              </div>
+            ) : null}
+
+            <div className={`ai-agent-phase-bar ${phaseClass}`}>
+              {PHASE_LABELS[view.runPhase] ?? view.runPhase}
+            </div>
+
+            {attachments.length > 0 ? (
+              <div className="ai-agent-file-chips">
+                {attachments.map((file, index) => (
+                  <span
+                    key={`${file.name}-${index}`}
+                    className={`ai-agent-file-chip${file.binary ? ' binary' : ''}${file.truncated ? ' truncated' : ''}`}
+                    title={
+                      file.binary
+                        ? `${file.name} (binary — content omitted)`
+                        : file.truncated
+                          ? `${file.name} (truncated)`
+                          : file.name
+                    }
+                  >
+                    <span className="ai-agent-file-chip-name">{file.name}</span>
+                    <button
+                      type="button"
+                      title="Remove attachment"
+                      onClick={() =>
+                        setAttachments((prev) => prev.filter((_, i) => i !== index))
+                      }
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                const list = e.target.files
+                if (list && list.length > 0) {
+                  void addFiles(Array.from(list))
                 }
+                e.target.value = ''
               }}
             />
-            <button
-              type="button"
-              onClick={handleSend}
-              disabled={
-                busy
-                  ? !queued && !input.trim()
-                  : (!input.trim() && !queued) || !view.ssh
-              }
-              title={
-                busy
-                  ? queued
-                    ? 'Stop the current run and send the queued message now'
-                    : 'Queue this message until the agent finishes'
-                  : 'Send message'
-              }
-            >
-              {busy ? (queued ? 'Send now' : 'Queue') : 'Send'}
-            </button>
+
+            <div className="ai-agent-inputbar">
+              <div className="ai-agent-input-actions">
+                <button
+                  type="button"
+                  className="ai-agent-file-btn"
+                  title="Attach local files"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={attachments.length >= AI_AGENT_MAX_ATTACHMENTS}
+                >
+                  📎
+                </button>
+                <button
+                  type="button"
+                  className={`ai-agent-terminal-btn${attach ? ' active' : ''}`}
+                  title="Attach recent terminal output to the next message"
+                  onClick={() => setAttach((prev) => !prev)}
+                >
+                  ⌁
+                </button>
+              </div>
+              <textarea
+                className="ai-agent-input"
+                value={input}
+                placeholder={
+                  busy
+                    ? queued
+                      ? 'Enter again to send queued message now…'
+                      : 'Queue a follow-up… (Enter to queue)'
+                    : 'Message the agent… (Shift+Enter for newline, or drop files)'
+                }
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    handleSend()
+                  }
+                }}
+              />
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={
+                  busy
+                    ? !queued && !input.trim() && attachments.length === 0
+                    : (!input.trim() && attachments.length === 0 && !queued) || !view.ssh
+                }
+                title={
+                  busy
+                    ? queued
+                      ? 'Stop the current run and send the queued message now'
+                      : 'Queue this message until the agent finishes'
+                    : 'Send message'
+                }
+              >
+                {busy ? (queued ? 'Send now' : 'Queue') : 'Send'}
+              </button>
+            </div>
           </div>
         </>
       )}
