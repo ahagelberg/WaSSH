@@ -512,6 +512,19 @@ export default function AiAgentView({
         <div className="ai-agent-assistant-text">{formatText(stream)}</div>
       </div>
     )
+  } else if (running) {
+    messageRows.push(
+      <div key="thinking" className="ai-agent-msg ai-agent-assistant">
+        <div className="ai-agent-thinking" aria-live="polite">
+          Thinking
+          <span className="ai-agent-thinking-dots" aria-hidden="true">
+            <span>.</span>
+            <span>.</span>
+            <span>.</span>
+          </span>
+        </div>
+      </div>
+    )
   }
 
   useEffect(() => {
