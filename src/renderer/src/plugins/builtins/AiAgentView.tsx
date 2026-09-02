@@ -276,6 +276,11 @@ export default function AiAgentView({
   }
 
   const handleSend = (): void => {
+    if (view.runPhase === 'running' || view.runPhase === 'ask') {
+      // While the agent is busy the Send action is Stop (pauses the run).
+      send({ type: 'stop' })
+      return
+    }
     const text = input.trim()
     if (!text) {
       return
@@ -330,10 +335,10 @@ export default function AiAgentView({
   }
 
   const canResume =
-    view.runPhase === 'idle' &&
     conv !== null &&
     conv.messages.length > 0 &&
-    conv.messages[conv.messages.length - 1].role === 'user'
+    (view.runPhase === 'paused' ||
+      (view.runPhase === 'idle' && conv.messages[conv.messages.length - 1].role === 'user'))
 
   const openGear = (): void => {
     setDrafts(
@@ -791,14 +796,6 @@ export default function AiAgentView({
             ) : (
               messageRows
             )}
-            {canResume ? (
-              <div className="ai-agent-resume">
-                The previous run was interrupted.
-                <button type="button" onClick={() => send({ type: 'resume' })}>
-                  Continue
-                </button>
-              </div>
-            ) : null}
           </div>
 
           {view.runPhase === 'ask' && view.pendingApproval ? (
@@ -819,6 +816,15 @@ export default function AiAgentView({
                   Always deny
                 </button>
               </div>
+            </div>
+          ) : null}
+
+          {canResume ? (
+            <div className="ai-agent-continue">
+              <span>The previous run was interrupted.</span>
+              <button type="button" onClick={() => send({ type: 'resume' })}>
+                Continue
+              </button>
             </div>
           ) : null}
 
@@ -852,8 +858,14 @@ export default function AiAgentView({
                 }
               }}
             />
-            <button type="button" onClick={handleSend} disabled={!input.trim() || !view.ssh || busy}>
-              Send
+            <button
+              type="button"
+              className={busy ? 'ai-agent-danger' : undefined}
+              onClick={handleSend}
+              disabled={!busy && (!input.trim() || !view.ssh)}
+              title={busy ? 'Stop and pause the agent' : 'Send message'}
+            >
+              {busy ? 'Stop' : 'Send'}
             </button>
           </div>
         </>

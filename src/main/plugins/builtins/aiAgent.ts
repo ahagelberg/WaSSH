@@ -677,7 +677,9 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     if (host.inRun) {
       host.inRun = false
       host.runCtx = null
-      host.phase = 'idle'
+      // A user-initiated stop parks the run in 'paused' so the view can offer
+      // a Continue action; anything else returns to idle.
+      host.phase = host.stopped ? 'paused' : 'idle'
     }
     pushState(host)
     persistConversation(host)

@@ -2468,13 +2468,24 @@
   font-size: 11px;
 }
 
-.ai-agent-resume {
+.ai-agent-continue {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  justify-content: center;
-  color: var(--text-muted);
+  padding: 8px;
   font-size: 12px;
+  color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--ok) 55%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ok) 12%, var(--bg-panel-2));
+}
+
+.ai-agent-continue button {
+  flex-shrink: 0;
+  border-color: color-mix(in srgb, var(--ok) 60%, var(--border));
+  color: var(--ok);
 }
 
 .ai-agent-approval {
