@@ -130,8 +130,8 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
 const TAB_COLOR_THEME_VAR = '--accent'
 /** CSS variable for themed terminal background */
 const TERM_BG_THEME_VAR = '--bg-term'
-/** CSS variable for themed terminal text */
-const TERM_FG_THEME_VAR = '--text'
+/** Default terminal text color: fixed, not theme-dependent */
+const TERM_FG_THEME_VAR = '--term-fg-default'
 /** Hex digits per RGB channel */
 const HEX_CHANNEL_DIGITS = 2
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/

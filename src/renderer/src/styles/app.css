@@ -46,6 +46,7 @@
   --ok: #3dd68c;
   --warn: #f0b429;
   --bg-term: #0c0d0f;
+  --term-fg-default: #e8eaed;
   --term-selection: #3d8bfd66;
   --tab-active-border: #ffffff;
 }
@@ -794,7 +795,7 @@ textarea:focus {
   height: 100%;
   padding: 4px;
   background-color: var(--bg-term);
-  color: var(--text);
+  color: var(--term-fg-default);
   position: relative;
   isolation: isolate;
 }

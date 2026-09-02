@@ -44,10 +44,10 @@ function optionsPayload(draft: AppSettings): Partial<AppSettings> {
   }
 }
 
-/** CSS vars for theme-default color sampling */
+/** CSS vars for color sampling; terminal text default is theme-independent */
 const TAB_COLOR_THEME_VAR = '--accent'
 const TERM_BG_THEME_VAR = '--bg-term'
-const TERM_FG_THEME_VAR = '--text'
+const TERM_FG_THEME_VAR = '--term-fg-default'
 const HEX_CHANNEL_DIGITS = 2
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
 
@@ -276,7 +276,7 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
             />
             <DefaultsColorRow
               label="Terminal text"
-              hint="Theme default follows the app text color."
+              hint="The built-in default is fixed light gray; it does not follow the app theme."
               value={draft.sessionStyleDefaults.termForeground}
               themeVar={TERM_FG_THEME_VAR}
               onChange={(termForeground) => patchDefaults({ termForeground })}
