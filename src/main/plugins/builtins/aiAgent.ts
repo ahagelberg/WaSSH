@@ -1,16 +1,20 @@
 import { randomUUID } from 'crypto'
 import {
+  AI_AGENT_CONVERSATIONS_PER_HOST_MAX,
   AI_AGENT_DATA_VERSION,
+  AI_AGENT_DEFAULT_CHAT_TITLE,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
+  AI_AGENT_TITLE_MAX_CHARS,
   aiAgentVaultId,
   type AiAgentApprovalRequest,
   type AiAgentConversation,
   type AiAgentConversationMsg,
+  type AiAgentConversationSummary,
   type AiAgentConversationToolMsg,
   type AiAgentDataFile,
   type AiAgentProviderConfig,
@@ -106,12 +110,13 @@ function asDataFile(raw: unknown): AiAgentDataFile {
     version: AI_AGENT_DATA_VERSION,
     providers: [],
     conversations: {},
+    activeConversationId: {},
     rules: ''
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return fallback
   }
-  const src = raw as AiAgentDataFile
+  const src = raw as AiAgentDataFile & { conversations?: Record<string, unknown> }
   const providers: AiAgentProviderConfig[] = Array.isArray(src.providers)
     ? src.providers
         .filter(
@@ -129,16 +134,172 @@ function asDataFile(raw: unknown): AiAgentDataFile {
           models: Array.isArray(p.models) ? p.models.filter((m) => typeof m === 'string') : []
         }))
     : []
-  const conversations: Record<string, AiAgentConversation> =
+  const { conversations, activeConversationId } = migrateConversations(
     src.conversations && typeof src.conversations === 'object' && !Array.isArray(src.conversations)
-      ? src.conversations
+      ? (src.conversations as Record<string, unknown>)
+      : {},
+    src.activeConversationId &&
+      typeof src.activeConversationId === 'object' &&
+      !Array.isArray(src.activeConversationId)
+      ? src.activeConversationId
       : {}
+  )
   return {
     version: AI_AGENT_DATA_VERSION,
     providers,
     conversations,
+    activeConversationId,
     rules: typeof src.rules === 'string' ? src.rules : ''
   }
+}
+
+/** Marker separating user text from attached terminal excerpt */
+const TERMINAL_CONTEXT_MARKER = '\n\n[Recent terminal output]'
+
+function titleFromMessages(messages: AiAgentConversationMsg[]): string {
+  const first = messages.find((m): m is Extract<AiAgentConversationMsg, { role: 'user' }> => m.role === 'user')
+  if (!first) {
+    return AI_AGENT_DEFAULT_CHAT_TITLE
+  }
+  let text = first.text
+  const markerAt = text.indexOf(TERMINAL_CONTEXT_MARKER)
+  if (markerAt >= 0) {
+    text = text.slice(0, markerAt)
+  }
+  text = text.replace(/\s+/g, ' ').trim()
+  if (!text) {
+    return AI_AGENT_DEFAULT_CHAT_TITLE
+  }
+  if (text.length <= AI_AGENT_TITLE_MAX_CHARS) {
+    return text
+  }
+  return `${text.slice(0, AI_AGENT_TITLE_MAX_CHARS - 1).trimEnd()}…`
+}
+
+function normalizeConversation(
+  raw: Record<string, unknown>,
+  fallbackHostKey: string
+): AiAgentConversation | null {
+  const messages = Array.isArray(raw.messages) ? (raw.messages as AiAgentConversationMsg[]) : []
+  const id = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : randomUUID()
+  const hostKey =
+    typeof raw.hostKey === 'string' && raw.hostKey.length > 0 ? raw.hostKey : fallbackHostKey
+  if (!hostKey) {
+    return null
+  }
+  const title =
+    typeof raw.title === 'string' && raw.title.trim().length > 0
+      ? raw.title.trim()
+      : titleFromMessages(messages)
+  return {
+    id,
+    hostKey,
+    title,
+    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+    version: AI_AGENT_DATA_VERSION,
+    activeProviderId: typeof raw.activeProviderId === 'string' ? raw.activeProviderId : '',
+    activeModel: typeof raw.activeModel === 'string' ? raw.activeModel : '',
+    hostLabel: typeof raw.hostLabel === 'string' ? raw.hostLabel : '',
+    cwd: typeof raw.cwd === 'string' ? raw.cwd : '/',
+    messages
+  }
+}
+
+/**
+ * v1 stored one conversation per hostKey. v2 keys by conversation id and
+ * tracks the active id per host.
+ */
+function migrateConversations(
+  raw: Record<string, unknown>,
+  activeRaw: Record<string, string>
+): {
+  conversations: Record<string, AiAgentConversation>
+  activeConversationId: Record<string, string>
+} {
+  const conversations: Record<string, AiAgentConversation> = {}
+  const activeConversationId: Record<string, string> = { ...activeRaw }
+  for (const [key, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      continue
+    }
+    const entry = value as Record<string, unknown>
+    const hasNewShape = typeof entry.id === 'string' && typeof entry.hostKey === 'string'
+    const conv = normalizeConversation(entry, hasNewShape ? String(entry.hostKey) : key)
+    if (!conv) {
+      continue
+    }
+    conversations[conv.id] = conv
+    if (!hasNewShape && !activeConversationId[key]) {
+      activeConversationId[key] = conv.id
+    }
+  }
+  return { conversations, activeConversationId }
+}
+
+function createConversation(
+  hostKey: string,
+  hostLabel: string,
+  providerId: string,
+  model: string,
+  cwd: string
+): AiAgentConversation {
+  return {
+    id: randomUUID(),
+    hostKey,
+    title: AI_AGENT_DEFAULT_CHAT_TITLE,
+    updatedAt: Date.now(),
+    version: AI_AGENT_DATA_VERSION,
+    activeProviderId: providerId,
+    activeModel: model,
+    hostLabel,
+    cwd,
+    messages: []
+  }
+}
+
+function conversationsForHost(hostKey: string): AiAgentConversation[] {
+  if (!dataFile) {
+    return []
+  }
+  return Object.values(dataFile.conversations).filter((c) => c.hostKey === hostKey)
+}
+
+function listConversationSummaries(hostKey: string): AiAgentConversationSummary[] {
+  return conversationsForHost(hostKey)
+    .slice()
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((c) => ({
+      id: c.id,
+      title: c.title || AI_AGENT_DEFAULT_CHAT_TITLE,
+      updatedAt: c.updatedAt
+    }))
+}
+
+function pruneHostConversations(hostKey: string): void {
+  if (!dataFile) {
+    return
+  }
+  const list = conversationsForHost(hostKey)
+    .slice()
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+  if (list.length <= AI_AGENT_CONVERSATIONS_PER_HOST_MAX) {
+    return
+  }
+  const activeId = dataFile.activeConversationId[hostKey]
+  const drop = list.slice(AI_AGENT_CONVERSATIONS_PER_HOST_MAX)
+  for (const conv of drop) {
+    if (conv.id === activeId) {
+      continue
+    }
+    delete dataFile.conversations[conv.id]
+  }
+}
+
+function refreshConversationTitle(conversation: AiAgentConversation): void {
+  if (conversation.title !== AI_AGENT_DEFAULT_CHAT_TITLE && conversation.title.length > 0) {
+    return
+  }
+  conversation.title = titleFromMessages(conversation.messages)
 }
 
 function loadData(ctx: PluginMainContext): void {
@@ -186,6 +347,7 @@ function pushState(host: HostState): void {
     providers: dataFile?.providers ?? [],
     providerKeys,
     conversation: host.conversation,
+    conversationSummaries: listConversationSummaries(host.hostKey),
     runPhase: host.phase,
     hostKey: host.hostKey,
     hostLabel: host.hostLabel,
@@ -248,13 +410,16 @@ function trimHistory(conversation: AiAgentConversation): void {
 }
 
 function persistConversation(host: HostState): void {
-  if (!host.conversation) {
+  if (!host.conversation || !dataFile) {
     return
   }
   trimHistory(host.conversation)
-  if (dataFile) {
-    dataFile.conversations[host.hostKey] = host.conversation
-  }
+  refreshConversationTitle(host.conversation)
+  host.conversation.updatedAt = Date.now()
+  host.conversation.hostKey = host.hostKey
+  dataFile.conversations[host.conversation.id] = host.conversation
+  dataFile.activeConversationId[host.hostKey] = host.conversation.id
+  pruneHostConversations(host.hostKey)
   saveData()
 }
 
@@ -310,15 +475,25 @@ async function probeHost(ctx: PluginMainContext): Promise<ProbeResult | null> {
 function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext): HostState {
   let host = hosts.get(hostKey)
   if (!host) {
-    const stored = dataFile?.conversations[hostKey]
-    const conversation: AiAgentConversation = stored ?? {
-      version: AI_AGENT_DATA_VERSION,
-      activeProviderId: '',
-      activeModel: '',
-      hostLabel,
-      cwd: '/',
-      messages: []
+    const activeId = dataFile?.activeConversationId[hostKey]
+    let conversation =
+      activeId && dataFile?.conversations[activeId]?.hostKey === hostKey
+        ? dataFile.conversations[activeId]
+        : null
+    if (!conversation) {
+      const recent = conversationsForHost(hostKey)
+        .slice()
+        .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+      conversation =
+        recent ??
+        createConversation(hostKey, hostLabel, '', '', '/')
+      if (dataFile) {
+        dataFile.conversations[conversation.id] = conversation
+        dataFile.activeConversationId[hostKey] = conversation.id
+        saveData()
+      }
     }
+    conversation.hostLabel = hostLabel
     host = {
       hostKey,
       hostLabel,
@@ -1009,7 +1184,7 @@ function chatMessageWithTerminal(tab: TabRuntime, text: string, attachTerminal: 
     return text
   }
   const tail = tab.terminalTail.slice(-TERMINAL_CONTEXT_EXCERPT_CHARS)
-  return `${text}\n\n[Recent terminal output]\n${tail}`
+  return `${text}${TERMINAL_CONTEXT_MARKER}\n${tail}`
 }
 
 async function handleRendererMessage(
@@ -1108,10 +1283,78 @@ async function handleRendererMessage(
     return
   }
   if (payload.type === 'newChat') {
-    host.conversation.messages = []
-    host.conversation.activeProviderId = payload.providerId
-    host.conversation.activeModel = payload.model
+    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
+      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+      return
+    }
+    if (host.conversation.messages.length === 0) {
+      host.conversation.activeProviderId = payload.providerId
+      host.conversation.activeModel = payload.model
+      host.conversation.title = AI_AGENT_DEFAULT_CHAT_TITLE
+      persistConversation(host)
+      pushState(host)
+      return
+    }
     persistConversation(host)
+    host.conversation = createConversation(
+      host.hostKey,
+      host.hostLabel,
+      payload.providerId,
+      payload.model,
+      host.conversation.cwd || '/'
+    )
+    persistConversation(host)
+    pushState(host)
+    return
+  }
+  if (payload.type === 'openChat') {
+    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
+      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+      return
+    }
+    const next = dataFile?.conversations[payload.conversationId]
+    if (!next || next.hostKey !== host.hostKey) {
+      return
+    }
+    persistConversation(host)
+    host.conversation = next
+    if (dataFile) {
+      dataFile.activeConversationId[host.hostKey] = next.id
+      saveData()
+    }
+    pushState(host)
+    return
+  }
+  if (payload.type === 'deleteChat') {
+    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
+      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+      return
+    }
+    if (!dataFile) {
+      return
+    }
+    const target = dataFile.conversations[payload.conversationId]
+    if (!target || target.hostKey !== host.hostKey) {
+      return
+    }
+    delete dataFile.conversations[payload.conversationId]
+    if (host.conversation.id === payload.conversationId) {
+      const fallback =
+        conversationsForHost(host.hostKey)
+          .slice()
+          .sort((a, b) => b.updatedAt - a.updatedAt)[0] ??
+        createConversation(
+          host.hostKey,
+          host.hostLabel,
+          host.conversation.activeProviderId,
+          host.conversation.activeModel,
+          host.conversation.cwd || '/'
+        )
+      host.conversation = fallback
+      dataFile.conversations[fallback.id] = fallback
+      dataFile.activeConversationId[host.hostKey] = fallback.id
+    }
+    saveData()
     pushState(host)
     return
   }

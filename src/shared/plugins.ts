@@ -581,7 +581,7 @@ export const AI_AGENT_SAFE_RULES: string[] = [
 ]
 
 /** Plugin-owned data file schema */
-export const AI_AGENT_DATA_VERSION = 1
+export const AI_AGENT_DATA_VERSION = 2
 
 /** Vault id namespace for AI agent provider API keys (safeStorage-encrypted). */
 export const AI_AGENT_KEY_VAULT_PREFIX = 'ai-agent:'
@@ -593,7 +593,10 @@ export function aiAgentVaultId(providerId: string): string {
 export interface AiAgentDataFile {
   version: number
   providers: AiAgentProviderConfig[]
+  /** All conversations keyed by conversation id */
   conversations: Record<string, AiAgentConversation>
+  /** hostKey → active conversation id */
+  activeConversationId: Record<string, string>
   /** User-authored instructions always added to prompts (all providers) */
   rules: string
 }
@@ -637,14 +640,34 @@ export type AiAgentConversationMsg =
   | AiAgentConversationAssistantMsg
   | AiAgentConversationToolMsg
 
-/** Persisted per-host conversation */
+/** Default title before the first user message */
+export const AI_AGENT_DEFAULT_CHAT_TITLE = 'New chat'
+
+/** Max stored conversations kept per host (oldest pruned) */
+export const AI_AGENT_CONVERSATIONS_PER_HOST_MAX = 40
+
+/** Max characters in an auto-generated conversation title */
+export const AI_AGENT_TITLE_MAX_CHARS = 48
+
+/** Persisted conversation (one of many per host) */
 export interface AiAgentConversation {
+  id: string
+  hostKey: string
+  title: string
+  updatedAt: number
   version: number
   activeProviderId: string
   activeModel: string
   hostLabel: string
   cwd: string
   messages: AiAgentConversationMsg[]
+}
+
+/** Compact row for the history list */
+export interface AiAgentConversationSummary {
+  id: string
+  title: string
+  updatedAt: number
 }
 
 export type AiAgentRunPhase = 'no_session' | 'idle' | 'running' | 'ask' | 'ask_sudo' | 'paused'
@@ -668,6 +691,8 @@ export interface AiAgentStateSnapshot {
   /** Provider ids that currently have a key stored in the vault */
   providerKeys: string[]
   conversation: AiAgentConversation | null
+  /** Other chats for this host (including the active one), newest first */
+  conversationSummaries: AiAgentConversationSummary[]
   runPhase: AiAgentRunPhase
   hostKey: string
   hostLabel: string
@@ -708,6 +733,8 @@ export type AiAgentRendererMessage =
   | { type: 'select'; providerId: string; model: string }
   | { type: 'providersChanged'; providers: AiAgentProviderConfig[] }
   | { type: 'newChat'; providerId: string; model: string }
+  | { type: 'openChat'; conversationId: string }
+  | { type: 'deleteChat'; conversationId: string }
 
 export function defaultPluginSettingsFromSchema(
   schema: PluginSettingsField[] | undefined

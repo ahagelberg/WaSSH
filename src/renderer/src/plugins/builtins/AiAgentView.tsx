@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
+  AI_AGENT_DEFAULT_CHAT_TITLE,
   AI_AGENT_DEFAULT_PROVIDERS,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
@@ -9,6 +10,7 @@ import {
   aiAgentVaultId,
   type AiAgentApprovalDecision,
   type AiAgentConversation,
+  type AiAgentConversationSummary,
   type AiAgentConversationToolMsg,
   type AiAgentProviderConfig,
   type AiAgentProviderProtocol,
@@ -140,6 +142,7 @@ interface ViewState {
   /** Provider ids with a key currently stored in the vault */
   providerKeys: string[]
   conversation: AiAgentConversation | null
+  conversationSummaries: AiAgentConversationSummary[]
   runPhase: AiAgentStateSnapshot['runPhase']
   hostLabel: string
   ssh: boolean
@@ -154,12 +157,26 @@ function emptyViewState(): ViewState {
     providers: [],
     providerKeys: [],
     conversation: null,
+    conversationSummaries: [],
     runPhase: 'no_session',
     hostLabel: '',
     ssh: false,
     pendingApproval: null,
     pendingSudo: null,
     rules: ''
+  }
+}
+
+function formatChatTime(ts: number): string {
+  try {
+    return new Date(ts).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    })
+  } catch {
+    return ''
   }
 }
 
@@ -174,6 +191,7 @@ export default function AiAgentView({
   const [input, setInput] = useState('')
   const [attach, setAttach] = useState(false)
   const [gearOpen, setGearOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [drafts, setDrafts] = useState<DraftProvider[]>([])
   const [expandedDraftId, setExpandedDraftId] = useState<string | null>(null)
   const [newTemplateId, setNewTemplateId] = useState(PROVIDER_TEMPLATES[0]?.id ?? '')
@@ -221,6 +239,7 @@ export default function AiAgentView({
           providers: payload.providers,
           providerKeys: payload.providerKeys,
           conversation: payload.conversation,
+          conversationSummaries: payload.conversationSummaries ?? [],
           runPhase: payload.runPhase,
           hostLabel: payload.hostLabel,
           ssh: payload.ssh,
@@ -657,7 +676,7 @@ export default function AiAgentView({
     if (el) {
       el.scrollTop = el.scrollHeight
     }
-  }, [messages.length, stream, view.runPhase, gearOpen])
+  }, [messages.length, stream, view.runPhase, gearOpen, historyOpen])
 
   const phaseClass = view.runPhase
   const providerOptions =
@@ -883,16 +902,27 @@ export default function AiAgentView({
       ) : (
         <>
           <div className="ai-agent-header">
-            <span className={`ai-agent-phase ${phaseClass}`}>
-              {PHASE_LABELS[view.runPhase] ?? view.runPhase}
-            </span>
             <div className="ai-agent-header-controls">
               {providerOptions}
               <button
                 type="button"
                 className="ai-agent-gear-btn"
+                title="Chat history"
+                onClick={() => {
+                  setGearOpen(false)
+                  setHistoryOpen((prev) => !prev)
+                }}
+              >
+                History
+              </button>
+              <button
+                type="button"
+                className="ai-agent-gear-btn"
                 title="Providers & API keys"
-                onClick={openGear}
+                onClick={() => {
+                  setHistoryOpen(false)
+                  openGear()
+                }}
               >
                 ⚙
               </button>
@@ -900,6 +930,7 @@ export default function AiAgentView({
                 type="button"
                 onClick={() => {
                   if (activeProvider) {
+                    setHistoryOpen(false)
                     send({ type: 'newChat', providerId: activeProvider.id, model: activeModel })
                   }
                 }}
@@ -915,6 +946,56 @@ export default function AiAgentView({
               ) : null}
             </div>
           </div>
+
+          {historyOpen ? (
+            <div className="ai-agent-history-panel">
+              <div className="ai-agent-pane-label">Chat history</div>
+              {view.conversationSummaries.length === 0 ? (
+                <div className="ai-agent-history-empty">No saved conversations yet.</div>
+              ) : (
+                <ul className="ai-agent-history-list">
+                  {view.conversationSummaries.map((item) => {
+                    const active = conv?.id === item.id
+                    return (
+                      <li key={item.id} className={`ai-agent-history-item${active ? ' active' : ''}`}>
+                        <button
+                          type="button"
+                          className="ai-agent-history-open"
+                          disabled={busy && !active}
+                          title={item.title}
+                          onClick={() => {
+                            if (!active) {
+                              send({ type: 'openChat', conversationId: item.id })
+                            }
+                            setHistoryOpen(false)
+                          }}
+                        >
+                          <span className="ai-agent-history-title">
+                            {item.title || AI_AGENT_DEFAULT_CHAT_TITLE}
+                          </span>
+                          <span className="ai-agent-history-time">{formatChatTime(item.updatedAt)}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="ai-agent-danger ai-agent-history-delete"
+                          disabled={busy}
+                          title="Delete conversation"
+                          onClick={() => send({ type: 'deleteChat', conversationId: item.id })}
+                        >
+                          ×
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+              <div className="ai-agent-history-actions">
+                <button type="button" onClick={() => setHistoryOpen(false)}>
+                  Close
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           {view.lastError ? <div className="ai-agent-error-bar">{view.lastError}</div> : null}
 
@@ -1017,6 +1098,10 @@ export default function AiAgentView({
               </button>
             </div>
           ) : null}
+
+          <div className={`ai-agent-phase-bar ${phaseClass}`}>
+            {PHASE_LABELS[view.runPhase] ?? view.runPhase}
+          </div>
 
           <div className="ai-agent-inputbar">
             <button
