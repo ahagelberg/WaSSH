@@ -361,7 +361,14 @@ app.whenReady().then(() => {
     sessionStore,
     getWindow
   )
-  pluginSystem = createPluginSystem(settingsStore, sessionStore, sessions, getWindow, pluginData)
+  pluginSystem = createPluginSystem(
+    settingsStore,
+    sessionStore,
+    sessions,
+    getWindow,
+    pluginData,
+    vault
+  )
   registerIpc(
     vault,
     sessionStore,

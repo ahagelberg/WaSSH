@@ -1,6 +1,7 @@
 import { BrowserWindow } from 'electron'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
+import type { CredentialVault } from '../store/credentialVault'
 import type { SessionManager } from '../ssh/SessionManager'
 import { PluginHost } from './PluginHost'
 import { SessionDataPipeline } from './SessionDataPipeline'
@@ -21,7 +22,8 @@ export function createPluginSystem(
   sessionStore: SessionStore,
   sessions: SessionManager,
   getWindow: () => BrowserWindow | null,
-  pluginData: PluginDataStore
+  pluginData: PluginDataStore,
+  vault: CredentialVault
 ): PluginSystem {
   const pipeline = new SessionDataPipeline()
   sessions.setPipeline(pipeline)
@@ -42,7 +44,8 @@ export function createPluginSystem(
     broker,
     (tabId, data) => sessions.writeRaw(tabId, data),
     getWindow,
-    pluginData
+    pluginData,
+    vault
   )
   host.registerBuiltins()
   hostRef = host

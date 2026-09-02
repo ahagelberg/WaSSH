@@ -7,6 +7,7 @@ import {
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
+  aiAgentVaultId,
   type AiAgentApprovalRequest,
   type AiAgentConversation,
   type AiAgentConversationMsg,
@@ -64,7 +65,6 @@ interface HostState {
   hostLabel: string
   conversation: AiAgentConversation | null
   phase: AiAgentRunPhase
-  keys: Map<string, string>
   extraAllow: string[]
   extraDeny: string[]
   pendingApproval: AiAgentApprovalRequest | null
@@ -109,8 +109,7 @@ function asDataFile(raw: unknown): AiAgentDataFile {
               ? AI_AGENT_PROTOCOL_ANTHROPIC
               : AI_AGENT_PROTOCOL_OPENAI,
           baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
-          models: Array.isArray(p.models) ? p.models.filter((m) => typeof m === 'string') : [],
-          hasKey: p.hasKey === true
+          models: Array.isArray(p.models) ? p.models.filter((m) => typeof m === 'string') : []
         }))
     : []
   const conversations: Record<string, AiAgentConversation> =
@@ -144,13 +143,31 @@ function findProvider(providerId: string): AiAgentProviderConfig | undefined {
   return dataFile?.providers.find((p) => p.id === providerId)
 }
 
+function tabCtxForHost(hostKey: string): PluginMainContext | undefined {
+  for (const tab of tabs.values()) {
+    if (tab.hostKey === hostKey) {
+      return tab.ctx
+    }
+  }
+  return undefined
+}
+
 function pushState(host: HostState): void {
+  const ctx = tabCtxForHost(host.hostKey)
+  // Key presence is derived live from the vault; nothing is persisted on the
+  // provider config.
+  const providerKeys = ctx
+    ? (dataFile?.providers ?? [])
+        .filter((p) => ctx.getSecret(aiAgentVaultId(p.id)) !== null)
+        .map((p) => p.id)
+    : []
   const ssh = Array.from(tabs.values()).some(
     (tab) => tab.hostKey === host.hostKey && tab.ctx.isSshSession()
   )
   const snapshot: AiAgentStateSnapshot = {
     type: 'state',
     providers: dataFile?.providers ?? [],
+    providerKeys,
     conversation: host.conversation,
     runPhase: host.phase,
     hostKey: host.hostKey,
@@ -289,7 +306,6 @@ function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext):
       hostLabel,
       conversation,
       phase: 'idle',
-      keys: new Map(),
       extraAllow: [],
       extraDeny: [],
       pendingApproval: null,
@@ -318,7 +334,6 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
       if (host.inRun) {
         pauseHost(host)
       }
-      host.keys.clear()
       host.extraAllow = []
       host.extraDeny = []
       host.approvalResolve = null
@@ -495,7 +510,9 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     pushToast(host, 'error', 'Pick a model for this conversation first.')
     return
   }
-  const apiKey = host.keys.get(provider.id) ?? ''
+  // Read the key from the encrypted vault (safeStorage/DPAPI) for every run so
+  // keys survive restarts without any renderer round-trip or in-memory cache.
+  const apiKey = ctx.getSecret(aiAgentVaultId(provider.id)) ?? ''
   if (!apiKey && provider.protocol === 'anthropic') {
     pushToast(host, 'error', `No API key set for provider "${provider.name}".`)
     return
@@ -811,15 +828,6 @@ function hostForCtx(ctx: PluginMainContext): HostState | null {
   return hosts.get(tab.hostKey) ?? null
 }
 
-function updateProviderHasKey(host: HostState, providerId: string, hasKey: boolean): void {
-  const provider = dataFile?.providers.find((p) => p.id === providerId)
-  if (provider) {
-    provider.hasKey = hasKey
-    saveData()
-  }
-  pushState(host)
-}
-
 function chatMessageWithTerminal(tab: TabRuntime, text: string, attachTerminal: boolean): string {
   if (!attachTerminal || !tab.terminalTail) {
     return text
@@ -864,20 +872,6 @@ async function handleRendererMessage(
     const host = hostForCtx(ctx)
     if (host) {
       pushState(host)
-    }
-    return
-  }
-  if (payload.type === 'setApiKey' || payload.type === 'clearApiKey') {
-    const host = hostForCtx(ctx)
-    if (!host) {
-      return
-    }
-    if (payload.type === 'clearApiKey') {
-      host.keys.delete(payload.providerId)
-      updateProviderHasKey(host, payload.providerId, false)
-    } else {
-      host.keys.set(payload.providerId, payload.apiKey)
-      updateProviderHasKey(host, payload.providerId, payload.apiKey.length > 0)
     }
     return
   }

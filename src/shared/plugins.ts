@@ -485,8 +485,6 @@ export interface AiAgentProviderConfig {
   protocol: AiAgentProviderProtocol
   baseUrl: string
   models: string[]
-  /** True when an API key is stored in the vault for this provider */
-  hasKey: boolean
 }
 
 export const AI_AGENT_DEFAULT_PROVIDERS: AiAgentProviderConfig[] = [
@@ -495,40 +493,35 @@ export const AI_AGENT_DEFAULT_PROVIDERS: AiAgentProviderConfig[] = [
     name: 'Local (OpenAI compatible)',
     protocol: AI_AGENT_PROTOCOL_OPENAI,
     baseUrl: AI_AGENT_LOCAL_BASE_URL,
-    models: [...AI_AGENT_LOCAL_DEFAULT_MODELS],
-    hasKey: false
+    models: [...AI_AGENT_LOCAL_DEFAULT_MODELS]
   },
   {
     id: AI_AGENT_OPENROUTER_PROVIDER_ID,
     name: 'Open Router',
     protocol: AI_AGENT_PROTOCOL_OPENAI,
     baseUrl: AI_AGENT_OPENROUTER_BASE_URL,
-    models: [...AI_AGENT_OPENROUTER_DEFAULT_MODELS],
-    hasKey: false
+    models: [...AI_AGENT_OPENROUTER_DEFAULT_MODELS]
   },
   {
     id: AI_AGENT_ANTHROPIC_PROVIDER_ID,
     name: 'Anthropic',
     protocol: AI_AGENT_PROTOCOL_ANTHROPIC,
     baseUrl: AI_AGENT_ANTHROPIC_BASE_URL,
-    models: [...AI_AGENT_ANTHROPIC_DEFAULT_MODELS],
-    hasKey: false
+    models: [...AI_AGENT_ANTHROPIC_DEFAULT_MODELS]
   },
   {
     id: AI_AGENT_DEEPSEEK_PROVIDER_ID,
     name: 'DeepSeek',
     protocol: AI_AGENT_PROTOCOL_OPENAI,
     baseUrl: AI_AGENT_DEEPSEEK_BASE_URL,
-    models: [...AI_AGENT_DEEPSEEK_DEFAULT_MODELS],
-    hasKey: false
+    models: [...AI_AGENT_DEEPSEEK_DEFAULT_MODELS]
   },
   {
     id: AI_AGENT_GROK_PROVIDER_ID,
     name: 'Grok (xAI)',
     protocol: AI_AGENT_PROTOCOL_OPENAI,
     baseUrl: AI_AGENT_GROK_BASE_URL,
-    models: [...AI_AGENT_GROK_DEFAULT_MODELS],
-    hasKey: false
+    models: [...AI_AGENT_GROK_DEFAULT_MODELS]
   }
 ]
 
@@ -560,6 +553,13 @@ export const AI_AGENT_SAFE_RULES: string[] = [
 
 /** Plugin-owned data file schema */
 export const AI_AGENT_DATA_VERSION = 1
+
+/** Vault id namespace for AI agent provider API keys (safeStorage-encrypted). */
+export const AI_AGENT_KEY_VAULT_PREFIX = 'ai-agent:'
+
+export function aiAgentVaultId(providerId: string): string {
+  return `${AI_AGENT_KEY_VAULT_PREFIX}${providerId}`
+}
 
 export interface AiAgentDataFile {
   version: number
@@ -630,6 +630,8 @@ export interface AiAgentApprovalRequest {
 export interface AiAgentStateSnapshot {
   type: 'state'
   providers: AiAgentProviderConfig[]
+  /** Provider ids that currently have a key stored in the vault */
+  providerKeys: string[]
   conversation: AiAgentConversation | null
   runPhase: AiAgentRunPhase
   hostKey: string
@@ -665,8 +667,6 @@ export type AiAgentRendererMessage =
   | { type: 'resume' }
   | { type: 'discardPaused' }
   | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision }
-  | { type: 'setApiKey'; providerId: string; apiKey: string }
-  | { type: 'clearApiKey'; providerId: string }
   | { type: 'rulesChanged'; rules: string }
   | { type: 'select'; providerId: string; model: string }
   | { type: 'providersChanged'; providers: AiAgentProviderConfig[] }

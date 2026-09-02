@@ -12,6 +12,7 @@ import type {
 import { mergePluginSessionSettings, PLUGIN_ID_AI_AGENT, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
+import type { CredentialVault } from '../store/credentialVault'
 import { BUILTIN_MANIFESTS } from './builtins/manifests'
 import { aiAgentMain } from './builtins/aiAgent'
 import { macroPadMain } from './builtins/macroPad'
@@ -33,6 +34,8 @@ export interface PluginMainContext {
   getData: () => unknown
   /** Write this plugin's JSON file under userData */
   setData: (data: unknown) => void
+  /** Read a vault secret (DPAPI/safeStorage encrypted); null when absent */
+  getSecret: (vaultId: string) => string | null
   sendToRenderer: (payload: unknown) => void
   openSideConnection: (req: SideConnectionOpenRequest) => Promise<string>
   closeSideConnection: (connectionId: string) => void
@@ -92,7 +95,8 @@ export class PluginHost {
     private broker: SideConnectionBroker,
     private writeSession: (tabId: string, data: string) => void,
     private getWindow: () => BrowserWindow | null,
-    private pluginData: PluginDataStore
+    private pluginData: PluginDataStore,
+    private vault: CredentialVault
   ) {}
 
   /** Call after construction once builtin modules are registered */
@@ -197,6 +201,7 @@ export class PluginHost {
       setData: (data: unknown) => {
         this.pluginData.set(pluginId, data)
       },
+      getSecret: (vaultId: string) => this.vault.get(vaultId),
       sendToRenderer: (payload: unknown) => {
         this.send('plugin:message', {
           tabId,

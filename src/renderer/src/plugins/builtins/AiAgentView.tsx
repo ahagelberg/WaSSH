@@ -1,25 +1,20 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
-  AI_AGENT_ANTHROPIC_PROVIDER_ID,
   AI_AGENT_DEFAULT_PROVIDERS,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
-  PLUGIN_ID_AI_AGENT,
+  aiAgentVaultId,
   type AiAgentApprovalDecision,
   type AiAgentConversation,
-  type AiAgentConversationMsg,
   type AiAgentConversationToolMsg,
   type AiAgentProviderConfig,
   type AiAgentProviderProtocol,
   type AiAgentStateSnapshot
 } from '@shared/plugins'
 import type { PluginViewProps } from '../registry'
-
-/** Vault id namespace for provider API keys */
-const AI_AGENT_KEY_VAULT_PREFIX = 'ai-agent:'
 
 /** Streaming rows rendered between two state snapshots may not exceed this */
 const STREAM_PLACEHOLDER_LIMIT = 1_000_000
@@ -30,8 +25,7 @@ const CUSTOM_OPENAI_TEMPLATE: AiAgentProviderConfig = {
   name: 'OpenAI compatible',
   protocol: AI_AGENT_PROTOCOL_OPENAI,
   baseUrl: '',
-  models: [],
-  hasKey: false
+  models: []
 }
 
 const CUSTOM_ANTHROPIC_TEMPLATE: AiAgentProviderConfig = {
@@ -39,8 +33,7 @@ const CUSTOM_ANTHROPIC_TEMPLATE: AiAgentProviderConfig = {
   name: 'Anthropic compatible',
   protocol: AI_AGENT_PROTOCOL_ANTHROPIC,
   baseUrl: AI_AGENT_ANTHROPIC_BASE_URL,
-  models: [],
-  hasKey: false
+  models: []
 }
 
 const PROVIDER_TEMPLATES: AiAgentProviderConfig[] = [
@@ -65,6 +58,8 @@ const PHASE_LABELS: PhaseLabel = {
 }
 
 interface DraftProvider extends AiAgentProviderConfig {
+  /** Runtime flag: a key is stored in the vault for this provider */
+  hasKey: boolean
   /** transient key entry, never persisted in config */
   draftKey: string
 }
@@ -74,6 +69,7 @@ function templateDraft(template: AiAgentProviderConfig): DraftProvider {
     ...template,
     id: newProviderId(),
     models: [...template.models],
+    hasKey: false,
     draftKey: ''
   }
 }
@@ -91,10 +87,6 @@ function baseHost(baseUrl: string): string {
   } catch {
     return baseUrl
   }
-}
-
-function vaultIdFor(providerId: string): string {
-  return `${AI_AGENT_KEY_VAULT_PREFIX}${providerId}`
 }
 
 function outcomeLabel(outcome: AiAgentConversationToolMsg['outcome']): string {
@@ -133,6 +125,8 @@ function formatText(text: string): ReactElement[] {
 
 interface ViewState {
   providers: AiAgentProviderConfig[]
+  /** Provider ids with a key currently stored in the vault */
+  providerKeys: string[]
   conversation: AiAgentConversation | null
   runPhase: AiAgentStateSnapshot['runPhase']
   hostLabel: string
@@ -145,6 +139,7 @@ interface ViewState {
 function emptyViewState(): ViewState {
   return {
     providers: [],
+    providerKeys: [],
     conversation: null,
     runPhase: 'no_session',
     hostLabel: '',
@@ -170,7 +165,6 @@ export default function AiAgentView({
   const [newTemplateId, setNewTemplateId] = useState(PROVIDER_TEMPLATES[0]?.id ?? '')
   const [rulesDraft, setRulesDraft] = useState('')
   const [toast, setToast] = useState<{ kind: 'error' | 'info'; text: string } | null>(null)
-  const secretCache = useRef(new Map<string, string>())
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const send = (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
@@ -186,28 +180,6 @@ export default function AiAgentView({
       toastTimer.current = null
       setToast(null)
     }, 5000)
-  }
-
-  const sendCachedKeys = (providers: AiAgentProviderConfig[]): void => {
-    for (const provider of providers) {
-      if (provider.hasKey) {
-        continue
-      }
-      const cached = secretCache.current.get(provider.id)
-      if (cached) {
-        send({ type: 'setApiKey', providerId: provider.id, apiKey: cached })
-      }
-    }
-  }
-
-  const loadSecrets = async (providers: AiAgentProviderConfig[]): Promise<void> => {
-    for (const provider of providers) {
-      const secret = await window.wassh.getSecret(vaultIdFor(provider.id))
-      if (secret) {
-        secretCache.current.set(provider.id, secret)
-      }
-    }
-    sendCachedKeys(providers)
   }
 
   useEffect(() => {
@@ -226,6 +198,7 @@ export default function AiAgentView({
       if (payload.type === 'state') {
         setView({
           providers: payload.providers,
+          providerKeys: payload.providerKeys,
           conversation: payload.conversation,
           runPhase: payload.runPhase,
           hostLabel: payload.hostLabel,
@@ -235,7 +208,6 @@ export default function AiAgentView({
           lastError: payload.lastError
         })
         setStream('')
-        void loadSecrets(payload.providers)
         return
       }
       if (payload.type === 'delta') {
@@ -364,7 +336,14 @@ export default function AiAgentView({
     conv.messages[conv.messages.length - 1].role === 'user'
 
   const openGear = (): void => {
-    setDrafts(providers.map((p) => ({ ...p, models: [...p.models], draftKey: '' })))
+    setDrafts(
+      providers.map((p) => ({
+        ...p,
+        models: [...p.models],
+        hasKey: view.providerKeys.includes(p.id),
+        draftKey: ''
+      }))
+    )
     setExpandedDraftId(null)
     setRulesDraft(view.rules)
     setGearOpen(true)
@@ -387,8 +366,7 @@ export default function AiAgentView({
   const removeDraft = (index: number): void => {
     const removed = drafts[index]
     if (removed?.hasKey) {
-      void window.wassh.deleteSecret(vaultIdFor(removed.id))
-      secretCache.current.delete(removed.id)
+      void window.wassh.deleteSecret(aiAgentVaultId(removed.id))
     }
     setDrafts((prev) => prev.filter((_, i) => i !== index))
   }
@@ -412,19 +390,19 @@ export default function AiAgentView({
     if (!key) {
       return
     }
-    await window.wassh.setSecret(vaultIdFor(draft.id), key)
-    secretCache.current.set(draft.id, key)
-    send({ type: 'setApiKey', providerId: draft.id, apiKey: key })
+    // The key is handed to the main process once and stored there encrypted
+    // (safeStorage/DPAPI). The renderer never caches the plaintext.
+    await window.wassh.setSecret(aiAgentVaultId(draft.id), key)
     updateDraft(index, { hasKey: true, draftKey: '' })
+    send({ type: 'sync' })
     showToast('info', 'API key saved (encrypted).')
   }
 
   const removeDraftKey = async (index: number): Promise<void> => {
     const draft = drafts[index]
-    await window.wassh.deleteSecret(vaultIdFor(draft.id))
-    secretCache.current.delete(draft.id)
-    send({ type: 'clearApiKey', providerId: draft.id })
+    await window.wassh.deleteSecret(aiAgentVaultId(draft.id))
     updateDraft(index, { hasKey: false, draftKey: '' })
+    send({ type: 'sync' })
   }
 
   const saveRules = (): void => {
@@ -438,8 +416,7 @@ export default function AiAgentView({
       name: d.name.trim() || 'Provider',
       protocol: d.protocol,
       baseUrl: d.baseUrl.trim(),
-      models: d.models.map((m) => m.trim()).filter((m) => m.length > 0),
-      hasKey: d.hasKey
+      models: d.models.map((m) => m.trim()).filter((m) => m.length > 0)
     }))
     send({ type: 'providersChanged', providers: next })
     setGearOpen(false)
