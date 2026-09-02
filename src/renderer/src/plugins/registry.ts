@@ -5,6 +5,7 @@ import ScratchpadView from './builtins/ScratchpadView'
 import MacroPadView from './builtins/MacroPadView'
 import MqttExplorerView from './builtins/MqttExplorerView'
 import SftpView from './builtins/SftpView'
+import AiAgentView from './builtins/AiAgentView'
 
 export interface PluginViewProps {
   tabId: string
@@ -18,7 +19,8 @@ const VIEW_REGISTRY: Record<string, ComponentType<PluginViewProps>> = {
   scratchpad: ScratchpadView,
   'macro-pad': MacroPadView,
   'mqtt-explorer': MqttExplorerView,
-  sftp: SftpView
+  sftp: SftpView,
+  'ai-agent': AiAgentView
 }
 
 export function getPluginView(pluginId: string): ComponentType<PluginViewProps> | null {

@@ -9,10 +9,11 @@ import type {
   StreamDirection,
   StreamMode
 } from '../../shared/plugins'
-import { mergePluginSessionSettings, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
+import { mergePluginSessionSettings, PLUGIN_ID_AI_AGENT, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import { BUILTIN_MANIFESTS } from './builtins/manifests'
+import { aiAgentMain } from './builtins/aiAgent'
 import { macroPadMain } from './builtins/macroPad'
 import { mqttExplorerMain } from './builtins/mqttExplorer'
 import { scratchpadMain } from './builtins/scratchpad'
@@ -101,6 +102,7 @@ export class PluginHost {
     this.modules.set(PLUGIN_ID_MACRO_PAD, macroPadMain)
     this.modules.set(PLUGIN_ID_MQTT_EXPLORER, mqttExplorerMain)
     this.modules.set(PLUGIN_ID_SFTP, sftpMain)
+    this.modules.set(PLUGIN_ID_AI_AGENT, aiAgentMain)
   }
 
   private send(channel: string, payload: unknown): void {

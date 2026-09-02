@@ -1,10 +1,16 @@
 import type { PluginManifest, PluginMacroButton } from '../../../shared/plugins'
 import {
+  PLUGIN_ID_AI_AGENT,
   PLUGIN_ID_MACRO_PAD,
   PLUGIN_ID_MQTT_EXPLORER,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_SERVER_MONITOR,
   PLUGIN_ID_SFTP,
+  AI_AGENT_SAFE_RULES,
+  AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
+  AI_AGENT_SETTING_DEFAULT_DENY_RULES,
+  AI_AGENT_SETTING_HOST_ALLOW_RULES,
+  AI_AGENT_SETTING_HOST_DENY_RULES,
   MQTT_EXPLORER_DEFAULT_HOST,
   MQTT_EXPLORER_DEFAULT_PORT,
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
@@ -187,10 +193,63 @@ export const sftpManifest: PluginManifest = {
   }
 }
 
+export const aiAgentManifest: PluginManifest = {
+  id: PLUGIN_ID_AI_AGENT,
+  name: 'AI agent',
+  version: '1.0.0',
+  description:
+    'Chat with an LLM that can run commands on the remote host. Commands outside the safe/allow lists ask for approval.',
+  activation: 'manual',
+  source: 'builtin',
+  contributes: {
+    toolbar: { label: 'AI' },
+    settingsHeading: 'AI agent',
+    settingsSchema: [
+      {
+        key: AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
+        label: 'Default allow rules',
+        type: 'stringList',
+        default: AI_AGENT_SAFE_RULES,
+        description:
+          'App-wide command patterns that run without asking (applies to every host). One per line; glob by default, prefix a line with "regex:" for a regular expression. Host allow rules are checked first.'
+      },
+      {
+        key: AI_AGENT_SETTING_DEFAULT_DENY_RULES,
+        label: 'Default deny rules',
+        type: 'stringList',
+        default: [],
+        description:
+          'App-wide command patterns that are always blocked. Deny always wins over allow.'
+      }
+    ],
+    hostSettingsHeading: 'AI agent',
+    hostSettingsSchema: [
+      {
+        key: AI_AGENT_SETTING_HOST_ALLOW_RULES,
+        label: 'Allow rules',
+        type: 'stringList',
+        default: [],
+        description:
+          'Command patterns for this host that run without asking. One per line; glob by default, prefix with "regex:" for a regular expression.'
+      },
+      {
+        key: AI_AGENT_SETTING_HOST_DENY_RULES,
+        label: 'Deny rules',
+        type: 'stringList',
+        default: [],
+        description:
+          'Command patterns for this host that are always blocked. Deny always wins over allow.'
+      }
+    ],
+    views: [{ id: 'panel', placement: 'split-right', title: 'AI agent' }]
+  }
+}
+
 export const BUILTIN_MANIFESTS: PluginManifest[] = [
   serverMonitorManifest,
   scratchpadManifest,
   macroPadManifest,
   mqttExplorerManifest,
-  sftpManifest
+  sftpManifest,
+  aiAgentManifest
 ]

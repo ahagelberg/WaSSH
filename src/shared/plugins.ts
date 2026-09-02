@@ -4,13 +4,15 @@ export const PLUGIN_ID_SCRATCHPAD = 'scratchpad'
 export const PLUGIN_ID_MACRO_PAD = 'macro-pad'
 export const PLUGIN_ID_MQTT_EXPLORER = 'mqtt-explorer'
 export const PLUGIN_ID_SFTP = 'sftp'
+export const PLUGIN_ID_AI_AGENT = 'ai-agent'
 
 export const DEFAULT_ENABLED_PLUGINS: string[] = [
   PLUGIN_ID_SERVER_MONITOR,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_MACRO_PAD,
   PLUGIN_ID_MQTT_EXPLORER,
-  PLUGIN_ID_SFTP
+  PLUGIN_ID_SFTP,
+  PLUGIN_ID_AI_AGENT
 ]
 
 export type PluginActivation = 'manual' | 'auto'
@@ -429,6 +431,246 @@ export type SftpRendererMessage =
   | { type: 'uploadEnd'; name: string }
   | { type: 'cancel' }
   | { type: 'resetCwd' }
+
+/* AI agent */
+
+/** Settings field keys (stringList of allow/deny rules) */
+export const AI_AGENT_SETTING_DEFAULT_ALLOW_RULES = 'defaultAllowRules'
+export const AI_AGENT_SETTING_DEFAULT_DENY_RULES = 'defaultDenyRules'
+export const AI_AGENT_SETTING_HOST_ALLOW_RULES = 'allowRules'
+export const AI_AGENT_SETTING_HOST_DENY_RULES = 'denyRules'
+
+/** Line prefix that switches a rule to regex matching */
+export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
+
+/** Agent wire protocols */
+export const AI_AGENT_PROTOCOL_OPENAI = 'openai'
+export const AI_AGENT_PROTOCOL_ANTHROPIC = 'anthropic'
+export type AiAgentProviderProtocol =
+  | typeof AI_AGENT_PROTOCOL_OPENAI
+  | typeof AI_AGENT_PROTOCOL_ANTHROPIC
+
+/** Built-in provider presets (ids are stable) */
+export const AI_AGENT_LOCAL_PROVIDER_ID = 'local'
+export const AI_AGENT_OPENROUTER_PROVIDER_ID = 'openrouter'
+export const AI_AGENT_ANTHROPIC_PROVIDER_ID = 'anthropic'
+export const AI_AGENT_DEEPSEEK_PROVIDER_ID = 'deepseek'
+export const AI_AGENT_GROK_PROVIDER_ID = 'grok'
+
+export const AI_AGENT_LOCAL_BASE_URL = 'http://127.0.0.1:11434/v1'
+export const AI_AGENT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1'
+export const AI_AGENT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
+export const AI_AGENT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
+export const AI_AGENT_GROK_BASE_URL = 'https://api.x.ai/v1'
+
+/** Anthropic protocol additions */
+export const AI_AGENT_ANTHROPIC_VERSION = '2023-06-01'
+export const AI_AGENT_ANTHROPIC_PATH = '/v1/messages'
+export const AI_AGENT_OPENAI_CHAT_PATH = '/chat/completions'
+
+/** Default model suggestions per provider (editable in the provider manager) */
+export const AI_AGENT_LOCAL_DEFAULT_MODELS = ['llama3.1', 'qwen2.5-coder:7b']
+export const AI_AGENT_OPENROUTER_DEFAULT_MODELS = ['anthropic/claude-sonnet-4-20250514']
+export const AI_AGENT_ANTHROPIC_DEFAULT_MODELS = [
+  'claude-sonnet-4-20250514',
+  'claude-opus-4-20250514',
+  'claude-3-5-haiku-20241022'
+]
+export const AI_AGENT_DEEPSEEK_DEFAULT_MODELS = ['deepseek-chat', 'deepseek-reasoner']
+export const AI_AGENT_GROK_DEFAULT_MODELS = ['grok-3', 'grok-3-mini-beta']
+
+export interface AiAgentProviderConfig {
+  id: string
+  name: string
+  protocol: AiAgentProviderProtocol
+  baseUrl: string
+  models: string[]
+  /** True when an API key is stored in the vault for this provider */
+  hasKey: boolean
+}
+
+export const AI_AGENT_DEFAULT_PROVIDERS: AiAgentProviderConfig[] = [
+  {
+    id: AI_AGENT_LOCAL_PROVIDER_ID,
+    name: 'Local (OpenAI compatible)',
+    protocol: AI_AGENT_PROTOCOL_OPENAI,
+    baseUrl: AI_AGENT_LOCAL_BASE_URL,
+    models: [...AI_AGENT_LOCAL_DEFAULT_MODELS],
+    hasKey: false
+  },
+  {
+    id: AI_AGENT_OPENROUTER_PROVIDER_ID,
+    name: 'Open Router',
+    protocol: AI_AGENT_PROTOCOL_OPENAI,
+    baseUrl: AI_AGENT_OPENROUTER_BASE_URL,
+    models: [...AI_AGENT_OPENROUTER_DEFAULT_MODELS],
+    hasKey: false
+  },
+  {
+    id: AI_AGENT_ANTHROPIC_PROVIDER_ID,
+    name: 'Anthropic',
+    protocol: AI_AGENT_PROTOCOL_ANTHROPIC,
+    baseUrl: AI_AGENT_ANTHROPIC_BASE_URL,
+    models: [...AI_AGENT_ANTHROPIC_DEFAULT_MODELS],
+    hasKey: false
+  },
+  {
+    id: AI_AGENT_DEEPSEEK_PROVIDER_ID,
+    name: 'DeepSeek',
+    protocol: AI_AGENT_PROTOCOL_OPENAI,
+    baseUrl: AI_AGENT_DEEPSEEK_BASE_URL,
+    models: [...AI_AGENT_DEEPSEEK_DEFAULT_MODELS],
+    hasKey: false
+  },
+  {
+    id: AI_AGENT_GROK_PROVIDER_ID,
+    name: 'Grok (xAI)',
+    protocol: AI_AGENT_PROTOCOL_OPENAI,
+    baseUrl: AI_AGENT_GROK_BASE_URL,
+    models: [...AI_AGENT_GROK_DEFAULT_MODELS],
+    hasKey: false
+  }
+]
+
+/**
+ * Built-in read-only command patterns that auto-run without approval.
+ * Lines may be globs; `regex:` prefix switches to a regular expression.
+ */
+export const AI_AGENT_SAFE_RULES: string[] = [
+  'pwd',
+  'whoami',
+  'id*',
+  'hostname*',
+  'uname*',
+  'date',
+  'uptime',
+  'ls*',
+  'lscpu*',
+  'free*',
+  'df*',
+  'ps*',
+  'git status*',
+  'git log*',
+  'git diff*',
+  'git branch*',
+  'git remote*',
+  'git show*',
+  'git rev-parse*'
+]
+
+/** Plugin-owned data file schema */
+export const AI_AGENT_DATA_VERSION = 1
+
+export interface AiAgentDataFile {
+  version: number
+  providers: AiAgentProviderConfig[]
+  conversations: Record<string, AiAgentConversation>
+  /** User-authored instructions always added to prompts (all providers) */
+  rules: string
+}
+
+/** One tool invocation requested by the model */
+export interface AiAgentToolCall {
+  id: string
+  command: string
+}
+
+export type AiAgentToolOutcome = 'ok' | 'denied' | 'error' | 'timeout' | 'cancelled'
+
+export interface AiAgentConversationUserMsg {
+  role: 'user'
+  text: string
+  /** Whether recent terminal output was attached to this message */
+  usedTerminalContext: boolean
+}
+
+export interface AiAgentConversationAssistantMsg {
+  role: 'assistant'
+  text?: string
+  toolCalls?: AiAgentToolCall[]
+  providerId?: string
+  model?: string
+  /** True when the run was stopped by the user mid-message */
+  stopped?: boolean
+}
+
+export interface AiAgentConversationToolMsg {
+  role: 'tool'
+  toolCallId: string
+  command: string
+  content: string
+  outcome: AiAgentToolOutcome
+  truncated: boolean
+}
+
+export type AiAgentConversationMsg =
+  | AiAgentConversationUserMsg
+  | AiAgentConversationAssistantMsg
+  | AiAgentConversationToolMsg
+
+/** Persisted per-host conversation */
+export interface AiAgentConversation {
+  version: number
+  activeProviderId: string
+  activeModel: string
+  hostLabel: string
+  cwd: string
+  messages: AiAgentConversationMsg[]
+}
+
+export type AiAgentRunPhase = 'no_session' | 'idle' | 'running' | 'ask' | 'paused'
+
+export interface AiAgentApprovalRequest {
+  requestId: string
+  command: string
+  cwd: string
+}
+
+/** Main → renderer: full UI snapshot */
+export interface AiAgentStateSnapshot {
+  type: 'state'
+  providers: AiAgentProviderConfig[]
+  conversation: AiAgentConversation | null
+  runPhase: AiAgentRunPhase
+  hostKey: string
+  hostLabel: string
+  ssh: boolean
+  pendingApproval: AiAgentApprovalRequest | null
+  /** User-authored rules for prompts (all providers) */
+  rules: string
+  lastError?: string
+}
+
+/** Main → renderer: streamed assistant text delta */
+export interface AiAgentDeltaPayload {
+  type: 'delta'
+  text: string
+}
+
+/** Main → renderer: transient status line */
+export interface AiAgentToastPayload {
+  type: 'toast'
+  kind: 'error' | 'info'
+  text: string
+}
+
+export type AiAgentApprovalDecision = 'allow' | 'deny' | 'allowAlways' | 'denyAlways'
+
+/** Renderer → main */
+export type AiAgentRendererMessage =
+  | { type: 'sync' }
+  | { type: 'probe' }
+  | { type: 'chat'; providerId: string; model: string; text: string; attachTerminal?: boolean }
+  | { type: 'stop' }
+  | { type: 'resume' }
+  | { type: 'discardPaused' }
+  | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision }
+  | { type: 'setApiKey'; providerId: string; apiKey: string }
+  | { type: 'clearApiKey'; providerId: string }
+  | { type: 'rulesChanged'; rules: string }
+  | { type: 'select'; providerId: string; model: string }
+  | { type: 'providersChanged'; providers: AiAgentProviderConfig[] }
+  | { type: 'newChat'; providerId: string; model: string }
 
 export function defaultPluginSettingsFromSchema(
   schema: PluginSettingsField[] | undefined
