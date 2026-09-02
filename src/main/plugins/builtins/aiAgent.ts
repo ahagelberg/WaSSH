@@ -16,7 +16,8 @@ import {
   type AiAgentProviderConfig,
   type AiAgentRendererMessage,
   type AiAgentRunPhase,
-  type AiAgentStateSnapshot
+  type AiAgentStateSnapshot,
+  type AiAgentSudoRequest
 } from '../../../shared/plugins'
 import type { PluginMainContext, PluginMainModule } from '../PluginHost'
 import { decideCommand } from '../aiAgent/permissions'
@@ -54,6 +55,15 @@ const HISTORY_MAX = 160
 /** Remote project rules file read from the working directory */
 const PROJECT_RULES_FILE = '.wasshrules'
 
+/** How long a successful sudo password / NOPASSWD probe stays cached in memory (ms) */
+const SUDO_PASSWORD_CACHE_MS = 5 * 60 * 1000
+
+/** Detects a sudo invocation in a shell command line */
+const SUDO_COMMAND_RE = /\bsudo\b/
+
+/** Marker printed when sudo -S / -n authentication fails inside the exec wrapper */
+const SUDO_AUTH_FAILED_MARKER = '[wassh: sudo authentication failed]'
+
 interface TabRuntime {
   ctx: PluginMainContext
   hostKey: string
@@ -69,6 +79,13 @@ interface HostState {
   extraDeny: string[]
   pendingApproval: AiAgentApprovalRequest | null
   approvalResolve: ((decision: string) => void) | null
+  pendingSudo: AiAgentSudoRequest | null
+  sudoResolve: ((password: string | null) => void) | null
+  /** In-memory only — never persisted or sent to the renderer */
+  sudoPassword: string | null
+  sudoPasswordExpiresAt: number
+  /** True while NOPASSWD sudo works; expires with the same cache window */
+  sudoNopassExpiresAt: number
   controller: AbortController | null
   connectionId: string | null
   /** The tab ctx that started the current run (used to close exec channels) */
@@ -174,6 +191,7 @@ function pushState(host: HostState): void {
     hostLabel: host.hostLabel,
     ssh,
     pendingApproval: host.pendingApproval,
+    pendingSudo: host.pendingSudo,
     rules: dataFile?.rules ?? '',
     lastError: host.lastError
   }
@@ -310,6 +328,11 @@ function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext):
       extraDeny: [],
       pendingApproval: null,
       approvalResolve: null,
+      pendingSudo: null,
+      sudoResolve: null,
+      sudoPassword: null,
+      sudoPasswordExpiresAt: 0,
+      sudoNopassExpiresAt: 0,
       controller: null,
       connectionId: null,
       runCtx: null,
@@ -338,6 +361,13 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
       host.extraDeny = []
       host.approvalResolve = null
       host.pendingApproval = null
+      if (host.sudoResolve) {
+        const resolve = host.sudoResolve
+        host.sudoResolve = null
+        host.pendingSudo = null
+        resolve(null)
+      }
+      clearSudoCache(host)
       hosts.delete(hostKey)
     }
   } else {
@@ -355,6 +385,7 @@ function systemPrompt(host: HostState, projectRules: string): string {
     'You can execute shell commands on that host with the run_command tool.',
     'Commands run non-interactively in a fresh shell (your working directory is preserved between calls).',
     'Avoid interactive commands (vim, top, less, tail -f). Prefer small, verifiable steps.',
+    'sudo is supported: the user may be prompted once for their password when needed.',
     'After each command you see its combined stdout/stderr and exit code.',
     'Never invent command output. If a step fails, diagnose from the real output and continue or report.',
     'When the task is complete, reply with a concise plain-text summary; you do not need to call more tools.'
@@ -429,8 +460,88 @@ function pauseHost(host: HostState): void {
   }
   host.pendingApproval = null
   host.approvalResolve = null
+  if (host.sudoResolve) {
+    const resolve = host.sudoResolve
+    host.sudoResolve = null
+    host.pendingSudo = null
+    resolve(null)
+  }
+  clearSudoCache(host)
   host.inRun = false
   host.phase = 'paused'
+}
+
+function clearSudoCache(host: HostState): void {
+  host.sudoPassword = null
+  host.sudoPasswordExpiresAt = 0
+  host.sudoNopassExpiresAt = 0
+}
+
+function commandNeedsSudo(command: string): boolean {
+  return SUDO_COMMAND_RE.test(command)
+}
+
+function hasCachedSudoPassword(host: HostState): boolean {
+  return host.sudoPassword !== null && Date.now() < host.sudoPasswordExpiresAt
+}
+
+function hasCachedSudoNopass(host: HostState): boolean {
+  return Date.now() < host.sudoNopassExpiresAt
+}
+
+async function canSudoWithoutPassword(host: HostState): Promise<boolean> {
+  const ctx = host.runCtx
+  if (!ctx) {
+    return false
+  }
+  try {
+    const out = await ctx.execCapture(
+      'sudo -n -v >/dev/null 2>&1; printf "__WASSH_SUDO_NOPASS:%s\\n" "$?"'
+    )
+    return /__WASSH_SUDO_NOPASS:0\b/.test(out)
+  } catch {
+    return false
+  }
+}
+
+async function askSudoPassword(host: HostState, command: string): Promise<string | null> {
+  host.pendingSudo = { requestId: randomUUID(), command }
+  host.phase = 'ask_sudo'
+  pushState(host)
+  const password = await new Promise<string | null>((resolve) => {
+    host.sudoResolve = resolve
+  })
+  host.sudoResolve = null
+  host.pendingSudo = null
+  if (host.inRun && !host.stopped) {
+    host.phase = 'running'
+    pushState(host)
+  }
+  return password
+}
+
+/**
+ * Ensure sudo can authenticate for this command.
+ * Returns false if the user cancelled the password prompt.
+ */
+async function ensureSudoCredentials(host: HostState, command: string): Promise<boolean> {
+  if (hasCachedSudoPassword(host) || hasCachedSudoNopass(host)) {
+    return true
+  }
+  if (await canSudoWithoutPassword(host)) {
+    host.sudoNopassExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+    return true
+  }
+  if (!host.inRun || host.stopped) {
+    return false
+  }
+  const password = await askSudoPassword(host, command)
+  if (password === null) {
+    return false
+  }
+  host.sudoPassword = password
+  host.sudoPasswordExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+  return true
 }
 
 function listSetting(settings: Record<string, unknown>, key: string): string[] {
@@ -623,10 +734,39 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           continue
         }
 
-        const execResult = await execCommand(host, command)
+        let sudoStdin: string | undefined
+        if (commandNeedsSudo(command)) {
+          const ok = await ensureSudoCredentials(host, command)
+          if (!host.inRun) {
+            keepRunning = false
+            break
+          }
+          if (!ok) {
+            conv.messages.push(
+              toolResultMessage(tc.id, command, 'Sudo password prompt was cancelled.', 'cancelled', false)
+            )
+            pushState(host)
+            persistConversation(host)
+            continue
+          }
+          // Always feed one stdin line when sudo is involved (password or empty for NOPASSWD).
+          sudoStdin = hasCachedSudoPassword(host) ? (host.sudoPassword ?? '') : ''
+        }
+
+        const execResult = await execCommand(host, command, sudoStdin)
         if (!host.inRun) {
           keepRunning = false
           break
+        }
+        if (execResult.content.includes(SUDO_AUTH_FAILED_MARKER)) {
+          clearSudoCache(host)
+        } else if (sudoStdin !== undefined && execResult.outcome === 'ok') {
+          // Refresh cache window after successful sudo use
+          if (hasCachedSudoPassword(host)) {
+            host.sudoPasswordExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+          } else {
+            host.sudoNopassExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+          }
         }
         if (execResult.pwd) {
           conv.cwd = execResult.pwd
@@ -686,7 +826,11 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   }
 }
 
-async function execCommand(host: HostState, command: string): Promise<ExecResult> {
+async function execCommand(
+  host: HostState,
+  command: string,
+  sudoStdin?: string
+): Promise<ExecResult> {
   const ctx = host.runCtx
   if (!ctx) {
     return { outcome: 'error', content: 'Session is not connected', exitCode: null, truncated: false, pwd: null }
@@ -695,10 +839,37 @@ async function execCommand(host: HostState, command: string): Promise<ExecResult
   const statusTag = `__WASSH_STATUS_${token}`
   const pwdTag = `__WASSH_PWD_${token}`
   const cwd = host.conversation?.cwd || '/'
+  const sudoPreamble =
+    sudoStdin === undefined
+      ? []
+      : [
+          // Password is read from stdin (written by the main process) — never embedded in argv.
+          'IFS= read -r __wassh_sudo_pw || true',
+          'if [ -n "${__wassh_sudo_pw}" ]; then',
+          '  printf \'%s\\n\' "${__wassh_sudo_pw}" | sudo -S -p \'\' -v >/dev/null 2>&1',
+          '  __wassh_sudo_auth=$?',
+          'else',
+          '  sudo -n -v >/dev/null 2>&1',
+          '  __wassh_sudo_auth=$?',
+          'fi',
+          'unset __wassh_sudo_pw',
+          'if [ "${__wassh_sudo_auth}" -ne 0 ]; then',
+          `  printf '%s\\n' '${SUDO_AUTH_FAILED_MARKER}'`,
+          '  __wassh_status=1',
+          'else'
+        ]
+  const sudoClose = sudoStdin === undefined ? [] : ['fi']
   const wrapped = [
     `cd ${shellQuote(cwd)} >/dev/null 2>&1 || true`,
-    command,
-    '__wassh_status=$?',
+    '__wassh_status=0',
+    ...sudoPreamble,
+    ...(sudoStdin === undefined
+      ? [command, '__wassh_status=$?']
+      : [
+          `  ${command}`,
+          '  __wassh_status=$?',
+          ...sudoClose
+        ]),
     `printf '\\n${statusTag}:%s__\\n' "$__wassh_status"`,
     `printf '${pwdTag}:%s__\\n' "$(pwd 2>/dev/null)"`
   ].join('\n')
@@ -761,6 +932,9 @@ async function execCommand(host: HostState, command: string): Promise<ExecResult
           return
         }
         host.connectionId = connectionId
+        if (sudoStdin !== undefined) {
+          ctx.writeSideConnection(connectionId, `${sudoStdin}\n`)
+        }
         const offData = ctx.onSideData(connectionId, (chunk) => {
           if (settled) {
             return
@@ -898,6 +1072,16 @@ async function handleRendererMessage(
     }
     return
   }
+  if (payload.type === 'sudoPassword') {
+    if (host.phase === 'ask_sudo' && host.pendingSudo?.requestId === payload.requestId) {
+      const resolve = host.sudoResolve
+      if (resolve) {
+        host.sudoResolve = null
+        resolve(payload.password)
+      }
+    }
+    return
+  }
   if (payload.type === 'stop') {
     host.stopped = true
     if (host.controller) {
@@ -907,6 +1091,12 @@ async function handleRendererMessage(
       const resolve = host.approvalResolve
       host.approvalResolve = null
       resolve('deny')
+    }
+    if (host.phase === 'ask_sudo' && host.sudoResolve) {
+      const resolve = host.sudoResolve
+      host.sudoResolve = null
+      host.pendingSudo = null
+      resolve(null)
     }
     return
   }
@@ -930,7 +1120,7 @@ async function handleRendererMessage(
       pushToast(host, 'error', 'The AI agent needs an SSH session to run commands.')
       return
     }
-    if (host.phase === 'running' || host.phase === 'ask') {
+    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
       pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
       return
     }

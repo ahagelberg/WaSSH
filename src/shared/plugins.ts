@@ -647,12 +647,18 @@ export interface AiAgentConversation {
   messages: AiAgentConversationMsg[]
 }
 
-export type AiAgentRunPhase = 'no_session' | 'idle' | 'running' | 'ask' | 'paused'
+export type AiAgentRunPhase = 'no_session' | 'idle' | 'running' | 'ask' | 'ask_sudo' | 'paused'
 
 export interface AiAgentApprovalRequest {
   requestId: string
   command: string
   cwd: string
+}
+
+/** Prompt for a sudo password (never includes the secret itself) */
+export interface AiAgentSudoRequest {
+  requestId: string
+  command: string
 }
 
 /** Main → renderer: full UI snapshot */
@@ -667,6 +673,7 @@ export interface AiAgentStateSnapshot {
   hostLabel: string
   ssh: boolean
   pendingApproval: AiAgentApprovalRequest | null
+  pendingSudo: AiAgentSudoRequest | null
   /** User-authored rules for prompts (all providers) */
   rules: string
   lastError?: string
@@ -696,6 +703,7 @@ export type AiAgentRendererMessage =
   | { type: 'resume' }
   | { type: 'discardPaused' }
   | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision }
+  | { type: 'sudoPassword'; requestId: string; password: string | null }
   | { type: 'rulesChanged'; rules: string }
   | { type: 'select'; providerId: string; model: string }
   | { type: 'providersChanged'; providers: AiAgentProviderConfig[] }

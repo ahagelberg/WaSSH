@@ -19,6 +19,17 @@ import type { PluginViewProps } from '../registry'
 /** Streaming rows rendered between two state snapshots may not exceed this */
 const STREAM_PLACEHOLDER_LIMIT = 1_000_000
 
+/** Max characters shown in the queued-message preview strip */
+const QUEUE_PREVIEW_MAX_CHARS = 120
+
+interface QueuedMessage {
+  id: string
+  text: string
+  attachTerminal: boolean
+  providerId: string
+  model: string
+}
+
 /** New provider templates: presets plus generic types */
 const CUSTOM_OPENAI_TEMPLATE: AiAgentProviderConfig = {
   id: 'custom-openai',
@@ -53,6 +64,7 @@ const PHASE_LABELS: PhaseLabel = {
   idle: 'Ready',
   running: 'Running…',
   ask: 'Waiting for approval',
+  ask_sudo: 'Waiting for sudo password',
   paused: 'Paused',
   no_session: 'No SSH session'
 }
@@ -132,6 +144,7 @@ interface ViewState {
   hostLabel: string
   ssh: boolean
   pendingApproval: AiAgentStateSnapshot['pendingApproval']
+  pendingSudo: AiAgentStateSnapshot['pendingSudo']
   rules: string
   lastError?: string
 }
@@ -145,6 +158,7 @@ function emptyViewState(): ViewState {
     hostLabel: '',
     ssh: false,
     pendingApproval: null,
+    pendingSudo: null,
     rules: ''
   }
 }
@@ -165,7 +179,14 @@ export default function AiAgentView({
   const [newTemplateId, setNewTemplateId] = useState(PROVIDER_TEMPLATES[0]?.id ?? '')
   const [rulesDraft, setRulesDraft] = useState('')
   const [toast, setToast] = useState<{ kind: 'error' | 'info'; text: string } | null>(null)
+  const [queued, setQueued] = useState<QueuedMessage | null>(null)
+  const [sudoPassword, setSudoPassword] = useState('')
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sudoInputRef = useRef<HTMLInputElement>(null)
+  /** After force-send: wait for stop to settle, then drain the queue */
+  const forceAfterStopRef = useRef(false)
+  /** Prevents double-drain of the same queued message (Strict Mode / duplicate effects) */
+  const drainedQueueIdRef = useRef<string | null>(null)
 
   const send = (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
     void window.wassh.sendPluginMessage(tabId, pluginId, payload)
@@ -204,10 +225,14 @@ export default function AiAgentView({
           hostLabel: payload.hostLabel,
           ssh: payload.ssh,
           pendingApproval: payload.pendingApproval,
+          pendingSudo: payload.pendingSudo,
           rules: payload.rules,
           lastError: payload.lastError
         })
         setStream('')
+        if (payload.runPhase !== 'ask_sudo') {
+          setSudoPassword('')
+        }
         return
       }
       if (payload.type === 'delta') {
@@ -235,6 +260,75 @@ export default function AiAgentView({
   const activeProvider =
     providers.find((p) => p.id === conv?.activeProviderId) ?? providers[0]
   const activeModel = conv?.activeModel || activeProvider?.models[0] || ''
+  const busy =
+    view.runPhase === 'running' || view.runPhase === 'ask' || view.runPhase === 'ask_sudo'
+
+  const dispatchChat = (msg: Omit<QueuedMessage, 'id'>): void => {
+    send({
+      type: 'chat',
+      providerId: msg.providerId,
+      model: msg.model,
+      text: msg.text,
+      attachTerminal: msg.attachTerminal
+    })
+  }
+
+  /** Send a queued message once the run is idle (auto) or settled after a forced stop */
+  useEffect(() => {
+    if (!queued) {
+      return
+    }
+    if (drainedQueueIdRef.current === queued.id) {
+      return
+    }
+    const forceReady =
+      forceAfterStopRef.current &&
+      (view.runPhase === 'idle' || view.runPhase === 'paused')
+    const autoReady = !forceAfterStopRef.current && view.runPhase === 'idle'
+    if (!forceReady && !autoReady) {
+      return
+    }
+    drainedQueueIdRef.current = queued.id
+    forceAfterStopRef.current = false
+    const msg = queued
+    setQueued(null)
+    dispatchChat(msg)
+  }, [view.runPhase, queued, tabId, pluginId])
+
+  const validateOutgoing = (text: string): boolean => {
+    if (!text) {
+      return false
+    }
+    if (providers.length === 0) {
+      showToast('error', 'No model providers configured — open the gear menu and add one.')
+      return false
+    }
+    if (!activeProvider) {
+      return false
+    }
+    if (!activeModel) {
+      showToast('error', 'Pick a model first.')
+      return false
+    }
+    if (!view.ssh) {
+      showToast('error', 'The AI agent needs an SSH session to run commands.')
+      return false
+    }
+    return true
+  }
+
+  const buildQueued = (text: string, attachTerminal: boolean): QueuedMessage | null => {
+    if (!activeProvider || !validateOutgoing(text)) {
+      return null
+    }
+    return {
+      id: crypto.randomUUID(),
+      text,
+      attachTerminal,
+      providerId: activeProvider.id,
+      model: activeModel
+    }
+  }
 
   const selectProvider = (providerId: string): void => {
     const provider = providers.find((p) => p.id === providerId)
@@ -276,39 +370,55 @@ export default function AiAgentView({
   }
 
   const handleSend = (): void => {
-    if (view.runPhase === 'running' || view.runPhase === 'ask') {
-      // While the agent is busy the Send action is Stop (pauses the run).
-      send({ type: 'stop' })
-      return
-    }
     const text = input.trim()
-    if (!text) {
+
+    if (busy) {
+      if (queued) {
+        // Enter again: stop the current run and send as soon as it settles
+        const next = text
+          ? buildQueued(text, attach)
+          : queued
+        if (!next) {
+          return
+        }
+        forceAfterStopRef.current = true
+        drainedQueueIdRef.current = null
+        setQueued(next)
+        setInput('')
+        setAttach(false)
+        send({ type: 'stop' })
+        return
+      }
+      if (!text) {
+        return
+      }
+      const next = buildQueued(text, attach)
+      if (!next) {
+        return
+      }
+      drainedQueueIdRef.current = null
+      setQueued(next)
+      setInput('')
+      setAttach(false)
       return
     }
-    if (providers.length === 0) {
-      showToast('error', 'No model providers configured — open the gear menu and add one.')
+
+    const toSend = text ? buildQueued(text, attach) : queued
+    if (!toSend) {
       return
     }
-    if (!activeProvider) {
-      return
-    }
-    if (!activeModel) {
-      showToast('error', 'Pick a model first.')
-      return
-    }
-    if (!view.ssh) {
-      showToast('error', 'The AI agent needs an SSH session to run commands.')
-      return
-    }
-    send({
-      type: 'chat',
-      providerId: activeProvider.id,
-      model: activeModel,
-      text,
-      attachTerminal: attach
-    })
+    forceAfterStopRef.current = false
+    drainedQueueIdRef.current = toSend.id
+    setQueued(null)
     setInput('')
     setAttach(false)
+    dispatchChat(toSend)
+  }
+
+  const clearQueue = (): void => {
+    forceAfterStopRef.current = false
+    drainedQueueIdRef.current = queued?.id ?? null
+    setQueued(null)
   }
 
   const hostRuleList = (key: string): string[] => {
@@ -333,6 +443,21 @@ export default function AiAgentView({
     }
     send({ type: 'approval', requestId: request.requestId, decision })
   }
+
+  const submitSudoPassword = (password: string | null): void => {
+    const request = view.pendingSudo
+    if (!request) {
+      return
+    }
+    send({ type: 'sudoPassword', requestId: request.requestId, password })
+    setSudoPassword('')
+  }
+
+  useEffect(() => {
+    if (view.runPhase === 'ask_sudo' && sudoInputRef.current) {
+      sudoInputRef.current.focus()
+    }
+  }, [view.runPhase, view.pendingSudo?.requestId])
 
   const canResume =
     conv !== null &&
@@ -535,7 +660,6 @@ export default function AiAgentView({
   }, [messages.length, stream, view.runPhase, gearOpen])
 
   const phaseClass = view.runPhase
-  const busy = view.runPhase === 'running' || view.runPhase === 'ask'
   const providerOptions =
     providers.length > 0 ? (
       <>
@@ -832,6 +956,36 @@ export default function AiAgentView({
             </div>
           ) : null}
 
+          {view.runPhase === 'ask_sudo' && view.pendingSudo ? (
+            <div className="ai-agent-sudo">
+              <div className="ai-agent-sudo-title">Sudo password required</div>
+              <pre className="ai-agent-sudo-command">{view.pendingSudo.command}</pre>
+              <p className="ai-agent-sudo-hint">
+                Cached in memory for a few minutes. Leave blank for passwordless sudo.
+              </p>
+              <form
+                className="ai-agent-sudo-form"
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  submitSudoPassword(sudoPassword)
+                }}
+              >
+                <input
+                  ref={sudoInputRef}
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="Sudo password"
+                  value={sudoPassword}
+                  onChange={(e) => setSudoPassword(e.target.value)}
+                />
+                <button type="submit">Continue</button>
+                <button type="button" className="ai-agent-danger" onClick={() => submitSudoPassword(null)}>
+                  Cancel
+                </button>
+              </form>
+            </div>
+          ) : null}
+
           {canResume ? (
             <div className="ai-agent-continue">
               <span>The previous run was interrupted.</span>
@@ -850,6 +1004,23 @@ export default function AiAgentView({
             </div>
           ) : null}
 
+          {queued ? (
+            <div className="ai-agent-queue">
+              <span className="ai-agent-queue-label">Queued</span>
+              <span className="ai-agent-queue-text" title={queued.text}>
+                {queued.text.length > QUEUE_PREVIEW_MAX_CHARS
+                  ? `${queued.text.slice(0, QUEUE_PREVIEW_MAX_CHARS)}…`
+                  : queued.text}
+              </span>
+              <span className="ai-agent-queue-hint">
+                {busy ? 'Enter again to send now' : 'Press Enter to send'}
+              </span>
+              <button type="button" title="Discard queued message" onClick={clearQueue}>
+                ×
+              </button>
+            </div>
+          ) : null}
+
           <div className="ai-agent-inputbar">
             <button
               type="button"
@@ -862,7 +1033,13 @@ export default function AiAgentView({
             <textarea
               className="ai-agent-input"
               value={input}
-              placeholder="Message the agent… (Shift+Enter for newline)"
+              placeholder={
+                busy
+                  ? queued
+                    ? 'Enter again to send queued message now…'
+                    : 'Queue a follow-up… (Enter to queue)'
+                  : 'Message the agent… (Shift+Enter for newline)'
+              }
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
@@ -873,12 +1050,21 @@ export default function AiAgentView({
             />
             <button
               type="button"
-              className={busy ? 'ai-agent-danger' : undefined}
               onClick={handleSend}
-              disabled={!busy && (!input.trim() || !view.ssh)}
-              title={busy ? 'Stop and pause the agent' : 'Send message'}
+              disabled={
+                busy
+                  ? !queued && !input.trim()
+                  : (!input.trim() && !queued) || !view.ssh
+              }
+              title={
+                busy
+                  ? queued
+                    ? 'Stop the current run and send the queued message now'
+                    : 'Queue this message until the agent finishes'
+                  : 'Send message'
+              }
             >
-              {busy ? 'Stop' : 'Send'}
+              {busy ? (queued ? 'Send now' : 'Queue') : 'Send'}
             </button>
           </div>
         </>

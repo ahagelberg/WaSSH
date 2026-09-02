@@ -2367,6 +2367,10 @@
   color: var(--warn);
 }
 
+.ai-agent-phase.ask_sudo {
+  color: var(--warn);
+}
+
 .ai-agent-header-controls {
   margin-left: auto;
   display: flex;
@@ -2617,6 +2621,61 @@
   padding: 3px 8px;
 }
 
+.ai-agent-sudo {
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-panel-2));
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ai-agent-sudo-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.ai-agent-sudo-command {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 100px;
+  overflow: auto;
+}
+
+.ai-agent-sudo-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ai-agent-sudo-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-agent-sudo-form input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.ai-agent-sudo-form button {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
 .ai-agent-error-bar {
   flex-shrink: 0;
   padding: 4px var(--gap);
@@ -2647,6 +2706,47 @@
 
 .ai-agent-toast button {
   margin-left: auto;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+.ai-agent-queue {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel-2));
+  color: var(--text-muted);
+}
+
+.ai-agent-queue-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+}
+
+.ai-agent-queue-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.ai-agent-queue-hint {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-style: italic;
+}
+
+.ai-agent-queue > button {
+  flex-shrink: 0;
   padding: 0 6px;
   font-size: 12px;
 }
