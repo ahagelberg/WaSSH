@@ -1960,6 +1960,10 @@
   cursor: default;
 }
 
+.sftp-row:focus {
+  outline: none;
+}
+
 .sftp-row:hover {
   background: color-mix(in srgb, var(--bg-input) 80%, transparent);
 }

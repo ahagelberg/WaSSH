@@ -870,9 +870,19 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             {entries.map((entry) => (
               <tr
                 key={entry.path}
+                tabIndex={-1}
                 className={`sftp-row${entry.path === selectedPath ? ' selected' : ''}${entry.type === 'directory' ? ' dir' : ''}`}
-                onClick={() => setSelectedPath(entry.path)}
+                onClick={(e) => {
+                  setSelectedPath(entry.path)
+                  e.currentTarget.focus({ preventScroll: true })
+                }}
                 onDoubleClick={() => openEntry(entry)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Delete' && connected) {
+                    e.preventDefault()
+                    openDialog({ kind: 'delete', path: entry.path, name: entry.name })
+                  }
+                }}
                 onContextMenu={(e) => {
                   if (!connected) {
                     return
