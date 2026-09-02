@@ -2335,22 +2335,17 @@
 }
 
 .ai-agent-header {
+  --ai-header-controls-min: 12rem;
+  --ai-header-select-min: 7rem;
   flex-shrink: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
   padding: 6px var(--gap);
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel-2);
   font-size: 12px;
-}
-
-.ai-agent-host {
-  font-weight: 600;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .ai-agent-phase {
@@ -2372,16 +2367,25 @@
 }
 
 .ai-agent-header-controls {
-  margin-left: auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 6px;
+  flex: 1 1 var(--ai-header-controls-min);
+  min-width: min(100%, var(--ai-header-controls-min));
 }
 
 .ai-agent-header select {
-  max-width: 150px;
+  flex: 1 1 var(--ai-header-select-min);
+  min-width: 0;
+  max-width: 100%;
   font-size: 11px;
   padding: 2px 4px;
+}
+
+.ai-agent-header-controls > button {
+  flex-shrink: 0;
 }
 
 .ai-agent-gear-btn {

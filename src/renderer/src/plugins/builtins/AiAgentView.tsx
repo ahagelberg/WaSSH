@@ -883,9 +883,6 @@ export default function AiAgentView({
       ) : (
         <>
           <div className="ai-agent-header">
-            <span className="ai-agent-host" title={view.hostLabel}>
-              {view.hostLabel || 'No session'}
-            </span>
             <span className={`ai-agent-phase ${phaseClass}`}>
               {PHASE_LABELS[view.runPhase] ?? view.runPhase}
             </span>
