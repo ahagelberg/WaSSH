@@ -49,9 +49,11 @@ interface TopicNode {
    */
   path: string
   children: Map<string, TopicNode>
-  /** Messages received on this exact topic */
+  /** Recent messages on this exact topic (capped by history limit) */
   messages: TopicMessage[]
-  /** Self + descendants */
+  /** Lifetime messages received on this exact topic (not capped by history) */
+  receivedCount: number
+  /** Self + descendants lifetime message totals */
   messageCount: number
   /** Descendant nodes that have ≥1 message on their exact path */
   subTopicCount: number
@@ -68,6 +70,7 @@ function createRoot(): TopicNode {
     path: ROOT_PATH,
     children: new Map(),
     messages: [],
+    receivedCount: 0,
     messageCount: 0,
     subTopicCount: 0,
     hasOwnMessages: false
@@ -82,6 +85,7 @@ function ensureChild(parent: TopicNode, segment: string, fullPath: string): Topi
       path: fullPath,
       children: new Map(),
       messages: [],
+      receivedCount: 0,
       messageCount: 0,
       subTopicCount: 0,
       hasOwnMessages: false
@@ -107,7 +111,7 @@ function pathFromSegments(segments: string[]): string {
 
 function recomputeCounts(node: TopicNode): void {
   let subTopics = 0
-  let messages = node.messages.length
+  let messages = node.receivedCount
   for (const child of Array.from(node.children.values())) {
     recomputeCounts(child)
     messages += child.messageCount
@@ -133,6 +137,7 @@ function insertMessage(root: TopicNode, msg: TopicMessage, topic: string): Topic
     node = ensureChild(node, seg, fullPath)
   }
   node.hasOwnMessages = true
+  node.receivedCount += 1
   node.messages = [msg, ...node.messages].slice(0, MQTT_EXPLORER_HISTORY_LIMIT)
   recomputeCounts(next)
   return next
@@ -148,6 +153,7 @@ function cloneTree(node: TopicNode): TopicNode {
     path: node.path,
     children,
     messages: node.messages.slice(),
+    receivedCount: node.receivedCount,
     messageCount: node.messageCount,
     subTopicCount: node.subTopicCount,
     hasOwnMessages: node.hasOwnMessages
@@ -242,6 +248,7 @@ function clearTopicMessages(root: TopicNode, path: string): TopicNode {
     return root
   }
   node.messages = []
+  node.receivedCount = 0
   node.hasOwnMessages = false
   if (node.children.size === 0) {
     const parentPath = parentPathOf(path)
@@ -681,7 +688,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
                 {child.messageCount} msg{child.messageCount === 1 ? '' : 's'}
               </span>
             ) : child.hasOwnMessages ? (
-              <span className="mqtt-tree-meta">{child.messages.length}</span>
+              <span className="mqtt-tree-meta">{child.receivedCount}</span>
             ) : null}
           </button>
           {hasChildren && isExpanded ? (
