@@ -852,79 +852,79 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
                   ))
                 )}
               </div>
-
-              <div className="mqtt-publish">
-                <div className="mqtt-pane-label">Publish</div>
-                <label className="mqtt-field">
-                  <span>Topic</span>
-                  <input
-                    type="text"
-                    value={publishTopic}
-                    onChange={(e) => setPublishTopic(e.target.value)}
-                  />
-                </label>
-                <div className="mqtt-publish-modes">
-                  {(['text', 'json', 'file'] as PublishMode[]).map((mode) => (
-                    <button
-                      key={mode}
-                      type="button"
-                      className={publishMode === mode ? 'active' : ''}
-                      onClick={() => setPublishMode(mode)}
-                    >
-                      {mode === 'file' ? 'Raw file' : mode === 'json' ? 'JSON' : 'Text'}
-                    </button>
-                  ))}
-                </div>
-                {publishMode === 'file' ? (
-                  <label className="mqtt-field">
-                    <span>File</span>
-                    <input
-                      type="file"
-                      onChange={(e) => {
-                        void onFileChange(e.target.files?.[0] ?? null)
-                      }}
-                    />
-                    {fileName ? <span className="mqtt-file-name">{fileName}</span> : null}
-                  </label>
-                ) : (
-                  <label className="mqtt-field">
-                    <span>Payload</span>
-                    <textarea
-                      value={publishText}
-                      onChange={(e) => setPublishText(e.target.value)}
-                      rows={4}
-                      spellCheck={false}
-                    />
-                  </label>
-                )}
-                <div className="mqtt-publish-options">
-                  <label>
-                    QoS
-                    <select
-                      value={publishQos}
-                      onChange={(e) => setPublishQos(Number(e.target.value) as 0 | 1 | 2)}
-                    >
-                      <option value={0}>0</option>
-                      <option value={1}>1</option>
-                      <option value={2}>2</option>
-                    </select>
-                  </label>
-                  <label className="mqtt-retain-check">
-                    <input
-                      type="checkbox"
-                      checked={publishRetain}
-                      onChange={(e) => setPublishRetain(e.target.checked)}
-                    />
-                    Retain
-                  </label>
-                  <button type="button" onClick={() => void handlePublish()}>
-                    Publish
-                  </button>
-                </div>
-                {publishError ? <div className="mqtt-publish-error">{publishError}</div> : null}
-              </div>
             </>
           )}
+
+          <div className="mqtt-publish">
+            <div className="mqtt-pane-label">Publish</div>
+            <label className="mqtt-field">
+              <span>Topic</span>
+              <input
+                type="text"
+                value={publishTopic}
+                onChange={(e) => setPublishTopic(e.target.value)}
+              />
+            </label>
+            <div className="mqtt-publish-modes">
+              {(['text', 'json', 'file'] as PublishMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={publishMode === mode ? 'active' : ''}
+                  onClick={() => setPublishMode(mode)}
+                >
+                  {mode === 'file' ? 'Raw file' : mode === 'json' ? 'JSON' : 'Text'}
+                </button>
+              ))}
+            </div>
+            {publishMode === 'file' ? (
+              <label className="mqtt-field">
+                <span>File</span>
+                <input
+                  type="file"
+                  onChange={(e) => {
+                    void onFileChange(e.target.files?.[0] ?? null)
+                  }}
+                />
+                {fileName ? <span className="mqtt-file-name">{fileName}</span> : null}
+              </label>
+            ) : (
+              <label className="mqtt-field">
+                <span>Payload</span>
+                <textarea
+                  value={publishText}
+                  onChange={(e) => setPublishText(e.target.value)}
+                  rows={4}
+                  spellCheck={false}
+                />
+              </label>
+            )}
+            <div className="mqtt-publish-options">
+              <label>
+                QoS
+                <select
+                  value={publishQos}
+                  onChange={(e) => setPublishQos(Number(e.target.value) as 0 | 1 | 2)}
+                >
+                  <option value={0}>0</option>
+                  <option value={1}>1</option>
+                  <option value={2}>2</option>
+                </select>
+              </label>
+              <label className="mqtt-retain-check">
+                <input
+                  type="checkbox"
+                  checked={publishRetain}
+                  onChange={(e) => setPublishRetain(e.target.checked)}
+                />
+                Retain
+              </label>
+              <button type="button" onClick={() => void handlePublish()}>
+                Publish
+              </button>
+            </div>
+            {publishError ? <div className="mqtt-publish-error">{publishError}</div> : null}
+          </div>
         </div>
       </div>
     </div>

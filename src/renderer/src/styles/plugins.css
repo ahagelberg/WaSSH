@@ -1687,6 +1687,9 @@
 
 .mqtt-publish {
   flex-shrink: 0;
+  /* Keep the publish panel pinned to the bottom of the detail pane in every
+     state (topic selected or not); the content above may not fill the pane. */
+  margin-top: auto;
   border-top: 1px solid var(--border);
   padding: 0 var(--gap) var(--gap);
   display: flex;
@@ -1770,6 +1773,7 @@
 
 /* SFTP file manager */
 .sftp-view {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -1901,11 +1905,23 @@
 }
 
 .sftp-notice {
-  flex-shrink: 0;
-  padding: 4px var(--gap);
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 16;
+  max-width: calc(100% - 24px);
+  padding: 6px 12px;
   font-size: 12px;
-  color: var(--warn);
-  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sftp-table-wrap {
