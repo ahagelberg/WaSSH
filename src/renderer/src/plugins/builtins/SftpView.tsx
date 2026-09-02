@@ -489,7 +489,31 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     }
     return (
       <div className="sftp-modal-backdrop" onMouseDown={() => setDialog(null)}>
-        <div className="sftp-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <div
+          className="sftp-modal"
+          onMouseDown={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              setDialog(null)
+              return
+            }
+            if (e.key !== 'Enter' && e.key !== ' ') {
+              return
+            }
+            const target = e.target as HTMLElement
+            // Focused buttons already activate on Enter/Space natively.
+            if (target instanceof HTMLButtonElement) {
+              return
+            }
+            // Space still types inside text fields.
+            if (target instanceof HTMLInputElement && e.key === ' ') {
+              return
+            }
+            e.preventDefault()
+            void submitDialog()
+          }}
+        >
           <div className="sftp-modal-title">
             {dialog.kind === 'mkdir'
               ? 'New folder'
@@ -515,14 +539,6 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
                 className="sftp-modal-input"
                 value={dialogInput}
                 onChange={(e) => setDialogInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    void submitDialog()
-                  }
-                  if (e.key === 'Escape') {
-                    setDialog(null)
-                  }
-                }}
                 autoFocus
               />
               {dialogError && <p className="sftp-modal-error">{dialogError}</p>}
@@ -535,6 +551,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             <button
               type="button"
               className="sftp-btn sftp-btn-primary"
+              autoFocus={dialog.kind === 'delete'}
               onClick={() => void submitDialog()}
             >
               {dialog.kind === 'delete' ? 'Delete' : 'OK'}
