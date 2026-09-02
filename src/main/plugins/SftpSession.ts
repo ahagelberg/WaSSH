@@ -1,4 +1,11 @@
-import type { FileEntryWithStats, SFTPWrapper, ReadStream, WriteStream, Stats } from 'ssh2'
+import type {
+  FileEntryWithStats,
+  SFTPWrapper,
+  ReadStream,
+  WriteStream,
+  WriteStreamOptions,
+  Stats
+} from 'ssh2'
 import type { SftpEntry, SftpEntryType, SftpErrorKind } from '../../shared/plugins'
 
 /** OpenSSH SFTPv3 status codes (superset of the base protocol) */
@@ -288,8 +295,21 @@ export class SftpSession {
     return this.sftp.createReadStream(path)
   }
 
-  createWriteStream(path: string): WriteStream {
-    return this.sftp.createWriteStream(path)
+  createWriteStream(path: string, options?: WriteStreamOptions): WriteStream {
+    return this.sftp.createWriteStream(path, options)
+  }
+
+  /** Explicitly close a remote file handle, waiting for the server's reply. */
+  close(handle: Buffer): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.sftp.close(handle, (err) => {
+        if (err) {
+          reject(classifySftpError(err))
+          return
+        }
+        resolve()
+      })
+    })
   }
 
   end(): void {

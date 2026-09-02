@@ -354,13 +354,13 @@ async function uploadFile(
   state: SessionState,
   localPath: string,
   targetDir: string
-): Promise<void> {
+): Promise<boolean> {
   const sftp = state.sftp
   if (!sftp) {
-    return
+    return false
   }
   if (state.upload && !state.upload.done) {
-    return
+    return false
   }
   let size = 0
   try {
@@ -443,16 +443,17 @@ async function uploadFile(
     error: outcome.error?.message,
     errorKind: outcome.error?.kind
   } satisfies SftpTransferDonePayload)
+  return outcome.state === 'done'
 }
 
 async function handleUploadDialog(
   ctx: PluginMainContext,
   state: SessionState,
   path?: string
-): Promise<void> {
+): Promise<number> {
   const sftp = state.sftp
   if (!sftp) {
-    return
+    return 0
   }
   const opts: OpenDialogOptions = {
     title: 'Upload files',
@@ -462,15 +463,19 @@ async function handleUploadDialog(
   const win = focusedWindow()
   const result = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
   if (result.canceled || result.filePaths.length === 0) {
-    return
+    return 0
   }
   const targetDir = path && path.trim() !== '' ? path.trim() : state.cwd || '/'
+  let uploaded = 0
   for (const localPath of result.filePaths) {
     if (state.stopped) {
       break
     }
-    await uploadFile(ctx, state, localPath, targetDir)
+    if (await uploadFile(ctx, state, localPath, targetDir)) {
+      uploaded += 1
+    }
   }
+  return uploaded
 }
 
 async function handleChunkUploadStart(
@@ -484,11 +489,21 @@ async function handleChunkUploadStart(
   }
   const existing = state.chunkUpload
   if (existing && !existing.done && !existing.cancelled) {
-    return
+    // A previous chunk upload never finished (interrupted flow / write error).
+    // Tear it down so this fresh start is never silently ignored.
+    existing.cancelled = true
+    try {
+      existing.write?.destroy()
+    } catch {
+      /* ignore */
+    }
   }
   const targetDir =
     payload.path && payload.path.trim() !== '' ? payload.path.trim() : state.cwd || '/tmp'
   const remotePath = joinRemotePath(targetDir, payload.name)
+  // autoClose:false keeps the remote handle open after end() so finalize can
+  // close it explicitly and wait for the server's reply (see handleChunkUploadEnd).
+  const write = sftp.createWriteStream(remotePath, { autoClose: false })
   const cu: ChunkUploadState = {
     cancelled: false,
     done: false,
@@ -496,9 +511,32 @@ async function handleChunkUploadStart(
     remotePath,
     total: payload.size,
     received: 0,
-    write: sftp.createWriteStream(remotePath),
+    write,
     queue: Promise.resolve()
   }
+  write.on('error', (err: Error) => {
+    if (cu.done || cu.cancelled) {
+      return
+    }
+    cu.cancelled = true
+    if (state.chunkUpload === cu) {
+      state.chunkUpload = null
+    }
+    try {
+      write.destroy()
+    } catch {
+      /* ignore */
+    }
+    const e = classifySftpError(err)
+    ctx.sendToRenderer({
+      type: 'transferDone',
+      direction: 'upload',
+      remotePath,
+      state: 'error',
+      error: e.message,
+      errorKind: e.kind
+    } satisfies SftpTransferDonePayload)
+  })
   state.chunkUpload = cu
   ctx.sendToRenderer({
     type: 'transferProgress',
@@ -530,6 +568,9 @@ async function handleChunkUploadChunk(
       }
       if (!cu.write.write(buf)) {
         await once(cu.write, 'drain')
+        if (cu.cancelled || cu.done || !cu.write) {
+          return
+        }
       }
       cu.received += buf.length
       ctx.sendToRenderer({
@@ -551,6 +592,7 @@ async function handleChunkUploadEnd(ctx: PluginMainContext, state: SessionState)
     return
   }
   const write = cu.write
+  const sftp = state.sftp
   const prev = cu.queue
   cu.queue = prev
     .catch(() => {
@@ -563,6 +605,45 @@ async function handleChunkUploadEnd(ctx: PluginMainContext, state: SessionState)
       await new Promise<void>((resolve) => {
         write.end(() => resolve())
       })
+      if (cu.cancelled) {
+        return
+      }
+      // ssh2's WriteStream auto-close does not wait for the server to finish
+      // closing the file, so a follow-up listing can race the close and miss
+      // the new file. Close the handle explicitly and wait for the reply
+      // before signalling the transfer as done.
+      const handle = (write as unknown as { handle?: Buffer | null }).handle
+      if (sftp && handle) {
+        try {
+          await sftp.close(handle)
+        } catch (err) {
+          if (cu.cancelled) {
+            return
+          }
+          const e = classifySftpError(err)
+          cu.cancelled = true
+          if (state.chunkUpload === cu) {
+            state.chunkUpload = null
+          }
+          ctx.sendToRenderer({
+            type: 'transferDone',
+            direction: 'upload',
+            remotePath: cu.remotePath,
+            state: 'error',
+            error: e.message,
+            errorKind: e.kind
+          } satisfies SftpTransferDonePayload)
+          return
+        }
+        // Already closed remotely; make sure a later destroy() does not try a
+        // second remote close.
+        ;(write as unknown as { handle?: Buffer | null }).handle = null
+      }
+      try {
+        write.destroy()
+      } catch {
+        /* ignore */
+      }
       if (cu.cancelled) {
         return
       }
@@ -700,7 +781,7 @@ async function handleMessage(
   ctx: PluginMainContext,
   state: SessionState,
   payload: SftpRendererMessage
-): Promise<void> {
+): Promise<number | undefined> {
   switch (payload.type) {
     case 'getStatus':
       handleGetStatus(ctx, state)
@@ -718,8 +799,7 @@ async function handleMessage(
       await handleDownload(ctx, state, payload.path)
       break
     case 'uploadDialog':
-      await handleUploadDialog(ctx, state, payload.path)
-      break
+      return handleUploadDialog(ctx, state, payload.path)
     case 'uploadStart':
       await handleChunkUploadStart(ctx, state, payload)
       break

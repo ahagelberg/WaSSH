@@ -66,7 +66,7 @@ export interface PluginMainContext {
 export interface PluginMainModule {
   onActivate: (ctx: PluginMainContext) => void | Promise<void>
   onDeactivate?: (ctx: PluginMainContext) => void | Promise<void>
-  onMessage?: (ctx: PluginMainContext, payload: unknown) => void | Promise<void>
+  onMessage?: (ctx: PluginMainContext, payload: unknown) => void | Promise<unknown>
 }
 
 interface ActiveInstance {
@@ -359,12 +359,12 @@ export class PluginHost {
     }
   }
 
-  async handleRendererMessage(tabId: string, pluginId: string, payload: unknown): Promise<void> {
+  async handleRendererMessage(tabId: string, pluginId: string, payload: unknown): Promise<unknown> {
     const instance = this.instances.get(tabId)?.get(pluginId)
     if (!instance) {
-      return
+      return undefined
     }
-    await instance.module.onMessage?.(instance.ctx, payload)
+    return instance.module.onMessage?.(instance.ctx, payload)
   }
 
   /** Forward broker side-data into plugin listeners (and renderer already gets IPC). */

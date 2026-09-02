@@ -679,7 +679,7 @@ export default function App() {
         ...prev,
         [tabId]: { name: file.name, transferredBytes: 0, totalBytes: file.size }
       }))
-      const send = (payload: SftpRendererMessage): Promise<void> =>
+      const send = (payload: SftpRendererMessage): Promise<unknown> =>
         window.wassh.sendPluginMessage(tabId, PLUGIN_ID_SFTP, payload)
       try {
         await send({ type: 'uploadStart', name: file.name, size: file.size })

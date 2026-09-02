@@ -600,7 +600,7 @@ export interface WasshApi {
   activatePlugin: (tabId: string, pluginId: string) => Promise<void>
   deactivatePlugin: (tabId: string, pluginId: string) => Promise<void>
   getActivePlugins: (tabId: string) => Promise<string[]>
-  sendPluginMessage: (tabId: string, pluginId: string, payload: unknown) => Promise<void>
+  sendPluginMessage: (tabId: string, pluginId: string, payload: unknown) => Promise<unknown>
   queuePluginRestore: (tabId: string, activePluginIds: string[]) => Promise<void>
   /** Read plugin-owned JSON from userData/plugin-<id>.json */
   getPluginData: (pluginId: string) => Promise<unknown>

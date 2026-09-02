@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -67,6 +68,13 @@ type SftpDialog =
   | { kind: 'delete'; path: string; name: string }
   | null
 
+interface SftpContextMenu {
+  x: number
+  y: number
+  /** Entry the menu was opened on; null = opened on empty folder space. */
+  entry: SftpEntry | null
+}
+
 function joinPath(parent: string, name: string): string {
   if (parent === '/' || parent === '') {
     return `/${name}`
@@ -84,6 +92,10 @@ function parentPath(path: string): string | null {
     return '/'
   }
   return trimmed.slice(0, idx)
+}
+
+function baseName(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1)
 }
 
 function formatBytes(n: number): string {
@@ -128,25 +140,30 @@ function isFileDrag(e: ReactDragEvent<HTMLDivElement>): boolean {
 }
 
 /** Files dropped from the OS; directories are skipped (cannot be chunk-uploaded). */
-function collectDroppedFiles(items: DataTransferItemList | null): File[] {
-  if (!items) {
+function collectDroppedFiles(dt: DataTransfer | null): File[] {
+  if (!dt) {
     return []
   }
-  const files: File[] = []
-  for (const item of Array.from(items)) {
-    if (item.kind !== 'file') {
-      continue
+  const items = dt.items
+  if (items && items.length > 0) {
+    const files: File[] = []
+    for (const item of Array.from(items)) {
+      if (item.kind !== 'file') {
+        continue
+      }
+      const entry = item.webkitGetAsEntry?.()
+      if (entry?.isDirectory) {
+        continue
+      }
+      const file = item.getAsFile()
+      if (file) {
+        files.push(file)
+      }
     }
-    const entry = item.webkitGetAsEntry()
-    if (entry?.isDirectory) {
-      continue
-    }
-    const file = item.getAsFile()
-    if (file) {
-      files.push(file)
-    }
+    return files
   }
-  return files
+  // Some sources expose only dataTransfer.files (no items API).
+  return Array.from(dt.files)
 }
 
 export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactElement {
@@ -163,6 +180,9 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(() => new Map())
+  const [contextMenu, setContextMenu] = useState<SftpContextMenu | null>(null)
+  const contextMenuRef = useRef<HTMLDivElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const dragDepthRef = useRef(0)
   const [dropActive, setDropActive] = useState(false)
 
@@ -193,7 +213,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   )
 
   const send = useCallback(
-    (payload: SftpRendererMessage): Promise<void> =>
+    (payload: SftpRendererMessage): Promise<unknown> =>
       window.wassh.sendPluginMessage(tabId, pluginId, payload),
     [tabId, pluginId]
   )
@@ -204,8 +224,16 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
       if (!dir || files.length === 0) {
         return
       }
+      const removeTransfer = (remotePath: string): void => {
+        setTransfers((prev) => {
+          const next = new Map(prev)
+          next.delete(remotePath)
+          return next
+        })
+      }
       let failed = 0
       for (const file of files) {
+        const remotePath = joinPath(dir, file.name)
         try {
           await send({ type: 'uploadStart', name: file.name, size: file.size, path: dir })
           let offset = 0
@@ -216,15 +244,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             offset = end
           }
           await send({ type: 'uploadEnd', name: file.name })
-          showNotice(`Uploaded ${file.name}`)
         } catch {
           void send({ type: 'cancel' })
           // Cancelled chunk uploads never emit transferDone; drop their bar now.
-          setTransfers((prev) => {
-            const next = new Map(prev)
-            next.delete(joinPath(dir, file.name))
-            return next
-          })
+          removeTransfer(remotePath)
           failed += 1
         }
       }
@@ -234,6 +257,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     },
     [send, showNotice]
   )
+
+  const openFilePicker = useCallback((): void => {
+    fileInputRef.current?.click()
+  }, [])
 
   // On mount, request the latest status in case the connection event fired
   // before this view mounted. The 'status: connected' handler drives the list.
@@ -319,6 +346,9 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           return
         }
         case 'transferDone': {
+          // Single completion point for every upload/download (drag-drop and
+          // file-picker uploads both funnel through the same chunk transfer,
+          // so they arrive here identically).
           setTransfers((prev) => {
             const next = new Map(prev)
             next.delete(payload.remotePath)
@@ -330,15 +360,66 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             } else if (payload.state === 'cancelled') {
               showNotice('Transfer cancelled')
             }
+            return
           }
-          if (payload.state === 'done' && payload.direction === 'upload' && pathRef.current) {
-            requestList(pathRef.current)
+          if (payload.direction === 'upload') {
+            showNotice(`Uploaded ${baseName(payload.remotePath)}`)
+            if (pathRef.current) {
+              requestList(pathRef.current)
+            }
           }
           return
         }
       }
     })
   }, [tabId, pluginId, requestList, showNotice])
+
+  // Close the context menu on outside mousedown, Escape, or window blur.
+  useEffect(() => {
+    if (!contextMenu) {
+      return
+    }
+    const onMouseDown = (e: MouseEvent): void => {
+      if (contextMenuRef.current && contextMenuRef.current.contains(e.target as Node)) {
+        return
+      }
+      setContextMenu(null)
+    }
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        setContextMenu(null)
+      }
+    }
+    const onBlur = (): void => setContextMenu(null)
+    window.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('blur', onBlur)
+    }
+  }, [contextMenu])
+
+  // Keep the menu inside the window when opened near an edge.
+  useLayoutEffect(() => {
+    const el = contextMenuRef.current
+    if (!contextMenu || !el) {
+      return
+    }
+    const rect = el.getBoundingClientRect()
+    const pad = 4
+    let x = contextMenu.x
+    let y = contextMenu.y
+    if (x + rect.width > window.innerWidth - pad) {
+      x = Math.max(pad, window.innerWidth - rect.width - pad)
+    }
+    if (y + rect.height > window.innerHeight - pad) {
+      y = Math.max(pad, window.innerHeight - rect.height - pad)
+    }
+    el.style.left = `${x}px`
+    el.style.top = `${y}px`
+  }, [contextMenu])
 
   const selected = entries.find((e) => e.path === selectedPath) ?? null
   const parentDir = path ? parentPath(path) : null
@@ -453,13 +534,72 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             </button>
             <button
               type="button"
-              className={`sftp-btn sftp-btn-primary${dialog.kind === 'delete' ? ' sftp-btn-danger' : ''}`}
+              className="sftp-btn sftp-btn-primary"
               onClick={() => void submitDialog()}
             >
               {dialog.kind === 'delete' ? 'Delete' : 'OK'}
             </button>
           </div>
         </div>
+      </div>
+    )
+  }
+
+  const renderContextMenu = (): ReactElement | null => {
+    if (!contextMenu) {
+      return null
+    }
+    const { entry } = contextMenu
+    const run = (fn: () => void): void => {
+      setContextMenu(null)
+      fn()
+    }
+    const item = (label: string, icon: string, danger: boolean, onSelect: () => void): ReactElement => (
+      <button
+        type="button"
+        className={`sftp-context-item${danger ? ' danger' : ''}`}
+        onClick={() => run(onSelect)}
+      >
+        <span className="sftp-context-icon">{icon}</span>
+        {label}
+      </button>
+    )
+    return (
+      <div
+        className="sftp-context-menu"
+        ref={contextMenuRef}
+        style={{ left: contextMenu.x, top: contextMenu.y }}
+      >
+        {entry ? (
+          <>
+            {entry.type === 'directory' &&
+              item('Open', '📂', false, () => navigate(entry.path))}
+            {entry.type === 'file' &&
+              item('Download', '⬇', false, () => {
+                void send({ type: 'download', path: entry.path })
+              })}
+            {item('Rename', '✎', false, () =>
+              openDialog({ kind: 'rename', path: entry.path, name: entry.name })
+            )}
+            {item('Permissions', '🔒', false, () =>
+              openDialog({ kind: 'chmod', path: entry.path, mode: entry.mode })
+            )}
+            <div className="sftp-context-sep" />
+            {item('Delete', '🗑', true, () =>
+              openDialog({ kind: 'delete', path: entry.path, name: entry.name })
+            )}
+          </>
+        ) : (
+          <>
+            {item('New folder', '+', false, () => openDialog({ kind: 'mkdir' }))}
+            {item('Upload files…', '⬆', false, () => openFilePicker())}
+            {item('Refresh', '⟳', false, () => {
+              if (pathRef.current) {
+                requestList(pathRef.current)
+              }
+            })}
+          </>
+        )}
       </div>
     )
   }
@@ -503,7 +643,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     if (!connected) {
       return
     }
-    const files = collectDroppedFiles(e.dataTransfer.items)
+    const files = collectDroppedFiles(e.dataTransfer)
     if (files.length > 0) {
       void uploadDroppedFiles(files)
     }
@@ -539,31 +679,6 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           </button>
         )}
       </div>
-
-      {transfers.size > 0 && (
-        <div className="sftp-transfers">
-          {Array.from(transfers.entries()).map(([remotePath, t]) => (
-            <div key={remotePath} className="sftp-transfer">
-              <div className="sftp-transfer-label">
-                <span>{t.direction === 'upload' ? '⬆ Upload' : '⬇ Download'}</span>
-                <span className="sftp-transfer-name" title={remotePath}>
-                  {remotePath}
-                </span>
-                <span className="sftp-transfer-amount">
-                  {formatBytes(t.transferred)}
-                  {t.total > 0 ? ` / ${formatBytes(t.total)}` : ''}
-                </span>
-              </div>
-              <div className="sftp-transfer-track">
-                <div
-                  className="sftp-transfer-fill"
-                  style={{ width: t.total > 0 ? `${Math.min(100, (t.transferred / t.total) * 100)}%` : '100%' }}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
 
       <div className="sftp-toolbar">
         <button
@@ -610,7 +725,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           className="sftp-btn"
           disabled={!connected}
           title="Upload files into the current folder (or drop them here)"
-          onClick={() => void send({ type: 'uploadDialog', path: path ?? undefined })}
+          onClick={() => openFilePicker()}
         >
           ⬆ Upload…
         </button>
@@ -693,7 +808,18 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
 
       {notice && <div className="sftp-notice">{notice}</div>}
 
-      <div className="sftp-table-wrap">
+      <div
+        className="sftp-table-wrap"
+        onContextMenu={(e) => {
+          e.preventDefault()
+          if (!connected || !path || (e.target as HTMLElement).closest('th')) {
+            setContextMenu(null)
+            return
+          }
+          setSelectedPath(null)
+          setContextMenu({ x: e.clientX, y: e.clientY, entry: null })
+        }}
+      >
         <table className="sftp-table">
           <thead>
             <tr>
@@ -705,7 +831,16 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           </thead>
           <tbody>
             {parentDir && (
-              <tr key=".." className="sftp-row dir" onClick={() => navigate(parentDir)}>
+              <tr
+                key=".."
+                className="sftp-row dir"
+                onDoubleClick={() => navigate(parentDir)}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  setContextMenu(null)
+                }}
+              >
                 <td className="sftp-col-name">
                   <span className="sftp-icon">📁</span>
                   <span className="sftp-name">..</span>
@@ -721,6 +856,15 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
                 className={`sftp-row${entry.path === selectedPath ? ' selected' : ''}${entry.type === 'directory' ? ' dir' : ''}`}
                 onClick={() => setSelectedPath(entry.path)}
                 onDoubleClick={() => openEntry(entry)}
+                onContextMenu={(e) => {
+                  if (!connected) {
+                    return
+                  }
+                  e.preventDefault()
+                  e.stopPropagation()
+                  setSelectedPath(entry.path)
+                  setContextMenu({ x: e.clientX, y: e.clientY, entry })
+                }}
               >
                 <td className="sftp-col-name">
                   <span className="sftp-icon">{typeIcon(entry)}</span>
@@ -762,7 +906,46 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         )}
       </div>
 
+      {transfers.size > 0 && (
+        <div className="sftp-transfers">
+          {Array.from(transfers.entries()).map(([remotePath, t]) => (
+            <div key={remotePath} className="sftp-transfer">
+              <div className="sftp-transfer-label">
+                <span>{t.direction === 'upload' ? '⬆ Upload' : '⬇ Download'}</span>
+                <span className="sftp-transfer-name" title={remotePath}>
+                  {remotePath}
+                </span>
+                <span className="sftp-transfer-amount">
+                  {formatBytes(t.transferred)}
+                  {t.total > 0 ? ` / ${formatBytes(t.total)}` : ''}
+                </span>
+              </div>
+              <div className="sftp-transfer-track">
+                <div
+                  className="sftp-transfer-fill"
+                  style={{ width: t.total > 0 ? `${Math.min(100, (t.transferred / t.total) * 100)}%` : '100%' }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        hidden
+        onChange={(e) => {
+          const files = e.target.files ? Array.from(e.target.files) : []
+          e.target.value = ''
+          if (files.length > 0) {
+            void uploadDroppedFiles(files)
+          }
+        }}
+      />
       {renderDialog()}
+      {renderContextMenu()}
     </div>
   )
 }

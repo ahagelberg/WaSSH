@@ -139,9 +139,8 @@ export function registerIpc(
   ipcMain.handle('plugins:getActive', (_e, tabId: string) => pluginHost.getActivePlugins(tabId))
   ipcMain.handle(
     'plugins:message',
-    async (_e, tabId: string, pluginId: string, payload: unknown) => {
-      await pluginHost.handleRendererMessage(tabId, pluginId, payload)
-    }
+    (_e, tabId: string, pluginId: string, payload: unknown) =>
+      pluginHost.handleRendererMessage(tabId, pluginId, payload)
   )
   ipcMain.handle(
     'plugins:queueRestore',
