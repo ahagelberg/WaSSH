@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type ReactElement
+} from 'react'
 import type {
   SftpEntry,
   SftpErrorKind,
@@ -113,6 +120,35 @@ function typeIcon(entry: SftpEntry): string {
   return '❓'
 }
 
+const UPLOAD_CHUNK_SIZE = 256 * 1024
+
+/** Only OS file payloads qualify for drop-upload (never internal panel drags). */
+function isFileDrag(e: ReactDragEvent<HTMLDivElement>): boolean {
+  return Array.from(e.dataTransfer.types).includes('Files')
+}
+
+/** Files dropped from the OS; directories are skipped (cannot be chunk-uploaded). */
+function collectDroppedFiles(items: DataTransferItemList | null): File[] {
+  if (!items) {
+    return []
+  }
+  const files: File[] = []
+  for (const item of Array.from(items)) {
+    if (item.kind !== 'file') {
+      continue
+    }
+    const entry = item.webkitGetAsEntry()
+    if (entry?.isDirectory) {
+      continue
+    }
+    const file = item.getAsFile()
+    if (file) {
+      files.push(file)
+    }
+  }
+  return files
+}
+
 export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactElement {
   const [status, setStatus] = useState<SftpStatusState>('idle')
   const [cwd, setCwd] = useState<string | null>(null)
@@ -127,6 +163,8 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(() => new Map())
+  const dragDepthRef = useRef(0)
+  const [dropActive, setDropActive] = useState(false)
 
   const requestedRef = useRef<string | null>(null)
   const pathRef = useRef<string | null>(null)
@@ -158,6 +196,43 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     (payload: SftpRendererMessage): Promise<void> =>
       window.wassh.sendPluginMessage(tabId, pluginId, payload),
     [tabId, pluginId]
+  )
+
+  const uploadDroppedFiles = useCallback(
+    async (files: File[]): Promise<void> => {
+      const dir = pathRef.current
+      if (!dir || files.length === 0) {
+        return
+      }
+      let failed = 0
+      for (const file of files) {
+        try {
+          await send({ type: 'uploadStart', name: file.name, size: file.size, path: dir })
+          let offset = 0
+          while (offset < file.size) {
+            const end = Math.min(offset + UPLOAD_CHUNK_SIZE, file.size)
+            const data = await file.slice(offset, end).arrayBuffer()
+            await send({ type: 'uploadChunk', name: file.name, data: new Uint8Array(data) })
+            offset = end
+          }
+          await send({ type: 'uploadEnd', name: file.name })
+          showNotice(`Uploaded ${file.name}`)
+        } catch {
+          void send({ type: 'cancel' })
+          // Cancelled chunk uploads never emit transferDone; drop their bar now.
+          setTransfers((prev) => {
+            const next = new Map(prev)
+            next.delete(joinPath(dir, file.name))
+            return next
+          })
+          failed += 1
+        }
+      }
+      if (failed > 0) {
+        showNotice(`${failed} upload${failed === 1 ? '' : 's'} failed`)
+      }
+    },
+    [send, showNotice]
   )
 
   // On mount, request the latest status in case the connection event fired
@@ -391,8 +466,57 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
 
   const connected = status === 'connected'
 
+  const handleDragEnter = (e: ReactDragEvent<HTMLDivElement>): void => {
+    if (!connected || !isFileDrag(e)) {
+      return
+    }
+    e.preventDefault()
+    dragDepthRef.current += 1
+    setDropActive(true)
+  }
+
+  const handleDragOver = (e: ReactDragEvent<HTMLDivElement>): void => {
+    if (!connected || !isFileDrag(e)) {
+      return
+    }
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+  }
+
+  const handleDragLeave = (e: ReactDragEvent<HTMLDivElement>): void => {
+    if (!connected || !isFileDrag(e)) {
+      return
+    }
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) {
+      setDropActive(false)
+    }
+  }
+
+  const handleDrop = (e: ReactDragEvent<HTMLDivElement>): void => {
+    if (!isFileDrag(e)) {
+      return
+    }
+    e.preventDefault()
+    dragDepthRef.current = 0
+    setDropActive(false)
+    if (!connected) {
+      return
+    }
+    const files = collectDroppedFiles(e.dataTransfer.items)
+    if (files.length > 0) {
+      void uploadDroppedFiles(files)
+    }
+  }
+
   return (
-    <div className="sftp-view">
+    <div
+      className="sftp-view"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <div className="sftp-statusbar">
         <span className={`sftp-status-dot sftp-status-${status}`} />
         <span className="sftp-status-text">
@@ -485,7 +609,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           type="button"
           className="sftp-btn"
           disabled={!connected}
-          title="Upload files into the current folder"
+          title="Upload files into the current folder (or drop them here)"
           onClick={() => void send({ type: 'uploadDialog', path: path ?? undefined })}
         >
           ⬆ Upload…
@@ -626,6 +750,15 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         {!loading && listError && <div className="sftp-empty sftp-error">⚠ {listError}</div>}
         {!loading && !listError && entries.length === 0 && (
           <div className="sftp-empty">Empty folder</div>
+        )}
+        {dropActive && (
+          <div className="sftp-drop-hint">
+            <div className="sftp-drop-box">
+              <div className="sftp-drop-icon">⬆</div>
+              <div className="sftp-drop-title">Drop files to upload</div>
+              <div className="sftp-drop-text">into {path ?? '/'}</div>
+            </div>
+          </div>
         )}
       </div>
 

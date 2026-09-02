@@ -125,6 +125,17 @@
   cursor: pointer;
 }
 
+.settings-color-hex {
+  width: 84px;
+  font-family: var(--font-mono, Consolas, monospace);
+  font-size: 12px;
+  padding: 4px 6px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+}
+
 .settings-color-field {
   display: flex;
   align-items: center;

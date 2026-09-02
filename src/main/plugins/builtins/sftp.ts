@@ -476,7 +476,7 @@ async function handleUploadDialog(
 async function handleChunkUploadStart(
   ctx: PluginMainContext,
   state: SessionState,
-  payload: { name: string; size: number }
+  payload: { name: string; size: number; path?: string }
 ): Promise<void> {
   const sftp = state.sftp
   if (!sftp) {
@@ -486,7 +486,9 @@ async function handleChunkUploadStart(
   if (existing && !existing.done && !existing.cancelled) {
     return
   }
-  const remotePath = joinRemotePath(state.cwd || '/tmp', payload.name)
+  const targetDir =
+    payload.path && payload.path.trim() !== '' ? payload.path.trim() : state.cwd || '/tmp'
+  const remotePath = joinRemotePath(targetDir, payload.name)
   const cu: ChunkUploadState = {
     cancelled: false,
     done: false,

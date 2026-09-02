@@ -19,16 +19,18 @@ interface Props {
   onToggleCollapse: () => void
   onConnect: (host: HostProfile) => void
   onEdit: (host: HostProfile) => void
+  onDuplicate: (host: HostProfile) => void
   onDelete: (host: HostProfile) => void
   onNewHost: () => void
+  onAddHostToGroup: (groupId: string) => void
   onSaveOrganization: (org: HostsOrganization) => void
 }
 
 /** Gap between anchor and menu */
 const HOST_MENU_GAP_PX = 4
 
-/** Approximate menu height (3 items) for flip-above calculation */
-const HOST_MENU_ESTIMATED_HEIGHT_PX = 120
+/** Approximate menu height (4 items) for flip-above calculation */
+const HOST_MENU_ESTIMATED_HEIGHT_PX = 160
 
 /** Minimum menu width; keep in sync with --host-menu-min-width */
 const HOST_MENU_MIN_WIDTH_PX = 120
@@ -192,8 +194,10 @@ export default function SessionsSidebar({
   onToggleCollapse,
   onConnect,
   onEdit,
+  onDuplicate,
   onDelete,
   onNewHost,
+  onAddHostToGroup,
   onSaveOrganization
 }: Props): ReactElement {
   const [hostMenu, setHostMenu] = useState<HostMenuState | null>(null)
@@ -706,6 +710,16 @@ export default function SessionsSidebar({
               <button
                 type="button"
                 role="menuitem"
+                onClick={() => {
+                  closeHostMenu()
+                  onDuplicate(menuHost)
+                }}
+              >
+                Duplicate
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 className="danger"
                 onClick={() => {
                   closeHostMenu()
@@ -722,6 +736,16 @@ export default function SessionsSidebar({
               role="menu"
               style={{ left: groupMenu.left, top: groupMenu.top }}
             >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closeGroupMenu()
+                  onAddHostToGroup(menuGroup.id)
+                }}
+              >
+                Add host
+              </button>
               <button
                 type="button"
                 role="menuitem"

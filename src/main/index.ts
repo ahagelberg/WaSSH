@@ -29,7 +29,7 @@ import { PluginDataStore } from './store/pluginDataStore'
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
 
 /** Accelerator for Edit > Find */
-const FIND_ACCELERATOR = 'CommandOrControl+F'
+const FIND_ACCELERATOR = 'CommandOrControl+Shift+F'
 
 /** Accelerator for Session > Reopen closed session */
 const REOPEN_CLOSED_ACCELERATOR = 'CommandOrControl+Shift+T'
@@ -53,7 +53,13 @@ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
   'ERR_STREAM_DESTROYED'
 ])
 
+/** Cooldown before another auto-reload after a renderer module-link error. */
+const DEV_MODULE_RELOAD_COOLDOWN_MS = 10_000
+
 let wakeReconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+/** Whether the machine has suspended since startup (module-graph corruptions only follow sleep). */
+let rendererSuspended = false
 
 function errorCodeOf(err: unknown): string {
   if (!err || typeof err !== 'object' || !('code' in err)) {
@@ -83,6 +89,7 @@ function installProcessErrorGuards(): void {
 
 function attachPowerMonitor(): void {
   powerMonitor.on('suspend', () => {
+    rendererSuspended = true
     if (wakeReconnectTimer) {
       clearTimeout(wakeReconnectTimer)
       wakeReconnectTimer = null
@@ -167,6 +174,36 @@ function createWindow(): void {
     void shell.openExternal(details.url)
     return { action: 'deny' }
   })
+
+  // Vite dev can leave the renderer's ESM module graph stale/corrupt after the
+  // machine sleeps/wakes (requests for `?t=`-versioned modules whose exports were
+  // never registered), blacking out the window. Reload once (rate-limited) when a
+  // module-link error is reported so the page reboots from a clean module graph.
+  if (process.env.ELECTRON_RENDERER_URL) {
+    let moduleReloadAvailableAt = 0
+    mainWindow.webContents.on('console-message', (details) => {
+      // Only recover after a sleep/wake cycle — before that, a module error is a
+      // real bug that should surface normally (error overlay, console).
+      if (!rendererSuspended) {
+        return
+      }
+      const text = details.message
+      const isModuleLinkError =
+        text.includes('does not provide an export named') ||
+        text.includes('Failed to fetch dynamically imported module') ||
+        text.includes('error loading dynamically imported module') ||
+        text.includes('Importing a module script failed')
+      if (!isModuleLinkError) {
+        return
+      }
+      const now = Date.now()
+      if (now < moduleReloadAvailableAt) {
+        return
+      }
+      moduleReloadAvailableAt = now + DEV_MODULE_RELOAD_COOLDOWN_MS
+      mainWindow?.webContents.reload()
+    })
+  }
 
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown' || !input.control || input.alt || input.meta) {

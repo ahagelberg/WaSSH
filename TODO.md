@@ -43,3 +43,4 @@
 - SCP/SFTP plugin. Allows files to be dropped on terminal for upload (always when loaded). Show file manager when active allowing file download, upload, rename, folder creation, permission edits
 - SCP/SFTP plugin: add edit function (text files using builtin editor) etc.
 - SCP/SFTP plugin: Allow tansfer between hosts?
+- AI Agent: help with admin tasks in terminal. Permission checks for running commands, whitelist/blacklist commands

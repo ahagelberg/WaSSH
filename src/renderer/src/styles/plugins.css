@@ -1280,6 +1280,50 @@
   }
 }
 
+/* Very wide (--monitor-cq-wide): sections tile sideways, adding columns as the
+   panel grows. The CPU overview stays full-width because its inner layout is
+   sized against the whole container. */
+@container server-monitor (min-width: 980px) and (min-height: 320px) {
+  .monitor-body {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-flow: dense;
+    gap: 10px 14px;
+    align-items: start;
+  }
+
+  .monitor-cpu-block,
+  .monitor-processes {
+    grid-column: 1 / -1;
+  }
+
+  .monitor-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Ultra wide: four groupings across, only the overview spans */
+@container server-monitor (min-width: 1700px) and (min-height: 320px) {
+  .monitor-body {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .monitor-cpu-block {
+    grid-column: 1 / -1;
+  }
+
+  .monitor-facts,
+  .monitor-processes {
+    grid-column: auto;
+  }
+}
+
+/* A lone Network/Disk tile takes the full row so it never leaves a hole. */
+.monitor-body:has(.monitor-network):not(:has(.monitor-disk)) .monitor-network,
+.monitor-body:has(.monitor-disk):not(:has(.monitor-network)) .monitor-disk {
+  grid-column: 1 / -1;
+}
+
 .plugin-monitor-output {
   flex: 1;
   margin: 0;
@@ -1973,6 +2017,44 @@
 
 .sftp-empty.sftp-error {
   color: var(--danger);
+}
+
+.sftp-drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--bg-panel) 80%, transparent);
+  pointer-events: none;
+}
+
+.sftp-drop-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 16px 24px;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  text-align: center;
+}
+
+.sftp-drop-icon {
+  font-size: 26px;
+  line-height: 1;
+}
+
+.sftp-drop-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.sftp-drop-text {
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .sftp-transfers {

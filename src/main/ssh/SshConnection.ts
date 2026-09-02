@@ -4,7 +4,7 @@ import { readFileSync } from 'fs'
 import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import type { SFTPWrapper } from 'ssh2'
 import { Readable } from 'stream'
-import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, parseTmuxListForName, remoteSessionBusyFallbackMessage, type ScreenSessionConfig } from '../../shared/connection'
+import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, parseTmuxListForName, remoteSessionBusyFallbackMessage, remoteSessionUnavailableMessage, type ScreenSessionConfig, type ScreenSessionPresence } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_RECONNECT_MODE,
@@ -897,12 +897,33 @@ export class SshConnection extends EventEmitter {
     screenPlan: { command: string | null; statusMessage?: string },
     resolve: () => void
   ): void {
-    const wireStream = (stream: ClientChannel, statusMessage?: string): void => {
+    const wireStream = (
+      stream: ClientChannel,
+      statusMessage?: string,
+      multiplexer = false
+    ): void => {
       this.stream = stream
       this.opening = false
       this.reconnectAttempt = 0
       this.everConnected = true
       this.emitStatus('connected', statusMessage)
+
+      if (multiplexer) {
+        // A newly created screen/tmux window only paints its first frame after a
+        // window-change / SIGWINCH. Re-apply the current size (the exec pty may
+        // have been created at the default size because resizes that arrived
+        // before the channel were dropped) and signal WINCH so the prompt shows.
+        try {
+          stream.setWindow(this.rows, this.cols, 0, 0)
+        } catch {
+          /* ignore */
+        }
+        try {
+          stream.signal('WINCH')
+        } catch {
+          /* ignore */
+        }
+      }
 
       if (this.usedInteractivePassword && this.interactivePassword) {
         this.pendingSavePassword = this.interactivePassword
@@ -934,6 +955,14 @@ export class SshConnection extends EventEmitter {
         if (this.intentionalDisconnect || this.disposed) {
           this.emitStatus('disconnected')
           resolve()
+          return
+        }
+        if (this.remoteShellExited && multiplexer) {
+          // The screen/tmux client exited. That may be a real logout or a
+          // transient exit (e.g. detaching a nested screen took this client
+          // down) while the first screen session is still alive — so decide by
+          // probing the remote session instead of ending unconditionally.
+          void this.recoverRemoteSessionIfAlive(client).finally(resolve)
           return
         }
         if (this.remoteShellExited) {
@@ -971,7 +1000,7 @@ export class SshConnection extends EventEmitter {
         openLoginShell()
         return
       }
-      wireStream(stream)
+      wireStream(stream, undefined, true)
     })
   }
 
@@ -984,6 +1013,16 @@ export class SshConnection extends EventEmitter {
     }
     const kind = screen.remoteSessionKind
 
+    // Probe for the tool first: if tmux/screen is missing, fall back to a normal
+    // shell with a warning regardless of the busy-handling mode.
+    const presence = await this.probeRemoteSession(client, kind, screen.screenSessionName)
+    if (presence === 'unavailable') {
+      return {
+        command: null,
+        statusMessage: remoteSessionUnavailableMessage(kind)
+      }
+    }
+
     if (
       screen.screenBusyHandling === SCREEN_BUSY_SHARE ||
       screen.screenBusyHandling === SCREEN_BUSY_FORCE_DETACH
@@ -993,10 +1032,6 @@ export class SshConnection extends EventEmitter {
       }
     }
 
-    const presence = await this.probeRemoteSession(client, kind, screen.screenSessionName)
-    if (presence === 'unavailable') {
-      return { command: null }
-    }
     if (presence === 'attached') {
       return {
         command: null,
@@ -1070,6 +1105,43 @@ export class SshConnection extends EventEmitter {
     this.clearReconnectTimer()
     this.closeClientOnly()
     this.emitStatus('closed', SESSION_CLOSED_MESSAGE)
+  }
+
+  /**
+   * The screen/tmux client of a remote session exited. The session itself may
+   * still exist (e.g. a nested screen was attached from within it and its
+   * detach took this client down), so only treat it as logout when the remote
+   * session is really gone.
+   */
+  private async recoverRemoteSessionIfAlive(client: Client): Promise<void> {
+    if (this.intentionalDisconnect || this.disposed || this.opening) {
+      return
+    }
+    const screen = screenConfigFrom(this.connection)
+    let presence: ScreenSessionPresence | 'unavailable'
+    try {
+      presence = await this.probeRemoteSession(
+        client,
+        screen.remoteSessionKind,
+        screen.screenSessionName
+      )
+    } catch {
+      presence = 'unavailable'
+    }
+    if (presence === 'detached' || presence === 'attached' || presence === 'unknown') {
+      // The first screen session is still alive — re-attach to it.
+      this.emitStatus('reconnecting', 'Remote session still active; re-attaching…')
+      void this.open()
+      return
+    }
+    if (presence === 'unavailable') {
+      // Could not determine state (e.g. the transport dropped); reconnect.
+      this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
+      this.scheduleReconnect()
+      return
+    }
+    // No such session — it was closed; this is a real logout.
+    this.endAfterRemoteLogout()
   }
 
   private scheduleReconnect(): void {

@@ -424,7 +424,7 @@ export type SftpRendererMessage =
   | { type: 'delete'; path: string }
   | { type: 'download'; path: string }
   | { type: 'uploadDialog'; path?: string }
-  | { type: 'uploadStart'; name: string; size: number }
+  | { type: 'uploadStart'; name: string; size: number; path?: string }
   | { type: 'uploadChunk'; name: string; data: Uint8Array }
   | { type: 'uploadEnd'; name: string }
   | { type: 'cancel' }

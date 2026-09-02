@@ -368,6 +368,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
   const [treeRatio, setTreeRatio] = useState(MQTT_SPLIT_DEFAULT_RATIO)
   const splitRef = useRef<HTMLDivElement>(null)
   const splitterLastX = useRef(0)
+  const treeContainerRef = useRef<HTMLDivElement>(null)
   const expandedRef = useRef(expanded)
   expandedRef.current = expanded
 
@@ -556,6 +557,55 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
   const sortedChildren = (node: TopicNode): TopicNode[] =>
     Array.from(node.children.values()).sort((a, b) => a.name.localeCompare(b.name))
 
+  // Flat, depth-first list of rows currently visible in the tree (expanded
+  // children only) plus each node's parent, for keyboard navigation.
+  const visibleNodes: TopicNode[] = []
+  const parentOfPath = new Map<string, string>()
+  const collectVisible = (node: TopicNode): void => {
+    for (const child of sortedChildren(node)) {
+      visibleNodes.push(child)
+      parentOfPath.set(child.path, node.path)
+      if (expanded.has(child.path)) {
+        collectVisible(child)
+      }
+    }
+  }
+  collectVisible(root)
+
+  const selectedVisibleIndex = selectedPath
+    ? visibleNodes.findIndex((n) => n.path === selectedPath)
+    : -1
+
+  const expandPath = (path: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.add(path)
+      return next
+    })
+  }
+
+  const collapsePath = (path: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.delete(path)
+      return next
+    })
+  }
+
+  useEffect(() => {
+    if (selectedPath === null || !treeContainerRef.current) {
+      return
+    }
+    for (const el of Array.from(
+      treeContainerRef.current.querySelectorAll<HTMLElement>('[data-mqtt-path]')
+    )) {
+      if (el.dataset.mqttPath === selectedPath) {
+        el.scrollIntoView({ block: 'nearest' })
+        break
+      }
+    }
+  }, [selectedPath])
+
   const renderTreeNode = (node: TopicNode): ReactElement[] => {
     const elements: ReactElement[] = []
     for (const child of sortedChildren(node)) {
@@ -576,6 +626,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
             ]
               .filter(Boolean)
               .join(' ')}
+            data-mqtt-path={child.path}
             onClick={() => setSelectedPath(child.path)}
             onDoubleClick={() => {
               if (hasChildren) {
@@ -628,18 +679,57 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
         e.currentTarget.focus({ preventScroll: true })
       }}
       onKeyDown={(e) => {
-        if (e.key !== 'Delete') {
-          return
-        }
         const target = e.target as HTMLElement
         if (target.closest('input, textarea, select')) {
           return
         }
-        if (selectedPath === null || status !== 'connected') {
+        if (e.key === 'Delete') {
+          if (selectedPath === null || status !== 'connected') {
+            return
+          }
+          e.preventDefault()
+          void handleDelete()
+          return
+        }
+        if (!e.key.startsWith('Arrow')) {
           return
         }
         e.preventDefault()
-        void handleDelete()
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          const delta = e.key === 'ArrowDown' ? 1 : -1
+          const next = visibleNodes[selectedVisibleIndex + delta]
+          if (next) {
+            setSelectedPath(next.path)
+          } else if (selectedVisibleIndex < 0 && visibleNodes.length > 0) {
+            setSelectedPath(visibleNodes[0].path)
+          }
+          return
+        }
+        const node = selectedPath !== null ? findNode(root, selectedPath) : null
+        if (e.key === 'ArrowRight') {
+          if (node && node.children.size > 0) {
+            if (expanded.has(node.path)) {
+              const firstChild = sortedChildren(node)[0]
+              if (firstChild) {
+                setSelectedPath(firstChild.path)
+              }
+            } else {
+              expandPath(node.path)
+            }
+          }
+          return
+        }
+        // ArrowLeft
+        if (node && node.children.size > 0 && expanded.has(node.path)) {
+          collapsePath(node.path)
+          return
+        }
+        if (selectedPath !== null) {
+          const parent = parentOfPath.get(selectedPath)
+          if (parent !== undefined && parent !== ROOT_PATH) {
+            setSelectedPath(parent)
+          }
+        }
       }}
     >
       <div className="mqtt-status-bar">
@@ -670,7 +760,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
           style={{ flexGrow: treeRatio, flexBasis: 0 }}
         >
           <div className="mqtt-pane-label">Topics</div>
-          <div className="mqtt-tree">
+          <div className="mqtt-tree" ref={treeContainerRef}>
             {root.children.size === 0 ? (
               <div className="mqtt-empty">No messages yet</div>
             ) : (

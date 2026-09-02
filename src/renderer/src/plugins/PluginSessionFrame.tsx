@@ -51,6 +51,48 @@ type DropTarget =
   | { kind: 'edge'; edge: DockEdge; insert: 'inner' | 'outer' }
   | { kind: 'leaf'; pluginId: string; zone: LeafSplitZone }
 
+/** Splitter bar thickness between panes (must match --plugin-splitter-size). */
+const PLUGIN_SPLITTER_SIZE_PX = 4
+
+/**
+ * Largest a dock on `edge` may become so the terminal / mid area keeps at least
+ * MIN_DOCK_SIZE_PX and the dock cannot overflow the session frame.
+ */
+function dockMaxSizePx(
+  frame: HTMLElement | null,
+  cur: TabPluginLayout,
+  edge: DockEdge
+): number {
+  if (!frame) {
+    return Number.POSITIVE_INFINITY
+  }
+  const horizontal = edge === 'left' || edge === 'right'
+  const avail = horizontal ? frame.clientWidth : frame.clientHeight
+  const other: DockEdge = horizontal
+    ? edge === 'left'
+      ? 'right'
+      : 'left'
+    : edge === 'top'
+      ? 'bottom'
+      : 'top'
+  const hasOther = cur[other] !== null
+  const otherPx = hasOther
+    ? horizontal
+      ? other === 'left'
+        ? cur.leftWidthPx
+        : cur.rightWidthPx
+      : other === 'top'
+        ? cur.topHeightPx
+        : cur.bottomHeightPx
+    : 0
+  const reserved =
+    otherPx +
+    (hasOther ? PLUGIN_SPLITTER_SIZE_PX : 0) +
+    PLUGIN_SPLITTER_SIZE_PX +
+    MIN_DOCK_SIZE_PX
+  return Math.max(MIN_DOCK_SIZE_PX, avail - reserved)
+}
+
 function zoneFromPoint(rect: DOMRect, clientX: number, clientY: number): LeafSplitZone {
   const x = (clientX - rect.left) / Math.max(rect.width, 1)
   const y = (clientY - rect.top) / Math.max(rect.height, 1)
@@ -297,6 +339,53 @@ export default function PluginSessionFrame({
     [layout, activePluginIds]
   )
 
+  // Keep stored dock sizes within the current frame: shrink any dock that would
+  // overflow the frame (window resized smaller / restored oversized layout).
+  useEffect(() => {
+    const frame = frameRef.current
+    if (!frame) {
+      return
+    }
+    let raf = 0
+    const fit = (): void => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => {
+        if (frame.clientWidth <= 0 || frame.clientHeight <= 0) {
+          return
+        }
+        const cur = layoutRef.current
+        let next = cur
+        for (const edge of ['left', 'right', 'top', 'bottom'] as DockEdge[]) {
+          if (!next[edge]) {
+            continue
+          }
+          const key =
+            edge === 'left'
+              ? ('leftWidthPx' as const)
+              : edge === 'right'
+                ? ('rightWidthPx' as const)
+                : edge === 'top'
+                  ? ('topHeightPx' as const)
+                  : ('bottomHeightPx' as const)
+          const max = dockMaxSizePx(frame, next, edge)
+          const clamped = Math.max(MIN_DOCK_SIZE_PX, Math.min(next[key], max))
+          if (clamped !== next[key]) {
+            next = { ...next, [key]: clamped }
+          }
+        }
+        if (next !== cur) {
+          onLayoutChangeRef.current(next)
+        }
+      })
+    }
+    const observer = new ResizeObserver(fit)
+    observer.observe(frame)
+    return () => {
+      observer.disconnect()
+      cancelAnimationFrame(raf)
+    }
+  }, [])
+
   const resolveDropTarget = useCallback(
     (clientX: number, clientY: number, movingId: string): DropTarget | null => {
       const frame = frameRef.current
@@ -416,14 +505,17 @@ export default function PluginSessionFrame({
 
   const resizeDock = (edge: DockEdge, delta: number): void => {
     const next = { ...layoutRef.current }
+    const max = dockMaxSizePx(frameRef.current, next, edge)
+    const clampSize = (value: number): number =>
+      Math.max(MIN_DOCK_SIZE_PX, Math.min(value, max))
     if (edge === 'left') {
-      next.leftWidthPx = Math.max(MIN_DOCK_SIZE_PX, next.leftWidthPx + delta)
+      next.leftWidthPx = clampSize(next.leftWidthPx + delta)
     } else if (edge === 'right') {
-      next.rightWidthPx = Math.max(MIN_DOCK_SIZE_PX, next.rightWidthPx - delta)
+      next.rightWidthPx = clampSize(next.rightWidthPx - delta)
     } else if (edge === 'top') {
-      next.topHeightPx = Math.max(MIN_DOCK_SIZE_PX, next.topHeightPx + delta)
+      next.topHeightPx = clampSize(next.topHeightPx + delta)
     } else {
-      next.bottomHeightPx = Math.max(MIN_DOCK_SIZE_PX, next.bottomHeightPx - delta)
+      next.bottomHeightPx = clampSize(next.bottomHeightPx - delta)
     }
     onLayoutChangeRef.current(next)
   }

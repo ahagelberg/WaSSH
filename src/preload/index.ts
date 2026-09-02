@@ -6,12 +6,12 @@ import type {
   HostKeyDecision,
   HostKeyPrompt,
   HostProfile,
+  HostsOrganization,
   SavePasswordDecision,
   SavePasswordPrompt,
   SessionStatusEvent,
   TabSnapshot,
-  WasshApi,
-  type HostsOrganization
+  WasshApi
 } from '../shared/types'
 import type {
   PluginActiveStateEvent,

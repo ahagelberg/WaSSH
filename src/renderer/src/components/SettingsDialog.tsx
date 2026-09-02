@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 export interface SettingsSection {
   id: string
@@ -14,8 +14,8 @@ interface Props {
   footer?: ReactNode
 }
 
-/** Intersection ratio to consider a section active */
-const SECTION_VISIBLE_RATIO = 0.35
+/** Offset from the scroll viewport top before a section counts as current; keep in sync with .settings-section scroll-margin-top */
+const SECTION_ACTIVE_OFFSET_PX = 16
 
 /** Keyboard key that dismisses the dialog like Cancel */
 const DIALOG_DISMISS_KEY = 'Escape'
@@ -33,34 +33,57 @@ export default function SettingsDialog({ title, sections, onClose, footer }: Pro
       e.preventDefault()
       onClose()
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    // Capture phase: fire before any focused element / inner handler can
+    // swallow Escape, so the dialog always cancels on ESC.
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [onClose])
+
+  const updateActiveSection = useCallback((): void => {
+    const root = contentRef.current
+    if (!root) {
+      return
+    }
+    // At the bottom the last section is current even when it cannot reach the top.
+    if (root.scrollTop + root.clientHeight >= root.scrollHeight - 1) {
+      const last = sections[sections.length - 1]
+      if (last) {
+        setActiveId(last.id)
+      }
+      return
+    }
+    // The current section is the last one whose top has scrolled to the top of
+    // the viewport (sections are laid out top to bottom in document order).
+    const rootTop = root.getBoundingClientRect().top
+    let current: string | null = null
+    for (const s of sections) {
+      const el = sectionRefs.current[s.id]
+      if (!el) {
+        continue
+      }
+      if (el.getBoundingClientRect().top <= rootTop + SECTION_ACTIVE_OFFSET_PX) {
+        current = s.id
+      } else {
+        break
+      }
+    }
+    setActiveId(current ?? sections[0]?.id ?? '')
+  }, [sections])
 
   useEffect(() => {
     const root = contentRef.current
     if (!root) {
       return
     }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)
-        if (visible[0]?.target.id) {
-          setActiveId(visible[0].target.id)
-        }
-      },
-      { root, threshold: [SECTION_VISIBLE_RATIO, 0.5, 0.75] }
-    )
-    for (const section of sections) {
-      const el = sectionRefs.current[section.id]
-      if (el) {
-        observer.observe(el)
-      }
+    updateActiveSection()
+    root.addEventListener('scroll', updateActiveSection, { passive: true })
+    // Settle after smooth programmatic scrolling finishes (final resting position).
+    root.addEventListener('scrollend', updateActiveSection)
+    return () => {
+      root.removeEventListener('scroll', updateActiveSection)
+      root.removeEventListener('scrollend', updateActiveSection)
     }
-    return () => observer.disconnect()
-  }, [sections])
+  }, [updateActiveSection])
 
   const scrollTo = (id: string): void => {
     sectionRefs.current[id]?.scrollIntoView({ behavior: 'smooth', block: 'start' })

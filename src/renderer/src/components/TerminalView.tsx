@@ -16,6 +16,7 @@ import {
   type CursorStyle
 } from '@shared/types'
 import { terminalFontStack } from '@shared/connection'
+import { toXtermSearchOptions, type TerminalSearchController } from '../terminalSearch'
 import { sessionTerminalStyle } from '../sessionStyleCss'
 import TerminalSearchBar from './TerminalSearchBar'
 
@@ -29,7 +30,7 @@ const BELL_FLASH_MS = 200
 const DECSCUSR_INTERMEDIATE = ' '
 const DECSCUSR_FINAL = 'q'
 
-/** Open find bar (must not be consumed by xterm) */
+/** Open find bar (Ctrl/Cmd+Shift+F; must not be consumed by xterm) */
 const FIND_KEY = 'f'
 
 interface Props {
@@ -65,6 +66,8 @@ interface Props {
   /** When true, dropping files onto the terminal uploads them via the SFTP plugin. */
   dropEnabled: boolean
   onDropFiles: (tabId: string, files: File[]) => void
+  /** Live progress of a file dropped onto this terminal for SFTP upload (null when idle). */
+  dropUpload: { name: string; meta: string; pct: number } | null
 }
 
 function xtermThemeFromHost(el: HTMLElement) {
@@ -122,7 +125,8 @@ export default function TerminalView({
   registerSearch,
   unregisterSearch,
   dropEnabled,
-  onDropFiles
+  onDropFiles,
+  dropUpload
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const bellLineRef = useRef<HTMLDivElement>(null)
@@ -293,10 +297,11 @@ export default function TerminalView({
       if (ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key === TAB_CYCLE_KEY) {
         return false
       }
+      // Ctrl/Cmd+Shift+F opens find; plain Ctrl+F must reach the remote program.
       if (
         (ev.ctrlKey || ev.metaKey) &&
+        ev.shiftKey &&
         !ev.altKey &&
-        !ev.shiftKey &&
         ev.key.toLowerCase() === FIND_KEY
       ) {
         return false
@@ -485,6 +490,17 @@ export default function TerminalView({
             <div className="terminal-drop-icon">⬆</div>
             <div className="terminal-drop-title">Drop to upload over SFTP</div>
             <div className="terminal-drop-hint">Files are uploaded to the remote upload directory</div>
+          </div>
+        </div>
+      ) : null}
+      {dropUpload ? (
+        <div className="drop-upload-banner">
+          <div className="drop-upload-row">
+            <span className="drop-upload-name">⬆ {dropUpload.name}</span>
+            <span className="drop-upload-meta">{dropUpload.meta}</span>
+          </div>
+          <div className="drop-upload-track">
+            <div className="drop-upload-fill" style={{ width: `${dropUpload.pct}%` }} />
           </div>
         </div>
       ) : null}

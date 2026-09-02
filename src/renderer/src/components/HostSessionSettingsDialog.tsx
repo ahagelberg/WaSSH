@@ -87,6 +87,7 @@ import {
 } from '@shared/plugins'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
+import ColorHexInput from './ColorHexInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
 import PluginFieldEditor from '../plugins/PluginFieldEditor'
@@ -103,6 +104,8 @@ interface Props {
   styleDefaults: SessionStyle
   onSaveHost: (host: HostProfile, password: string, passphrase: string) => void
   onSaveSession: (connection: ConnectionParams) => void
+  /** Push the edited host settings to every open session of this host */
+  onApplyToSessions?: (host: HostProfile, password: string, passphrase: string) => void
   onClose: () => void
   pickPrivateKey: () => Promise<string | null>
 }
@@ -196,12 +199,21 @@ function ColorRow({
           {defaultLabel}
         </label>
         {HEX_COLOR_RE.test(pickerValue) ? (
-          <input
-            type="color"
-            value={pickerValue}
-            disabled={useDefault}
-            onChange={(e) => onChange(e.target.value)}
-          />
+          <>
+            <input
+              type="color"
+              value={pickerValue}
+              onClick={() => {
+                // Clicking the swatch starts a custom color: clear “use default”
+                // even if the picker is cancelled.
+                if (useDefault) {
+                  onChange(HEX_COLOR_RE.test(resolvedFallback) ? resolvedFallback : themeHex)
+                }
+              }}
+              onChange={(e) => onChange(e.target.value)}
+            />
+            <ColorHexInput value={pickerValue} onChange={onChange} />
+          </>
         ) : null}
       </div>
     </div>
@@ -252,6 +264,7 @@ export default function HostSessionSettingsDialog({
   styleDefaults,
   onSaveHost,
   onSaveSession,
+  onApplyToSessions,
   onClose,
   pickPrivateKey
 }: Props) {
@@ -1097,37 +1110,40 @@ export default function HostSessionSettingsDialog({
     plugins
   ])
 
+  const buildHostProfile = (): HostProfile => {
+    const id =
+      form.hostId ||
+      ('id' in initial ? initial.id : crypto.randomUUID())
+    return {
+      id,
+      name:
+        form.name ||
+        (isSerial
+          ? form.host
+          : form.username
+            ? `${form.username}@${form.host}`
+            : form.host),
+      host: form.host,
+      port: form.port,
+      username: form.username,
+      passwordVaultId: form.passwordVaultId || `pwd-${id}`,
+      privateKeyPath: form.privateKeyPath,
+      passphraseVaultId: form.passphraseVaultId || (passphrase ? `pp-${id}` : ''),
+      authMethod: form.authMethod,
+      proxyHostId: isSsh ? form.proxyHostId || '' : '',
+      ...protocolConfigFrom(form),
+      ...sessionStyleOverridesFrom(form),
+      ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false }),
+      pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
+      reconnectMode: reconnectModeFrom(form),
+      ...screenConfigFrom(form),
+      tags
+    }
+  }
+
   const handleSave = (): void => {
     if (mode === 'editHost') {
-      const id =
-        form.hostId ||
-        ('id' in initial ? initial.id : crypto.randomUUID())
-      const host: HostProfile = {
-        id,
-        name:
-          form.name ||
-          (isSerial
-            ? form.host
-            : form.username
-              ? `${form.username}@${form.host}`
-              : form.host),
-        host: form.host,
-        port: form.port,
-        username: form.username,
-        passwordVaultId: form.passwordVaultId || `pwd-${id}`,
-        privateKeyPath: form.privateKeyPath,
-        passphraseVaultId: form.passphraseVaultId || (passphrase ? `pp-${id}` : ''),
-        authMethod: form.authMethod,
-        proxyHostId: isSsh ? form.proxyHostId || '' : '',
-        ...protocolConfigFrom(form),
-        ...sessionStyleOverridesFrom(form),
-        ...tunnelConfigFrom(isSsh ? form : { ...form, tunnels: [], x11Forwarding: false }),
-        pluginSettings: normalizeHostPluginSettings(form.pluginSettings),
-        reconnectMode: reconnectModeFrom(form),
-        ...screenConfigFrom(form),
-        tags
-      }
-      onSaveHost(host, password, passphrase)
+      onSaveHost(buildHostProfile(), password, passphrase)
       onClose()
       return
     }
@@ -1146,6 +1162,14 @@ export default function HostSessionSettingsDialog({
     onClose()
   }
 
+  const applyToSessions = (): void => {
+    if (!onApplyToSessions) {
+      return
+    }
+    onApplyToSessions(buildHostProfile(), password, passphrase)
+    onClose()
+  }
+
   return (
     <SettingsDialog
       title={mode === 'editHost' ? 'Host settings' : 'Session settings'}
@@ -1156,6 +1180,11 @@ export default function HostSessionSettingsDialog({
           <button type="button" onClick={onClose}>
             Cancel
           </button>
+          {mode === 'editHost' && onApplyToSessions ? (
+            <button type="button" onClick={applyToSessions}>
+              Apply to sessions
+            </button>
+          ) : null}
           <button type="button" className="primary" onClick={handleSave}>
             Save
           </button>

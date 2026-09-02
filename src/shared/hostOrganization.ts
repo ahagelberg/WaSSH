@@ -50,7 +50,7 @@ export function normalizeHostsOrganization(raw: unknown): HostsOrganization {
   return {
     groups: Array.isArray(obj.groups)
       ? obj.groups
-          .filter((g): g is Partial<HostGroup> & { id: string } => Boolean(g && typeof g.id === 'string'))
+          .filter((g): g is HostGroup => Boolean(g && typeof g.id === 'string'))
           .map((g) => normalizeGroup(g))
       : [],
     ungroupedHostIds: dedupeIds(

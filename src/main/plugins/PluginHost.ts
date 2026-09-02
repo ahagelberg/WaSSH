@@ -74,6 +74,8 @@ interface ActiveInstance {
   cleanups: Array<() => void>
   ctx: PluginMainContext
   module: PluginMainModule
+  /** Whether the renderer was told this plugin is active (i.e. a view is docked). */
+  announced: boolean
 }
 
 export class PluginHost {
@@ -152,7 +154,7 @@ export class PluginHost {
     return map ? Array.from(map.keys()) : []
   }
 
-  async activate(tabId: string, pluginId: string): Promise<void> {
+  async activate(tabId: string, pluginId: string, announce = true): Promise<void> {
     if (!this.isEnabled(pluginId)) {
       throw new Error(`Plugin "${pluginId}" is not enabled`)
     }
@@ -165,7 +167,17 @@ export class PluginHost {
       tabMap = new Map()
       this.instances.set(tabId, tabMap)
     }
-    if (tabMap.has(pluginId)) {
+    const existing = tabMap.get(pluginId)
+    if (existing) {
+      // Promote a headless instance to a visible one (dock its view) on demand.
+      if (announce && !existing.announced) {
+        existing.announced = true
+        this.send('plugin:active', {
+          tabId,
+          pluginId,
+          active: true
+        } satisfies PluginActiveStateEvent)
+      }
       return
     }
 
@@ -241,20 +253,36 @@ export class PluginHost {
       }
     }
 
-    const instance: ActiveInstance = { pluginId, tabId, cleanups, ctx, module: mod }
+    const instance: ActiveInstance = {
+      pluginId,
+      tabId,
+      cleanups,
+      ctx,
+      module: mod,
+      announced: announce
+    }
     tabMap.set(pluginId, instance)
     await mod.onActivate(ctx)
-    this.send('plugin:active', {
-      tabId,
-      pluginId,
-      active: true
-    } satisfies PluginActiveStateEvent)
+    if (announce) {
+      this.send('plugin:active', {
+        tabId,
+        pluginId,
+        active: true
+      } satisfies PluginActiveStateEvent)
+    }
   }
 
-  async deactivate(tabId: string, pluginId: string): Promise<void> {
+  async deactivate(tabId: string, pluginId: string, force = false): Promise<void> {
     const tabMap = this.instances.get(tabId)
     const instance = tabMap?.get(pluginId)
     if (!instance) {
+      return
+    }
+    // Closing the SFTP Files browser must not disable terminal drop-upload:
+    // keep the module running headless while the session is still SSH. The
+    // renderer already removed the plugin from its view state locally.
+    if (!force && pluginId === PLUGIN_ID_SFTP && this.broker.isSshSession(tabId)) {
+      instance.announced = false
       return
     }
     tabMap?.delete(pluginId)
@@ -285,7 +313,7 @@ export class PluginHost {
   async deactivateAll(tabId: string): Promise<void> {
     const ids = this.getActivePlugins(tabId)
     for (const id of ids) {
-      await this.deactivate(tabId, id)
+      await this.deactivate(tabId, id, true)
     }
     this.pipeline.clearTab(tabId)
     this.broker.closeForTab(tabId)
@@ -311,6 +339,20 @@ export class PluginHost {
         await this.activate(tabId, id)
       } catch (err) {
         console.error(`Failed to activate plugin ${id}:`, err)
+      }
+    }
+
+    // SFTP powers drop-to-upload on the terminal, so keep it running (headless)
+    // for every SSH session — even while the Files browser is closed.
+    if (
+      enabled.some((p) => p.id === PLUGIN_ID_SFTP) &&
+      this.broker.isSshSession(tabId) &&
+      !this.instances.get(tabId)?.has(PLUGIN_ID_SFTP)
+    ) {
+      try {
+        await this.activate(tabId, PLUGIN_ID_SFTP, false)
+      } catch (err) {
+        console.error(`Failed to activate plugin ${PLUGIN_ID_SFTP}:`, err)
       }
     }
   }
@@ -358,7 +400,7 @@ export class PluginHost {
     const removed = previous.filter((id) => !next.includes(id))
     for (const pluginId of removed) {
       for (const tabId of Array.from(this.instances.keys())) {
-        await this.deactivate(tabId, pluginId)
+        await this.deactivate(tabId, pluginId, true)
       }
     }
   }

@@ -23,6 +23,7 @@ import { mergePluginSettings } from '@shared/plugins'
 import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
+import ColorHexInput from './ColorHexInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import PluginFieldEditor from '../plugins/PluginFieldEditor'
 
@@ -97,12 +98,21 @@ function DefaultsColorRow({
           Theme default
         </label>
         {HEX_COLOR_RE.test(pickerValue) ? (
-          <input
-            type="color"
-            value={pickerValue}
-            disabled={useTheme}
-            onChange={(e) => onChange(e.target.value)}
-          />
+          <>
+            <input
+              type="color"
+              value={pickerValue}
+              onClick={() => {
+                // Clicking the swatch starts a custom color: clear “Theme default”
+                // even if the picker is cancelled.
+                if (useTheme) {
+                  onChange(themeVarHex(themeVar))
+                }
+              }}
+              onChange={(e) => onChange(e.target.value)}
+            />
+            <ColorHexInput value={pickerValue} onChange={onChange} />
+          </>
         ) : null}
       </div>
     </div>

@@ -17,6 +17,7 @@ import {
 } from '@shared/types'
 import {
   defaultPortForType,
+  hostDisplayName,
   hostToConnection,
   hostProfileFromConnection,
   protocolConfigFrom,
@@ -54,7 +55,9 @@ import {
 } from '@shared/pluginLayout'
 import {
   DEFAULT_HOSTS_ORGANIZATION,
-  normalizeHostsOrganization
+  moveHostInOrganization,
+  normalizeHostsOrganization,
+  UNGROUPED_SECTION_ID
 } from '@shared/hostOrganization'
 import { sessionAccentStyle, sessionTerminalStyle } from './sessionStyleCss'
 import PluginToolbar from './plugins/PluginToolbar'
@@ -169,6 +172,8 @@ export default function App() {
     connected: boolean
     /** Tab to link when saving a new host from an open session */
     linkTabId?: string
+    /** Group to place a newly created host into on save */
+    groupId?: string
   } | null>(null)
   const [saveAsHostName, setSaveAsHostName] = useState('')
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
@@ -655,11 +660,14 @@ export default function App() {
       return
     }
     setTabs((prev) =>
-      prev.map((t) =>
-        t.id === tabId
-          ? { ...t, pluginLayout: removePluginFromLayout(t.pluginLayout, pluginId) }
-          : t
-      )
+      prev.map((t) => {
+        if (t.id !== tabId) return t
+        return {
+          ...t,
+          pluginLayout: removePluginFromLayout(t.pluginLayout, pluginId),
+          activePluginIds: t.activePluginIds.filter((id) => id !== pluginId)
+        }
+      })
     )
     await window.wassh.deactivatePlugin(tabId, pluginId)
   }, [])
@@ -774,6 +782,47 @@ export default function App() {
     await window.wassh.saveHost(host)
     await refreshHosts()
   }
+
+  const applyHostToSessions = async (
+    host: HostProfile,
+    password: string,
+    passphrase: string
+  ): Promise<void> => {
+    await saveHost(host, password, passphrase)
+    const base = hostToConnection(host)
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.connection.hostId === host.id ? { ...t, connection: { ...base } } : t
+      )
+    )
+    const { ephemeralPassword, ephemeralPassphrase, ...livePatch } = base
+    for (const t of tabsRef.current) {
+      if (t.connection.hostId === host.id) {
+        void window.wassh.updateConnection(t.id, livePatch)
+      }
+    }
+  }
+
+  const duplicateHost = useCallback(
+    async (host: HostProfile) => {
+      const copy: HostProfile = {
+        ...host,
+        id: crypto.randomUUID(),
+        name: `${hostDisplayName(host)} (copy)`
+      }
+      await window.wassh.saveHost(copy)
+      // Place the copy right after the original in the same section.
+      const org = normalizeHostsOrganization(hostsOrganization)
+      const group = org.groups.find((g) => g.hostIds.includes(host.id))
+      const sectionId = group?.id ?? UNGROUPED_SECTION_ID
+      const sectionHostIds = group?.hostIds ?? org.ungroupedHostIds
+      await saveHostsOrganization(
+        moveHostInOrganization(org, copy.id, sectionId, sectionHostIds.indexOf(host.id) + 1)
+      )
+      await refreshHosts()
+    },
+    [hostsOrganization, saveHostsOrganization, refreshHosts]
+  )
 
   const closePalette = useCallback(() => {
     setPaletteOpen(false)
@@ -914,7 +963,11 @@ export default function App() {
             setTabs((prev) =>
               prev.map((t) =>
                 t.id === activeTabId
-                  ? { ...t, pluginLayout: removePluginFromLayout(t.pluginLayout, args) }
+                  ? {
+                      ...t,
+                      pluginLayout: removePluginFromLayout(t.pluginLayout, args),
+                      activePluginIds: t.activePluginIds.filter((id) => id !== args)
+                    }
                   : t
               )
             )
@@ -998,10 +1051,21 @@ export default function App() {
           onToggleCollapse={() => updateSettings({ sidebarCollapsed: !settings.sidebarCollapsed })}
           onConnect={(host) => openTab(hostToConnection(host))}
           onEdit={(host) => setHostEditor({ mode: 'editHost', initial: host, connected: false })}
+          onDuplicate={(host) => {
+            void duplicateHost(host)
+          }}
           onDelete={(host) => {
             void window.wassh.deleteHost(host.id).then(refreshHosts)
           }}
           onNewHost={() => setHostEditor({ mode: 'editHost', initial: emptyHost(), connected: false })}
+          onAddHostToGroup={(groupId) =>
+            setHostEditor({
+              mode: 'editHost',
+              initial: emptyHost(),
+              connected: false,
+              groupId
+            })
+          }
           onSaveOrganization={(org) => {
             void saveHostsOrganization(org)
           }}
@@ -1180,10 +1244,18 @@ export default function App() {
               {tabsByStablePaneOrder(tabs).map((t) => {
                 const style = resolveSessionStyle(t.connection, styleDefaults)
                 const dropUpload = dropUploads[t.id]
-                const dropPct =
-                  dropUpload && dropUpload.totalBytes > 0
-                    ? Math.min(100, (dropUpload.transferredBytes / dropUpload.totalBytes) * 100)
-                    : 0
+                const dropUploadView = dropUpload
+                  ? {
+                      name: dropUpload.name,
+                      meta: `${formatBytes(dropUpload.transferredBytes)} / ${formatBytes(
+                        dropUpload.totalBytes
+                      )}`,
+                      pct:
+                        dropUpload.totalBytes > 0
+                          ? Math.min(100, (dropUpload.transferredBytes / dropUpload.totalBytes) * 100)
+                          : 0
+                    }
+                  : null
                 return (
                   <div
                     key={t.id}
@@ -1242,25 +1314,12 @@ export default function App() {
                         registerSearch={registerSearch}
                         unregisterSearch={unregisterSearch}
                         dropEnabled={sftpReadyRef.current.has(t.id)}
+                        dropUpload={dropUploadView}
                         onDropFiles={(tabId, files) => {
                           void uploadDroppedFiles(tabId, files)
                         }}
                       />
                     </PluginSessionFrame>
-                    {dropUpload ? (
-                      <div className="drop-upload-banner">
-                        <div className="drop-upload-row">
-                          <span className="drop-upload-name">⬆ {dropUpload.name}</span>
-                          <span className="drop-upload-meta">
-                            {formatBytes(dropUpload.transferredBytes)} /{' '}
-                            {formatBytes(dropUpload.totalBytes)}
-                          </span>
-                        </div>
-                        <div className="drop-upload-track">
-                          <div className="drop-upload-fill" style={{ width: `${dropPct}%` }} />
-                        </div>
-                      </div>
-                    ) : null}
                   </div>
                 )
               })}
@@ -1436,25 +1495,49 @@ export default function App() {
           onClose={() => setHostEditor(null)}
           onSaveHost={(host, password, passphrase) => {
             const linkTabId = hostEditor.linkTabId
-            void saveHost(host, password, passphrase)
-            if (!linkTabId) return
-            setTabs((prev) =>
-              prev.map((t) =>
-                t.id === linkTabId && !t.connection.hostId
-                  ? {
-                      ...t,
-                      connection: {
-                        ...t.connection,
-                        hostId: host.id,
-                        passwordVaultId: host.passwordVaultId || t.connection.passwordVaultId,
-                        passphraseVaultId:
-                          host.passphraseVaultId || t.connection.passphraseVaultId
+            const groupId = hostEditor.groupId
+            void (async () => {
+              await saveHost(host, password, passphrase)
+              if (groupId) {
+                const group = hostsOrganization.groups.find((g) => g.id === groupId)
+                if (group) {
+                  await saveHostsOrganization(
+                    moveHostInOrganization(
+                      hostsOrganization,
+                      host.id,
+                      groupId,
+                      group.hostIds.length
+                    )
+                  )
+                }
+                await refreshHosts()
+              }
+              if (!linkTabId) return
+              setTabs((prev) =>
+                prev.map((t) =>
+                  t.id === linkTabId && !t.connection.hostId
+                    ? {
+                        ...t,
+                        connection: {
+                          ...t.connection,
+                          hostId: host.id,
+                          passwordVaultId: host.passwordVaultId || t.connection.passwordVaultId,
+                          passphraseVaultId:
+                            host.passphraseVaultId || t.connection.passphraseVaultId
+                        }
                       }
-                    }
-                  : t
+                    : t
+                )
               )
-            )
+            })()
           }}
+          onApplyToSessions={
+            hostEditor.mode === 'editHost' &&
+            'id' in hostEditor.initial &&
+            tabs.some((t) => t.connection.hostId === (hostEditor.initial as HostProfile).id)
+              ? applyHostToSessions
+              : undefined
+          }
           onSaveSession={(connection) => {
             const tabId = hostEditor.linkTabId
             if (!tabId) return

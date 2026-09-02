@@ -629,6 +629,12 @@ export function remoteSessionBusyFallbackMessage(
   return `${label} session "${sessionName}" is busy; opened a normal shell instead.`
 }
 
+/** Remote session tool is not installed on the host; a plain shell is opened instead */
+export function remoteSessionUnavailableMessage(kind: RemoteSessionKind): string {
+  const label = kind === REMOTE_SESSION_KIND_TMUX ? 'tmux' : 'screen'
+  return `${label} is not available on this host; opened a normal shell instead.`
+}
+
 function serialParityAbbrev(parity: SerialParity): string {
   if (parity === SERIAL_PARITY_EVEN) {
     return 'E'
