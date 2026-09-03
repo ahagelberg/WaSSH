@@ -494,7 +494,7 @@ export default function TerminalView({
           <div className="terminal-drop-box">
             <div className="terminal-drop-icon">⬆</div>
             <div className="terminal-drop-title">Drop to upload over SFTP</div>
-            <div className="terminal-drop-hint">Files are uploaded to the remote upload directory</div>
+            <div className="terminal-drop-hint">Files are uploaded to the remote user's home folder</div>
           </div>
         </div>
       ) : null}
