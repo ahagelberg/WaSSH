@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "WaSSH — native multi-tab SSH client",
   "main": "./out/main/index.js",
-  "author": "WaSSH",
+  "author": "Andreas Hagelberg",
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",

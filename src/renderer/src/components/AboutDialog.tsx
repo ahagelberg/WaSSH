@@ -42,10 +42,8 @@ export default function AboutDialog({ onClose }: Props) {
             <div className="about-app-name">{APP_NAME}</div>
             <div className="about-app-version">Version {APP_VERSION}</div>
             <p className="about-app-desc">{APP_DESCRIPTION}</p>
-            <p className="about-app-meta">
-              License: {APP_LICENSE}
-              {APP_AUTHOR ? ` · ${APP_AUTHOR}` : null}
-            </p>
+            <p className="about-app-meta">By {APP_AUTHOR}</p>
+            <p className="about-app-meta">License: {APP_LICENSE}</p>
           </div>
           <section className="about-licenses">
             <h3>Third-party licenses</h3>
