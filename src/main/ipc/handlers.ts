@@ -23,6 +23,20 @@ import type { PluginHost } from '../plugins/PluginHost'
 import { queuePluginRestore } from '../plugins/createPluginSystem'
 import type { PluginDataStore } from '../store/pluginDataStore'
 
+/** Protocols the shell may open in the default browser */
+const EXTERNAL_URL_PROTOCOLS = new Set(['http:', 'https:'])
+
+/** True when a string is an http(s) URL safe to hand to the OS. */
+export function isSafeExternalUrl(url: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
+  }
+  return EXTERNAL_URL_PROTOCOLS.has(parsed.protocol)
+}
+
 export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): void {
   nativeTheme.themeSource = theme
   if (win && !win.isDestroyed()) {
@@ -128,6 +142,13 @@ export function registerIpc(
   })
 
   ipcMain.handle('serial:listPorts', () => listSerialPorts())
+
+  ipcMain.handle('shell:openExternal', async (_e, url: string) => {
+    if (!isSafeExternalUrl(url)) {
+      return
+    }
+    await shell.openExternal(url)
+  })
 
   ipcMain.handle('plugins:list', () => pluginHost.listPlugins())
   ipcMain.handle('plugins:activate', async (_e, tabId: string, pluginId: string) => {

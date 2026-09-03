@@ -12,7 +12,7 @@ import {
   WAKE_RECONNECT_DELAY_MS
 } from '../shared/types'
 import { APP_NAME } from '../shared/version'
-import { applyChromeTheme, registerIpc } from './ipc/handlers'
+import { applyChromeTheme, isSafeExternalUrl, registerIpc } from './ipc/handlers'
 import { SessionManager } from './ssh/SessionManager'
 import { CredentialVault } from './store/credentialVault'
 import {
@@ -171,7 +171,9 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    void shell.openExternal(details.url)
+    if (isSafeExternalUrl(details.url)) {
+      void shell.openExternal(details.url)
+    }
     return { action: 'deny' }
   })
 

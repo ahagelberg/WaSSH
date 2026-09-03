@@ -627,6 +627,8 @@ export interface WasshApi {
   onPluginMessage: (cb: (ev: PluginMessageEvent) => void) => () => void
   onSideConnectionData: (cb: (ev: SideConnectionDataEvent) => void) => () => void
   onSideConnectionClosed: (cb: (ev: SideConnectionClosedEvent) => void) => () => void
+  /** Open a URL in the OS default browser */
+  openExternal: (url: string) => Promise<void>
 }
 
 declare global {

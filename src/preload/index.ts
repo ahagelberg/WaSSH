@@ -98,7 +98,8 @@ const api: WasshApi = {
   onSideConnectionData: (cb) =>
     on('plugin:sideData', (ev) => cb(ev as SideConnectionDataEvent)),
   onSideConnectionClosed: (cb) =>
-    on('plugin:sideClosed', (ev) => cb(ev as SideConnectionClosedEvent))
+    on('plugin:sideClosed', (ev) => cb(ev as SideConnectionClosedEvent)),
+  openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url)
 }
 
 contextBridge.exposeInMainWorld('wassh', api)

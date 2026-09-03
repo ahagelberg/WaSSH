@@ -164,7 +164,12 @@ export default function TerminalView({
     term.loadAddon(fit)
     term.loadAddon(search)
     term.loadAddon(unicode)
-    term.loadAddon(new WebLinksAddon())
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        event?.preventDefault()
+        void window.wassh.openExternal(uri)
+      })
+    )
     term.unicode.activeVersion = '11'
     term.open(host)
     if (bellLineRef.current) {
