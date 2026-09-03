@@ -1,4 +1,5 @@
 import { app, BrowserWindow, Menu, powerMonitor, shell } from 'electron'
+import { copyFileSync, existsSync, mkdirSync, readdirSync } from 'fs'
 import { join } from 'path'
 import {
   DEFAULT_THEME,
@@ -11,7 +12,7 @@ import {
   THEME_WINDOW_BACKGROUND,
   WAKE_RECONNECT_DELAY_MS
 } from '../shared/types'
-import { APP_NAME } from '../shared/version'
+import { APP_ID, APP_NAME } from '../shared/version'
 import { applyChromeTheme, isSafeExternalUrl, registerIpc } from './ipc/handlers'
 import { SessionManager } from './ssh/SessionManager'
 import { CredentialVault } from './store/credentialVault'
@@ -24,6 +25,7 @@ import {
 import { attachWindowBoundsPersistence, restoreWindowBounds } from './windowBounds'
 import { createPluginSystem } from './plugins/createPluginSystem'
 import { PluginDataStore } from './store/pluginDataStore'
+import { checkForUpdatesManually, setupAutoUpdater } from './updater'
 
 /** Accelerator for File > Preferences */
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
@@ -85,6 +87,34 @@ function installProcessErrorGuards(): void {
     }
     console.error(reason)
   })
+}
+
+/** userData dir used by pre-pinning runs (Electron dev fell back to the package name). */
+const LEGACY_USER_DATA_DIR_NAME = 'wassh'
+
+/** Pin config to a stable per-user dir regardless of the app name Electron resolves to. */
+function pinUserDataPath(): void {
+  app.setPath('userData', join(app.getPath('appData'), APP_NAME))
+}
+
+/** One-time copy of config/credentials from the legacy dev userData dir into the pinned one. */
+function migrateLegacyUserData(): void {
+  const legacy = join(app.getPath('appData'), LEGACY_USER_DATA_DIR_NAME)
+  const target = join(app.getPath('appData'), APP_NAME)
+  if (legacy === target || !existsSync(legacy)) {
+    return
+  }
+  mkdirSync(target, { recursive: true })
+  for (const entry of readdirSync(legacy, { withFileTypes: true })) {
+    if (!entry.isFile()) {
+      continue
+    }
+    const from = join(legacy, entry.name)
+    const to = join(target, entry.name)
+    if (!existsSync(to)) {
+      copyFileSync(from, to)
+    }
+  }
 }
 
 function attachPowerMonitor(): void {
@@ -338,6 +368,11 @@ function installAppMenu(): void {
       role: 'help',
       submenu: [
         {
+          label: 'Check for Updates…',
+          click: () => checkForUpdatesManually()
+        },
+        { type: 'separator' },
+        {
           label: aboutLabel,
           click: () => openAboutDialog()
         }
@@ -348,8 +383,11 @@ function installAppMenu(): void {
 }
 
 installProcessErrorGuards()
+pinUserDataPath()
+migrateLegacyUserData()
 
 app.whenReady().then(() => {
+  app.setAppUserModelId(APP_ID)
   const vault = new CredentialVault()
   const sessionStore = new SessionStore()
   const tabStore = new TabStore()
@@ -385,6 +423,7 @@ app.whenReady().then(() => {
   installAppMenu()
   attachPowerMonitor()
   createWindow()
+  setupAutoUpdater(getWindow)
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow()

@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 20 20"
+   width="20"
+   height="20"
+   version="1.1"
+   id="svg5"
+   sodipodi:docname="WaSSH program icon.svg"
+   inkscape:version="1.4.4 (dcaf3e7, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs5">
+    <linearGradient
+       id="linearGradient10"
+       inkscape:collect="always">
+      <stop
+         style="stop-color:#31383f;stop-opacity:1;"
+         offset="0.24887556"
+         id="stop9" />
+      <stop
+         style="stop-color:#678082;stop-opacity:1;"
+         offset="0.65517241"
+         id="stop10" />
+    </linearGradient>
+    <linearGradient
+       id="linearGradient5"
+       inkscape:collect="always">
+      <stop
+         style="stop-color:#34383c;stop-opacity:1;"
+         offset="0"
+         id="stop5" />
+      <stop
+         style="stop-color:#668183;stop-opacity:1;"
+         offset="1"
+         id="stop6" />
+    </linearGradient>
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#linearGradient5"
+       id="linearGradient6"
+       x1="10"
+       y1="18.000004"
+       x2="10"
+       y2="1.9999989"
+       gradientUnits="userSpaceOnUse" />
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#linearGradient10"
+       id="linearGradient9"
+       x1="10"
+       y1="11.749999"
+       x2="10"
+       y2="-4.250001"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="translate(0,-0.14388489)" />
+  </defs>
+  <sodipodi:namedview
+     id="namedview5"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="62.55"
+     inkscape:cx="9.9920064"
+     inkscape:cy="9.4244604"
+     inkscape:window-width="2088"
+     inkscape:window-height="1701"
+     inkscape:window-x="2202"
+     inkscape:window-y="0"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="svg5" />
+  <!-- Washing Machine Main Body -->
+  <rect
+     x="2"
+     y="5.5811353"
+     width="16"
+     height="12.418865"
+     fill="#2A3846"
+     id="rect1"
+     inkscape:export-filename="WaSSH program icon.png"
+     inkscape:export-xdpi="4915.2002"
+     inkscape:export-ydpi="4915.2002"
+     style="fill:url(#linearGradient6)"
+     ry="1" />
+  <!-- Control Panel Bar -->
+  <rect
+     x="2"
+     y="1.8561156"
+     width="16"
+     height="3.5"
+     fill="#1E293B"
+     id="rect2"
+     rx="1"
+     style="fill:url(#linearGradient9)" />
+  <!-- Control Panel Details (Dials & Status Light) -->
+  <circle
+     cx="4.5"
+     cy="3.6061156"
+     r="0.75"
+     fill="#38bdf8"
+     id="circle2" />
+  <circle
+     cx="7"
+     cy="3.6061156"
+     r="0.5"
+     fill="#64748b"
+     id="circle3"
+     style="fill:#1e293b;fill-opacity:1" />
+  <rect
+     x="12"
+     y="3.1061156"
+     width="4"
+     height="1"
+     rx="0.5"
+     fill="#475569"
+     id="rect3"
+     style="fill:#272e39;fill-opacity:1" />
+  <!-- Outer Door Frame -->
+  <circle
+     cx="10"
+     cy="11.5"
+     r="5"
+     fill="#1E293B"
+     stroke="#38BDF8"
+     stroke-width="0.75"
+     id="circle4" />
+  <!-- Inner Glass Drum -->
+  <circle
+     cx="10"
+     cy="11.5"
+     r="3.75"
+     fill="#0F172A"
+     id="circle5" />
+  <!-- Terminal Prompt inside Drum (>_) -->
+  <!-- Chevron '>' -->
+  <path
+     d="M 8 9.75 L 10 11.5 L 8 13.25"
+     fill="none"
+     stroke="#38BDF8"
+     stroke-width="1.2"
+     stroke-linecap="round"
+     stroke-linejoin="round"
+     id="path5" />
+  <!-- Cursor '_' -->
+  <line
+     x1="11"
+     y1="13.25"
+     x2="12.5"
+     y2="13.25"
+     stroke="#38BDF8"
+     stroke-width="1.2"
+     stroke-linecap="round"
+     id="line5" />
+</svg>

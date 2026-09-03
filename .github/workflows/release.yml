@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate tag matches package.json version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build native modules
+        run: npm run setup-native
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build and publish release
+        run: npm run dist -- --publish always
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload installers as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wassh-${{ github.ref_name }}
+          path: |
+            release/*.exe
+            release/*.yml
+            release/*.blockmap
+          if-no-files-found: error

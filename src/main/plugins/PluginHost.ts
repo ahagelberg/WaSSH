@@ -69,7 +69,7 @@ export interface PluginMainContext {
 export interface PluginMainModule {
   onActivate: (ctx: PluginMainContext) => void | Promise<void>
   onDeactivate?: (ctx: PluginMainContext) => void | Promise<void>
-  onMessage?: (ctx: PluginMainContext, payload: unknown) => void | Promise<unknown>
+  onMessage?: (ctx: PluginMainContext, payload: unknown) => unknown | Promise<unknown>
 }
 
 interface ActiveInstance {
