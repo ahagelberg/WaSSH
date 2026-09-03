@@ -33,6 +33,12 @@ export const DEFAULT_MACRO_BUTTONS: PluginMacroButton[] = [
     label: 'apt upgrade',
     text: 'sudo apt update;sudo apt upgrade -y;sudo apt autoremove -y\n',
     hotkey: ''
+  },
+  {
+    id: 'm3',
+    label: 'create venv',
+    text: 'python3 -m venv .venv\n',
+    hotkey: ''
   }
 ]
 
@@ -74,7 +80,7 @@ export const serverMonitorManifest: PluginManifest = {
         label: 'Show status',
         type: 'boolean',
         default: SERVER_MONITOR_SHOW_STATUS_DEFAULT,
-        description: 'Uptime, load, temperatures, kernel, and task counts.'
+        description: 'OS, uptime, load, temperatures, kernel, and task counts.'
       },
       {
         key: 'showProcesses',
@@ -148,13 +154,6 @@ export const mqttExplorerManifest: PluginManifest = {
         type: 'string',
         default: MQTT_EXPLORER_DEFAULT_HOST,
         description: 'Broker address as seen from the remote SSH host (usually 127.0.0.1).'
-      },
-      {
-        key: 'port',
-        label: 'Broker port',
-        type: 'number',
-        default: MQTT_EXPLORER_DEFAULT_PORT,
-        description: 'Plain MQTT port (no TLS).'
       }
     ],
     hostSettingsHeading: 'MQTT',
@@ -173,6 +172,13 @@ export const mqttExplorerManifest: PluginManifest = {
         default: '',
         secret: true,
         description: 'Optional MQTT password for this host.'
+      },
+      {
+        key: 'port',
+        label: 'Server port',
+        type: 'number',
+        default: MQTT_EXPLORER_DEFAULT_PORT,
+        description: 'Plain MQTT port (no TLS).'
       }
     ],
     views: [{ id: 'panel', placement: 'split-right', title: 'MQTT' }]

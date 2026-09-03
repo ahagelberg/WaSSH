@@ -924,7 +924,7 @@ function TempFacts({ temps }: { temps: ServerMonitorTemp[] }): ReactElement | nu
     <>
       {temps.map((t) => (
         <div key={t.name} className="monitor-fact">
-          <span title={t.name}>{t.name}</span>
+          <span title={t.name}>{`Temp (${t.name}):`}</span>
           <strong>{formatTemp(t.celsius)}</strong>
         </div>
       ))}
@@ -1198,7 +1198,7 @@ export default function ServerMonitorView({
                 <strong>{formatUptime(snapshot?.uptimeSec ?? 0)}</strong>
               </div>
               <div className="monitor-fact">
-                <span>Load</span>
+                <span>Load avg</span>
                 <strong>
                   {snapshot
                     ? `${formatLoad(snapshot.load1)} · ${formatLoad(snapshot.load5)} · ${formatLoad(snapshot.load15)}`
@@ -1206,7 +1206,7 @@ export default function ServerMonitorView({
                 </strong>
               </div>
               <div className="monitor-fact">
-                <span>Available</span>
+                <span title="Free + reclaimable RAM">RAM free</span>
                 <strong>
                   {snapshot ? formatBytes(snapshot.memAvailableBytes) : MISSING}
                 </strong>
@@ -1226,6 +1226,10 @@ export default function ServerMonitorView({
                 </strong>
               </div>
               <TempFacts temps={snapshot?.temperatures ?? []} />
+              <div className="monitor-fact monitor-fact-wide">
+                <span>OS</span>
+                <strong title={snapshot?.distro || ''}>{snapshot?.distro || MISSING}</strong>
+              </div>
               <div className="monitor-fact monitor-fact-wide">
                 <span>Kernel</span>
                 <strong title={snapshot?.kernel || ''}>{snapshot?.kernel || MISSING}</strong>

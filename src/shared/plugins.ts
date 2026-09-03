@@ -263,6 +263,8 @@ export interface ServerMonitorSnapshot {
   load1: number
   load5: number
   load15: number
+  /** Best-effort distro name parsed from /etc/os-release and friends */
+  distro: string
   /** Kernel / OS summary from `uname` */
   kernel: string
   /** Logical CPU count */

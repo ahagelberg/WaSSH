@@ -36,6 +36,12 @@ const PS_SORT_FIELD: Record<ServerMonitorProcessSort, string> = {
 /** Max wait for one exec sample (ms) */
 const EXEC_WAIT_MS = 10000
 
+/** Process rows a baseline list must have before short samples are held back */
+const PROC_LIST_STABLE_MIN = 10
+
+/** Consecutive short samples before a shorter process list is accepted */
+const PROC_LIST_STALE_LIMIT = 3
+
 /** Milliseconds per second (rate math) */
 const MS_PER_SEC = 1000
 
@@ -61,6 +67,9 @@ interface DiskIoCounters {
   writeBytes: number
 }
 
+/** OS families the monitor can sample (Linux stays the primary path) */
+type MonitorFamily = 'linux' | 'macos' | 'freebsd'
+
 interface MonitorSessionState {
   stopped: boolean
   busy: boolean
@@ -73,6 +82,12 @@ interface MonitorSessionState {
   timer: ReturnType<typeof setInterval> | null
   intervalMs: number
   poll: () => Promise<void>
+  /** OS family detected from `uname`; selects the sample command + parser */
+  family: MonitorFamily
+  /** Last full process list, kept when a sample's list collapses (transient ps cut) */
+  lastProcesses: ServerMonitorProcess[]
+  /** Consecutive collapsed-list samples */
+  shortSamples: number
 }
 
 interface RendererMessage {
@@ -116,6 +131,8 @@ function buildMonitorCommand(sort: ServerMonitorProcessSort, descending: boolean
     '(cat /proc/loadavg 2>/dev/null || echo 0 0 0 0/0 0)',
     '(uname -srm 2>/dev/null || echo unknown)',
     '(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)',
+    "echo '===OS==='",
+    "(cat /etc/os-release /usr/lib/os-release /etc/lsb-release /etc/redhat-release /etc/system-release /etc/arch-release /etc/SuSE-release 2>/dev/null || true)",
     "echo '===CPU==='",
     "(grep -E '^cpu' /proc/stat 2>/dev/null || echo cpu 0 0 0 0 0 0 0 0)",
     "echo '===MEM==='",
@@ -133,6 +150,108 @@ function buildMonitorCommand(sort: ServerMonitorProcessSort, descending: boolean
     "echo '===PROCS==='",
     `(ps -eo pid=,user:16=,state=,ni=,nlwp=,pcpu=,pmem=,rss=,args= --sort=${procSort} 2>/dev/null | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT} || true)`
   ].join('; ')
+}
+
+/**
+ * BSD/macOS sample command. Shares Linux section markers + shapes where
+ * possible (META/OS/CPU/MEM/DISK/PROCS), so parsers can mostly be reused.
+ */
+function buildUnixCommand(family: MonitorFamily, sort: ServerMonitorProcessSort): string {
+  const isMac = family === 'macos'
+  const parts: string[] = [
+    // hostname / uptime / loadavg / kernel / cpu count
+    "echo '===META==='",
+    '(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)',
+    '(b=$(sysctl -n kern.boottime 2>/dev/null | sed -n "s/.*sec = \\([0-9][0-9]*\\).*/\\1/p"); if [ -n "$b" ]; then echo $(( $(date +%s 2>/dev/null || echo 0) - b )); else echo 0; fi)',
+    'echo "$(sysctl -n vm.loadavg 2>/dev/null | tr -d "{}" || echo 0 0 0) 0/0"',
+    '(uname -srm 2>/dev/null || echo unknown)',
+    '(sysctl -n hw.ncpu 2>/dev/null || echo 1)',
+    // OS / distro
+    "echo '===OS==='",
+    isMac
+      ? '(echo "PRETTY_NAME=\\"$(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)\\"")'
+      : '(cat /etc/os-release /usr/lib/os-release 2>/dev/null || true)',
+    '(echo "$(uname -sr 2>/dev/null)")',
+    // CPU: macOS reports a ready-made percent; BSD gives tick counters for deltas
+    "echo '===CPU==='",
+    isMac
+      ? "(top -l 1 -n 0 2>/dev/null | awk '/CPU usage:/' || true)"
+      : "(sysctl -n kern.cp_time 2>/dev/null | awk '{ print \"cpu\", $1, $2, $3, $5, $4 }' || true)",
+    // Memory in Linux-shaped MemTotal/… kB lines
+    "echo '===MEM==='",
+    isMac
+      ? '(p=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096); t=$(sysctl -n hw.memsize 2>/dev/null || echo 0); f=$(vm_stat 2>/dev/null | awk \'/Pages free/{print $3}\' | tr -d "."); i=$(vm_stat 2>/dev/null | awk \'/Pages inactive/{print $3}\' | tr -d "."); s=$(vm_stat 2>/dev/null | awk \'/Pages speculative/{print $3}\' | tr -d "."); f=${f:-0}; i=${i:-0}; s=${s:-0}; echo "MemTotal: $((t / 1024)) kB"; echo "MemAvailable: $(((f + i + s) * p / 1024)) kB"; echo "MemFree: $((f * p / 1024)) kB")'
+      : '(p=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096); t=$(sysctl -n hw.physmem 2>/dev/null || echo 0); f=$(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo 0); i=$(sysctl -n vm.stats.vm.v_inactive_count 2>/dev/null || echo 0); c=$(sysctl -n vm.stats.vm.v_cache_count 2>/dev/null || echo 0); f=${f:-0}; i=${i:-0}; c=${c:-0}; echo "MemTotal: $((t / 1024)) kB"; echo "MemAvailable: $(((f + i + c) * p / 1024)) kB"; echo "MemFree: $((f * p / 1024)) kB")',
+    isMac
+      ? '(sysctl vm.swapusage 2>/dev/null | awk \'{ t=0; u=0; for (i = 1; i <= NF; i++) { if ($i == "total") { gsub(/[A-Za-z]/, "", $(i+2)); t = $(i+2) * 1024 } if ($i == "free") { gsub(/[A-Za-z]/, "", $(i+2)); u = $(i+2) * 1024 } } } END { if (t > 0) { print "SwapTotal: " t " kB"; print "SwapFree: " u " kB" } }\' || true)'
+      : '(swapinfo -k 2>/dev/null | awk \'NR > 1 { s += $2; a += $4 } END { if (s > 0) { print "SwapTotal: " s " kB"; print "SwapFree: " a " kB" } }\' || true)',
+    // Root disk usage (KB blocks on BSD/macOS)
+    "echo '===DISK==='",
+    '(df -k / 2>/dev/null | tail -n 1 || true)',
+    // Per-interface RX/TX byte counters (link rows only)
+    "echo '===NET==='",
+    '(netstat -ib 2>/dev/null | awk \'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "Ibytes") cI = i; if ($i == "Obytes") cO = i } } NR > 1 { for (i = 1; i <= NF; i++) { if (index($i, "<Link") == 1) { print $1, $cI, $cO; break } } }\' || true)'
+  ]
+  if (!isMac) {
+    parts.push(
+      "echo '===TEMP==='",
+      '(i=0; n=$(sysctl -n hw.ncpu 2>/dev/null || echo 1); while [ "$i" -lt "$n" ]; do t=$(sysctl -n dev.cpu.$i.temperature 2>/dev/null); if [ -n "$t" ]; then echo "cpu$i $t"; fi; i=$((i + 1)); done || true)'
+    )
+  }
+  parts.push(
+    "echo '===PROCS==='",
+    buildBsdProcCommand(isMac, sort === 'mem')
+  )
+  return parts.join('; ')
+}
+
+/**
+ * BSD/macOS process list. BSD `ps -o` keywords differ across flavors (and some
+ * reject unknown ones entirely), so try the rich set first and fall back to a
+ * minimal set that only uses keywords found on every BSD-derived `ps`.
+ */
+function buildBsdProcCommand(isMac: boolean, byMem: boolean): string {
+  const psField = isMac ? 'command' : 'args'
+  const psState = isMac ? 'state' : 'stat'
+  const orderFlag = byMem ? '-m' : '-r'
+  return `(rows=$(ps -A ${orderFlag} -o pid=,user=,${psState}=,nice=,%cpu=,%mem=,rss=,${psField}= 2>/dev/null); if [ -n "$rows" ]; then printf '%s\n' "$rows" | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT}; else ps -A ${orderFlag} -o pid=,user=,%cpu=,%mem=,rss=,${psField}= 2>/dev/null | awk '{ cmd=$6; for (j = 7; j <= NF; j++) cmd = cmd " " $j; print $1, $2, "?", 0, $3, $4, $5, cmd }' | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT}; fi)`
+}
+
+/**
+ * Wrap a command so it runs under a POSIX `/bin/sh`, whatever the remote login
+ * shell is (e.g. FreeBSD defaults to csh).
+ */
+function shWrap(payload: string): string {
+  return `/bin/sh -c '${payload.replace(/'/g, `'\\''`)}'`
+}
+
+/** Pick the sample command for the detected OS family. */
+function buildSampleCommand(
+  family: MonitorFamily,
+  sort: ServerMonitorProcessSort,
+  descending: boolean
+): string {
+  const payload =
+    family === 'linux'
+      ? buildMonitorCommand(sort, descending)
+      : buildUnixCommand(family, sort)
+  return family === 'linux' ? payload : shWrap(payload)
+}
+
+/** Detect the OS family from a sample's META kernel line (`uname -srm`). */
+function detectFamilyFromSample(raw: string): MonitorFamily {
+  const meta = section(raw, 'META')
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  const first = (meta[3] || '').split(/\s+/)[0] || ''
+  if (first === 'Darwin') {
+    return 'macos'
+  }
+  if (first === 'FreeBSD' || first === 'OpenBSD' || first === 'NetBSD' || first === 'DragonFly') {
+    return 'freebsd'
+  }
+  return 'linux'
 }
 
 function section(raw: string, name: string): string {
@@ -214,6 +333,63 @@ function parseLoadProcs(field: string): { running: number; total: number } {
     running: Number(parts[0]) || 0,
     total: Number(parts[1]) || 0
   }
+}
+
+/** Strip surrounding quotes from an os-release style value */
+function unquoteField(value: string): string {
+  const v = value.trim()
+  if (v.length >= 2) {
+    const first = v[0]
+    const last = v[v.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return v.slice(1, -1).trim()
+    }
+  }
+  return v
+}
+
+/** Best-effort distro name (PRETTY_NAME preferred) from os-release style files */
+function parseDistroName(block: string): string {
+  let name = ''
+  let version = ''
+  let pretty = ''
+  for (const raw of block.split(/\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) {
+      continue
+    }
+    const eq = line.indexOf('=')
+    if (eq <= 0) {
+      if (!pretty) {
+        pretty = line
+      }
+      continue
+    }
+    const key = line.slice(0, eq).trim()
+    const value = unquoteField(line.slice(eq + 1))
+    if (!value) {
+      continue
+    }
+    if (key === 'PRETTY_NAME') {
+      return value
+    }
+    if (key === 'DISTRIB_DESCRIPTION' && !pretty) {
+      pretty = value
+    }
+    if (key === 'NAME' && !name) {
+      name = value
+    }
+    if (key === 'VERSION' && !version) {
+      version = value
+    }
+  }
+  if (pretty) {
+    return pretty
+  }
+  if (name) {
+    return version && !name.includes(version) ? `${name} ${version}` : name
+  }
+  return ''
 }
 
 function parseDiskIo(block: string): { readBytes: number; writeBytes: number } {
@@ -313,18 +489,26 @@ function parseTemperatures(block: string): ServerMonitorTemp[] {
     if (!trimmed) {
       continue
     }
-    const m = /^(\S+)\s+(-?\d+)$/.exec(trimmed)
-    if (!m) {
+    // Linux: "<type> <millidegrees>"
+    const milli = /^(\S+)\s+(-?\d+)$/.exec(trimmed)
+    if (milli) {
+      const value = Number(milli[2])
+      if (Number.isFinite(value)) {
+        rows.push({
+          name: milli[1],
+          celsius: value / SERVER_MONITOR_TEMP_MILLI_PER_C
+        })
+      }
       continue
     }
-    const milli = Number(m[2])
-    if (!Number.isFinite(milli)) {
-      continue
+    // BSD sysctl: "<name> 45.0C"
+    const degC = /^(\S+)\s+(-?[\d.]+)C$/.exec(trimmed)
+    if (degC) {
+      const value = Number(degC[2])
+      if (Number.isFinite(value)) {
+        rows.push({ name: degC[1], celsius: value })
+      }
     }
-    rows.push({
-      name: m[1],
-      celsius: milli / SERVER_MONITOR_TEMP_MILLI_PER_C
-    })
   }
   return rows
 }
@@ -361,6 +545,172 @@ function parseProcesses(block: string): ServerMonitorProcess[] {
   return rows
 }
 
+/** netstat -ib rows (`name rxBytes txBytes`) for BSD/macOS */
+function parseBsdNetworkCounters(block: string): Record<string, { rx: number; tx: number }> {
+  const ifaces: Record<string, { rx: number; tx: number }> = {}
+  for (const line of block.split(/\n/)) {
+    const parts = line.trim().split(/\s+/)
+    if (parts.length < 3 || parts[0].startsWith('lo')) {
+      continue
+    }
+    const rx = Number(parts[1])
+    const tx = Number(parts[2])
+    if (!Number.isFinite(rx) || !Number.isFinite(tx)) {
+      continue
+    }
+    ifaces[parts[0]] = { rx, tx }
+  }
+  return ifaces
+}
+
+/** Single-shot CPU percent from `top -l 1` (macOS has no /proc/stat). */
+function parseMacCpuPercent(block: string): number | null {
+  const m = /([\d.]+)%\s+idle/.exec(block)
+  if (!m) {
+    return null
+  }
+  const idle = Number(m[1])
+  if (!Number.isFinite(idle)) {
+    return null
+  }
+  return Math.max(0, Math.min(100, 100 - idle))
+}
+
+/** BSD `ps -A -r -o …` rows (thread count not available on all BSD flavors). */
+function parseBsdProcesses(block: string): ServerMonitorProcess[] {
+  const rows: ServerMonitorProcess[] = []
+  for (const line of block.split(/\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      continue
+    }
+    const m =
+      /^(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+[.,]?\d*)\s+(\d+[.,]?\d*)\s+(\d+)\s+(.*)$/.exec(
+        trimmed
+      )
+    if (!m) {
+      continue
+    }
+    const nice = Number(m[4]) || 0
+    rows.push({
+      pid: Number(m[1]) || 0,
+      user: m[2],
+      state: m[3],
+      nice,
+      threads: 0,
+      cpuPercent: Number(String(m[5]).replace(',', '.')) || 0,
+      memPercent: Number(String(m[6]).replace(',', '.')) || 0,
+      rssBytes: (Number(m[7]) || 0) * BYTES_PER_KIB,
+      command: m[8].trim()
+    })
+    if (rows.length >= SERVER_MONITOR_TOP_PROCESS_COUNT) {
+      break
+    }
+  }
+  return rows
+}
+
+/**
+ * Assemble a snapshot for macOS/FreeBSD samples. Data not available without
+ * root (macOS temps, per-core CPU, disk IO) degrades to empty/null.
+ */
+function parseUnixSample(
+  raw: string,
+  family: MonitorFamily,
+  prevCpu: CpuJiffies | null,
+  prevNet: NetCounters | null
+): {
+  snapshot: ServerMonitorSnapshot
+  cpu: CpuJiffies | null
+  cores: CpuJiffies[]
+  net: NetCounters
+  diskIo: DiskIoCounters
+} {
+  const now = Date.now()
+  const meta = section(raw, 'META').split(/\n/).map((l) => l.trim()).filter(Boolean)
+  const hostname = meta[0] || 'unknown'
+  const uptimeSec = Number(meta[1]) || 0
+  const loadParts = (meta[2] || '0 0 0 0/0 0').split(/\s+/)
+  const load1 = Number(loadParts[0]) || 0
+  const load5 = Number(loadParts[1]) || 0
+  const load15 = Number(loadParts[2]) || 0
+  const procs = parseLoadProcs(loadParts[3] || '0/0')
+  const distro = parseDistroName(section(raw, 'OS'))
+  const kernel = meta[3] || ''
+  const cpuCount = Number(meta[4]) || 0
+
+  let cpu: CpuJiffies | null = null
+  let cpuPercent: number | null = null
+  const cores: CpuJiffies[] = []
+  if (family === 'macos') {
+    cpuPercent = parseMacCpuPercent(section(raw, 'CPU'))
+  } else {
+    cpu = parseCpuBlock(section(raw, 'CPU')).aggregate ?? null
+    if (cpu && prevCpu) {
+      cpuPercent = cpuPercentFromDelta(cpu, prevCpu)
+    }
+  }
+
+  const memBlock = section(raw, 'MEM')
+  const memTotal = memKb(memBlock, 'MemTotal')
+  const memAvailable = memKb(memBlock, 'MemAvailable')
+  const memFree = memKb(memBlock, 'MemFree')
+  const available = memAvailable || memFree
+  const memUsed = Math.max(0, memTotal - available)
+  const swapTotal = memKb(memBlock, 'SwapTotal')
+  const swapFree = memKb(memBlock, 'SwapFree')
+  const swapUsed = Math.max(0, swapTotal - swapFree)
+
+  // BSD/macOS `df -k` reports 1024-byte blocks.
+  const disk = parseDisk(section(raw, 'DISK').split(/\n/)[0] || '')
+  const diskTotalBytes = disk.total * BYTES_PER_KIB
+  const diskUsedBytes = disk.used * BYTES_PER_KIB
+
+  const netCounters = parseBsdNetworkCounters(section(raw, 'NET'))
+  const network = netRates(netCounters, {}, prevNet, now)
+  const temperatures = parseTemperatures(section(raw, 'TEMP'))
+  const processes = parseBsdProcesses(section(raw, 'PROCS'))
+
+  return {
+    cpu,
+    cores,
+    net: { at: now, ifaces: netCounters },
+    diskIo: { at: now, readBytes: 0, writeBytes: 0 },
+    snapshot: emptySnapshot({
+      updatedAt: now,
+      hostname,
+      uptimeSec,
+      load1,
+      load5,
+      load15,
+      distro,
+      kernel,
+      cpuCount,
+      procsRunning: procs.running,
+      procsTotal: procs.total,
+      cpuPercent,
+      cpuCores: [] as Array<number | null>,
+      memTotalBytes: memTotal,
+      memUsedBytes: memUsed,
+      memAvailableBytes: available,
+      memFreeBytes: memFree,
+      memBuffersBytes: 0,
+      memCachedBytes: 0,
+      swapTotalBytes: swapTotal,
+      swapUsedBytes: swapUsed,
+      diskTotalBytes,
+      diskUsedBytes,
+      diskReadBytes: 0,
+      diskWriteBytes: 0,
+      diskReadRate: null,
+      diskWriteRate: null,
+      temperatures,
+      processes,
+      network
+    })
+  }
+}
+
 function emptySnapshot(partial: Partial<ServerMonitorSnapshot> = {}): ServerMonitorSnapshot {
   return {
     updatedAt: Date.now(),
@@ -369,6 +719,7 @@ function emptySnapshot(partial: Partial<ServerMonitorSnapshot> = {}): ServerMoni
     load1: 0,
     load5: 0,
     load15: 0,
+    distro: '',
     kernel: '',
     cpuCount: 0,
     procsRunning: 0,
@@ -418,6 +769,7 @@ function parseSample(
   const load5 = Number(loadParts[1]) || 0
   const load15 = Number(loadParts[2]) || 0
   const procs = parseLoadProcs(loadParts[3] || '0/0')
+  const distro = parseDistroName(section(raw, 'OS'))
   const kernel = meta[3] || ''
   const cpuCount = Number(meta[4]) || 0
 
@@ -468,6 +820,7 @@ function parseSample(
       load1,
       load5,
       load15,
+      distro,
       kernel,
       cpuCount,
       procsRunning: procs.running,
@@ -571,10 +924,13 @@ export const serverMonitorMain: PluginMainModule = {
       busy: false,
       processSort: SERVER_MONITOR_PROCESS_SORT_DEFAULT,
       processSortDesc: SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
+      family: 'linux',
       prevCpu: null,
       prevCores: [],
       prevNet: null,
       prevDiskIo: null,
+      lastProcesses: [],
+      shortSamples: 0,
       timer: null,
       intervalMs: parseInterval(ctx.getSettings()),
       poll: async () => undefined
@@ -588,7 +944,7 @@ export const serverMonitorMain: PluginMainModule = {
       try {
         const connectionId = await ctx.openSideConnection({
           kind: 'ssh-exec',
-          command: buildMonitorCommand(state.processSort, state.processSortDesc)
+          command: buildSampleCommand(state.family, state.processSort, state.processSortDesc)
         })
         let buf = ''
         const offData = ctx.onSideData(connectionId, (chunk) => {
@@ -607,19 +963,51 @@ export const serverMonitorMain: PluginMainModule = {
           }, EXEC_WAIT_MS)
         })
         offData()
-        const parsed = parseSample(
-          buf,
-          state.prevCpu,
-          state.prevCores,
-          state.prevNet,
-          state.prevDiskIo
-        )
+
+        // The first sample may have run the Linux command against a BSD/macOS
+        // host; switch family and clear cross-family deltas for the next poll.
+        const family = detectFamilyFromSample(buf)
+        if (family !== state.family) {
+          state.family = family
+          state.prevCpu = null
+          state.prevCores = []
+          state.prevNet = null
+          state.prevDiskIo = null
+        }
+
+        const parsed =
+          family === 'linux'
+            ? parseSample(buf, state.prevCpu, state.prevCores, state.prevNet, state.prevDiskIo)
+            : parseUnixSample(buf, family, state.prevCpu, state.prevNet)
         if (parsed.cpu) {
           state.prevCpu = parsed.cpu
         }
         state.prevCores = parsed.cores
         state.prevNet = parsed.net
         state.prevDiskIo = parsed.diskIo
+
+        // A sample that comes back with far fewer process rows than the last full
+        // list is usually a cut/partial ps output; hold the stable list briefly so
+        // the table does not jump between sizes every poll.
+        const lastProcs = state.lastProcesses
+        const sampledProcs = parsed.snapshot.processes
+        let procs = sampledProcs
+        if (
+          lastProcs.length >= PROC_LIST_STABLE_MIN &&
+          sampledProcs.length * 2 < lastProcs.length
+        ) {
+          state.shortSamples += 1
+          if (state.shortSamples <= PROC_LIST_STALE_LIMIT) {
+            procs = lastProcs
+          } else {
+            state.shortSamples = 0
+          }
+        } else {
+          state.shortSamples = 0
+        }
+        state.lastProcesses = procs
+        parsed.snapshot.processes = procs
+
         ctx.sendToRenderer({
           type: 'stats',
           snapshot: parsed.snapshot
