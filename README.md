@@ -1,6 +1,6 @@
 # WaSSH
 
-Native multi-tab SSH client for Windows (Electron + React + xterm.js).
+Advanced Multi-tab SSH client for Windows (Electron + React + xterm.js).
 
 ## Develop
 
