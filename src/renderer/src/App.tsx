@@ -50,6 +50,7 @@ import {
 import {
   emptyTabPluginLayout,
   normalizeTabPluginLayout,
+  pruneLayoutToKeep,
   removePluginFromLayout,
   type TabPluginLayout
 } from '@shared/pluginLayout'
@@ -202,6 +203,7 @@ export default function App() {
   const lastFindQueryRef = useRef('')
   const tabsRef = useRef(tabs)
   const hostsRef = useRef(hosts)
+  const pluginsRef = useRef(plugins)
   const activeRef = useRef(activeTabId)
   const settingsRef = useRef(settings)
   const restoredRef = useRef(false)
@@ -209,6 +211,7 @@ export default function App() {
 
   tabsRef.current = tabs
   hostsRef.current = hosts
+  pluginsRef.current = plugins
   activeRef.current = activeTabId
   settingsRef.current = settings
   findQueryRef.current = findQuery
@@ -249,9 +252,10 @@ export default function App() {
     setHostsOrganization(normalizeHostsOrganization(saved))
   }, [])
 
-  const refreshPlugins = useCallback(async () => {
+  const refreshPlugins = useCallback(async (): Promise<PluginListItem[]> => {
     const list = await window.wassh.listPlugins()
     setPlugins(list)
+    return list
   }, [])
 
   const persistTabs = useCallback(() => {
@@ -343,26 +347,37 @@ export default function App() {
       const s = await window.wassh.getSettings()
       setSettings(s)
       await refreshHosts()
-      await refreshPlugins()
+      const pluginList = await refreshPlugins()
       if (restoredRef.current) return
       restoredRef.current = true
       if (!s.reconnectOnStartup) return
       const snapshot = await window.wassh.getTabSnapshot()
       if (snapshot.length === 0) return
-      const restored: TabState[] = snapshot.map((t) => ({
-        id: t.id,
-        connection: {
-          ...t.connection,
-          ...protocolConfigFrom(t.connection),
-          ...sessionStyleOverridesFrom(t.connection),
-          ...tunnelConfigFrom(t.connection),
-          reconnectMode: reconnectModeFrom(t.connection),
-          ...screenConfigFrom(t.connection)
-        },
-        status: 'connecting',
-        activePluginIds: Array.isArray(t.activePluginIds) ? t.activePluginIds : [],
-        pluginLayout: normalizeTabPluginLayout(t.pluginLayout)
-      }))
+      // Drop plugin ids that are no longer registered (removed from the code
+      // base / disabled) so their panes never come back on restored sessions.
+      const available = new Set(pluginList.map((p) => p.id))
+      const restored: TabState[] = snapshot.map((t) => {
+        const activePluginIds = (
+          Array.isArray(t.activePluginIds) ? t.activePluginIds : []
+        ).filter((id) => available.has(id))
+        return {
+          id: t.id,
+          connection: {
+            ...t.connection,
+            ...protocolConfigFrom(t.connection),
+            ...sessionStyleOverridesFrom(t.connection),
+            ...tunnelConfigFrom(t.connection),
+            reconnectMode: reconnectModeFrom(t.connection),
+            ...screenConfigFrom(t.connection)
+          },
+          status: 'connecting',
+          activePluginIds,
+          pluginLayout: pruneLayoutToKeep(
+            normalizeTabPluginLayout(t.pluginLayout),
+            pluginList.map((p) => p.id)
+          )
+        }
+      })
       setTabs(restored)
       const active = snapshot.find((t) => t.active)?.id || snapshot[0]?.id || null
       setActiveTabId(active)
@@ -401,15 +416,21 @@ export default function App() {
     closedSessionsRef.current = stack
     if (!entry) return
     const id = crypto.randomUUID()
-    const restoreIds = entry.activePluginIds.slice()
     const connection = structuredClone(entry.connection)
+    const pluginIds = pluginsRef.current.map((p) => p.id)
+    const available = new Set(pluginIds)
+    const restoreIds = entry.activePluginIds.filter((id) => available.has(id))
+    const pluginLayout = pruneLayoutToKeep(
+      normalizeTabPluginLayout(entry.pluginLayout),
+      pluginIds
+    )
     setTabs((prev) => {
       const tab: TabState = {
         id,
         connection,
         status: 'connecting',
         activePluginIds: restoreIds,
-        pluginLayout: normalizeTabPluginLayout(entry.pluginLayout)
+        pluginLayout
       }
       const next = prev.slice()
       const at = Math.min(Math.max(entry.insertIndex, 0), next.length)

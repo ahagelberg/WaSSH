@@ -21,6 +21,7 @@ import {
   innerInsertZone,
   outerInsertZone,
   pruneLayoutToActive,
+  pruneLayoutToKeep,
   setDockSplitRatio,
   splitPluginLeaf,
   type DockEdge,
@@ -366,21 +367,24 @@ export default function PluginSessionFrame({
     onLayoutChangeRef.current(fitDocksToFrame(nextLayout, frameRef.current))
   }, [])
 
+  const availablePluginIds = useMemo(() => plugins.map((p) => p.id), [plugins])
+
   // Keep inactive plugins in stored layout (reconnect briefly deactivates them).
-  // Only add missing actives; user close removes via onDeactivatePlugin.
+  // Only add missing actives; user close removes via onDeactivatePlugin. Panes
+  // for plugins no longer registered (removed from the code base) are dropped
+  // from the stored layout and never added.
   useEffect(() => {
-    let next = layoutRef.current
+    let next = pruneLayoutToKeep(layoutRef.current, availablePluginIds)
     for (const id of activePluginIds) {
-      next = ensurePluginInLayout(
-        next,
-        id,
-        plugins.find((p) => p.id === id)
-      )
+      const plugin = plugins.find((p) => p.id === id)
+      if (plugin) {
+        next = ensurePluginInLayout(next, id, plugin)
+      }
     }
     if (JSON.stringify(layoutRef.current) !== JSON.stringify(next)) {
       commitLayout(next)
     }
-  }, [activePluginIds, plugins, commitLayout])
+  }, [activePluginIds, plugins, availablePluginIds, commitLayout])
 
   const displayLayout = useMemo(
     () => pruneLayoutToActive(layout, activePluginIds),

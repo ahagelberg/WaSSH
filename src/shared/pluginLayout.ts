@@ -425,18 +425,25 @@ export function ensurePluginInLayout(
   return dockPluginOnEdge(layout, pluginId, edge)
 }
 
-export function pruneLayoutToActive(
+export function pruneLayoutToKeep(
   layout: TabPluginLayout,
-  activePluginIds: string[]
+  keepPluginIds: string[]
 ): TabPluginLayout {
-  const active = new Set(activePluginIds)
+  const keep = new Set(keepPluginIds)
   let next = layout
   for (const id of layoutPluginIds(layout)) {
-    if (!active.has(id)) {
+    if (!keep.has(id)) {
       next = removePluginFromLayout(next, id)
     }
   }
   return next
+}
+
+export function pruneLayoutToActive(
+  layout: TabPluginLayout,
+  activePluginIds: string[]
+): TabPluginLayout {
+  return pruneLayoutToKeep(layout, activePluginIds)
 }
 
 function parseNode(raw: unknown): LayoutNode | null {
