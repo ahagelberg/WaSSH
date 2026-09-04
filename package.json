@@ -1,6 +1,6 @@
 {
   "name": "wassh",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "WaSSH — advanced multi-tab SSH client",
   "main": "./out/main/index.js",
   "author": "Andreas Hagelberg",
