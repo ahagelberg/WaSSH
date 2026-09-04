@@ -130,6 +130,8 @@ export const macroPadManifest: PluginManifest = {
   contributes: {
     toolbar: { label: 'Macros' },
     settingsHeading: 'Macro pad',
+    // Options dialog hides this section (macros are configured in the pane).
+    // Keys below exist so patch routing + merging keep the extra settings keys.
     settingsSchema: [
       {
         key: 'buttons',
@@ -137,6 +139,20 @@ export const macroPadManifest: PluginManifest = {
         type: 'macroList',
         default: DEFAULT_MACRO_BUTTONS,
         description: 'Label, text to send, and optional hotkey per button.'
+      },
+      {
+        key: 'groups',
+        label: 'Groups',
+        type: 'macroList',
+        default: [],
+        description: 'Macro groups (name, color, collapsed state).'
+      },
+      {
+        key: 'ungroupedCollapsed',
+        label: 'Collapse ungrouped',
+        type: 'boolean',
+        default: false,
+        description: 'Whether the ungrouped macro section is collapsed.'
       }
     ],
     views: [{ id: 'panel', placement: 'split-right', title: 'Macros' }]

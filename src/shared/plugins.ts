@@ -71,6 +71,8 @@ export interface PluginMacroButton {
   text: string
   /** e.g. "Ctrl+Shift+1" — empty = no hotkey */
   hotkey: string
+  /** Macro pad group id; empty/absent = ungrouped */
+  groupId?: string
 }
 
 export interface PluginSettingsField {

@@ -19,7 +19,7 @@ import {
   type SessionStyleDefaults
 } from '@shared/types'
 import type { PluginListItem } from '@shared/plugins'
-import { mergePluginSettings } from '@shared/plugins'
+import { PLUGIN_ID_MACRO_PAD, mergePluginSettings } from '@shared/plugins'
 import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
@@ -400,6 +400,10 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
       }
       const schema = plugin.contributes.settingsSchema
       if (!schema || schema.length === 0) {
+        continue
+      }
+      // Macros are configured inside the macro pad pane itself, not here.
+      if (plugin.id === PLUGIN_ID_MACRO_PAD) {
         continue
       }
       const values = mergePluginSettings(schema, draft.pluginSettings[plugin.id])
