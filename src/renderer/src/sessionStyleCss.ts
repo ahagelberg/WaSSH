@@ -24,7 +24,7 @@ function sessionStyleCss(style: SessionStyleCss): CSSProperties | undefined {
 }
 
 /** Bridge resolved tab accent hex into CSS via --tab-accent-color */
-export function sessionAccentStyle(tabColor: string): CSSProperties | undefined {
+export function sessionAccentStyle(tabColor: string | undefined): CSSProperties | undefined {
   return sessionStyleCss({ tabColor })
 }
 

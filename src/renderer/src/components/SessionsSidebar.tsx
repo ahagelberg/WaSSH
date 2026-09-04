@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactElement } from 'react'
 import type { HostProfile, HostsOrganization } from '@shared/types'
 import { hostDisplayName, hostSubtitle, resolveSessionStyle, type SessionStyle } from '@shared/connection'
 import { sessionAccentStyle } from '../sessionStyleCss'
+import ColorHexInput from './ColorHexInput'
 import {
   UNGROUPED_SECTION_ID,
   deleteNamedGroup,
@@ -44,6 +45,29 @@ const HOST_DRAG_GHOST_OFFSET_Y_PX = 10
 
 /** Drop before host when pointer is above this fraction of row height */
 const HOST_DROP_BEFORE_RATIO = 0.5
+
+/** Preset accent colors offered in the group color picker */
+const GROUP_COLOR_PRESETS = [
+  '#e35d6a',
+  '#f0b429',
+  '#3dd68c',
+  '#14b8a6',
+  '#3d8bfd',
+  '#5a9dff',
+  '#8b5cf6',
+  '#d946ef',
+  '#ec4899',
+  '#f97316',
+  '#84cc16',
+  '#94a3b8'
+]
+
+/** Shown in the native swatch while a group has no color yet */
+const GROUP_COLOR_FALLBACK = '#3d8bfd'
+
+/** Group color popover sizing (keep in sync with .host-group-color-pop CSS) */
+const GROUP_COLOR_POP_WIDTH_PX = 224
+const GROUP_COLOR_POP_ESTIMATED_HEIGHT_PX = 176
 
 interface HostMenuState {
   hostId: string
@@ -157,7 +181,8 @@ function findHostDropHint(listEl: HTMLElement, clientY: number): HostDropHint | 
 function gapIndexAtY(listEl: HTMLElement, clientY: number, groupCount: number): number {
   const headers = listEl.querySelectorAll<HTMLElement>('.host-group-header[data-group-id]')
   for (let i = 0; i < headers.length; i++) {
-    const rect = headers[i].getBoundingClientRect()
+    const section = headers[i].closest<HTMLElement>('.host-group')
+    const rect = (section ?? headers[i]).getBoundingClientRect()
     const mid = rect.top + rect.height * HOST_DROP_BEFORE_RATIO
     if (clientY < mid) {
       return i
@@ -210,11 +235,18 @@ export default function SessionsSidebar({
   const [hostDropHint, setHostDropHint] = useState<HostDropHint | null>(null)
   const [groupDropGap, setGroupDropGap] = useState<number | null>(null)
   const [appendTargetSectionId, setAppendTargetSectionId] = useState<string | null>(null)
+  const [groupColorMenu, setGroupColorMenu] = useState<GroupMenuState | null>(null)
+  const [groupDragGhost, setGroupDragGhost] = useState<{
+    groupId: string
+    x: number
+    y: number
+  } | null>(null)
 
   const listRef = useRef<HTMLDivElement>(null)
   const hostDragRef = useRef<HostDragState | null>(null)
   const groupDragRef = useRef<GroupDragState | null>(null)
   const suppressHostClickRef = useRef(false)
+  const suppressGroupClickRef = useRef(false)
   const hostDropHintRef = useRef<HostDropHint | null>(null)
   const orgRef = useRef(organization)
   const onSaveOrgRef = useRef(onSaveOrganization)
@@ -226,7 +258,7 @@ export default function SessionsSidebar({
   const hostById = new Map(hosts.map((h) => [h.id, h]))
 
   useEffect(() => {
-    if (!hostMenu && !groupMenu) {
+    if (!hostMenu && !groupMenu && !groupColorMenu) {
       return
     }
     const close = (ev: MouseEvent): void => {
@@ -234,23 +266,36 @@ export default function SessionsSidebar({
       if (!(target instanceof Element)) {
         return
       }
-      if (target.closest('.host-context-menu') || target.closest('.host-group-context-menu')) {
+      if (
+        target.closest('.host-context-menu') ||
+        target.closest('.host-group-context-menu') ||
+        target.closest('.host-group-color-pop')
+      ) {
         return
       }
       setHostMenu(null)
       setGroupMenu(null)
+      setGroupColorMenu(null)
     }
     const closeOnScroll = (): void => {
       setHostMenu(null)
       setGroupMenu(null)
+      setGroupColorMenu(null)
+    }
+    const closeOnEscape = (ev: KeyboardEvent): void => {
+      if (ev.key === 'Escape') {
+        setGroupColorMenu(null)
+      }
     }
     document.addEventListener('mousedown', close)
     document.addEventListener('scroll', closeOnScroll, true)
+    document.addEventListener('keydown', closeOnEscape)
     return () => {
       document.removeEventListener('mousedown', close)
       document.removeEventListener('scroll', closeOnScroll, true)
+      document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [hostMenu, groupMenu])
+  }, [hostMenu, groupMenu, groupColorMenu])
 
   useEffect(() => {
     const onMove = (e: PointerEvent): void => {
@@ -265,6 +310,7 @@ export default function SessionsSidebar({
           hostDrag.active = true
           setHostMenu(null)
           setGroupMenu(null)
+          setGroupColorMenu(null)
           setDraggingHostId(hostDrag.hostId)
           setHostDragGhost({ hostId: hostDrag.hostId, x: e.clientX, y: e.clientY })
         }
@@ -296,8 +342,10 @@ export default function SessionsSidebar({
         groupDrag.active = true
         setHostMenu(null)
         setGroupMenu(null)
+        setGroupColorMenu(null)
         setDraggingGroupId(groupDrag.groupId)
       }
+      setGroupDragGhost({ groupId: groupDrag.groupId, x: e.clientX, y: e.clientY })
       const list = listRef.current
       if (!list) {
         return
@@ -341,16 +389,23 @@ export default function SessionsSidebar({
 
       const groupDrag = groupDragRef.current
       if (groupDrag) {
-        if (groupDrag.active && groupDrag.dropGap !== null) {
-          const from = orgRef.current.groups.findIndex((g) => g.id === groupDrag.groupId)
-          const insert = groupInsertIndexFromGap(from, groupDrag.dropGap)
-          if (from >= 0 && insert !== null) {
-            onSaveOrgRef.current(reorderNamedGroups(orgRef.current, from, insert))
+        if (groupDrag.active) {
+          suppressGroupClickRef.current = true
+          window.setTimeout(() => {
+            suppressGroupClickRef.current = false
+          }, 0)
+          if (groupDrag.dropGap !== null) {
+            const from = orgRef.current.groups.findIndex((g) => g.id === groupDrag.groupId)
+            const insert = groupInsertIndexFromGap(from, groupDrag.dropGap)
+            if (from >= 0 && insert !== null) {
+              onSaveOrgRef.current(reorderNamedGroups(orgRef.current, from, insert))
+            }
           }
         }
         groupDragRef.current = null
         setDraggingGroupId(null)
         setGroupDropGap(null)
+        setGroupDragGhost(null)
       }
     }
 
@@ -432,11 +487,26 @@ export default function SessionsSidebar({
     onSaveOrganization(deleteNamedGroup(organization, groupId))
   }
 
+  const setGroupColor = (groupId: string, color: string | undefined): void => {
+    onSaveOrganization({
+      ...organization,
+      groups: organization.groups.map((g) =>
+        g.id === groupId ? { ...g, color: color ?? undefined } : g
+      )
+    })
+  }
+
   const menuHost = hostMenu ? hostById.get(hostMenu.hostId) : undefined
   const menuGroup = groupMenu
     ? organization.groups.find((g) => g.id === groupMenu.groupId)
     : undefined
+  const menuColorGroup = groupColorMenu
+    ? organization.groups.find((g) => g.id === groupColorMenu.groupId)
+    : undefined
   const ghostHost = hostDragGhost ? hostById.get(hostDragGhost.hostId) : undefined
+  const ghostGroup = groupDragGhost
+    ? organization.groups.find((g) => g.id === groupDragGhost.groupId)
+    : undefined
 
   const renderHostRow = (host: HostProfile, sectionId: string): ReactElement => {
     const proxy = host.proxyHostId ? hostById.get(host.proxyHostId) : null
@@ -517,24 +587,38 @@ export default function SessionsSidebar({
     const isNamed = options.named
     const group = options.group
     const isDraggingGroup = isNamed && group && draggingGroupId === group.id
-    const showGroupDropBefore =
-      isNamed && groupDropGap !== null && organization.groups[groupDropGap]?.id === sectionId
     const isAppendTarget = appendTargetSectionId === sectionId
+    const groupColor = isNamed && group?.color ? group.color : undefined
+    const groupIndex = isNamed && group ? organization.groups.indexOf(group) : -1
+    // Horizontal insertion line above this card; hidden for gaps next to the
+    // dragged group itself (those are no-ops). Ungrouped anchors the end gap.
+    const showDropLineAbove =
+      groupDropGap !== null &&
+      groupDragFromIndex >= 0 &&
+      groupDropGap !== groupDragFromIndex &&
+      groupDropGap !== groupDragFromIndex + 1 &&
+      (isNamed ? groupDropGap === groupIndex : groupDropGap === organization.groups.length)
 
     return (
       <section
         key={sectionId}
-        className={`host-group${sectionCollapsed ? ' collapsed' : ''}${isAppendTarget ? ' is-drop-target' : ''}${showGroupDropBefore ? ' is-drop-target' : ''}`}
+        className={`host-group${sectionCollapsed ? ' collapsed' : ''}${isAppendTarget ? ' is-drop-target' : ''}${showDropLineAbove ? ' group-drop-before' : ''}`}
         data-section-id={sectionId}
+        data-tab-color={groupColor}
+        style={sessionAccentStyle(groupColor)}
       >
         <div
           className={`host-group-header${isDraggingGroup ? ' is-dragging' : ''}`}
           data-group-id={isNamed ? sectionId : undefined}
           onClick={(e) => {
+            if (suppressGroupClickRef.current) {
+              return
+            }
             if (e.target instanceof Element) {
               if (
                 e.target.closest('.host-group-title-input') ||
-                e.target.closest('.host-group-collapse')
+                e.target.closest('.host-group-collapse') ||
+                e.target.closest('.host-group-color-dot')
               ) {
                 return
               }
@@ -558,6 +642,7 @@ export default function SessionsSidebar({
             e.preventDefault()
             e.stopPropagation()
             setHostMenu(null)
+            setGroupColorMenu(null)
             setGroupMenu({ groupId: group.id, ...menuPositionAtPoint(e.clientX, e.clientY) })
           }}
           onPointerDown={(e) => {
@@ -580,6 +665,17 @@ export default function SessionsSidebar({
               active: false,
               dropGap: null
             }
+            e.currentTarget.setPointerCapture(e.pointerId)
+          }}
+          onPointerUp={(e) => {
+            if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+              e.currentTarget.releasePointerCapture(e.pointerId)
+            }
+          }}
+          onPointerCancel={(e) => {
+            if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+              e.currentTarget.releasePointerCapture(e.pointerId)
+            }
           }}
         >
           <button
@@ -593,6 +689,9 @@ export default function SessionsSidebar({
           >
             {sectionCollapsed ? '▸' : '▾'}
           </button>
+          {groupColor ? (
+            <span className="host-group-color-dot" aria-hidden="true" title="Colored group" />
+          ) : null}
           {isNamed && renamingGroupId === sectionId ? (
             <input
               className="host-group-title-input"
@@ -629,6 +728,11 @@ export default function SessionsSidebar({
       </section>
     )
   }
+
+  const groupDragFromIndex =
+    draggingGroupId !== null
+      ? organization.groups.findIndex((g) => g.id === draggingGroupId)
+      : -1
 
   const listDraggingClass =
     draggingHostId !== null
@@ -749,6 +853,20 @@ export default function SessionsSidebar({
               <button
                 type="button"
                 role="menuitem"
+                onClick={() => {
+                  closeGroupMenu()
+                  setGroupColorMenu({
+                    groupId: menuGroup.id,
+                    left: groupMenu.left,
+                    top: groupMenu.top
+                  })
+                }}
+              >
+                Color…
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 onClick={() => startRenameGroup(menuGroup)}
               >
                 Rename
@@ -761,6 +879,59 @@ export default function SessionsSidebar({
               >
                 Delete
               </button>
+            </div>
+          ) : null}
+          {groupColorMenu && menuColorGroup ? (
+            <div
+              className="host-group-color-pop"
+              role="dialog"
+              aria-label={`Color for ${menuColorGroup.name}`}
+              style={{
+                left: Math.min(
+                  groupColorMenu.left,
+                  Math.max(0, window.innerWidth - GROUP_COLOR_POP_WIDTH_PX - 8)
+                ),
+                top: Math.min(
+                  groupColorMenu.top,
+                  Math.max(0, window.innerHeight - GROUP_COLOR_POP_ESTIMATED_HEIGHT_PX)
+                )
+              }}
+            >
+              <div className="host-group-color-title">Group color</div>
+              <div className="host-group-color-swatches">
+                {GROUP_COLOR_PRESETS.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    className={`host-group-color-swatch${menuColorGroup.color === c ? ' selected' : ''}`}
+                    style={{ background: c }}
+                    title={c}
+                    aria-label={c}
+                    onClick={() => setGroupColor(menuColorGroup.id, c)}
+                  />
+                ))}
+              </div>
+              <div className="host-group-color-custom">
+                <input
+                  type="color"
+                  value={menuColorGroup.color ?? GROUP_COLOR_FALLBACK}
+                  title="Custom color"
+                  onChange={(e) => setGroupColor(menuColorGroup.id, e.target.value)}
+                />
+                <ColorHexInput
+                  value={menuColorGroup.color ?? ''}
+                  onChange={(hex) => setGroupColor(menuColorGroup.id, hex)}
+                />
+              </div>
+              {menuColorGroup.color ? (
+                <button
+                  type="button"
+                  className="host-group-color-clear"
+                  onClick={() => setGroupColor(menuColorGroup.id, undefined)}
+                >
+                  Remove color
+                </button>
+              ) : null}
             </div>
           ) : null}
           {hostDragGhost && ghostHost ? (
@@ -778,6 +949,25 @@ export default function SessionsSidebar({
             >
               <div className="host-drag-ghost-name">{hostDisplayName(ghostHost)}</div>
               <div className="host-drag-ghost-meta">{hostSubtitle(ghostHost)}</div>
+            </div>
+          ) : null}
+          {groupDragGhost && ghostGroup ? (
+            <div
+              className="host-drag-ghost"
+              aria-hidden="true"
+              data-tab-color={ghostGroup.color}
+              style={{
+                ...(ghostGroup.color ? sessionAccentStyle(ghostGroup.color) : {}),
+                left: groupDragGhost.x + HOST_DRAG_GHOST_OFFSET_X_PX,
+                top: groupDragGhost.y + HOST_DRAG_GHOST_OFFSET_Y_PX
+              }}
+            >
+              <div className="host-drag-ghost-name">{ghostGroup.name}</div>
+              <div className="host-drag-ghost-meta">
+                {ghostGroup.hostIds.length === 1
+                  ? '1 host'
+                  : `${ghostGroup.hostIds.length} hosts`}
+              </div>
             </div>
           ) : null}
         </>

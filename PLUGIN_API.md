@@ -333,7 +333,7 @@ main⇄renderer messages:
 | macro-pad | `send` → `writeToSession` | — |
 | scratchpad | — (renderer-driven; main is a no-op hook) | — |
 | mqtt-explorer | `publish` / `reconnect` | `status` → `MqttExplorerStatusPayload`; `message` → `MqttExplorerMessagePayload` |
-| sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone` |
+| sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `viewFile`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone`, `viewFileResult` → `SftpViewFilePayload` |
 | ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval`, `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
 
 `AiAgentRendererMessage`, `SftpRendererMessage`, `MqttExplorerRendererMessage`

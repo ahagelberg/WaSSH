@@ -1,9 +1,23 @@
 /** Sentinel id for the ungrouped section in drag/drop UI */
 export const UNGROUPED_SECTION_ID = '__ungrouped__'
 
+/** 6-digit hex color (#rrggbb), optional leading # */
+const HEX_COLOR_RE = /^#?[0-9a-fA-F]{6}$/
+
+/** Normalize a stored group color to lowercase '#rrggbb', or undefined when invalid/absent. */
+function normalizeGroupColor(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') {
+    return undefined
+  }
+  const m = HEX_COLOR_RE.exec(raw.trim())
+  return m ? `#${m[0].toLowerCase().replace('#', '')}` : undefined
+}
+
 export interface HostGroup {
   id: string
   name: string
+  /** Accent color (hex) for the group header in the host list; empty = no color */
+  color?: string
   collapsed: boolean
   hostIds: string[]
 }
@@ -37,6 +51,7 @@ function normalizeGroup(raw: Partial<HostGroup> & { id: string }): HostGroup {
   return {
     id: raw.id,
     name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : 'Group',
+    color: normalizeGroupColor(raw.color),
     collapsed: raw.collapsed === true,
     hostIds: dedupeIds(Array.isArray(raw.hostIds) ? raw.hostIds.filter((id) => typeof id === 'string') : [])
   }
