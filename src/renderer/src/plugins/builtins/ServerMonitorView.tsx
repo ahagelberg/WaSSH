@@ -1262,6 +1262,14 @@ export default function ServerMonitorView({
                 <span>Kernel</span>
                 <strong title={snapshot?.kernel || ''}>{snapshot?.kernel || MISSING}</strong>
               </div>
+              <div className="monitor-fact monitor-fact-wide">
+                <span>IP address</span>
+                <strong
+                  title={snapshot && snapshot.ips.length > 0 ? snapshot.ips.join(', ') : ''}
+                >
+                  {snapshot && snapshot.ips.length > 0 ? snapshot.ips.join(', ') : MISSING}
+                </strong>
+              </div>
             </div>
           ) : null}
 

@@ -131,6 +131,8 @@ function buildMonitorCommand(sort: ServerMonitorProcessSort, descending: boolean
     '(cat /proc/loadavg 2>/dev/null || echo 0 0 0 0/0 0)',
     '(uname -srm 2>/dev/null || echo unknown)',
     '(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)',
+    "echo '===IP==='",
+    "(out=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); if [ -n \"$out\" ]; then echo \"$out\"; else hostname -I 2>/dev/null; fi)",
     "echo '===OS==='",
     "(cat /etc/os-release /usr/lib/os-release /etc/lsb-release /etc/redhat-release /etc/system-release /etc/arch-release /etc/SuSE-release 2>/dev/null || true)",
     "echo '===CPU==='",
@@ -166,6 +168,8 @@ function buildUnixCommand(family: MonitorFamily, sort: ServerMonitorProcessSort)
     'echo "$(sysctl -n vm.loadavg 2>/dev/null | tr -d "{}" || echo 0 0 0) 0/0"',
     '(uname -srm 2>/dev/null || echo unknown)',
     '(sysctl -n hw.ncpu 2>/dev/null || echo 1)',
+    "echo '===IP==='",
+    "(ifconfig -a 2>/dev/null | awk '$1 == \"inet\" && $2 != \"127.0.0.1\" { print $2 }')",
     // OS / distro
     "echo '===OS==='",
     isMac
@@ -333,6 +337,24 @@ function parseLoadProcs(field: string): { running: number; total: number } {
     running: Number(parts[0]) || 0,
     total: Number(parts[1]) || 0
   }
+}
+
+/** Unique, plausible v4/v6 address tokens reported by the sample command */
+function parseIps(block: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of block.split(/[\s,]+/)) {
+    const ip = raw.trim()
+    if (!ip || ip === '127.0.0.1' || ip === '::1' || seen.has(ip)) {
+      continue
+    }
+    if (!/^[0-9a-fA-F:.]+$/.test(ip)) {
+      continue
+    }
+    seen.add(ip)
+    out.push(ip)
+  }
+  return out
 }
 
 /** Strip surrounding quotes from an os-release style value */
@@ -638,6 +660,7 @@ function parseUnixSample(
   const distro = parseDistroName(section(raw, 'OS'))
   const kernel = meta[3] || ''
   const cpuCount = Number(meta[4]) || 0
+  const ips = parseIps(section(raw, 'IP'))
 
   let cpu: CpuJiffies | null = null
   let cpuPercent: number | null = null
@@ -704,6 +727,7 @@ function parseUnixSample(
       diskWriteBytes: 0,
       diskReadRate: null,
       diskWriteRate: null,
+      ips,
       temperatures,
       processes,
       network
@@ -715,6 +739,7 @@ function emptySnapshot(partial: Partial<ServerMonitorSnapshot> = {}): ServerMoni
   return {
     updatedAt: Date.now(),
     hostname: '',
+    ips: [],
     uptimeSec: 0,
     load1: 0,
     load5: 0,
@@ -772,6 +797,7 @@ function parseSample(
   const distro = parseDistroName(section(raw, 'OS'))
   const kernel = meta[3] || ''
   const cpuCount = Number(meta[4]) || 0
+  const ips = parseIps(section(raw, 'IP'))
 
   const { aggregate: cpu, cores } = parseCpuBlock(section(raw, 'CPU'))
   let cpuPercent: number | null = null
@@ -841,6 +867,7 @@ function parseSample(
       diskWriteBytes: diskIo.writeBytes,
       diskReadRate,
       diskWriteRate,
+      ips,
       temperatures,
       processes,
       network

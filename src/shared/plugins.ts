@@ -261,6 +261,8 @@ export interface ServerMonitorTemp {
 export interface ServerMonitorSnapshot {
   updatedAt: number
   hostname: string
+  /** Global (non-loopback) IPv4 addresses seen on the remote host */
+  ips: string[]
   uptimeSec: number
   load1: number
   load5: number
