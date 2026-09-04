@@ -836,7 +836,10 @@ function NetworkPanel({
             <tbody>
               {ifaces.map((iface) => (
                 <tr key={iface.name}>
-                  <td className="monitor-iface" title={iface.name}>
+                  <td
+                    className="monitor-iface"
+                    title={iface.ips.length > 0 ? iface.ips.join(', ') : undefined}
+                  >
                     {iface.name}
                   </td>
                   <td className="monitor-num">{formatLinkSpeed(iface.speedBitsPerSec)}</td>

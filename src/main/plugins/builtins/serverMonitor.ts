@@ -145,6 +145,8 @@ function buildMonitorCommand(sort: ServerMonitorProcessSort, descending: boolean
     '(cat /proc/diskstats 2>/dev/null || true)',
     "echo '===NET==='",
     '(cat /proc/net/dev 2>/dev/null || true)',
+    "echo '===IPMAP==='",
+    "(out=$(ip -o addr show scope global 2>/dev/null | awk '{print $2, $4}' | sed 's#/.*##'); if [ -z \"$out\" ]; then out=$(ifconfig -a 2>/dev/null | awk '{ if ($0 ~ /^[A-Za-z0-9.]+:/) { iface = $1; sub(/:/, \"\", iface) } if (iface != \"\" && $1 == \"inet\") { a = $2; sub(/^addr:/, \"\", a); if (a != \"127.0.0.1\") print iface, a } }'); fi; if [ -n \"$out\" ]; then printf '%s\\n' \"$out\"; fi)",
     "echo '===NETSPEED==='",
     'for i in /sys/class/net/*; do [ -d "$i" ] || continue; n=$(basename "$i"); [ "$n" = lo ] && continue; s=$(cat "$i/speed" 2>/dev/null || echo -1); echo "$n $s"; done 2>/dev/null || true',
     "echo '===TEMP==='",
@@ -194,7 +196,10 @@ function buildUnixCommand(family: MonitorFamily, sort: ServerMonitorProcessSort)
     '(df -k / 2>/dev/null | tail -n 1 || true)',
     // Per-interface RX/TX byte counters (link rows only)
     "echo '===NET==='",
-    '(netstat -ib 2>/dev/null | awk \'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "Ibytes") cI = i; if ($i == "Obytes") cO = i } } NR > 1 { for (i = 1; i <= NF; i++) { if (index($i, "<Link") == 1) { print $1, $cI, $cO; break } } }\' || true)'
+    '(netstat -ib 2>/dev/null | awk \'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "Ibytes") cI = i; if ($i == "Obytes") cO = i } } NR > 1 { for (i = 1; i <= NF; i++) { if (index($i, "<Link") == 1) { print $1, $cI, $cO; break } } }\' || true)',
+    // Interface → IPv4 address map (used for the network list hover tooltip)
+    "echo '===IPMAP==='",
+    "(ifconfig -a 2>/dev/null | awk '{ if ($0 ~ /^[A-Za-z0-9.]+:/) { iface = $1; sub(/:/, \"\", iface) } if (iface != \"\" && $1 == \"inet\" && $2 != \"127.0.0.1\" && iface != \"lo0\") print iface, $2 }' || true)"
   ]
   if (!isMac) {
     parts.push(
@@ -481,11 +486,29 @@ function parseNetSpeeds(block: string): Record<string, number> {
   return speeds
 }
 
+function parseIfaceIps(block: string): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  for (const raw of block.split(/\n/)) {
+    const line = raw.trim()
+    const parts = line.split(/\s+/)
+    if (parts.length < 2) {
+      continue
+    }
+    const [name, ip] = parts
+    if (!name || !/^[0-9a-fA-F:.]+$/.test(ip)) {
+      continue
+    }
+    (out[name] ??= []).push(ip)
+  }
+  return out
+}
+
 function netRates(
   current: Record<string, { rx: number; tx: number }>,
   speeds: Record<string, number>,
   prev: NetCounters | null,
-  now: number
+  now: number,
+  ifaceIps: Record<string, string[]> = {}
 ): ServerMonitorNetIface[] {
   const elapsedSec = prev && now > prev.at ? (now - prev.at) / MS_PER_SEC : 0
   const names = Object.keys(current).sort((a, b) => a.localeCompare(b))
@@ -495,6 +518,7 @@ function netRates(
     const speedBits = speeds[name]
     return {
       name,
+      ips: ifaceIps[name] || [],
       rxBytes: cur.rx,
       txBytes: cur.tx,
       rxRate: rateFromDelta(cur.rx, old?.rx, elapsedSec),
@@ -690,7 +714,7 @@ function parseUnixSample(
   const diskUsedBytes = disk.used * BYTES_PER_KIB
 
   const netCounters = parseBsdNetworkCounters(section(raw, 'NET'))
-  const network = netRates(netCounters, {}, prevNet, now)
+  const network = netRates(netCounters, {}, prevNet, now, parseIfaceIps(section(raw, 'IPMAP')))
   const temperatures = parseTemperatures(section(raw, 'TEMP'))
   const processes = parseBsdProcesses(section(raw, 'PROCS'))
 
@@ -830,7 +854,7 @@ function parseSample(
 
   const netCounters = parseNetDev(section(raw, 'NET'))
   const netSpeeds = parseNetSpeeds(section(raw, 'NETSPEED'))
-  const network = netRates(netCounters, netSpeeds, prevNet, now)
+  const network = netRates(netCounters, netSpeeds, prevNet, now, parseIfaceIps(section(raw, 'IPMAP')))
   const temperatures = parseTemperatures(section(raw, 'TEMP'))
   const processes = parseProcesses(section(raw, 'PROCS'))
 

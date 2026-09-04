@@ -241,6 +241,8 @@ export interface ServerMonitorProcess {
 /** Per-interface counters and derived rates */
 export interface ServerMonitorNetIface {
   name: string
+  /** Non-loopback IP addresses configured on this interface */
+  ips: string[]
   rxBytes: number
   txBytes: number
   /** Bytes/sec; null until two samples exist */
