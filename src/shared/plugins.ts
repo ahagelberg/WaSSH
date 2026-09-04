@@ -447,6 +447,27 @@ export interface SftpTransferDonePayload {
   errorKind?: SftpErrorKind
 }
 
+/** Main → renderer: content fetched for the in-panel file viewer */
+export interface SftpViewFilePayload {
+  type: 'viewFileResult'
+  path: string
+  ok: boolean
+  /** 'text' = decoded text; 'binary' = raw bytes sent as base64 */
+  kind?: 'text' | 'binary'
+  /** Decoded text when kind === 'text' */
+  text?: string
+  /** Base64-encoded bytes when kind === 'binary' */
+  contentBase64?: string
+  /** Number of bytes actually fetched (≤ view cap) */
+  bytesRead: number
+  /** Full remote size; 0 when the stat failed */
+  totalBytes?: number
+  /** True when the remote file is larger than the view cap */
+  truncated: boolean
+  error?: string
+  errorKind?: SftpErrorKind
+}
+
 /** Renderer → main SFTP commands */
 export type SftpRendererMessage =
   | { type: 'getStatus' }
@@ -456,6 +477,7 @@ export type SftpRendererMessage =
   | { type: 'chmod'; path: string; mode: number }
   | { type: 'delete'; path: string }
   | { type: 'download'; path: string }
+  | { type: 'viewFile'; path: string }
   | { type: 'uploadDialog'; path?: string }
   | { type: 'uploadStart'; name: string; size: number; path?: string }
   | { type: 'uploadChunk'; name: string; data: Uint8Array }

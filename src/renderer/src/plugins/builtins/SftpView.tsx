@@ -54,6 +54,19 @@ type SftpMainPayload =
       error?: string
       errorKind?: SftpErrorKind
     }
+  | {
+      type: 'viewFileResult'
+      path: string
+      ok: boolean
+      kind?: 'text' | 'binary'
+      text?: string
+      contentBase64?: string
+      bytesRead: number
+      totalBytes?: number
+      truncated: boolean
+      error?: string
+      errorKind?: SftpErrorKind
+    }
 
 interface TransferProgress {
   direction: 'upload' | 'download'
@@ -67,6 +80,19 @@ type SftpDialog =
   | { kind: 'chmod'; path: string; mode: number }
   | { kind: 'delete'; path: string; name: string }
   | null
+
+interface SftpViewer {
+  path: string
+  name: string
+  loading: boolean
+  kind?: 'text' | 'binary'
+  text?: string
+  bytes?: Uint8Array
+  truncated: boolean
+  bytesRead: number
+  totalBytes?: number
+  error?: string
+}
 
 interface SftpContextMenu {
   x: number
@@ -119,6 +145,40 @@ function formatDate(ms: number): string {
   const d = new Date(ms)
   const pad = (x: number): string => String(x).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i)
+  }
+  return out
+}
+
+const HEX_BYTES_PER_ROW = 16
+
+/** Total-Commander-style hex dump: offset · two 8-byte groups · ASCII column. */
+function hexDump(bytes: Uint8Array): string {
+  const lines: string[] = []
+  for (let off = 0; off < bytes.length; off += HEX_BYTES_PER_ROW) {
+    const hex: string[] = []
+    const ascii: string[] = []
+    const end = Math.min(off + HEX_BYTES_PER_ROW, bytes.length)
+    for (let i = off; i < end; i++) {
+      const b = bytes[i]
+      hex.push(b.toString(16).padStart(2, '0'))
+      ascii.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.')
+    }
+    while (hex.length < HEX_BYTES_PER_ROW) {
+      hex.push('  ')
+    }
+    const half = HEX_BYTES_PER_ROW / 2
+    const hexText = `${hex.slice(0, half).join(' ')}  ${hex.slice(half).join(' ')}`
+    const addr = off.toString(16).padStart(8, '0')
+    lines.push(`${addr}  ${hexText}  ${ascii.join('').padEnd(HEX_BYTES_PER_ROW)}`)
+  }
+  return lines.join('\n')
 }
 
 function octalMode(mode: number): string {
@@ -181,6 +241,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   const [notice, setNotice] = useState<string | null>(null)
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(() => new Map())
   const [contextMenu, setContextMenu] = useState<SftpContextMenu | null>(null)
+  const [viewer, setViewer] = useState<SftpViewer | null>(null)
   const contextMenuRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const dragDepthRef = useRef(0)
@@ -370,9 +431,59 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           }
           return
         }
+        case 'viewFileResult': {
+          setViewer((prev) => {
+            if (!prev || prev.path !== payload.path) {
+              return prev
+            }
+            if (!payload.ok) {
+              return {
+                ...prev,
+                loading: false,
+                error: payload.error ?? 'Failed to read file'
+              }
+            }
+            const kind = payload.kind ?? 'binary'
+            return {
+              ...prev,
+              loading: false,
+              kind,
+              text: kind === 'text' ? (payload.text ?? '') : undefined,
+              bytes:
+                kind === 'binary'
+                  ? payload.contentBase64
+                    ? base64ToBytes(payload.contentBase64)
+                    : new Uint8Array(0)
+                  : undefined,
+              truncated: payload.truncated,
+              bytesRead: payload.bytesRead,
+              totalBytes: payload.totalBytes,
+              error: undefined
+            }
+          })
+          return
+        }
       }
     })
   }, [tabId, pluginId, requestList, showNotice])
+
+  const closeViewer = useCallback((): void => {
+    setViewer(null)
+  }, [])
+
+  const openViewer = useCallback(
+    (entry: SftpEntry): void => {
+      setViewer({
+        path: entry.path,
+        name: entry.name,
+        loading: true,
+        truncated: false,
+        bytesRead: 0
+      })
+      void send({ type: 'viewFile', path: entry.path })
+    },
+    [send]
+  )
 
   // Close the context menu on outside mousedown, Escape, or window blur.
   useEffect(() => {
@@ -562,6 +673,82 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     )
   }
 
+  const renderViewer = (): ReactElement | null => {
+    if (!viewer) {
+      return null
+    }
+    const hex = viewer.kind === 'binary' && viewer.bytes ? hexDump(viewer.bytes) : ''
+    const metaParts: string[] = []
+    if (viewer.kind) {
+      metaParts.push(viewer.kind)
+    }
+    metaParts.push(formatBytes(viewer.bytesRead))
+    if (viewer.totalBytes && viewer.totalBytes > viewer.bytesRead) {
+      metaParts.push(`of ${formatBytes(viewer.totalBytes)}`)
+    }
+    return (
+      <div className="sftp-modal-backdrop sftp-viewer-backdrop" onMouseDown={closeViewer}>
+        <div
+          className="sftp-viewer"
+          onMouseDown={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.preventDefault()
+              closeViewer()
+            }
+          }}
+        >
+          <div className="sftp-viewer-titlebar">
+            <span className="sftp-viewer-title" title={viewer.path}>
+              {viewer.name}
+            </span>
+            <span className="sftp-viewer-path" title={viewer.path}>
+              {viewer.path}
+            </span>
+            <span className="sftp-viewer-meta">{metaParts.join(' · ')}</span>
+            <button
+              type="button"
+              className="sftp-btn sftp-btn-mini"
+              autoFocus
+              onClick={closeViewer}
+            >
+              ✕ Close
+            </button>
+          </div>
+          {viewer.truncated && !viewer.loading && !viewer.error && (
+            <div className="sftp-viewer-truncated">
+              Showing first {formatBytes(viewer.bytesRead)}
+              {viewer.totalBytes ? ` of ${formatBytes(viewer.totalBytes)}` : ''} — file larger than
+              the 1 MiB view limit.
+            </div>
+          )}
+          <div className={`sftp-viewer-body${viewer.kind === 'binary' ? ' sftp-viewer-hex' : ''}`}>
+            {viewer.loading && (
+              <div className="sftp-loading">
+                <span className="sftp-spinner" />
+                Reading file…
+              </div>
+            )}
+            {!viewer.loading && viewer.error && (
+              <div className="sftp-empty sftp-error">⚠ {viewer.error}</div>
+            )}
+            {!viewer.loading && !viewer.error && viewer.bytesRead === 0 && (
+              <div className="sftp-empty">File is empty</div>
+            )}
+            {!viewer.loading &&
+              !viewer.error &&
+              viewer.bytesRead > 0 &&
+              (viewer.kind === 'binary' ? (
+                <pre className="sftp-viewer-content">{hex}</pre>
+              ) : (
+                <pre className="sftp-viewer-content sftp-viewer-text">{(viewer.text ?? '').replace(/\r?\n$/, '')}</pre>
+              ))}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   const renderContextMenu = (): ReactElement | null => {
     if (!contextMenu) {
       return null
@@ -591,6 +778,8 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           <>
             {entry.type === 'directory' &&
               item('Open', '📂', false, () => navigate(entry.path))}
+            {entry.type === 'file' &&
+              item('View', '👁', false, () => openViewer(entry))}
             {entry.type === 'file' &&
               item('Download', '⬇', false, () => {
                 void send({ type: 'download', path: entry.path })
@@ -972,6 +1161,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         }}
       />
       {renderDialog()}
+      {renderViewer()}
       {renderContextMenu()}
     </div>
   )
