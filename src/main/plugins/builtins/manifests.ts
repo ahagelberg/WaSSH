@@ -2,7 +2,7 @@ import type { PluginManifest, PluginMacroButton } from '../../../shared/plugins'
 import {
   PLUGIN_ID_AI_AGENT,
   PLUGIN_ID_MACRO_PAD,
-  PLUGIN_ID_MQTT_EXPLORER,
+  PLUGIN_ID_MQTT_ANALYSER,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_SERVER_MONITOR,
   PLUGIN_ID_SFTP,
@@ -11,8 +11,8 @@ import {
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
-  MQTT_EXPLORER_DEFAULT_HOST,
-  MQTT_EXPLORER_DEFAULT_PORT,
+  MQTT_ANALYSER_DEFAULT_HOST,
+  MQTT_ANALYSER_DEFAULT_PORT,
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
   SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
   SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
@@ -159,9 +159,9 @@ export const macroPadManifest: PluginManifest = {
   }
 }
 
-export const mqttExplorerManifest: PluginManifest = {
-  id: PLUGIN_ID_MQTT_EXPLORER,
-  name: 'MQTT explorer',
+export const mqttAnalyserManifest: PluginManifest = {
+  id: PLUGIN_ID_MQTT_ANALYSER,
+  name: 'MQTT Analyser',
   version: '1.0.0',
   description: 'Browse topics and messages on an MQTT broker on the SSH host.',
   activation: 'manual',
@@ -174,7 +174,7 @@ export const mqttExplorerManifest: PluginManifest = {
         key: 'host',
         label: 'Broker host',
         type: 'string',
-        default: MQTT_EXPLORER_DEFAULT_HOST,
+        default: MQTT_ANALYSER_DEFAULT_HOST,
         description: 'Broker address as seen from the remote SSH host (usually 127.0.0.1).'
       },
       {
@@ -196,7 +196,7 @@ export const mqttExplorerManifest: PluginManifest = {
         key: 'port',
         label: 'Server port',
         type: 'number',
-        default: MQTT_EXPLORER_DEFAULT_PORT,
+        default: MQTT_ANALYSER_DEFAULT_PORT,
         description: 'Plain MQTT port (no TLS).'
       }
     ],
@@ -274,7 +274,7 @@ export const BUILTIN_MANIFESTS: PluginManifest[] = [
   serverMonitorManifest,
   scratchpadManifest,
   macroPadManifest,
-  mqttExplorerManifest,
+  mqttAnalyserManifest,
   sftpManifest,
   aiAgentManifest
 ]

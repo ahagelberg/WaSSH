@@ -1,12 +1,12 @@
 import { MqttClient, type IPublishPacket } from 'mqtt'
 import type { Duplex } from 'stream'
 import {
-  MQTT_EXPLORER_DEFAULT_HOST,
-  MQTT_EXPLORER_DEFAULT_PORT,
-  type MqttExplorerErrorKind,
-  type MqttExplorerMessagePayload,
-  type MqttExplorerRendererMessage,
-  type MqttExplorerStatusPayload
+  MQTT_ANALYSER_DEFAULT_HOST,
+  MQTT_ANALYSER_DEFAULT_PORT,
+  type MqttAnalyserErrorKind,
+  type MqttAnalyserMessagePayload,
+  type MqttAnalyserRendererMessage,
+  type MqttAnalyserStatusPayload
 } from '../../../shared/plugins'
 import type { PluginMainContext, PluginMainModule } from '../PluginHost'
 
@@ -55,7 +55,7 @@ function isUtf8Text(buf: Buffer): boolean {
 }
 
 function encodePayload(buf: Buffer): Pick<
-  MqttExplorerMessagePayload,
+  MqttAnalyserMessagePayload,
   'payloadText' | 'payloadBase64' | 'binary'
 > {
   if (isUtf8Text(buf)) {
@@ -65,7 +65,7 @@ function encodePayload(buf: Buffer): Pick<
 }
 
 function classifyConnectError(err: unknown): {
-  errorKind: MqttExplorerErrorKind
+  errorKind: MqttAnalyserErrorKind
   reason: string
 } {
   const message = err instanceof Error ? err.message : String(err)
@@ -99,8 +99,8 @@ function classifyConnectError(err: unknown): {
   return { errorKind: 'other', reason: message || 'Connection failed' }
 }
 
-function sendStatus(ctx: PluginMainContext, payload: Omit<MqttExplorerStatusPayload, 'type'>): void {
-  ctx.sendToRenderer({ type: 'status', ...payload } satisfies MqttExplorerStatusPayload)
+function sendStatus(ctx: PluginMainContext, payload: Omit<MqttAnalyserStatusPayload, 'type'>): void {
+  ctx.sendToRenderer({ type: 'status', ...payload } satisfies MqttAnalyserStatusPayload)
 }
 
 function readBrokerSettings(ctx: PluginMainContext): {
@@ -111,8 +111,8 @@ function readBrokerSettings(ctx: PluginMainContext): {
 } {
   const s = ctx.getSettings()
   return {
-    host: asString(s.host, MQTT_EXPLORER_DEFAULT_HOST).trim() || MQTT_EXPLORER_DEFAULT_HOST,
-    port: asPort(s.port, MQTT_EXPLORER_DEFAULT_PORT),
+    host: asString(s.host, MQTT_ANALYSER_DEFAULT_HOST).trim() || MQTT_ANALYSER_DEFAULT_HOST,
+    port: asPort(s.port, MQTT_ANALYSER_DEFAULT_PORT),
     username: asString(s.username, '').trim(),
     password: asString(s.password, '')
   }
@@ -131,7 +131,7 @@ async function connectBroker(ctx: PluginMainContext, state: SessionState): Promi
   if (!ctx.isSshSession()) {
     sendStatus(ctx, {
       state: 'unavailable',
-      reason: 'MQTT Explorer requires an SSH session',
+      reason: 'MQTT Analyser requires an SSH session',
       errorKind: 'not_ssh'
     })
     return
@@ -224,7 +224,7 @@ async function connectBroker(ctx: PluginMainContext, state: SessionState): Promi
       qos,
       retain: Boolean(packet.retain),
       timestamp: Date.now()
-    } satisfies MqttExplorerMessagePayload)
+    } satisfies MqttAnalyserMessagePayload)
   })
 
   client.on('error', (err) => {
@@ -272,7 +272,7 @@ function teardownClient(state: SessionState): void {
   }
 }
 
-function isRendererMessage(payload: unknown): payload is MqttExplorerRendererMessage {
+function isRendererMessage(payload: unknown): payload is MqttAnalyserRendererMessage {
   if (!payload || typeof payload !== 'object') {
     return false
   }
@@ -280,7 +280,7 @@ function isRendererMessage(payload: unknown): payload is MqttExplorerRendererMes
   return type === 'publish' || type === 'reconnect'
 }
 
-export const mqttExplorerMain: PluginMainModule = {
+export const mqttAnalyserMain: PluginMainModule = {
   async onActivate(ctx) {
     const state: SessionState = {
       client: null,

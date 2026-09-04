@@ -95,6 +95,29 @@ function positionBellLine(host: HTMLElement, term: Terminal, lineEl: HTMLElement
   lineEl.style.height = `${cellHeight}px`
 }
 
+/** xterm internals (same private surface the fit addon reads) used for re-measure/snap */
+interface XtermCoreInternals {
+  _charSizeService?: { measure: () => void }
+  _renderService?: { dimensions: { css: { canvas: { height: number } } } }
+}
+
+/**
+ * Fit to the host, then pin the xterm element height to whole rows so the flex
+ * host bottom-aligns it. Fonts may finish loading after mount, so re-measure
+ * first: rows are otherwise computed from fallback metrics and the last line
+ * overflows the pane edge once the real font applies.
+ */
+function fitAndSnap(term: Terminal, fit: FitAddon): void {
+  const core = term as unknown as XtermCoreInternals
+  core._charSizeService?.measure()
+  fit.fit()
+  const canvasHeight = core._renderService?.dimensions.css.canvas.height ?? 0
+  const element = term.element
+  if (element && canvasHeight > 0) {
+    element.style.height = `${canvasHeight}px`
+  }
+}
+
 export default function TerminalView({
   tabId,
   active,
@@ -175,7 +198,7 @@ export default function TerminalView({
     if (bellLineRef.current) {
       host.appendChild(bellLineRef.current)
     }
-    fit.fit()
+    fitAndSnap(term, fit)
     if (active) {
       term.focus()
     }
@@ -324,7 +347,7 @@ export default function TerminalView({
 
     let resizeTimer: ReturnType<typeof setTimeout> | null = null
     const notifyResize = (): void => {
-      fit.fit()
+      fitAndSnap(term, fit)
       onResize(tabId, term.cols, term.rows)
     }
     const ro = new ResizeObserver(() => {
@@ -339,7 +362,19 @@ export default function TerminalView({
     ro.observe(host)
     notifyResize()
 
+    // Bundled fonts may still be loading when the terminal was created; once
+    // they are ready the cached fallback metrics are stale, so fit again.
+    let disposed = false
+    void document.fonts.ready.then(() => {
+      if (disposed) {
+        return
+      }
+      fitAndSnap(term, fit)
+      onResize(tabId, term.cols, term.rows)
+    })
+
     return () => {
+      disposed = true
       dataDisp.dispose()
       cursorSeqDisp.dispose()
       bellDisp.dispose()
@@ -368,7 +403,10 @@ export default function TerminalView({
     term.options.scrollback = scrollbackLines
     term.options.fontSize = fontSizePx
     term.options.fontFamily = terminalFontStack(fontFamily)
-    fitRef.current?.fit()
+    const fit = fitRef.current
+    if (fit) {
+      fitAndSnap(term, fit)
+    }
     onResize(tabId, term.cols, term.rows)
   }, [scrollbackLines, fontSizePx, fontFamily, tabId, onResize])
 
@@ -394,9 +432,10 @@ export default function TerminalView({
     if (!active) {
       return
     }
-    fitRef.current?.fit()
     const term = termRef.current
-    if (term) {
+    const fit = fitRef.current
+    if (term && fit) {
+      fitAndSnap(term, fit)
       onResize(tabId, term.cols, term.rows)
     }
     // Defer past display:none → visible and past the control that activated this tab

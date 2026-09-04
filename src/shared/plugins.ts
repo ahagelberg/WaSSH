@@ -2,7 +2,7 @@
 export const PLUGIN_ID_SERVER_MONITOR = 'server-monitor'
 export const PLUGIN_ID_SCRATCHPAD = 'scratchpad'
 export const PLUGIN_ID_MACRO_PAD = 'macro-pad'
-export const PLUGIN_ID_MQTT_EXPLORER = 'mqtt-explorer'
+export const PLUGIN_ID_MQTT_ANALYSER = 'mqtt-analyser'
 export const PLUGIN_ID_SFTP = 'sftp'
 export const PLUGIN_ID_AI_AGENT = 'ai-agent'
 
@@ -10,7 +10,7 @@ export const DEFAULT_ENABLED_PLUGINS: string[] = [
   PLUGIN_ID_SERVER_MONITOR,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_MACRO_PAD,
-  PLUGIN_ID_MQTT_EXPLORER,
+  PLUGIN_ID_MQTT_ANALYSER,
   PLUGIN_ID_SFTP,
   PLUGIN_ID_AI_AGENT
 ]
@@ -307,18 +307,18 @@ export interface ServerMonitorSnapshot {
 }
 
 /** Default MQTT broker host on the remote machine */
-export const MQTT_EXPLORER_DEFAULT_HOST = '127.0.0.1'
+export const MQTT_ANALYSER_DEFAULT_HOST = '127.0.0.1'
 
 /** Default plain MQTT port */
-export const MQTT_EXPLORER_DEFAULT_PORT = 1883
+export const MQTT_ANALYSER_DEFAULT_PORT = 1883
 
 /** Max retained history entries per topic in the UI */
-export const MQTT_EXPLORER_HISTORY_LIMIT = 100
+export const MQTT_ANALYSER_HISTORY_LIMIT = 100
 
 /** Brief highlight duration when a topic receives a message (ms) */
-export const MQTT_EXPLORER_BLINK_MS = 500
+export const MQTT_ANALYSER_BLINK_MS = 500
 
-export type MqttExplorerStatusState =
+export type MqttAnalyserStatusState =
   | 'idle'
   | 'connecting'
   | 'connected'
@@ -326,7 +326,7 @@ export type MqttExplorerStatusState =
   | 'unavailable'
   | 'error'
 
-export type MqttExplorerErrorKind =
+export type MqttAnalyserErrorKind =
   | 'not_ssh'
   | 'no_broker'
   | 'auth_failed'
@@ -334,15 +334,15 @@ export type MqttExplorerErrorKind =
   | 'other'
 
 /** Main → renderer status event */
-export interface MqttExplorerStatusPayload {
+export interface MqttAnalyserStatusPayload {
   type: 'status'
-  state: MqttExplorerStatusState
+  state: MqttAnalyserStatusState
   reason?: string
-  errorKind?: MqttExplorerErrorKind
+  errorKind?: MqttAnalyserErrorKind
 }
 
 /** Main → renderer message event */
-export interface MqttExplorerMessagePayload {
+export interface MqttAnalyserMessagePayload {
   type: 'message'
   topic: string
   /** UTF-8 text when binary is false */
@@ -356,7 +356,7 @@ export interface MqttExplorerMessagePayload {
 }
 
 /** Renderer → main */
-export type MqttExplorerRendererMessage =
+export type MqttAnalyserRendererMessage =
   | {
       type: 'publish'
       topic: string

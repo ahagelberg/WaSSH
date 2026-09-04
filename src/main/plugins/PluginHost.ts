@@ -9,14 +9,14 @@ import type {
   StreamDirection,
   StreamMode
 } from '../../shared/plugins'
-import { mergePluginSessionSettings, PLUGIN_ID_AI_AGENT, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_EXPLORER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
+import { mergePluginSessionSettings, PLUGIN_ID_AI_AGENT, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_ANALYSER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import type { CredentialVault } from '../store/credentialVault'
 import { BUILTIN_MANIFESTS } from './builtins/manifests'
 import { aiAgentMain } from './builtins/aiAgent'
 import { macroPadMain } from './builtins/macroPad'
-import { mqttExplorerMain } from './builtins/mqttExplorer'
+import { mqttAnalyserMain } from './builtins/mqttAnalyser'
 import { scratchpadMain } from './builtins/scratchpad'
 import { serverMonitorMain } from './builtins/serverMonitor'
 import { sftpMain } from './builtins/sftp'
@@ -104,7 +104,7 @@ export class PluginHost {
     this.modules.set(PLUGIN_ID_SERVER_MONITOR, serverMonitorMain)
     this.modules.set(PLUGIN_ID_SCRATCHPAD, scratchpadMain)
     this.modules.set(PLUGIN_ID_MACRO_PAD, macroPadMain)
-    this.modules.set(PLUGIN_ID_MQTT_EXPLORER, mqttExplorerMain)
+    this.modules.set(PLUGIN_ID_MQTT_ANALYSER, mqttAnalyserMain)
     this.modules.set(PLUGIN_ID_SFTP, sftpMain)
     this.modules.set(PLUGIN_ID_AI_AGENT, aiAgentMain)
   }

@@ -964,6 +964,9 @@ textarea:focus {
 .terminal-host {
   height: 100%;
   padding: 4px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
   background-color: var(--bg-term);
   color: var(--term-fg-default);
   position: relative;
@@ -998,7 +1001,9 @@ textarea:focus {
 }
 
 .terminal-host .xterm {
+  /* TerminalView pins this to whole rows; flex must not shrink or re-grow it. */
   height: 100%;
+  flex: none;
 }
 
 .terminal-host .xterm-viewport {

@@ -3,7 +3,7 @@ import type { PluginListItem, PluginViewPlacement } from '@shared/plugins'
 import ServerMonitorView from './builtins/ServerMonitorView'
 import ScratchpadView from './builtins/ScratchpadView'
 import MacroPadView from './builtins/MacroPadView'
-import MqttExplorerView from './builtins/MqttExplorerView'
+import MqttAnalyserView from './builtins/MqttAnalyserView'
 import SftpView from './builtins/SftpView'
 import AiAgentView from './builtins/AiAgentView'
 
@@ -20,7 +20,7 @@ const VIEW_REGISTRY: Record<string, ComponentType<PluginViewProps>> = {
   'server-monitor': ServerMonitorView,
   scratchpad: ScratchpadView,
   'macro-pad': MacroPadView,
-  'mqtt-explorer': MqttExplorerView,
+  'mqtt-analyser': MqttAnalyserView,
   sftp: SftpView,
   'ai-agent': AiAgentView
 }

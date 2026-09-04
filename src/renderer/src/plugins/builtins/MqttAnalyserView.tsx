@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
-  MQTT_EXPLORER_BLINK_MS,
-  MQTT_EXPLORER_HISTORY_LIMIT,
-  type MqttExplorerErrorKind,
-  type MqttExplorerMessagePayload,
-  type MqttExplorerStatusPayload,
-  type MqttExplorerStatusState
+  MQTT_ANALYSER_BLINK_MS,
+  MQTT_ANALYSER_HISTORY_LIMIT,
+  type MqttAnalyserErrorKind,
+  type MqttAnalyserMessagePayload,
+  type MqttAnalyserStatusPayload,
+  type MqttAnalyserStatusState
 } from '@shared/plugins'
 import type { PluginViewProps } from '../registry'
 
@@ -138,7 +138,7 @@ function insertMessage(root: TopicNode, msg: TopicMessage, topic: string): Topic
   }
   node.hasOwnMessages = true
   node.receivedCount += 1
-  node.messages = [msg, ...node.messages].slice(0, MQTT_EXPLORER_HISTORY_LIMIT)
+  node.messages = [msg, ...node.messages].slice(0, MQTT_ANALYSER_HISTORY_LIMIT)
   recomputeCounts(next)
   return next
 }
@@ -303,9 +303,9 @@ function formatPayload(msg: TopicMessage): string {
 }
 
 function statusLabel(
-  state: MqttExplorerStatusState,
+  state: MqttAnalyserStatusState,
   reason?: string,
-  errorKind?: MqttExplorerErrorKind
+  errorKind?: MqttAnalyserErrorKind
 ): string {
   switch (state) {
     case 'connecting':
@@ -357,10 +357,10 @@ function nextMessageId(): string {
   return `m${messageSeq}`
 }
 
-export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): ReactElement {
-  const [status, setStatus] = useState<MqttExplorerStatusState>('idle')
+export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): ReactElement {
+  const [status, setStatus] = useState<MqttAnalyserStatusState>('idle')
   const [statusReason, setStatusReason] = useState<string | undefined>()
-  const [errorKind, setErrorKind] = useState<MqttExplorerErrorKind | undefined>()
+  const [errorKind, setErrorKind] = useState<MqttAnalyserErrorKind | undefined>()
   const [root, setRoot] = useState<TopicNode>(() => createRoot())
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
@@ -415,7 +415,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
           next.delete(p)
           return next
         })
-      }, MQTT_EXPLORER_BLINK_MS)
+      }, MQTT_ANALYSER_BLINK_MS)
       blinkTimers.current.set(p, timer)
     }
   }
@@ -425,7 +425,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
       if (ev.tabId !== tabId || ev.pluginId !== pluginId) {
         return
       }
-      const payload = ev.payload as MqttExplorerStatusPayload | MqttExplorerMessagePayload | null
+      const payload = ev.payload as MqttAnalyserStatusPayload | MqttAnalyserMessagePayload | null
       if (!payload || typeof payload !== 'object' || !('type' in payload)) {
         return
       }
@@ -702,7 +702,7 @@ export default function MqttExplorerView({ tabId, pluginId }: PluginViewProps): 
 
   return (
     <div
-      className="plugin-panel mqtt-explorer"
+      className="plugin-panel mqtt-analyser"
       tabIndex={0}
       onMouseDown={(e) => {
         const target = e.target as HTMLElement

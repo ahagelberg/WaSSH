@@ -54,7 +54,7 @@ A plugin is three things:
 | `preload/index.ts` | Exposes `window.wassh` |
 
 Built-in ids (`shared/plugins.ts`): `server-monitor`, `scratchpad`,
-`macro-pad`, `mqtt-explorer`, `sftp`, `ai-agent`. All six are enabled by
+`macro-pad`, `mqtt-analyser`, `sftp`, `ai-agent`. All six are enabled by
 default (`DEFAULT_ENABLED_PLUGINS`) and declared `activation: 'manual'`.
 
 ## 3. Manifest (`PluginManifest`)
@@ -332,11 +332,11 @@ main⇄renderer messages:
 | server-monitor | `setProcessSort` / `signalProcess` (TERM\|KILL) / `refresh` | `stats` → `ServerMonitorSnapshot` |
 | macro-pad | `send` → `writeToSession` | — |
 | scratchpad | — (renderer-driven; main is a no-op hook) | — |
-| mqtt-explorer | `publish` / `reconnect` | `status` → `MqttExplorerStatusPayload`; `message` → `MqttExplorerMessagePayload` |
+| mqtt-analyser | `publish` / `reconnect` | `status` → `MqttAnalyserStatusPayload`; `message` → `MqttAnalyserMessagePayload` |
 | sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `viewFile`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone`, `viewFileResult` → `SftpViewFilePayload` |
 | ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval`, `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
 
-`AiAgentRendererMessage`, `SftpRendererMessage`, `MqttExplorerRendererMessage`
+`AiAgentRendererMessage`, `SftpRendererMessage`, `MqttAnalyserRendererMessage`
 (and their payload types) are exported from `shared/plugins.ts`.
 
 ## 12. Adding a built-in plugin (checklist)

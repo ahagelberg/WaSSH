@@ -1817,9 +1817,9 @@
   margin: 12px 0 0;
 }
 
-/* MQTT explorer */
+/* MQTT Analyser */
 
-.mqtt-explorer {
+.mqtt-analyser {
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -1829,7 +1829,7 @@
   overflow: hidden;
 }
 
-.mqtt-explorer:focus {
+.mqtt-analyser:focus {
   outline: none;
 }
 
