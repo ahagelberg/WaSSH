@@ -141,6 +141,7 @@ textarea:focus {
 .app-shell {
   display: grid;
   grid-template-columns: var(--sidebar-width) 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
 }
 
@@ -152,8 +153,17 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .sidebar-column .sidebar {
@@ -169,6 +179,7 @@ textarea:focus {
 
 .sidebar-header {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: var(--gap);
@@ -207,6 +218,7 @@ textarea:focus {
 
 .host-group {
   position: relative;
+  flex-shrink: 0;
   padding: 6px 8px;
   border-radius: var(--host-group-card-radius);
   background: var(--bg-input);
@@ -633,6 +645,7 @@ textarea:focus {
 }
 
 .sidebar-footer {
+  flex-shrink: 0;
   border-top: 1px solid var(--border);
   padding: var(--pad);
   display: flex;
