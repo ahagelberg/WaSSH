@@ -69,7 +69,6 @@ import {
 import {
   connectionTypeOf,
   defaultPortForType,
-  emptyTunnel,
   hostToConnection,
   isSshConnectionType,
   protocolConfigFrom,
@@ -92,6 +91,7 @@ import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
 import PluginFieldEditor from '../plugins/PluginFieldEditor'
 import TagInput from './TagInput'
+import TunnelBuilder from './TunnelBuilder'
 
 export type HostSessionMode = 'editHost' | 'editOpenSession'
 
@@ -279,6 +279,7 @@ export default function HostSessionSettingsDialog({
   })
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
+  const [showTunnelBuilder, setShowTunnelBuilder] = useState(false)
   const identityLocked = mode === 'editOpenSession' && connected
   const editingHostId =
     mode === 'editHost' && 'id' in initial ? initial.id : form.hostId || ''
@@ -892,6 +893,10 @@ export default function HostSessionSettingsDialog({
         ? 'Applied when a new session connects from this host.'
         : 'Applied on the next connect or reconnect for this tab.'
 
+    const sshEndpoint = isSsh
+      ? `${form.username ? `${form.username}@` : ''}${form.host || 'host'}:${form.port}`
+      : ''
+
     const updateTunnel = (id: string, partial: Partial<SshTunnel>): void => {
       patch({
         tunnels: form.tunnels.map((t) => (t.id === id ? { ...t, ...partial } : t))
@@ -996,13 +1001,25 @@ export default function HostSessionSettingsDialog({
                 </div>
               )
             })}
-            <button
-              type="button"
-              className="settings-tunnel-add"
-              onClick={() => patch({ tunnels: [...form.tunnels, emptyTunnel()] })}
-            >
-              Add tunnel
-            </button>
+            {showTunnelBuilder ? (
+              <TunnelBuilder
+                sshEndpoint={sshEndpoint}
+                existing={form.tunnels}
+                onAdd={(tunnel) => {
+                  patch({ tunnels: [...form.tunnels, tunnel] })
+                  setShowTunnelBuilder(false)
+                }}
+                onCancel={() => setShowTunnelBuilder(false)}
+              />
+            ) : (
+              <button
+                type="button"
+                className="settings-tunnel-add"
+                onClick={() => setShowTunnelBuilder(true)}
+              >
+                Add tunnel
+              </button>
+            )}
           </div>
         </div>
       </>
@@ -1107,7 +1124,8 @@ export default function HostSessionSettingsDialog({
     isSsh,
     isSerial,
     styleDefaults,
-    plugins
+    plugins,
+    showTunnelBuilder
   ])
 
   const buildHostProfile = (): HostProfile => {

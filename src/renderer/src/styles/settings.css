@@ -402,3 +402,348 @@
   font-size: 11px;
 }
 
+/* ---- Tunnel builder (Host settings → Tunnels → Add tunnel) ---- */
+
+.tunnel-builder {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel-2);
+}
+
+.tunnel-builder-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tunnel-builder-head strong {
+  font-size: 13px;
+  letter-spacing: 0.03em;
+}
+
+.tunnel-builder-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.tunnel-builder-close:hover {
+  border-color: transparent;
+  color: var(--text);
+}
+
+.tunnel-type-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.tunnel-type-option {
+  position: relative;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  cursor: pointer;
+  background: var(--bg-app);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.tunnel-type-option:hover {
+  border-color: var(--text-muted);
+}
+
+.tunnel-type-option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-app));
+}
+
+.tunnel-type-option input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.tunnel-type-option:has(input:focus-visible) {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.tunnel-type-option-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tunnel-type-option-top strong {
+  font-size: 12px;
+}
+
+.tunnel-type-option small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.tunnel-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 3px;
+  font-family: var(--font-mono, Consolas, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tunnel-badge.L {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.tunnel-badge.R {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+}
+
+.tunnel-badge.D {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+.tunnel-builder-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.tunnel-fields {
+  flex: 2 1 280px;
+  min-width: 230px;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.tunnel-field {
+  display: grid;
+  gap: 3px;
+}
+
+.tunnel-field-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tunnel-field-inputs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tunnel-field-inputs input {
+  flex: 1;
+  min-width: 0;
+}
+
+.tunnel-field-inputs input.tunnel-field-port {
+  flex: 0 0 72px;
+}
+
+.tunnel-field-colon {
+  color: var(--text-muted);
+}
+
+.tunnel-field-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.tunnel-diagram {
+  flex: 3 1 290px;
+  min-width: 240px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 10px 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-app);
+}
+
+.tunnel-diagram-side {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  align-content: center;
+}
+
+.tunnel-diagram-node {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.tunnel-diagram-chip {
+  min-width: 0;
+  max-width: 100%;
+  display: grid;
+  gap: 3px;
+  justify-items: center;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel-2);
+}
+
+.tunnel-diagram-chip.ready {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.tunnel-diagram-chip.pending {
+  opacity: 0.6;
+  border-style: dashed;
+}
+
+.tunnel-diagram-chip-role {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.tunnel-diagram-chip-addr {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, Consolas, monospace);
+  font-size: 11px;
+}
+
+.tunnel-diagram-mid {
+  min-width: 0;
+  max-width: 150px;
+  display: grid;
+  gap: 3px;
+  justify-items: center;
+  padding: 0 2px;
+}
+
+.tunnel-diagram-pipe {
+  display: grid;
+  place-items: center;
+  min-width: 44px;
+  padding: 12px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+}
+
+.tunnel-diagram-arrow {
+  color: var(--accent);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.tunnel-diagram[data-type='remote'] .tunnel-diagram-arrow {
+  color: var(--warn);
+}
+
+.tunnel-diagram[data-type='dynamic'] .tunnel-diagram-arrow {
+  color: var(--ok);
+}
+
+.tunnel-diagram-mid-label {
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.tunnel-diagram-mid-sub {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, Consolas, monospace);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.tunnel-builder-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.tunnel-builder-note {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.tunnel-builder-summary {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  font-family: var(--font-mono, Consolas, monospace);
+  font-size: 12px;
+}
+
+.tunnel-builder-summary .tunnel-badge {
+  flex: none;
+}
+
+.tunnel-builder-error {
+  color: var(--warn);
+  font-size: 11px;
+}
+
+.tunnel-builder-actions {
+  display: flex;
+  gap: var(--gap);
+}
+
+.tunnel-builder button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tunnel-builder button:disabled:hover {
+  border-color: var(--border);
+}
+
+@media (max-width: 680px) {
+  .tunnel-type-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+
