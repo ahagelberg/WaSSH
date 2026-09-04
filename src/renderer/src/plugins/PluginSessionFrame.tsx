@@ -95,6 +95,39 @@ function dockMaxSizePx(
   return Math.max(MIN_DOCK_SIZE_PX, avail - reserved)
 }
 
+/**
+ * Clamp every open dock so the terminal / mid area keeps at least
+ * MIN_DOCK_SIZE_PX. Returns the same layout reference when nothing changed.
+ */
+function fitDocksToFrame(
+  layout: TabPluginLayout,
+  frame: HTMLElement | null
+): TabPluginLayout {
+  if (!frame) {
+    return layout
+  }
+  let next = layout
+  for (const edge of ['left', 'right', 'top', 'bottom'] as DockEdge[]) {
+    if (!next[edge]) {
+      continue
+    }
+    const key =
+      edge === 'left'
+        ? ('leftWidthPx' as const)
+        : edge === 'right'
+          ? ('rightWidthPx' as const)
+          : edge === 'top'
+            ? ('topHeightPx' as const)
+            : ('bottomHeightPx' as const)
+    const max = dockMaxSizePx(frame, next, edge)
+    const clamped = Math.max(MIN_DOCK_SIZE_PX, Math.min(next[key], max))
+    if (clamped !== next[key]) {
+      next = { ...next, [key]: clamped }
+    }
+  }
+  return next
+}
+
 function zoneFromPoint(rect: DOMRect, clientX: number, clientY: number): LeafSplitZone {
   const x = (clientX - rect.left) / Math.max(rect.width, 1)
   const y = (clientY - rect.top) / Math.max(rect.height, 1)
@@ -326,6 +359,13 @@ export default function PluginSessionFrame({
   layoutRef.current = layout
   onLayoutChangeRef.current = onLayoutChange
 
+  // Every layout commit first snaps dock sizes to the frame so the terminal /
+  // mid area always keeps its MIN_DOCK_SIZE_PX minimum (activating a plugin or
+  // drag-docking otherwise inserts a fixed-size dock that can swallow it).
+  const commitLayout = useCallback((nextLayout: TabPluginLayout): void => {
+    onLayoutChangeRef.current(fitDocksToFrame(nextLayout, frameRef.current))
+  }, [])
+
   // Keep inactive plugins in stored layout (reconnect briefly deactivates them).
   // Only add missing actives; user close removes via onDeactivatePlugin.
   useEffect(() => {
@@ -338,9 +378,9 @@ export default function PluginSessionFrame({
       )
     }
     if (JSON.stringify(layoutRef.current) !== JSON.stringify(next)) {
-      onLayoutChangeRef.current(next)
+      commitLayout(next)
     }
-  }, [activePluginIds, plugins])
+  }, [activePluginIds, plugins, commitLayout])
 
   const displayLayout = useMemo(
     () => pruneLayoutToActive(layout, activePluginIds),
@@ -362,27 +402,9 @@ export default function PluginSessionFrame({
           return
         }
         const cur = layoutRef.current
-        let next = cur
-        for (const edge of ['left', 'right', 'top', 'bottom'] as DockEdge[]) {
-          if (!next[edge]) {
-            continue
-          }
-          const key =
-            edge === 'left'
-              ? ('leftWidthPx' as const)
-              : edge === 'right'
-                ? ('rightWidthPx' as const)
-                : edge === 'top'
-                  ? ('topHeightPx' as const)
-                  : ('bottomHeightPx' as const)
-          const max = dockMaxSizePx(frame, next, edge)
-          const clamped = Math.max(MIN_DOCK_SIZE_PX, Math.min(next[key], max))
-          if (clamped !== next[key]) {
-            next = { ...next, [key]: clamped }
-          }
-        }
+        const next = fitDocksToFrame(cur, frame)
         if (next !== cur) {
-          onLayoutChangeRef.current(next)
+          commitLayout(next)
         }
       })
     }
@@ -459,13 +481,11 @@ export default function PluginSessionFrame({
     if (target.kind === 'edge') {
       const zone =
         target.insert === 'inner' ? innerInsertZone(target.edge) : outerInsertZone(target.edge)
-      onLayoutChangeRef.current(dockPluginOnEdge(current, movingId, target.edge, zone))
+      commitLayout(dockPluginOnEdge(current, movingId, target.edge, zone))
       return
     }
-    onLayoutChangeRef.current(
-      splitPluginLeaf(current, target.pluginId, target.zone, movingId)
-    )
-  }, [])
+    commitLayout(splitPluginLeaf(current, target.pluginId, target.zone, movingId))
+  }, [commitLayout])
 
   const onGripPointerDown = useCallback(
     (pluginId: string, event: ReactPointerEvent) => {
@@ -506,9 +526,9 @@ export default function PluginSessionFrame({
 
   const onSplitRatioChange = useCallback(
     (edge: DockEdge | 'overlay', path: number[], ratio: number) => {
-      onLayoutChangeRef.current(setDockSplitRatio(layoutRef.current, edge, path, ratio))
+      commitLayout(setDockSplitRatio(layoutRef.current, edge, path, ratio))
     },
-    []
+    [commitLayout]
   )
 
   const resizeDock = (edge: DockEdge, delta: number): void => {
@@ -525,7 +545,7 @@ export default function PluginSessionFrame({
     } else {
       next.bottomHeightPx = clampSize(next.bottomHeightPx - delta)
     }
-    onLayoutChangeRef.current(next)
+    commitLayout(next)
   }
 
   const renderDock = (edge: DockEdge, node: LayoutNode): ReactNode => {

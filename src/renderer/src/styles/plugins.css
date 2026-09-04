@@ -5,6 +5,7 @@
   --plugin-outer-drop-band: 28px;
   --plugin-inner-drop-band: 36px;
   --plugin-splitter-size: 4px;
+  --plugin-terminal-min-width: 200px;
   --monitor-cpu: #3d8bfd;
   --monitor-mem: #3dd68c;
   --monitor-disk: #f0b429;
@@ -80,7 +81,7 @@
 
 .plugin-session-terminal {
   flex: 1;
-  min-width: 0;
+  min-width: var(--plugin-terminal-min-width);
   min-height: 0;
   position: relative;
 }

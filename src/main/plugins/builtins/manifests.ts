@@ -152,18 +152,15 @@ export const mqttExplorerManifest: PluginManifest = {
   source: 'builtin',
   contributes: {
     toolbar: { label: 'MQTT' },
-    settingsHeading: 'MQTT explorer',
-    settingsSchema: [
+    hostSettingsHeading: 'MQTT',
+    hostSettingsSchema: [
       {
         key: 'host',
         label: 'Broker host',
         type: 'string',
         default: MQTT_EXPLORER_DEFAULT_HOST,
         description: 'Broker address as seen from the remote SSH host (usually 127.0.0.1).'
-      }
-    ],
-    hostSettingsHeading: 'MQTT',
-    hostSettingsSchema: [
+      },
       {
         key: 'username',
         label: 'MQTT username',

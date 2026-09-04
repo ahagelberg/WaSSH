@@ -846,7 +846,7 @@ export default function HostSessionSettingsDialog({
           >
             <option value={BELL_MODE_SYSTEM}>Default system sound</option>
             <option value={BELL_MODE_INVERT_WINDOW}>
-              Blink whole terminal (invert background)
+              Blink whole terminal
             </option>
             <option value={BELL_MODE_INVERT_LINE}>Blink current line</option>
           </select>

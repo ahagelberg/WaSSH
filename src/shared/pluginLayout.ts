@@ -44,7 +44,7 @@ export const DEFAULT_DOCK_WIDTH_PX = 300
 export const DEFAULT_DOCK_HEIGHT_PX = 160
 
 /** Sole minimum for dock edges and split panes (px) */
-export const MIN_DOCK_SIZE_PX = 100
+export const MIN_DOCK_SIZE_PX = 200
 
 /** Default split ratio when creating a split */
 export const DEFAULT_SPLIT_RATIO = 0.5
