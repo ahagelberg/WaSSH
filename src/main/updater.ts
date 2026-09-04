@@ -11,7 +11,14 @@ const RESTART_NOW_BUTTON_INDEX = 0
 /** Index of the "Later" (cancel) button in the restart prompt. */
 const LATER_BUTTON_INDEX = 1
 
+/** Index of the "Download and install" button in the update-available prompt. */
+const DOWNLOAD_AND_INSTALL_BUTTON_INDEX = 0
+
+/** Index of the "Not now" (dismiss) button in the update-available prompt. */
+const NOT_NOW_BUTTON_INDEX = 1
+
 let downloadedVersion: string | null = null
+let declinedVersion: string | null = null
 let checkInProgress = false
 let manualCheckPending = false
 let getWindow: () => BrowserWindow | null = () => null
@@ -88,11 +95,42 @@ export function setupAutoUpdater(getWindowFn: () => BrowserWindow | null): void 
   }
   getWindow = getWindowFn
   autoUpdater.logger = console
-  autoUpdater.autoDownload = true
+  autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = false
 
-  autoUpdater.on('update-available', (info) => {
-    console.log(`Update ${info.version} is available; downloading…`)
+  autoUpdater.on('update-available', async (info) => {
+    // Ask before downloading. Declined updates are only re-offered on an explicit
+    // "Check for Updates" so the startup check stays silent after a decline.
+    const isManualCheck = manualCheckPending
+    manualCheckPending = false
+    if (!isManualCheck && declinedVersion === info.version) {
+      return
+    }
+
+    const { response } = await messageBox({
+      type: 'info',
+      title: 'Update available',
+      message: `${APP_NAME} ${info.version} is available.`,
+      detail: 'Download and install it now?',
+      buttons: ['Download and install', 'Not now'],
+      defaultId: DOWNLOAD_AND_INSTALL_BUTTON_INDEX,
+      cancelId: NOT_NOW_BUTTON_INDEX
+    })
+    if (response !== DOWNLOAD_AND_INSTALL_BUTTON_INDEX) {
+      declinedVersion = info.version
+      return
+    }
+    declinedVersion = null
+
+    try {
+      await autoUpdater.downloadUpdate()
+    } catch (err) {
+      console.error('Update download failed:', err)
+      void showInfoDialog(
+        'Download failed',
+        `Version ${info.version} could not be downloaded. Check your connection and try again.`
+      )
+    }
   })
 
   autoUpdater.on('update-not-available', () => {
