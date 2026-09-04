@@ -70,8 +70,10 @@ const api: WasshApi = {
     ipcRenderer.invoke('plugins:message', tabId, pluginId, payload),
   queuePluginRestore: (tabId, activePluginIds) =>
     ipcRenderer.invoke('plugins:queueRestore', tabId, activePluginIds),
-  getPluginData: (pluginId) => ipcRenderer.invoke('plugins:getData', pluginId),
-  setPluginData: (pluginId, data) => ipcRenderer.invoke('plugins:setData', pluginId, data),
+  getPluginData: (pluginId, scopeId) =>
+    ipcRenderer.invoke('plugins:getData', pluginId, scopeId),
+  setPluginData: (pluginId, data, scopeId) =>
+    ipcRenderer.invoke('plugins:setData', pluginId, data, scopeId),
   getCommandPaletteData: () => ipcRenderer.invoke('commandPalette:get'),
   setCommandPaletteData: (data) => ipcRenderer.invoke('commandPalette:set', data),
   onSessionData: (cb) =>

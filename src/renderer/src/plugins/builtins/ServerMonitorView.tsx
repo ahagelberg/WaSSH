@@ -44,6 +44,16 @@ const SEC_PER_MIN = 60
 /** Byte-format unit ladder */
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const
 
+/** Decimal bytes in one megabyte (net fallback scale rungs) */
+const BYTES_PER_MB = 1_000_000
+
+/**
+ * Assumed net scale rungs (bytes/sec) used when no interface reports a link
+ * speed: start at 10 MB/s and jump 100 → 250 → 1000 MB/s as traffic exceeds
+ * each rung.
+ */
+const NET_ASSUMED_SCALE_RUNGS = [10, 100, 250, 1000].map((mb) => mb * BYTES_PER_MB)
+
 /** Rate-bar fill floor so tiny traffic stays visible */
 const RATE_BAR_MIN_PCT = 2
 
@@ -291,6 +301,16 @@ function netTotals(ifaces: ServerMonitorNetIface[]): {
     txRate: haveTx ? txRate : null,
     capacityBytesPerSec: haveSpeed ? capacityBits / BITS_PER_BYTE : null
   }
+}
+
+/** Smallest assumed rung covering the peak rate; the top rung caps the scale. */
+function assumedNetScale(peakBytesPerSec: number): number {
+  for (const rung of NET_ASSUMED_SCALE_RUNGS) {
+    if (peakBytesPerSec <= rung) {
+      return rung
+    }
+  }
+  return NET_ASSUMED_SCALE_RUNGS[NET_ASSUMED_SCALE_RUNGS.length - 1]
 }
 
 function formatLinkSpeed(bitsPerSec: number | null): string {
@@ -746,10 +766,18 @@ function NetworkPanel({
   txHistory: number[]
 }): ReactElement {
   const totals = netTotals(ifaces)
+  const peakRate = Math.max(
+    historyMax(rxHistory),
+    historyMax(txHistory),
+    totals.rxRate ?? 0,
+    totals.txRate ?? 0
+  )
+  // Real combined capacity when known; otherwise assume a link ladder rung that
+  // covers the observed peak (10 → 100 → 250 → 1000 MB/s).
   const capacity =
     totals.capacityBytesPerSec != null && totals.capacityBytesPerSec > 0
       ? totals.capacityBytesPerSec
-      : Math.max(historyMax(rxHistory), historyMax(txHistory), 1)
+      : assumedNetScale(peakRate)
 
   return (
     <div className="monitor-section monitor-network">
@@ -790,7 +818,7 @@ function NetworkPanel({
                 Cap{' '}
                 {totals.capacityBytesPerSec != null
                   ? formatLinkSpeed(totals.capacityBytesPerSec * BITS_PER_BYTE)
-                  : MISSING}
+                  : `~${formatRate(capacity)}`}
               </span>
             </div>
           </div>

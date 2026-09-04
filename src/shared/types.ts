@@ -602,10 +602,10 @@ export interface WasshApi {
   getActivePlugins: (tabId: string) => Promise<string[]>
   sendPluginMessage: (tabId: string, pluginId: string, payload: unknown) => Promise<unknown>
   queuePluginRestore: (tabId: string, activePluginIds: string[]) => Promise<void>
-  /** Read plugin-owned JSON from userData/plugin-<id>.json */
-  getPluginData: (pluginId: string) => Promise<unknown>
-  /** Write plugin-owned JSON to userData/plugin-<id>.json */
-  setPluginData: (pluginId: string, data: unknown) => Promise<void>
+  /** Read plugin-owned JSON from userData/plugin-<id>.json (or plugin-<id>.<scope>.json) */
+  getPluginData: (pluginId: string, scopeId?: string) => Promise<unknown>
+  /** Write plugin-owned JSON to userData/plugin-<id>.json (or plugin-<id>.<scope>.json) */
+  setPluginData: (pluginId: string, data: unknown, scopeId?: string) => Promise<void>
   /** Read command palette history from userData/command-palette.json */
   getCommandPaletteData: () => Promise<{ recentCommandIds: string[]; lastArgByCommand: Record<string, string> }>
   /** Write command palette history to userData/command-palette.json */

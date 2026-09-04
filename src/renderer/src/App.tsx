@@ -1263,6 +1263,7 @@ export default function App() {
                   >
                     <PluginSessionFrame
                       tabId={t.id}
+                      hostId={t.connection.hostId}
                       active={t.id === activeTabId}
                       plugins={plugins}
                       activePluginIds={t.activePluginIds}

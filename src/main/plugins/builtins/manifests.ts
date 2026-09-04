@@ -39,6 +39,12 @@ export const DEFAULT_MACRO_BUTTONS: PluginMacroButton[] = [
     label: 'create venv',
     text: 'python3 -m venv .venv\n',
     hotkey: ''
+  },
+  {
+    id: 'm4',
+    label: 'ps aux',
+    text: 'ps aux\n',
+    hotkey: ''
   }
 ]
 
@@ -105,12 +111,12 @@ export const scratchpadManifest: PluginManifest = {
   id: PLUGIN_ID_SCRATCHPAD,
   name: 'Scratchpad',
   version: '1.0.0',
-  description: 'Notes and scratch text shared across sessions.',
+  description: 'Notes shared across sessions of the same host.',
   activation: 'manual',
   source: 'builtin',
   contributes: {
     toolbar: { label: 'Scratch' },
-    views: [{ id: 'panel', placement: 'split-bottom', title: 'Scratchpad' }]
+    views: [{ id: 'panel', placement: 'split-right', title: 'Scratchpad' }]
   }
 }
 

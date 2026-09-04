@@ -34,6 +34,8 @@ import PluginPanelShell from './PluginPanelShell'
 
 interface Props {
   tabId: string
+  /** Saved host profile id of the session; null for unsaved sessions */
+  hostId: string | null
   active: boolean
   plugins: PluginListItem[]
   activePluginIds: string[]
@@ -154,6 +156,7 @@ function LayoutTreeView({
   edge,
   path,
   tabId,
+  hostId,
   active,
   plugins,
   settings,
@@ -169,6 +172,7 @@ function LayoutTreeView({
   edge: DockEdge | 'overlay'
   path: number[]
   tabId: string
+  hostId: string | null
   active: boolean
   plugins: PluginListItem[]
   settings: AppSettings
@@ -198,6 +202,7 @@ function LayoutTreeView({
     )
     const props = {
       tabId,
+      hostId,
       pluginId: plugin.id,
       settings: pluginSettings,
       onSettingsPatch: (partial: Record<string, unknown>) =>
@@ -246,6 +251,7 @@ function LayoutTreeView({
           edge={edge}
           path={[...path, 0]}
           tabId={tabId}
+          hostId={hostId}
           active={active}
           plugins={plugins}
           settings={settings}
@@ -279,6 +285,7 @@ function LayoutTreeView({
           edge={edge}
           path={[...path, 1]}
           tabId={tabId}
+          hostId={hostId}
           active={active}
           plugins={plugins}
           settings={settings}
@@ -297,6 +304,7 @@ function LayoutTreeView({
 
 export default function PluginSessionFrame({
   tabId,
+  hostId,
   active,
   plugins,
   activePluginIds,
@@ -552,6 +560,7 @@ export default function PluginSessionFrame({
           edge={edge}
           path={[]}
           tabId={tabId}
+          hostId={hostId}
           active={active}
           plugins={plugins}
           settings={settings}
@@ -709,6 +718,7 @@ export default function PluginSessionFrame({
             edge="overlay"
             path={[]}
             tabId={tabId}
+            hostId={hostId}
             active={active}
             plugins={plugins}
             settings={settings}

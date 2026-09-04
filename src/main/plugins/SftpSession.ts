@@ -134,6 +134,16 @@ function entryToSftpEntry(entry: FileEntryWithStats, parent: string): SftpEntry 
   }
 }
 
+/** Directories first, then files; both groups sorted by name (case-insensitive, numeric-aware). */
+function compareListEntries(a: SftpEntry, b: SftpEntry): number {
+  const aIsDir = a.type === 'directory' ? 0 : 1
+  const bIsDir = b.type === 'directory' ? 0 : 1
+  if (aIsDir !== bIsDir) {
+    return aIsDir - bIsDir
+  }
+  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+}
+
 /** Promisified wrapper around an ssh2 SFTPWrapper (one per live SSH client). */
 export class SftpSession {
   readonly sftp: SFTPWrapper
@@ -151,7 +161,7 @@ export class SftpSession {
           return
         }
         const parent = path === '/' ? '' : path.replace(/\/+$/, '')
-        resolve(list.map((entry) => entryToSftpEntry(entry, parent)))
+        resolve(list.map((entry) => entryToSftpEntry(entry, parent)).sort(compareListEntries))
       })
     })
   }

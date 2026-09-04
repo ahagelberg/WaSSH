@@ -169,8 +169,10 @@ export function registerIpc(
       queuePluginRestore(tabId, activePluginIds)
     }
   )
-  ipcMain.handle('plugins:getData', (_e, pluginId: string) => pluginData.get(pluginId))
-  ipcMain.handle('plugins:setData', (_e, pluginId: string, data: unknown) => {
-    pluginData.set(pluginId, data)
+  ipcMain.handle('plugins:getData', (_e, pluginId: string, scopeId?: string) =>
+    pluginData.get(pluginId, scopeId)
+  )
+  ipcMain.handle('plugins:setData', (_e, pluginId: string, data: unknown, scopeId?: string) => {
+    pluginData.set(pluginId, data, scopeId)
   })
 }

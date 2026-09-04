@@ -10,6 +10,8 @@ import AiAgentView from './builtins/AiAgentView'
 export interface PluginViewProps {
   tabId: string
   pluginId: string
+  /** Saved host profile id this session is bound to; null for unsaved sessions */
+  hostId: string | null
   settings: Record<string, unknown>
   onSettingsPatch: (partial: Record<string, unknown>) => void
 }
