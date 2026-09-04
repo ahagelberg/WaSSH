@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -43,6 +47,23 @@ jobs:
         run: npm run dist -- --publish always
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # electron-builder can occasionally leave duplicate releases on one tag with
+      # assets split across them. Keep only the release that carries latest.yml,
+      # otherwise the in-app updater cannot find the update metadata.
+      - name: Keep only the complete release for this tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          for id in $(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name == \"${tag}\") | .id"); do
+            has_latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${id}/assets" --jq '[.[].name] | index("latest.yml") != null')
+            if [ "$has_latest" != "true" ]; then
+              echo "Deleting duplicate release ${id} on ${tag} (missing latest.yml)"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+            fi
+          done
 
       - name: Upload installers as workflow artifacts
         uses: actions/upload-artifact@v4
