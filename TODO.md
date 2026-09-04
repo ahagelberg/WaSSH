@@ -6,6 +6,7 @@
 - Tunnel tool to create tunnels for multiple ports through multiple layers of machines
 - Broadcast commands to multiple machines at ones. Collect output. Allow diff between machines.
 - Topology view (plugin) built up autoamtically based on connections, tunnels, hops etc.
+- Workspaces
 
 ## Nice to have ##
 - Share settings easily
@@ -21,3 +22,6 @@
 - Monitor all hosts - including not connected
 - SCP/SFTP plugin: add edit function (text files using builtin editor) etc.
 - SCP/SFTP plugin: Allow tansfer between hosts?
+- MQTT plugin: Add history for published messages.
+- MQTT plugin: Add option to enter common messages for publishing
+- MQTT plugin: add basic triggers for activating commands and other things based on messagesw received
