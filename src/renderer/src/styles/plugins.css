@@ -3148,12 +3148,68 @@
 }
 
 .ai-agent-tool-command {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
   font-size: 11px;
   padding: 4px 8px;
   color: var(--text);
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--bg-panel-2) 70%, transparent);
+}
+
+.ai-agent-tool-cmd-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-agent-tool-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.ai-agent-tool-badge.tool-badge-ssh {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  color: var(--accent);
+}
+
+.ai-agent-tool-badge.tool-badge-remote-fs {
+  background: color-mix(in srgb, #3dd68c 25%, transparent);
+  color: #3dd68c;
+}
+
+.ai-agent-tool-badge.tool-badge-local-fs {
+  background: color-mix(in srgb, #f0b429 25%, transparent);
+  color: #f0b429;
+}
+
+.ai-agent-tool-badge.tool-badge-search {
+  background: color-mix(in srgb, #38bdf8 25%, transparent);
+  color: #38bdf8;
+}
+
+.ai-agent-tool-badge.tool-badge-web {
+  background: color-mix(in srgb, #a78bfa 25%, transparent);
+  color: #a78bfa;
+}
+
+.ai-agent-tool-badge.tool-badge-time {
+  background: color-mix(in srgb, #fb7185 25%, transparent);
+  color: #fb7185;
+}
+
+.ai-agent-tool-badge.tool-badge-generic {
+  background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+  color: var(--text-muted);
 }
 
 .ai-agent-tool-out {

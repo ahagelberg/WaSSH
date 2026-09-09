@@ -64,8 +64,14 @@ export type PluginSettingsFieldType =
   | 'boolean'
   | 'number'
   | 'string'
+  | 'select'
   | 'stringList'
   | 'macroList'
+
+export interface PluginSettingsSelectOption {
+  value: string
+  label: string
+}
 
 export interface PluginMacroButton {
   id: string
@@ -85,6 +91,8 @@ export interface PluginSettingsField {
   description?: string
   /** When true, string fields use a password input in settings UI */
   secret?: boolean
+  /** When type is 'select', list of available dropdown options */
+  options?: PluginSettingsSelectOption[]
 }
 
 export interface PluginToolbarContribution {
@@ -502,6 +510,45 @@ export const AI_AGENT_SETTING_DEFAULT_DENY_RULES = 'defaultDenyRules'
 export const AI_AGENT_SETTING_HOST_ALLOW_RULES = 'allowRules'
 export const AI_AGENT_SETTING_HOST_DENY_RULES = 'denyRules'
 
+/** Tool capability settings */
+export const AI_AGENT_SETTING_ENABLE_WEB_ACCESS = 'enableWebAccess'
+export const AI_AGENT_SETTING_ENABLE_WEB_SEARCH = 'enableWebSearch'
+export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
+export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'
+export const AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS = 'enableRemoteFsAccess'
+export const AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS = 'enableLocalFsAccess'
+export const AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS = 'enableDateTimeAccess'
+
+export type AiAgentWebSearchProvider = 'bing' | 'brave' | 'google' | 'duckduckgo' | 'custom'
+
+export const AI_AGENT_SEARCH_PROVIDER_OPTIONS: PluginSettingsSelectOption[] = [
+  { value: 'bing', label: 'Bing (Default)' },
+  { value: 'brave', label: 'Brave Search' },
+  { value: 'google', label: 'Google Search' },
+  { value: 'duckduckgo', label: 'DuckDuckGo' },
+  { value: 'custom', label: 'Custom Endpoint' }
+]
+
+export const AI_AGENT_DEFAULT_WEB_ACCESS = true
+export const AI_AGENT_DEFAULT_WEB_SEARCH = true
+export const AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER: AiAgentWebSearchProvider = 'bing'
+export const AI_AGENT_DEFAULT_REMOTE_FS_ACCESS = true
+export const AI_AGENT_DEFAULT_LOCAL_FS_ACCESS = true
+export const AI_AGENT_DEFAULT_DATETIME_ACCESS = true
+
+/** Tool name constants */
+export const AI_AGENT_TOOL_RUN_COMMAND = 'run_command'
+export const AI_AGENT_TOOL_WEB_FETCH = 'web_fetch'
+export const AI_AGENT_TOOL_WEB_SEARCH = 'web_search'
+export const AI_AGENT_TOOL_REMOTE_FS_READ = 'remote_fs_read_file'
+export const AI_AGENT_TOOL_REMOTE_FS_WRITE = 'remote_fs_write_file'
+export const AI_AGENT_TOOL_REMOTE_FS_LIST = 'remote_fs_list_dir'
+export const AI_AGENT_TOOL_REMOTE_FS_DELETE = 'remote_fs_delete_file'
+export const AI_AGENT_TOOL_LOCAL_FS_READ = 'local_fs_read_file'
+export const AI_AGENT_TOOL_LOCAL_FS_WRITE = 'local_fs_write_file'
+export const AI_AGENT_TOOL_LOCAL_FS_LIST = 'local_fs_list_dir'
+export const AI_AGENT_TOOL_GET_CURRENT_TIME = 'get_current_time'
+
 /** Line prefix that switches a rule to regex matching */
 export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
 
@@ -637,7 +684,9 @@ export interface AiAgentDataFile {
 /** One tool invocation requested by the model */
 export interface AiAgentToolCall {
   id: string
+  name?: string
   command: string
+  argumentsJson?: string
 }
 
 export type AiAgentToolOutcome = 'ok' | 'denied' | 'error' | 'timeout' | 'cancelled'
@@ -667,6 +716,7 @@ export interface AiAgentConversationAssistantMsg {
 export interface AiAgentConversationToolMsg {
   role: 'tool'
   toolCallId: string
+  name?: string
   command: string
   content: string
   outcome: AiAgentToolOutcome

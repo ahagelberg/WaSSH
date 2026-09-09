@@ -3,13 +3,37 @@ import {
   AI_AGENT_CONVERSATIONS_PER_HOST_MAX,
   AI_AGENT_DATA_VERSION,
   AI_AGENT_DEFAULT_CHAT_TITLE,
+  AI_AGENT_DEFAULT_DATETIME_ACCESS,
+  AI_AGENT_DEFAULT_LOCAL_FS_ACCESS,
+  AI_AGENT_DEFAULT_REMOTE_FS_ACCESS,
+  AI_AGENT_DEFAULT_WEB_ACCESS,
+  AI_AGENT_DEFAULT_WEB_SEARCH,
+  AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
+  AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS,
+  AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS,
+  AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS,
+  AI_AGENT_SETTING_ENABLE_WEB_ACCESS,
+  AI_AGENT_SETTING_ENABLE_WEB_SEARCH,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
+  AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
+  AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
   AI_AGENT_TITLE_MAX_CHARS,
+  AI_AGENT_TOOL_GET_CURRENT_TIME,
+  AI_AGENT_TOOL_LOCAL_FS_LIST,
+  AI_AGENT_TOOL_LOCAL_FS_READ,
+  AI_AGENT_TOOL_LOCAL_FS_WRITE,
+  AI_AGENT_TOOL_REMOTE_FS_DELETE,
+  AI_AGENT_TOOL_REMOTE_FS_LIST,
+  AI_AGENT_TOOL_REMOTE_FS_READ,
+  AI_AGENT_TOOL_REMOTE_FS_WRITE,
+  AI_AGENT_TOOL_RUN_COMMAND,
+  AI_AGENT_TOOL_WEB_FETCH,
+  AI_AGENT_TOOL_WEB_SEARCH,
   aiAgentVaultId,
   type AiAgentApprovalRequest,
   type AiAgentChatAttachment,
@@ -22,7 +46,8 @@ import {
   type AiAgentRendererMessage,
   type AiAgentRunPhase,
   type AiAgentStateSnapshot,
-  type AiAgentSudoRequest
+  type AiAgentSudoRequest,
+  type AiAgentToolOutcome
 } from '../../../shared/plugins'
 import type { PluginMainContext, PluginMainModule } from '../PluginHost'
 import { decideCommand } from '../aiAgent/permissions'
@@ -32,6 +57,20 @@ import {
   type ApiMessage,
   type ApiToolCallMsg
 } from '../aiAgent/providers'
+import {
+  executeDateTime,
+  executeLocalFsList,
+  executeLocalFsRead,
+  executeLocalFsWrite,
+  executeRemoteFsDelete,
+  executeRemoteFsList,
+  executeRemoteFsRead,
+  executeRemoteFsWrite,
+  executeWebFetch,
+  executeWebSearch,
+  getActiveTools,
+  isMutatingTool
+} from '../aiAgent/tools'
 
 /** Max chained tool steps per run before we stop the loop */
 const MAX_RUN_STEPS = 50
@@ -601,8 +640,8 @@ function toApiMessages(conversation: AiAgentConversation): ApiMessage[] {
     if (msg.role === 'assistant') {
       const toolCalls: ApiToolCallMsg[] = (msg.toolCalls ?? []).map((tc) => ({
         id: tc.id,
-        name: RUN_COMMAND_TOOL_NAME,
-        arguments: JSON.stringify({ command: tc.command })
+        name: tc.name || RUN_COMMAND_TOOL_NAME,
+        arguments: tc.argumentsJson || JSON.stringify({ command: tc.command })
       }))
       out.push({
         role: 'assistant',
@@ -735,12 +774,13 @@ interface ExecResult {
 
 function toolResultMessage(
   toolCallId: string,
+  name: string,
   command: string,
   content: string,
   outcome: AiAgentConversationToolMsg['outcome'],
   truncated: boolean
 ): AiAgentConversationMsg {
-  return { role: 'tool', toolCallId, command, content, outcome, truncated }
+  return { role: 'tool', toolCallId, name, command, content, outcome, truncated }
 }
 
 async function askApproval(host: HostState, command: string): Promise<string> {
@@ -753,6 +793,53 @@ async function askApproval(host: HostState, command: string): Promise<string> {
   host.approvalResolve = null
   host.pendingApproval = null
   return decision
+}
+
+function parseJsonArgs(jsonStr: string): Record<string, unknown> {
+  try {
+    const val = JSON.parse(jsonStr)
+    return val && typeof val === 'object' ? (val as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function extractToolDisplayCommand(name: string, argsJson: string): string {
+  const args = parseJsonArgs(argsJson)
+  if (name === AI_AGENT_TOOL_RUN_COMMAND) {
+    return typeof args.command === 'string' ? args.command : ''
+  }
+  if (name === AI_AGENT_TOOL_GET_CURRENT_TIME) {
+    return 'get_current_time'
+  }
+  if (name === AI_AGENT_TOOL_WEB_FETCH) {
+    return `fetch ${String(args.url || '')}`
+  }
+  if (name === AI_AGENT_TOOL_WEB_SEARCH) {
+    return `search "${String(args.query || '')}"`
+  }
+  if (name === AI_AGENT_TOOL_REMOTE_FS_READ) {
+    return `remote_read ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_REMOTE_FS_WRITE) {
+    return `remote_write ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_REMOTE_FS_LIST) {
+    return `remote_ls ${String(args.path || '.')}`
+  }
+  if (name === AI_AGENT_TOOL_REMOTE_FS_DELETE) {
+    return `remote_delete ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_LOCAL_FS_READ) {
+    return `local_read ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_LOCAL_FS_WRITE) {
+    return `local_write ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_LOCAL_FS_LIST) {
+    return `local_ls ${String(args.path || '.')}`
+  }
+  return `${name} ${JSON.stringify(args)}`
 }
 
 function toolContentForModel(
@@ -812,6 +899,43 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   const appDeny = listSetting(settings, AI_AGENT_SETTING_DEFAULT_DENY_RULES)
   const projectRules = await readProjectRules(ctx)
 
+  const enableWebAccess =
+    typeof settings[AI_AGENT_SETTING_ENABLE_WEB_ACCESS] === 'boolean'
+      ? (settings[AI_AGENT_SETTING_ENABLE_WEB_ACCESS] as boolean)
+      : AI_AGENT_DEFAULT_WEB_ACCESS
+  const enableWebSearch =
+    typeof settings[AI_AGENT_SETTING_ENABLE_WEB_SEARCH] === 'boolean'
+      ? (settings[AI_AGENT_SETTING_ENABLE_WEB_SEARCH] as boolean)
+      : AI_AGENT_DEFAULT_WEB_SEARCH
+  const webSearchProvider =
+    typeof settings[AI_AGENT_SETTING_WEB_SEARCH_PROVIDER] === 'string'
+      ? (settings[AI_AGENT_SETTING_WEB_SEARCH_PROVIDER] as string)
+      : AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER
+  const webSearchApiKey =
+    typeof settings[AI_AGENT_SETTING_WEB_SEARCH_API_KEY] === 'string'
+      ? (settings[AI_AGENT_SETTING_WEB_SEARCH_API_KEY] as string)
+      : ''
+  const enableRemoteFsAccess =
+    typeof settings[AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS] === 'boolean'
+      ? (settings[AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS] as boolean)
+      : AI_AGENT_DEFAULT_REMOTE_FS_ACCESS
+  const enableLocalFsAccess =
+    typeof settings[AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS] === 'boolean'
+      ? (settings[AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS] as boolean)
+      : AI_AGENT_DEFAULT_LOCAL_FS_ACCESS
+  const enableDateTimeAccess =
+    typeof settings[AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS] === 'boolean'
+      ? (settings[AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS] as boolean)
+      : AI_AGENT_DEFAULT_DATETIME_ACCESS
+
+  const activeTools = getActiveTools({
+    enableWebAccess,
+    enableWebSearch,
+    enableRemoteFsAccess,
+    enableLocalFsAccess,
+    enableDateTimeAccess
+  })
+
   host.runCtx = ctx
   host.inRun = true
   host.stopped = false
@@ -831,6 +955,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         model: conv.activeModel,
         system: systemPrompt(host, projectRules),
         messages: toApiMessages(conv),
+        tools: activeTools,
         maxTokens: MAX_TOKENS,
         signal: controller.signal,
         onDelta: (text) => {
@@ -856,9 +981,12 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         text: result.text,
         providerId: provider.id,
         model: conv.activeModel,
-        toolCalls: result.toolCalls
-          .map((tc) => ({ id: tc.id, command: extractCommand(tc.arguments) }))
-          .filter((tc) => tc.command.length > 0)
+        toolCalls: result.toolCalls.map((tc) => ({
+          id: tc.id,
+          name: tc.name,
+          command: extractToolDisplayCommand(tc.name, tc.arguments),
+          argumentsJson: tc.arguments
+        }))
       })
       pushState(host)
       persistConversation(host)
@@ -872,97 +1000,195 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           keepRunning = false
           break
         }
-        const command = extractCommand(tc.arguments)
-        if (!command) {
-          conv.messages.push(
-            toolResultMessage(tc.id, tc.arguments, 'Model sent an empty command.', 'error', false)
-          )
-          pushState(host)
-          continue
-        }
 
-        const decision = decideCommand(
-          command,
-          hostAllow,
-          hostDeny,
-          appAllow,
-          appDeny,
-          host.extraAllow,
-          host.extraDeny
-        )
-        let action: string = decision
-        if (decision === 'ask') {
-          action = await askApproval(host, command)
+        const toolName = tc.name || RUN_COMMAND_TOOL_NAME
+        const toolArgs = parseJsonArgs(tc.arguments)
+        const displayCommand = extractToolDisplayCommand(toolName, tc.arguments)
+
+        // Handle shell run_command specifically with approval & sudo flow
+        if (toolName === AI_AGENT_TOOL_RUN_COMMAND) {
+          const command = typeof toolArgs.command === 'string' ? toolArgs.command.trim() : ''
+          if (!command) {
+            conv.messages.push(
+              toolResultMessage(
+                tc.id,
+                toolName,
+                tc.arguments,
+                'Model sent an empty command.',
+                'error',
+                false
+              )
+            )
+            pushState(host)
+            continue
+          }
+
+          const decision = decideCommand(
+            command,
+            hostAllow,
+            hostDeny,
+            appAllow,
+            appDeny,
+            host.extraAllow,
+            host.extraDeny
+          )
+          let action: string = decision
+          if (decision === 'ask') {
+            action = await askApproval(host, command)
+            if (!host.inRun) {
+              keepRunning = false
+              break
+            }
+            if (action === 'allowAlways') {
+              host.extraAllow.push(command)
+            } else if (action === 'denyAlways') {
+              host.extraDeny.push(command)
+            }
+          }
+          if (action === 'deny' || action === 'denyAlways') {
+            conv.messages.push(toolResultMessage(tc.id, toolName, command, '', 'denied', false))
+            pushState(host)
+            persistConversation(host)
+            continue
+          }
+
+          let sudoStdin: string | undefined
+          if (commandNeedsSudo(command)) {
+            const ok = await ensureSudoCredentials(host, command)
+            if (!host.inRun) {
+              keepRunning = false
+              break
+            }
+            if (!ok) {
+              conv.messages.push(
+                toolResultMessage(
+                  tc.id,
+                  toolName,
+                  command,
+                  'Sudo password prompt was cancelled.',
+                  'cancelled',
+                  false
+                )
+              )
+              pushState(host)
+              persistConversation(host)
+              continue
+            }
+            sudoStdin = hasCachedSudoPassword(host) ? (host.sudoPassword ?? '') : ''
+          }
+
+          const execResult = await execCommand(host, command, sudoStdin)
           if (!host.inRun) {
             keepRunning = false
             break
           }
-          if (action === 'allowAlways') {
-            host.extraAllow.push(command)
-          } else if (action === 'denyAlways') {
-            host.extraDeny.push(command)
+          if (execResult.content.includes(SUDO_AUTH_FAILED_MARKER)) {
+            clearSudoCache(host)
+          } else if (sudoStdin !== undefined && execResult.outcome === 'ok') {
+            if (hasCachedSudoPassword(host)) {
+              host.sudoPasswordExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+            } else {
+              host.sudoNopassExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+            }
           }
-        }
-        if (action === 'deny' || action === 'denyAlways') {
-          conv.messages.push(toolResultMessage(tc.id, command, '', 'denied', false))
+          if (execResult.pwd) {
+            conv.cwd = execResult.pwd
+          }
+          const outcome: AiAgentConversationToolMsg['outcome'] =
+            execResult.outcome === 'ok'
+              ? 'ok'
+              : execResult.outcome === 'timeout'
+                ? 'timeout'
+                : execResult.outcome === 'cancelled'
+                  ? 'cancelled'
+                  : 'error'
+          conv.messages.push(
+            toolResultMessage(
+              tc.id,
+              toolName,
+              command,
+              toolContentForModel(execResult, command, outcome),
+              outcome,
+              execResult.truncated
+            )
+          )
           pushState(host)
           persistConversation(host)
           continue
         }
 
-        let sudoStdin: string | undefined
-        if (commandNeedsSudo(command)) {
-          const ok = await ensureSudoCredentials(host, command)
+        // Handle Mutating Tools (Remote Write/Delete, Local Write) with Approval
+        if (isMutatingTool(toolName)) {
+          const action = await askApproval(host, displayCommand)
           if (!host.inRun) {
             keepRunning = false
             break
           }
-          if (!ok) {
+          if (action === 'deny' || action === 'denyAlways') {
             conv.messages.push(
-              toolResultMessage(tc.id, command, 'Sudo password prompt was cancelled.', 'cancelled', false)
+              toolResultMessage(tc.id, toolName, displayCommand, 'Action denied by user.', 'denied', false)
             )
             pushState(host)
             persistConversation(host)
             continue
           }
-          // Always feed one stdin line when sudo is involved (password or empty for NOPASSWD).
-          sudoStdin = hasCachedSudoPassword(host) ? (host.sudoPassword ?? '') : ''
         }
 
-        const execResult = await execCommand(host, command, sudoStdin)
+        // Execute non-command tools
+        let toolOutput = ''
+        let toolOutcome: AiAgentToolOutcome = 'ok'
+        try {
+          if (toolName === AI_AGENT_TOOL_GET_CURRENT_TIME) {
+            toolOutput = executeDateTime()
+          } else if (toolName === AI_AGENT_TOOL_WEB_FETCH) {
+            const url = String(toolArgs.url || '')
+            const maxChars = typeof toolArgs.maxChars === 'number' ? toolArgs.maxChars : undefined
+            toolOutput = await executeWebFetch(url, maxChars)
+          } else if (toolName === AI_AGENT_TOOL_WEB_SEARCH) {
+            const query = String(toolArgs.query || '')
+            const limit = typeof toolArgs.limit === 'number' ? toolArgs.limit : undefined
+            toolOutput = await executeWebSearch(query, webSearchProvider, webSearchApiKey, limit)
+          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_READ) {
+            const filePath = String(toolArgs.path || '')
+            const maxChars = typeof toolArgs.maxChars === 'number' ? toolArgs.maxChars : undefined
+            toolOutput = await executeRemoteFsRead(ctx, filePath, maxChars)
+          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_WRITE) {
+            const filePath = String(toolArgs.path || '')
+            const content = String(toolArgs.content || '')
+            toolOutput = await executeRemoteFsWrite(ctx, filePath, content)
+          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_LIST) {
+            const dirPath = typeof toolArgs.path === 'string' ? toolArgs.path : '.'
+            toolOutput = await executeRemoteFsList(ctx, dirPath)
+          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_DELETE) {
+            const targetPath = String(toolArgs.path || '')
+            toolOutput = await executeRemoteFsDelete(ctx, targetPath)
+          } else if (toolName === AI_AGENT_TOOL_LOCAL_FS_READ) {
+            const filePath = String(toolArgs.path || '')
+            const maxChars = typeof toolArgs.maxChars === 'number' ? toolArgs.maxChars : undefined
+            toolOutput = await executeLocalFsRead(filePath, maxChars)
+          } else if (toolName === AI_AGENT_TOOL_LOCAL_FS_WRITE) {
+            const filePath = String(toolArgs.path || '')
+            const content = String(toolArgs.content || '')
+            toolOutput = await executeLocalFsWrite(filePath, content)
+          } else if (toolName === AI_AGENT_TOOL_LOCAL_FS_LIST) {
+            const dirPath = String(toolArgs.path || '.')
+            toolOutput = await executeLocalFsList(dirPath)
+          } else {
+            toolOutput = `Unknown tool: ${toolName}`
+            toolOutcome = 'error'
+          }
+        } catch (err) {
+          toolOutput = `Error running tool "${toolName}": ${err instanceof Error ? err.message : String(err)}`
+          toolOutcome = 'error'
+        }
+
         if (!host.inRun) {
           keepRunning = false
           break
         }
-        if (execResult.content.includes(SUDO_AUTH_FAILED_MARKER)) {
-          clearSudoCache(host)
-        } else if (sudoStdin !== undefined && execResult.outcome === 'ok') {
-          // Refresh cache window after successful sudo use
-          if (hasCachedSudoPassword(host)) {
-            host.sudoPasswordExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
-          } else {
-            host.sudoNopassExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
-          }
-        }
-        if (execResult.pwd) {
-          conv.cwd = execResult.pwd
-        }
-        const outcome: AiAgentConversationToolMsg['outcome'] =
-          execResult.outcome === 'ok'
-            ? 'ok'
-            : execResult.outcome === 'timeout'
-              ? 'timeout'
-              : execResult.outcome === 'cancelled'
-                ? 'cancelled'
-                : 'error'
+
         conv.messages.push(
-          toolResultMessage(
-            tc.id,
-            command,
-            toolContentForModel(execResult, command, outcome),
-            outcome,
-            execResult.truncated
-          )
+          toolResultMessage(tc.id, toolName, displayCommand, toolOutput, toolOutcome, false)
         )
         pushState(host)
         persistConversation(host)

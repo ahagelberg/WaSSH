@@ -5,6 +5,7 @@ import {
   AI_AGENT_PROTOCOL_ANTHROPIC,
   type AiAgentProviderProtocol
 } from '../../../shared/plugins'
+import type { ToolDefinition } from './tools'
 
 /** Cap on provider error text attached to thrown errors */
 const MAX_ERROR_BODY_CHARS = 500
@@ -34,46 +35,34 @@ export interface CompletionOptions {
   model: string
   system: string
   messages: ApiMessage[]
+  tools?: ToolDefinition[]
   maxTokens: number
   signal: AbortSignal
   /** Called as assistant text streams in */
   onDelta: (text: string) => void
 }
 
-/** The single tool exposed to the model in v1 */
+/** The default shell command tool name */
 export const RUN_COMMAND_TOOL_NAME = 'run_command'
 
-const RUN_COMMAND_TOOL_OPENAI = {
-  type: 'function',
-  function: {
-    name: RUN_COMMAND_TOOL_NAME,
-    description:
-      'Run a single non-interactive shell command on the remote host. Output and exit code are returned. Use several calls to work step by step.',
-    parameters: {
-      type: 'object',
-      properties: {
-        command: {
-          type: 'string',
-          description: 'The shell command to execute'
-        }
-      },
-      required: ['command']
+function toOpenAiTool(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters
     }
   }
-} as const
+}
 
-const RUN_COMMAND_TOOL_ANTHROPIC = {
-  name: RUN_COMMAND_TOOL_NAME,
-  description:
-    'Run a single non-interactive shell command on the remote host. Output and exit code are returned. Use several calls to work step by step.',
-  input_schema: {
-    type: 'object',
-    properties: {
-      command: { type: 'string', description: 'The shell command to execute' }
-    },
-    required: ['command']
+function toAnthropicTool(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    name: tool.name,
+    description: tool.description,
+    input_schema: tool.parameters
   }
-} as const
+}
 
 function joinUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, '')}${path}`
@@ -189,6 +178,7 @@ async function readSse(
 }
 
 async function completeOpenAi(opts: CompletionOptions): Promise<CompletionResult> {
+  const tools = opts.tools && opts.tools.length > 0 ? opts.tools.map(toOpenAiTool) : undefined
   const res = await fetch(joinUrl(opts.baseUrl, AI_AGENT_OPENAI_CHAT_PATH), {
     method: 'POST',
     headers: {
@@ -198,7 +188,7 @@ async function completeOpenAi(opts: CompletionOptions): Promise<CompletionResult
     body: JSON.stringify({
       model: opts.model,
       messages: toOpenAiMessages(opts.system, opts.messages),
-      tools: [RUN_COMMAND_TOOL_OPENAI],
+      ...(tools ? { tools } : {}),
       stream: true
     }),
     signal: opts.signal
@@ -256,12 +246,13 @@ async function completeOpenAi(opts: CompletionOptions): Promise<CompletionResult
 
   const toolCalls: ApiToolCallMsg[] = Array.from(toolFragments.entries())
     .sort((a, b) => a[0] - b[0])
-    .filter(([, frag]) => frag.name === RUN_COMMAND_TOOL_NAME && frag.id)
+    .filter(([, frag]) => frag.name && frag.id)
     .map(([, frag]) => ({ id: frag.id, name: frag.name, arguments: frag.arguments }))
   return { text, toolCalls, stopReason }
 }
 
 async function completeAnthropic(opts: CompletionOptions): Promise<CompletionResult> {
+  const tools = opts.tools && opts.tools.length > 0 ? opts.tools.map(toAnthropicTool) : undefined
   const res = await fetch(joinUrl(opts.baseUrl, AI_AGENT_ANTHROPIC_PATH), {
     method: 'POST',
     headers: {
@@ -274,7 +265,7 @@ async function completeAnthropic(opts: CompletionOptions): Promise<CompletionRes
       max_tokens: opts.maxTokens,
       system: opts.system,
       messages: toAnthropicMessages(opts.messages),
-      tools: [RUN_COMMAND_TOOL_ANTHROPIC],
+      ...(tools ? { tools } : {}),
       stream: true
     }),
     signal: opts.signal
@@ -332,7 +323,7 @@ async function completeAnthropic(opts: CompletionOptions): Promise<CompletionRes
 
   const toolCalls: ApiToolCallMsg[] = Array.from(toolBlocks.entries())
     .sort((a, b) => a[0] - b[0])
-    .filter(([, block]) => block.name === RUN_COMMAND_TOOL_NAME && block.id)
+    .filter(([, block]) => block.name && block.id)
     .map(([, block]) => ({ id: block.id, name: block.name, arguments: block.arguments }))
   return { text, toolCalls, stopReason }
 }

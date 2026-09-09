@@ -133,6 +133,28 @@ function outcomeLabel(outcome: AiAgentConversationToolMsg['outcome']): string {
   return 'failed'
 }
 
+function toolBadge(name?: string): { label: string; className: string } {
+  if (!name || name === 'run_command') {
+    return { label: 'SSH', className: 'tool-badge-ssh' }
+  }
+  if (name.startsWith('remote_fs_')) {
+    return { label: 'Remote SFTP', className: 'tool-badge-remote-fs' }
+  }
+  if (name.startsWith('local_fs_')) {
+    return { label: 'Local PC', className: 'tool-badge-local-fs' }
+  }
+  if (name === 'web_search') {
+    return { label: 'Search', className: 'tool-badge-search' }
+  }
+  if (name === 'web_fetch') {
+    return { label: 'Web', className: 'tool-badge-web' }
+  }
+  if (name === 'get_current_time') {
+    return { label: 'Time', className: 'tool-badge-time' }
+  }
+  return { label: 'Tool', className: 'tool-badge-generic' }
+}
+
 /** Render simple inline code / code fences without a markdown dependency */
 function formatText(text: string): ReactElement[] {
   const parts = text.split(/```/)
@@ -748,9 +770,13 @@ export default function AiAgentView({
               </div>
             ))
           )
+        const badge = toolBadge(tc.name)
         toolChildren.push(
           <div key={tc.id} className="ai-agent-tool">
-            <div className="ai-agent-tool-command">$ {tc.command}</div>
+            <div className="ai-agent-tool-command">
+              <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
+              <span className="ai-agent-tool-cmd-text">{tc.command.startsWith('$') ? tc.command : `$ ${tc.command}`}</span>
+            </div>
             {body}
           </div>
         )
@@ -764,9 +790,13 @@ export default function AiAgentView({
       )
       continue
     }
+    const badge = toolBadge(msg.name)
     messageRows.push(
       <div key={i} className="ai-agent-tool">
-        <div className="ai-agent-tool-command">$ {msg.command}</div>
+        <div className="ai-agent-tool-command">
+          <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
+          <span className="ai-agent-tool-cmd-text">{msg.command.startsWith('$') ? msg.command : `$ ${msg.command}`}</span>
+        </div>
         <span className={`ai-agent-tool-outcome ${msg.outcome}`}>{outcomeLabel(msg.outcome)}</span>
       </div>
     )

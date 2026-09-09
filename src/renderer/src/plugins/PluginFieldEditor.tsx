@@ -97,6 +97,21 @@ export default function PluginFieldEditor({
       />
     )
   }
+  if (field.type === 'select') {
+    const currentValue = typeof value === 'string' ? value : String(value ?? field.default ?? '')
+    return (
+      <select
+        value={currentValue}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {(field.options || []).map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+    )
+  }
   if (field.type === 'macroList') {
     const list = Array.isArray(value) ? (value as PluginMacroButton[]) : []
     return <MacroListEditor value={list} onChange={onChange} />
