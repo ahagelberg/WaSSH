@@ -5,6 +5,7 @@ export const PLUGIN_ID_MACRO_PAD = 'macro-pad'
 export const PLUGIN_ID_MQTT_ANALYSER = 'mqtt-analyser'
 export const PLUGIN_ID_SFTP = 'sftp'
 export const PLUGIN_ID_AI_AGENT = 'ai-agent'
+export const PLUGIN_ID_CONNECTION_LOGGER = 'connection-logger'
 
 export const DEFAULT_ENABLED_PLUGINS: string[] = [
   PLUGIN_ID_SERVER_MONITOR,
@@ -12,7 +13,8 @@ export const DEFAULT_ENABLED_PLUGINS: string[] = [
   PLUGIN_ID_MACRO_PAD,
   PLUGIN_ID_MQTT_ANALYSER,
   PLUGIN_ID_SFTP,
-  PLUGIN_ID_AI_AGENT
+  PLUGIN_ID_AI_AGENT,
+  PLUGIN_ID_CONNECTION_LOGGER
 ]
 
 export type PluginActivation = 'manual' | 'auto'
@@ -847,6 +849,39 @@ export function mergePluginSessionSettings(
   const host = mergePluginSettings(manifest?.contributes.hostSettingsSchema, hostStored)
   return { ...app, ...host }
 }
+
+/** Default maximum connection log entries to retain per host */
+export const CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES = 500
+
+/** Default whether connection logging is enabled for a host */
+export const CONNECTION_LOGGER_DEFAULT_ENABLED = true
+
+export type ConnectionLogEventKind = 'connected' | 'disconnected' | 'reconnecting' | 'failed'
+
+export interface ConnectionLogEntry {
+  id: string
+  timestamp: number
+  kind: ConnectionLogEventKind
+  /** Status detail, error message or disconnect reason */
+  message?: string
+  /** Duration in ms of the state that preceded this event */
+  durationMs?: number
+}
+
+export interface ConnectionLoggerData {
+  version: number
+  hostKey: string
+  events: ConnectionLogEntry[]
+}
+
+export type ConnectionLoggerGraphMode = 'timeline' | 'step' | 'heatmap'
+
+export type ConnectionLoggerTimeWindow = '1h' | '6h' | '24h' | '7d' | 'all'
+
+export type ConnectionLoggerRendererMessage =
+  | { type: 'sync'; scopeId: string }
+  | { type: 'clearLogs'; scopeId: string }
+
 
 /** Normalize HostProfile / ConnectionParams pluginSettings maps */
 export function normalizeHostPluginSettings(

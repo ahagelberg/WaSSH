@@ -9,12 +9,28 @@ import type {
   StreamDirection,
   StreamMode
 } from '../../shared/plugins'
-import { mergePluginSessionSettings, PLUGIN_ID_AI_AGENT, PLUGIN_ID_MACRO_PAD, PLUGIN_ID_MQTT_ANALYSER, PLUGIN_ID_SCRATCHPAD, PLUGIN_ID_SERVER_MONITOR, PLUGIN_ID_SFTP } from '../../shared/plugins'
+import {
+  mergePluginSessionSettings,
+  PLUGIN_ID_AI_AGENT,
+  PLUGIN_ID_CONNECTION_LOGGER,
+  PLUGIN_ID_MACRO_PAD,
+  PLUGIN_ID_MQTT_ANALYSER,
+  PLUGIN_ID_SCRATCHPAD,
+  PLUGIN_ID_SERVER_MONITOR,
+  PLUGIN_ID_SFTP,
+  CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES
+} from '../../shared/plugins'
+import type { SessionStatus } from '../../shared/types'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import type { CredentialVault } from '../store/credentialVault'
 import { BUILTIN_MANIFESTS } from './builtins/manifests'
 import { aiAgentMain } from './builtins/aiAgent'
+import {
+  connectionLoggerMain,
+  connectionLoggerScopeId,
+  appendConnectionLog
+} from './builtins/connectionLogger'
 import { macroPadMain } from './builtins/macroPad'
 import { mqttAnalyserMain } from './builtins/mqttAnalyser'
 import { scratchpadMain } from './builtins/scratchpad'
@@ -87,6 +103,7 @@ export class PluginHost {
   private sideDataListeners = new Map<string, Set<(data: string) => void>>()
   private sideClosedListeners = new Map<string, Set<(error?: string) => void>>()
   private modules = new Map<string, PluginMainModule>()
+  private tabStatus = new Map<string, { status: SessionStatus; at: number }>()
 
   constructor(
     private settingsStore: SettingsStore,
@@ -107,6 +124,7 @@ export class PluginHost {
     this.modules.set(PLUGIN_ID_MQTT_ANALYSER, mqttAnalyserMain)
     this.modules.set(PLUGIN_ID_SFTP, sftpMain)
     this.modules.set(PLUGIN_ID_AI_AGENT, aiAgentMain)
+    this.modules.set(PLUGIN_ID_CONNECTION_LOGGER, connectionLoggerMain)
   }
 
   private send(channel: string, payload: unknown): void {
@@ -197,8 +215,25 @@ export class PluginHost {
         const hostStored = this.resolveHostPluginSettings(tabId, pluginId)
         return mergePluginSessionSettings(manifest, appStored, hostStored)
       },
-      getData: () => this.pluginData.get(pluginId),
+      getData: () => {
+        if (pluginId === PLUGIN_ID_CONNECTION_LOGGER) {
+          const scopeId = connectionLoggerScopeId(
+            this.broker.getConnectionParams(tabId)?.hostId,
+            tabId
+          )
+          return this.pluginData.get(pluginId, scopeId)
+        }
+        return this.pluginData.get(pluginId)
+      },
       setData: (data: unknown) => {
+        if (pluginId === PLUGIN_ID_CONNECTION_LOGGER) {
+          const scopeId = connectionLoggerScopeId(
+            this.broker.getConnectionParams(tabId)?.hostId,
+            tabId
+          )
+          this.pluginData.set(pluginId, data, scopeId)
+          return
+        }
         this.pluginData.set(pluginId, data)
       },
       getSecret: (vaultId: string) => this.vault.get(vaultId),
@@ -324,6 +359,73 @@ export class PluginHost {
     }
     this.pipeline.clearTab(tabId)
     this.broker.closeForTab(tabId)
+    this.tabStatus.delete(tabId)
+  }
+
+  onSessionStatus(tabId: string, status: SessionStatus, message?: string): void {
+    const prev = this.tabStatus.get(tabId)
+    const now = Date.now()
+    const durationMs = prev ? Math.max(0, now - prev.at) : undefined
+    this.tabStatus.set(tabId, { status, at: now })
+
+    if (!this.isEnabled(PLUGIN_ID_CONNECTION_LOGGER)) {
+      return
+    }
+
+    let kind: 'connected' | 'disconnected' | 'reconnecting' | 'failed' | null = null
+    if (status === 'connected') {
+      kind = 'connected'
+    } else if (status === 'disconnected') {
+      kind = 'disconnected'
+    } else if (status === 'reconnecting') {
+      kind = 'reconnecting'
+    } else if (status === 'failed') {
+      kind = 'failed'
+    } else if (status === 'closed' && prev && prev.status === 'connected') {
+      kind = 'disconnected'
+    }
+
+    if (!kind) {
+      return
+    }
+
+    const connection = this.broker.getConnectionParams(tabId)
+    const appStored = this.settingsStore.get().pluginSettings[PLUGIN_ID_CONNECTION_LOGGER]
+    const hostStored = this.resolveHostPluginSettings(tabId, PLUGIN_ID_CONNECTION_LOGGER)
+    const manifest = this.getManifest(PLUGIN_ID_CONNECTION_LOGGER)
+    const settings = mergePluginSessionSettings(manifest, appStored, hostStored)
+    if (settings.enabled === false) {
+      return
+    }
+
+    const scopeId = connectionLoggerScopeId(connection?.hostId, tabId)
+    const maxEntries =
+      typeof settings.maxEntries === 'number' && settings.maxEntries > 0
+        ? settings.maxEntries
+        : CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES
+
+    const entry = appendConnectionLog(
+      this.pluginData,
+      scopeId,
+      {
+        timestamp: now,
+        kind,
+        message: message || undefined,
+        durationMs
+      },
+      maxEntries
+    )
+
+    this.send('plugin:message', {
+      tabId,
+      pluginId: PLUGIN_ID_CONNECTION_LOGGER,
+      payload: {
+        type: 'event',
+        scopeId,
+        entry,
+        currentStatus: status
+      }
+    } satisfies PluginMessageEvent)
   }
 
   async onSessionConnected(tabId: string, restoreIds?: string[]): Promise<void> {

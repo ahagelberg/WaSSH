@@ -1,11 +1,14 @@
 import type { PluginManifest, PluginMacroButton } from '../../../shared/plugins'
 import {
   PLUGIN_ID_AI_AGENT,
+  PLUGIN_ID_CONNECTION_LOGGER,
   PLUGIN_ID_MACRO_PAD,
   PLUGIN_ID_MQTT_ANALYSER,
   PLUGIN_ID_SCRATCHPAD,
   PLUGIN_ID_SERVER_MONITOR,
   PLUGIN_ID_SFTP,
+  CONNECTION_LOGGER_DEFAULT_ENABLED,
+  CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES,
   AI_AGENT_SAFE_RULES,
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
@@ -270,11 +273,60 @@ export const aiAgentManifest: PluginManifest = {
   }
 }
 
+export const connectionLoggerManifest: PluginManifest = {
+  id: PLUGIN_ID_CONNECTION_LOGGER,
+  name: 'Connection logger',
+  version: '1.0.0',
+  description:
+    'Logs connection and disconnection events to analyze network stability, with timeline graphs and uptime heatmaps.',
+  activation: 'manual',
+  source: 'builtin',
+  contributes: {
+    toolbar: { label: 'Conn Log' },
+    settingsHeading: 'Connection logger',
+    settingsSchema: [
+      {
+        key: 'defaultEnabled',
+        label: 'Enable connection logging by default',
+        type: 'boolean',
+        default: CONNECTION_LOGGER_DEFAULT_ENABLED,
+        description: 'Record connection and disconnection events for new hosts and sessions.'
+      },
+      {
+        key: 'retentionMaxEntries',
+        label: 'Default log retention (entries)',
+        type: 'number',
+        default: CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES,
+        description: 'Maximum number of event log entries kept in history per host.'
+      }
+    ],
+    hostSettingsHeading: 'Connection logger',
+    hostSettingsSchema: [
+      {
+        key: 'enabled',
+        label: 'Enable connection logging',
+        type: 'boolean',
+        default: CONNECTION_LOGGER_DEFAULT_ENABLED,
+        description: 'Record all connection and disconnection events for this host.'
+      },
+      {
+        key: 'maxEntries',
+        label: 'Max log entries',
+        type: 'number',
+        default: CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES,
+        description: 'Maximum number of connection events to store for this host.'
+      }
+    ],
+    views: [{ id: 'panel', placement: 'split-bottom', title: 'Connection Log' }]
+  }
+}
+
 export const BUILTIN_MANIFESTS: PluginManifest[] = [
   serverMonitorManifest,
   scratchpadManifest,
   macroPadManifest,
   mqttAnalyserManifest,
   sftpManifest,
-  aiAgentManifest
+  aiAgentManifest,
+  connectionLoggerManifest
 ]

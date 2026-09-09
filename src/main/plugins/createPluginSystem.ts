@@ -58,6 +58,9 @@ export function createPluginSystem(
     },
     onSessionRemoved: (tabId) => {
       void host.deactivateAll(tabId)
+    },
+    onSessionStatus: (tabId, status, message) => {
+      host.onSessionStatus(tabId, status, message)
     }
   })
 

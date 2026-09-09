@@ -47,14 +47,14 @@ A plugin is three things:
 | `main/plugins/SftpSession.ts` | Promisified SFTP wrapper |
 | `main/plugins/createPluginSystem.ts` | Wiring, restore queue |
 | `main/plugins/externalLoader.ts` | Future external-plugin scanner (stub) |
-| `main/plugins/builtins/*` | The six built-in plugins (manifest + main module) |
+| `main/plugins/builtins/*` | The seven built-in plugins (manifest + main module) |
 | `main/store/pluginDataStore.ts` | `userData/plugin-<id>.json` storage |
 | `shared/pluginLayout.ts` | Per-tab dock/split layout model |
 | `renderer/src/plugins/registry.ts` | Plugin id → React component |
 | `preload/index.ts` | Exposes `window.wassh` |
 
 Built-in ids (`shared/plugins.ts`): `server-monitor`, `scratchpad`,
-`macro-pad`, `mqtt-analyser`, `sftp`, `ai-agent`. All six are enabled by
+`macro-pad`, `mqtt-analyser`, `sftp`, `ai-agent`, `connection-logger`. All seven are enabled by
 default (`DEFAULT_ENABLED_PLUGINS`) and declared `activation: 'manual'`.
 
 ## 3. Manifest (`PluginManifest`)

@@ -25,6 +25,7 @@ export class SessionManager {
   private pipeline: SessionDataPipeline | null = null
   private onStatusConnected: ((tabId: string) => void) | null = null
   private onSessionRemoved: ((tabId: string) => void) | null = null
+  private onSessionStatus: ((tabId: string, status: SessionStatus, message?: string) => void) | null = null
 
   constructor(
     private vault: CredentialVault,
@@ -40,9 +41,11 @@ export class SessionManager {
   setPluginHooks(hooks: {
     onStatusConnected?: (tabId: string) => void
     onSessionRemoved?: (tabId: string) => void
+    onSessionStatus?: (tabId: string, status: SessionStatus, message?: string) => void
   }): void {
     this.onStatusConnected = hooks.onStatusConnected ?? null
     this.onSessionRemoved = hooks.onSessionRemoved ?? null
+    this.onSessionStatus = hooks.onSessionStatus ?? null
   }
 
   private send(channel: string, ...args: unknown[]): void {
@@ -69,6 +72,7 @@ export class SessionManager {
       if (status === 'connected') {
         this.onStatusConnected?.(conn.tabId)
       }
+      this.onSessionStatus?.(conn.tabId, status, message)
     })
     conn.on('hostKeyPrompt', (prompt) => {
       this.send('session:hostKeyPrompt', prompt)
