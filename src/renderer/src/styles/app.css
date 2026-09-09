@@ -384,12 +384,16 @@ textarea:focus {
   position: relative;
 }
 
-.host-item[data-tab-color]::before {
+.host-item::before {
   content: '';
   width: var(--tab-color-bar-width);
   flex-shrink: 0;
   margin: 2px 0;
   border-radius: 2px;
+  background-color: transparent;
+}
+
+.host-item[data-tab-color]::before {
   background-color: var(--tab-accent-color);
 }
 
@@ -515,22 +519,6 @@ textarea:focus {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.host-item-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 3px;
-  margin-top: 2px;
-}
-
-.host-tag {
-  padding: 1px 6px;
-  background: var(--bg-panel-2);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: 10px;
-  color: var(--text-muted);
 }
 
 .host-context-menu,
