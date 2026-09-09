@@ -432,7 +432,7 @@ export interface SftpOpResultPayload {
   errorKind?: SftpErrorKind
 }
 
-export type SftpTransferDirection = 'upload' | 'download'
+export type SftpTransferDirection = 'upload' | 'download' | 'download-zip'
 
 /** Main → renderer: byte progress for an active transfer */
 export interface SftpTransferProgressPayload {
@@ -483,6 +483,7 @@ export type SftpRendererMessage =
   | { type: 'chmod'; path: string; mode: number }
   | { type: 'delete'; path: string }
   | { type: 'download'; path: string }
+  | { type: 'downloadZip'; path: string }
   | { type: 'viewFile'; path: string }
   | { type: 'uploadDialog'; path?: string }
   | { type: 'uploadStart'; name: string; size: number; path?: string }

@@ -27,13 +27,15 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "serialport": "^13.0.0",
-    "ssh2": "^1.16.0"
+    "ssh2": "^1.16.0",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.2",
     "@types/react": "^19.0.8",
     "@types/react-dom": "^19.0.3",
     "@types/ssh2": "^1.15.4",
+    "@types/yazl": "^3.3.1",
     "@vitejs/plugin-react": "^4.7.0",
     "electron": "^44.0.0",
     "electron-builder": "^26.13.0",

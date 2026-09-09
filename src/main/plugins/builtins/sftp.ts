@@ -7,6 +7,7 @@ import {
 } from 'fs'
 import { basename } from 'path'
 import { BrowserWindow, dialog, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
+import { ZipFile } from 'yazl'
 import type {
   SftpErrorKind,
   SftpListPayload,
@@ -36,9 +37,10 @@ interface FileTransferState {
 }
 
 interface DownloadState extends FileTransferState {
-  remote: SftpReadStream
+  remote: SftpReadStream | null
   local: FsWriteStream
   transferred: number
+  archive?: ZipFile
 }
 
 interface UploadState extends FileTransferState {
@@ -95,6 +97,7 @@ const SFTP_MESSAGE_TYPES = new Set<string>([
   'chmod',
   'delete',
   'download',
+  'downloadZip',
   'uploadDialog',
   'uploadStart',
   'uploadChunk',
@@ -113,7 +116,17 @@ function isRendererMessage(payload: unknown): payload is SftpRendererMessage {
 }
 
 function focusedWindow(): BrowserWindow | null {
-  return BrowserWindow.getFocusedWindow()
+  const win = BrowserWindow.getFocusedWindow()
+  if (win && !win.isDestroyed()) {
+    return win
+  }
+  const all = BrowserWindow.getAllWindows()
+  for (const w of all) {
+    if (!w.isDestroyed()) {
+      return w
+    }
+  }
+  return null
 }
 
 /**
@@ -367,6 +380,7 @@ async function handleDownload(ctx: PluginMainContext, state: SessionState, path:
   if (!sftp) {
     return
   }
+
   if (state.download && !state.download.done) {
     return
   }
@@ -477,6 +491,191 @@ async function handleDownload(ctx: PluginMainContext, state: SessionState, path:
     state: outcome.state,
     error: outcome.error?.message,
     errorKind: outcome.error?.kind
+  } satisfies SftpTransferDonePayload)
+}
+
+const ARCHIVE_EMPTY_SIZE = 0
+const ARCHIVE_ROOT_MTIME = 0
+
+interface ArchiveEntry {
+  remotePath: string
+  archivePath: string
+  size: number
+  mtime: number
+  mode: number
+  directory: boolean
+}
+
+function archiveRootName(path: string): string {
+  return basename(path.replace(/\/+$/, '')) || 'archive'
+}
+
+async function collectArchiveEntries(
+  sftp: SftpSession,
+  remotePath: string,
+  archivePath: string
+): Promise<ArchiveEntry[]> {
+  const entries: ArchiveEntry[] = [
+    {
+      remotePath,
+      archivePath: `${archivePath}/`,
+      size: ARCHIVE_EMPTY_SIZE,
+      mtime: ARCHIVE_ROOT_MTIME,
+      mode: ARCHIVE_EMPTY_SIZE,
+      directory: true
+    }
+  ]
+  for (const child of await sftp.list(remotePath)) {
+    if (child.type === 'symlink' || child.type === 'other') {
+      continue
+    }
+    const childArchivePath = `${archivePath}/${child.name}`
+    if (child.type === 'directory') {
+      entries.push(...(await collectArchiveEntries(sftp, child.path, childArchivePath)))
+    } else {
+      entries.push({
+        remotePath: child.path,
+        archivePath: childArchivePath,
+        size: child.size,
+        mtime: child.mtime,
+        mode: child.mode,
+        directory: false
+      })
+    }
+  }
+  return entries
+}
+
+async function handleDownloadZip(
+  ctx: PluginMainContext,
+  state: SessionState,
+  path: string
+): Promise<void> {
+  const sftp = state.sftp
+  if (!sftp || (state.download && !state.download.done)) {
+    return
+  }
+  const rootName = archiveRootName(path)
+  const opts: SaveDialogOptions = {
+    title: 'Save folder as ZIP',
+    defaultPath: `${rootName}.zip`,
+    buttonLabel: 'Download',
+    filters: [{ name: 'ZIP archive (*.zip)', extensions: ['zip'] }]
+  }
+  const win = focusedWindow()
+  const result = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts)
+  if (result.canceled || !result.filePath) {
+    ctx.sendToRenderer({
+      type: 'transferDone',
+      direction: 'download-zip',
+      remotePath: path,
+      state: 'cancelled'
+    } satisfies SftpTransferDonePayload)
+    return
+  }
+
+  const local = fsCreateWriteStream(result.filePath)
+  const archive = new ZipFile()
+  const download: DownloadState = {
+    cancelled: false,
+    done: false,
+    remotePath: path,
+    localPath: result.filePath,
+    remote: null,
+    local,
+    transferred: ARCHIVE_EMPTY_SIZE,
+    archive
+  }
+  state.download = download
+
+  let outcome: 'done' | 'error' | 'cancelled' = 'done'
+  let error: SftpError | undefined
+  try {
+    const entries = await collectArchiveEntries(sftp, path, rootName)
+    const totalBytes = entries.reduce((total, entry) => total + entry.size, ARCHIVE_EMPTY_SIZE)
+    const archiveDone = new Promise<void>((resolve, reject) => {
+      archive.on('error', reject)
+      local.on('error', reject)
+      local.on('finish', resolve)
+    })
+    archive.outputStream.pipe(local)
+
+    for (const entry of entries) {
+      if (entry.directory) {
+        archive.addEmptyDirectory(entry.archivePath, {
+          mtime: entry.mtime > 0 ? new Date(entry.mtime) : new Date(),
+          mode: entry.mode > 0 ? entry.mode : undefined
+        })
+      } else {
+        archive.addReadStreamLazy(
+          entry.archivePath,
+          {
+            size: entry.size,
+            mtime: entry.mtime > 0 ? new Date(entry.mtime) : new Date(),
+            mode: entry.mode > 0 ? entry.mode : undefined
+          },
+          (cb) => {
+            if (download.cancelled) {
+              cb(new Error('Transfer cancelled'), null as unknown as SftpReadStream)
+              return
+            }
+            const remote = sftp.createReadStream(entry.remotePath)
+            download.remote = remote
+            remote.on('error', (err: Error) => {
+              archive.emit('error', err)
+            })
+            remote.on('data', (chunk: Buffer) => {
+              if (download.cancelled) {
+                return
+              }
+              download.transferred += chunk.length
+              ctx.sendToRenderer({
+                type: 'transferProgress',
+                direction: 'download-zip',
+                remotePath: path,
+                transferredBytes: download.transferred,
+                totalBytes
+              } satisfies SftpTransferProgressPayload)
+            })
+            cb(null, remote)
+          }
+        )
+      }
+    }
+
+    archive.end()
+    await archiveDone
+  } catch (err) {
+    outcome = download.cancelled ? 'cancelled' : 'error'
+    if (outcome === 'error') {
+      error = classifySftpError(err)
+    }
+  }
+
+  download.done = true
+  state.download = null
+  if (outcome !== 'done') {
+    try {
+      download.remote?.destroy()
+    } catch {
+      /* ignore */
+    }
+    try {
+      download.local.destroy()
+    } catch {
+      /* ignore */
+    }
+    fsUnlink(download.localPath, () => {
+      /* ignore */
+    })
+  }
+  ctx.sendToRenderer({
+    type: 'transferDone',
+    direction: 'download-zip',
+    remotePath: path,
+    state: outcome,
+    error: error?.message,
+    errorKind: error?.kind
   } satisfies SftpTransferDonePayload)
 }
 
@@ -799,7 +998,7 @@ function cancelDownload(state: SessionState): void {
   }
   dl.cancelled = true
   try {
-    dl.remote.destroy()
+    dl.remote?.destroy()
   } catch {
     /* ignore */
   }
@@ -928,6 +1127,9 @@ async function handleMessage(
       break
     case 'download':
       await handleDownload(ctx, state, payload.path)
+      break
+    case 'downloadZip':
+      await handleDownloadZip(ctx, state, payload.path)
       break
     case 'viewFile':
       await handleViewFile(ctx, state, payload.path)

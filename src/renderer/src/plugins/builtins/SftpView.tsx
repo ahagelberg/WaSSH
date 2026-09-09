@@ -41,14 +41,14 @@ type SftpMainPayload =
     }
   | {
       type: 'transferProgress'
-      direction: 'upload' | 'download'
+      direction: 'upload' | 'download' | 'download-zip'
       remotePath: string
       transferredBytes: number
       totalBytes: number
     }
   | {
       type: 'transferDone'
-      direction: 'upload' | 'download'
+      direction: 'upload' | 'download' | 'download-zip'
       remotePath: string
       state: 'done' | 'error' | 'cancelled'
       error?: string
@@ -69,7 +69,7 @@ type SftpMainPayload =
     }
 
 interface TransferProgress {
-  direction: 'upload' | 'download'
+  direction: 'upload' | 'download' | 'download-zip'
   transferred: number
   total: number
 }
@@ -428,6 +428,8 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             if (pathRef.current) {
               requestList(pathRef.current)
             }
+          } else if (payload.direction === 'download-zip') {
+            showNotice(`Downloaded ${baseName(payload.remotePath)} as ZIP`)
           }
           return
         }
@@ -533,6 +535,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   }, [contextMenu])
 
   const selected = entries.find((e) => e.path === selectedPath) ?? null
+  const zipTarget = selected?.type === 'directory' ? selected.path : !selected && path ? path : null
   const parentDir = path ? parentPath(path) : null
 
   const navigate = (target: string): void => {
@@ -784,6 +787,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
               item('Download', '⬇', false, () => {
                 void send({ type: 'download', path: entry.path })
               })}
+            {entry.type === 'directory' &&
+              item('Download as ZIP', '⬇', false, () => {
+                void send({ type: 'downloadZip', path: entry.path })
+              })}
             {item('Rename', '✎', false, () =>
               openDialog({ kind: 'rename', path: entry.path, name: entry.name })
             )}
@@ -799,6 +806,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           <>
             {item('New folder', '+', false, () => openDialog({ kind: 'mkdir' }))}
             {item('Upload files…', '⬆', false, () => openFilePicker())}
+            {path &&
+              item('Download current folder as ZIP', '⬇', false, () => {
+                void send({ type: 'downloadZip', path })
+              })}
             {item('Refresh', '⟳', false, () => {
               if (pathRef.current) {
                 requestList(pathRef.current)
@@ -989,6 +1000,23 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         >
           ⬇ Download
         </button>
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || !zipTarget}
+          title={
+            selected?.type === 'directory'
+              ? 'Download selected folder as a ZIP archive'
+              : 'Download current folder as a ZIP archive'
+          }
+          onClick={() => {
+            if (zipTarget) {
+              void send({ type: 'downloadZip', path: zipTarget })
+            }
+          }}
+        >
+          ⬇ Download ZIP
+        </button>
       </div>
 
       <div className="sftp-pathbar" title={path ?? ''}>
@@ -1127,7 +1155,13 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           {Array.from(transfers.entries()).map(([remotePath, t]) => (
             <div key={remotePath} className="sftp-transfer">
               <div className="sftp-transfer-label">
-                <span>{t.direction === 'upload' ? '⬆ Upload' : '⬇ Download'}</span>
+                <span>
+                  {t.direction === 'upload'
+                    ? '⬆ Upload'
+                    : t.direction === 'download-zip'
+                      ? '⬇ Download ZIP'
+                      : '⬇ Download'}
+                </span>
                 <span className="sftp-transfer-name" title={remotePath}>
                   {remotePath}
                 </span>
