@@ -386,61 +386,78 @@ installProcessErrorGuards()
 pinUserDataPath()
 migrateLegacyUserData()
 
-app.whenReady().then(() => {
-  app.setAppUserModelId(APP_ID)
-  const vault = new CredentialVault()
-  const sessionStore = new SessionStore()
-  const tabStore = new TabStore()
-  settingsStore = new SettingsStore()
-  sessionStore.migrateReconnectModes()
-  const knownHosts = new KnownHostsStore()
-  const pluginData = new PluginDataStore()
-  sessions = new SessionManager(
-    vault,
-    knownHosts,
-    sessionStore,
-    getWindow
-  )
-  pluginSystem = createPluginSystem(
-    settingsStore,
-    sessionStore,
-    sessions,
-    getWindow,
-    pluginData,
-    vault
-  )
-  registerIpc(
-    vault,
-    sessionStore,
-    tabStore,
-    settingsStore,
-    knownHosts,
-    sessions,
-    getWindow,
-    pluginSystem.host,
-    pluginData
-  )
-  installAppMenu()
-  attachPowerMonitor()
-  createWindow()
-  setupAutoUpdater(getWindow)
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+// Allow only one WaSSH instance: a second launch focuses the running window.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows()[0]
+    if (win) {
+      if (win.isMinimized()) {
+        win.restore()
+      }
+      win.focus()
+    } else if (process.platform === 'darwin') {
       createWindow()
     }
   })
-})
 
-app.on('window-all-closed', () => {
-  pluginSystem?.dispose()
-  sessions?.disposeAll()
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
-})
+  app.whenReady().then(() => {
+    app.setAppUserModelId(APP_ID)
+    const vault = new CredentialVault()
+    const sessionStore = new SessionStore()
+    const tabStore = new TabStore()
+    settingsStore = new SettingsStore()
+    sessionStore.migrateReconnectModes()
+    const knownHosts = new KnownHostsStore()
+    const pluginData = new PluginDataStore()
+    sessions = new SessionManager(
+      vault,
+      knownHosts,
+      sessionStore,
+      getWindow
+    )
+    pluginSystem = createPluginSystem(
+      settingsStore,
+      sessionStore,
+      sessions,
+      getWindow,
+      pluginData,
+      vault
+    )
+    registerIpc(
+      vault,
+      sessionStore,
+      tabStore,
+      settingsStore,
+      knownHosts,
+      sessions,
+      getWindow,
+      pluginSystem.host,
+      pluginData
+    )
+    installAppMenu()
+    attachPowerMonitor()
+    createWindow()
+    setupAutoUpdater(getWindow)
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow()
+      }
+    })
+  })
 
-app.on('before-quit', () => {
-  pluginSystem?.dispose()
-  sessions?.disposeAll()
-})
+  app.on('window-all-closed', () => {
+    pluginSystem?.dispose()
+    sessions?.disposeAll()
+    if (process.platform !== 'darwin') {
+      app.quit()
+    }
+  })
+
+  app.on('before-quit', () => {
+    pluginSystem?.dispose()
+    sessions?.disposeAll()
+  })
+}
 
