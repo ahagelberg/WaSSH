@@ -1,8 +1,8 @@
 ## Basic ##
-- sudo helper
+- [x] Connection logging: check for network instability - with graph/timeline
 
 ## Advanced ##
-- Kay manager for setting up password-less logins
+- Key manager for setting up password-less logins
 - Tunnel tool to create tunnels for multiple ports through multiple layers of machines
 - Broadcast commands to multiple machines at ones. Collect output. Allow diff between machines.
 - Topology view (plugin) built up autoamtically based on connections, tunnels, hops etc.
@@ -26,3 +26,8 @@
 - MQTT plugin: Add history for published messages.
 - MQTT plugin: Add option to have a list of common messages for publishing
 - MQTT plugin: add basic triggers for activating commands and other things based on messagesw received
+- Add MCP capability to plugins - AI Agent can access MQTT and other things.
+- AI Agent: Add option to include (yaml) files with prompts
+- AI Agent: tool access to file system
+- AI Agent: web search and web access support
+- AI Agent: date_time access
