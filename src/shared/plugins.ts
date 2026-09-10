@@ -560,13 +560,13 @@ export type AiAgentProviderProtocol =
   | typeof AI_AGENT_PROTOCOL_ANTHROPIC
 
 /** Built-in provider presets (ids are stable) */
-export const AI_AGENT_LOCAL_PROVIDER_ID = 'local'
+export const AI_AGENT_OLLAMA_PROVIDER_ID = 'ollama'
 export const AI_AGENT_OPENROUTER_PROVIDER_ID = 'openrouter'
 export const AI_AGENT_ANTHROPIC_PROVIDER_ID = 'anthropic'
 export const AI_AGENT_DEEPSEEK_PROVIDER_ID = 'deepseek'
 export const AI_AGENT_GROK_PROVIDER_ID = 'grok'
 
-export const AI_AGENT_LOCAL_BASE_URL = 'http://127.0.0.1:11434/v1'
+export const AI_AGENT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1'
 export const AI_AGENT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1'
 export const AI_AGENT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
 export const AI_AGENT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
@@ -576,9 +576,11 @@ export const AI_AGENT_GROK_BASE_URL = 'https://api.x.ai/v1'
 export const AI_AGENT_ANTHROPIC_VERSION = '2023-06-01'
 export const AI_AGENT_ANTHROPIC_PATH = '/v1/messages'
 export const AI_AGENT_OPENAI_CHAT_PATH = '/chat/completions'
+export const AI_AGENT_OPENAI_MODELS_PATH = '/models'
+export const AI_AGENT_ANTHROPIC_MODELS_PATH = '/v1/models'
 
 /** Default model suggestions per provider (editable in the provider manager) */
-export const AI_AGENT_LOCAL_DEFAULT_MODELS = ['llama3.1', 'qwen2.5-coder:7b']
+export const AI_AGENT_OLLAMA_DEFAULT_MODELS: string[] = []
 export const AI_AGENT_OPENROUTER_DEFAULT_MODELS = ['anthropic/claude-sonnet-4-20250514']
 export const AI_AGENT_ANTHROPIC_DEFAULT_MODELS = [
   'claude-sonnet-4-20250514',
@@ -598,11 +600,11 @@ export interface AiAgentProviderConfig {
 
 export const AI_AGENT_DEFAULT_PROVIDERS: AiAgentProviderConfig[] = [
   {
-    id: AI_AGENT_LOCAL_PROVIDER_ID,
-    name: 'Local (OpenAI compatible)',
+    id: AI_AGENT_OLLAMA_PROVIDER_ID,
+    name: 'Ollama',
     protocol: AI_AGENT_PROTOCOL_OPENAI,
-    baseUrl: AI_AGENT_LOCAL_BASE_URL,
-    models: [...AI_AGENT_LOCAL_DEFAULT_MODELS]
+    baseUrl: AI_AGENT_OLLAMA_BASE_URL,
+    models: [...AI_AGENT_OLLAMA_DEFAULT_MODELS]
   },
   {
     id: AI_AGENT_OPENROUTER_PROVIDER_ID,
@@ -848,6 +850,7 @@ export type AiAgentRendererMessage =
   | { type: 'rulesChanged'; rules: string }
   | { type: 'select'; providerId: string; model: string }
   | { type: 'providersChanged'; providers: AiAgentProviderConfig[] }
+  | { type: 'refreshModels'; providerId: string; silent?: boolean }
   | { type: 'newChat'; providerId: string; model: string }
   | { type: 'openChat'; conversationId: string }
   | { type: 'deleteChat'; conversationId: string }
@@ -888,7 +891,7 @@ export function mergePluginSettings(
 
 /**
  * Merge app-wide + per-host plugin settings for a session.
- * Host keys override app keys when both schemas define the same key (they should not).
+ * App settings provide the base configuration. Explicit host overrides take precedence.
  */
 export function mergePluginSessionSettings(
   manifest: Pick<PluginManifest, 'contributes'> | undefined,
@@ -896,8 +899,26 @@ export function mergePluginSessionSettings(
   hostStored: unknown
 ): Record<string, unknown> {
   const app = mergePluginSettings(manifest?.contributes.settingsSchema, appStored)
-  const host = mergePluginSettings(manifest?.contributes.hostSettingsSchema, hostStored)
-  return { ...app, ...host }
+  const hostDefaults = defaultPluginSettingsFromSchema(manifest?.contributes.hostSettingsSchema)
+  const hostSrc =
+    hostStored && typeof hostStored === 'object' && !Array.isArray(hostStored)
+      ? (hostStored as Record<string, unknown>)
+      : {}
+
+  const result: Record<string, unknown> = { ...app }
+  // Provide host defaults for keys that only exist in hostSettingsSchema (e.g. host-specific rules)
+  for (const [key, val] of Object.entries(hostDefaults)) {
+    if (!Object.prototype.hasOwnProperty.call(result, key)) {
+      result[key] = val
+    }
+  }
+  // Apply explicit host-level overrides
+  for (const field of manifest?.contributes.hostSettingsSchema ?? []) {
+    if (Object.prototype.hasOwnProperty.call(hostSrc, field.key)) {
+      result[field.key] = hostSrc[field.key]
+    }
+  }
+  return result
 }
 
 /** Default maximum connection log entries to retain per host */

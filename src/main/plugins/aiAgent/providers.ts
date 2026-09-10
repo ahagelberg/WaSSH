@@ -1,7 +1,9 @@
 import {
+  AI_AGENT_ANTHROPIC_MODELS_PATH,
   AI_AGENT_ANTHROPIC_PATH,
   AI_AGENT_ANTHROPIC_VERSION,
   AI_AGENT_OPENAI_CHAT_PATH,
+  AI_AGENT_OPENAI_MODELS_PATH,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   type AiAgentProviderProtocol
 } from '../../../shared/plugins'
@@ -228,13 +230,13 @@ async function completeOpenAi(opts: CompletionOptions): Promise<CompletionResult
     for (const call of calls) {
       const index = Number(call.index ?? 0)
       const frag = toolFragments.get(index) ?? { id: '', name: '', arguments: '' }
-      if (typeof call.id === 'string') {
+      if (typeof call.id === 'string' && call.id) {
         frag.id = call.id
       }
       const fn = call.function as Record<string, unknown> | undefined
       if (fn) {
-        if (typeof fn.name === 'string') {
-          frag.name = fn.name
+        if (typeof fn.name === 'string' && fn.name) {
+          frag.name = (frag.name ? frag.name : '') + fn.name
         }
         if (typeof fn.arguments === 'string') {
           frag.arguments += fn.arguments
@@ -246,8 +248,12 @@ async function completeOpenAi(opts: CompletionOptions): Promise<CompletionResult
 
   const toolCalls: ApiToolCallMsg[] = Array.from(toolFragments.entries())
     .sort((a, b) => a[0] - b[0])
-    .filter(([, frag]) => frag.name && frag.id)
-    .map(([, frag]) => ({ id: frag.id, name: frag.name, arguments: frag.arguments }))
+    .filter(([, frag]) => Boolean(frag.name))
+    .map(([index, frag]) => ({
+      id: frag.id || `call_${index}_${Math.random().toString(36).slice(2, 9)}`,
+      name: frag.name,
+      arguments: frag.arguments
+    }))
   return { text, toolCalls, stopReason }
 }
 
@@ -287,9 +293,9 @@ async function completeAnthropic(opts: CompletionOptions): Promise<CompletionRes
     if (type === 'content_block_start') {
       const block = json.content_block as Record<string, unknown> | undefined
       const index = Number(json.index ?? 0)
-      if (block?.type === 'tool_use' && typeof block.id === 'string') {
+      if (block?.type === 'tool_use') {
         toolBlocks.set(index, {
-          id: block.id,
+          id: typeof block.id === 'string' && block.id ? block.id : `call_${index}_${Math.random().toString(36).slice(2, 9)}`,
           name: typeof block.name === 'string' ? block.name : '',
           arguments: ''
         })
@@ -323,8 +329,12 @@ async function completeAnthropic(opts: CompletionOptions): Promise<CompletionRes
 
   const toolCalls: ApiToolCallMsg[] = Array.from(toolBlocks.entries())
     .sort((a, b) => a[0] - b[0])
-    .filter(([, block]) => block.name && block.id)
-    .map(([, block]) => ({ id: block.id, name: block.name, arguments: block.arguments }))
+    .filter(([, block]) => Boolean(block.name))
+    .map(([index, block]) => ({
+      id: block.id || `call_${index}_${Math.random().toString(36).slice(2, 9)}`,
+      name: block.name,
+      arguments: block.arguments
+    }))
   return { text, toolCalls, stopReason }
 }
 
@@ -334,4 +344,133 @@ export async function complete(opts: CompletionOptions): Promise<CompletionResul
     return completeAnthropic(opts)
   }
   return completeOpenAi(opts)
+}
+
+export interface ListModelsOptions {
+  baseUrl: string
+  apiKey: string
+  protocol: AiAgentProviderProtocol
+}
+
+/** Extract non-empty string "id" fields from a provider's models-list JSON body. */
+function extractModelIds(json: unknown): string[] {
+  const data = (json as { data?: unknown } | null)?.data
+  if (!Array.isArray(data)) {
+    return []
+  }
+  const ids: string[] = []
+  for (const entry of data) {
+    const id = (entry as { id?: unknown } | null)?.id
+    if (typeof id === 'string' && id.length > 0) {
+      ids.push(id)
+    }
+  }
+  return ids
+}
+
+/** Derive Ollama's native API origin (scheme + host) from an OpenAI-compat base URL. */
+function ollamaOriginFrom(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl)
+    return `${url.protocol}//${url.host}`
+  } catch {
+    // Not a full URL (unlikely) — strip a trailing /v1 segment as a best effort.
+    return baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')
+  }
+}
+
+/** Extract model names/tags from Ollama's native `/api/tags` response body. */
+function extractOllamaTagNames(json: unknown): string[] {
+  const models = (json as { models?: unknown } | null)?.models
+  if (!Array.isArray(models)) {
+    return []
+  }
+  const ids: string[] = []
+  for (const entry of models) {
+    const rec = entry as { model?: unknown; name?: unknown } | null
+    const id = (typeof rec?.model === 'string' && rec.model) || (typeof rec?.name === 'string' && rec.name) || ''
+    if (id) {
+      ids.push(id)
+    }
+  }
+  return ids
+}
+
+async function listOpenAiCompatModels(opts: ListModelsOptions): Promise<string[]> {
+  const res = await fetch(joinUrl(opts.baseUrl, AI_AGENT_OPENAI_MODELS_PATH), {
+    method: 'GET',
+    headers: {
+      ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {})
+    }
+  })
+  if (!res.ok) {
+    throw new Error(`Provider error ${res.status}: ${await errorText(res)}`)
+  }
+  return extractModelIds(await res.json())
+}
+
+/**
+ * Ollama's own model list lives at GET /api/tags (outside the /v1 OpenAI
+ * compat prefix) and reports every model pulled locally, e.g. via
+ * `ollama pull`. Not every OpenAI-compatible server exposes this, so
+ * failures here are non-fatal — see listOpenAiModels().
+ */
+async function listOllamaTags(baseUrl: string): Promise<string[]> {
+  const res = await fetch(`${ollamaOriginFrom(baseUrl)}/api/tags`, { method: 'GET' })
+  if (!res.ok) {
+    throw new Error(`Provider error ${res.status}: ${await errorText(res)}`)
+  }
+  return extractOllamaTagNames(await res.json())
+}
+
+async function listOpenAiModels(opts: ListModelsOptions): Promise<string[]> {
+  // Query both the standard OpenAI-compat listing (GET {baseUrl}/models) and
+  // Ollama's native tags endpoint, since Ollama's own /api/tags is the most
+  // reliable way to see everything currently pulled locally, while other
+  // OpenAI-compatible servers only support the former.
+  const [compat, tags] = await Promise.allSettled([
+    listOpenAiCompatModels(opts),
+    listOllamaTags(opts.baseUrl)
+  ])
+  const ids = new Set<string>()
+  if (compat.status === 'fulfilled') {
+    for (const id of compat.value) {
+      ids.add(id)
+    }
+  }
+  if (tags.status === 'fulfilled') {
+    for (const id of tags.value) {
+      ids.add(id)
+    }
+  }
+  if (ids.size === 0) {
+    const failure =
+      compat.status === 'rejected' ? compat.reason : tags.status === 'rejected' ? tags.reason : undefined
+    if (failure) {
+      throw failure instanceof Error ? failure : new Error(String(failure))
+    }
+  }
+  return Array.from(ids)
+}
+
+async function listAnthropicModels(opts: ListModelsOptions): Promise<string[]> {
+  const res = await fetch(joinUrl(opts.baseUrl, AI_AGENT_ANTHROPIC_MODELS_PATH), {
+    method: 'GET',
+    headers: {
+      'x-api-key': opts.apiKey,
+      'anthropic-version': AI_AGENT_ANTHROPIC_VERSION
+    }
+  })
+  if (!res.ok) {
+    throw new Error(`Provider error ${res.status}: ${await errorText(res)}`)
+  }
+  return extractModelIds(await res.json())
+}
+
+/** Fetch the list of model ids a provider currently reports as available. */
+export async function listModels(opts: ListModelsOptions): Promise<string[]> {
+  if (opts.protocol === AI_AGENT_PROTOCOL_ANTHROPIC) {
+    return listAnthropicModels(opts)
+  }
+  return listOpenAiModels(opts)
 }

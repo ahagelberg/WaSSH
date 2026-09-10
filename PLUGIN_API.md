@@ -334,7 +334,7 @@ main⇄renderer messages:
 | scratchpad | — (renderer-driven; main is a no-op hook) | — |
 | mqtt-analyser | `publish` / `reconnect` | `status` → `MqttAnalyserStatusPayload`; `message` → `MqttAnalyserMessagePayload` |
 | sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `viewFile`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone`, `viewFileResult` → `SftpViewFilePayload` |
-| ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval`, `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
+| ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval`, `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `refreshModels`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
 
 `AiAgentRendererMessage`, `SftpRendererMessage`, `MqttAnalyserRendererMessage`
 (and their payload types) are exported from `shared/plugins.ts`.
@@ -354,6 +354,5 @@ main⇄renderer messages:
 
 External plugins will follow the same manifest/main/ui split once the loader
 in `externalLoader.ts` is implemented.
-
 
 

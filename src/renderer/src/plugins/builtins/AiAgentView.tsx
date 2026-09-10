@@ -12,6 +12,7 @@ import {
   AI_AGENT_MAX_ATTACHMENT_BYTES,
   AI_AGENT_MAX_ATTACHMENT_CHARS,
   AI_AGENT_MAX_ATTACHMENTS,
+  AI_AGENT_OLLAMA_PROVIDER_ID,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
@@ -37,6 +38,16 @@ const QUEUE_PREVIEW_MAX_CHARS = 120
 /** Null bytes in the first N bytes → treat file as binary */
 const BINARY_PROBE_BYTES = 8_000
 
+/** Pointer movement before a provider row drag starts (mirrors the host list) */
+const PROVIDER_DRAG_THRESHOLD_PX = 4
+
+/** Drop before a provider row when the pointer is above this fraction of its height */
+const PROVIDER_DROP_BEFORE_RATIO = 0.5
+
+/** Drag ghost offset from the pointer (px) */
+const PROVIDER_DRAG_GHOST_OFFSET_X_PX = 12
+const PROVIDER_DRAG_GHOST_OFFSET_Y_PX = 10
+
 interface QueuedMessage {
   id: string
   text: string
@@ -46,7 +57,7 @@ interface QueuedMessage {
   model: string
 }
 
-/** New provider templates: presets plus generic types */
+/** Provider presets shown by the provider manager. */
 const CUSTOM_OPENAI_TEMPLATE: AiAgentProviderConfig = {
   id: 'custom-openai',
   name: 'OpenAI compatible',
@@ -69,7 +80,9 @@ const PROVIDER_TEMPLATES: AiAgentProviderConfig[] = [
   { ...CUSTOM_ANTHROPIC_TEMPLATE }
 ]
 
-/** Generic id factory for provider manager drafts */
+/** Built-in provider presets can only appear once in the provider list. */
+const BUILTIN_TEMPLATE_IDS = new Set(AI_AGENT_DEFAULT_PROVIDERS.map((p) => p.id))
+
 function newProviderId(): string {
   return crypto.randomUUID()
 }
@@ -95,7 +108,7 @@ interface DraftProvider extends AiAgentProviderConfig {
 function templateDraft(template: AiAgentProviderConfig): DraftProvider {
   return {
     ...template,
-    id: newProviderId(),
+    id: BUILTIN_TEMPLATE_IDS.has(template.id) ? template.id : newProviderId(),
     models: [...template.models],
     hasKey: false,
     draftKey: ''
@@ -104,6 +117,16 @@ function templateDraft(template: AiAgentProviderConfig): DraftProvider {
 
 function protocolLabel(protocol: AiAgentProviderProtocol): string {
   return protocol === AI_AGENT_PROTOCOL_ANTHROPIC ? 'anthropic' : 'openai-compatible'
+}
+
+function isOllamaLike(provider: {
+  id: string
+}): boolean {
+  return provider.id === AI_AGENT_OLLAMA_PROVIDER_ID
+}
+
+function isOllamaDraft(draft: DraftProvider): boolean {
+  return isOllamaLike(draft)
 }
 
 function baseHost(baseUrl: string): string {
@@ -115,6 +138,54 @@ function baseHost(baseUrl: string): string {
   } catch {
     return baseUrl
   }
+}
+
+interface ProviderDragState {
+  id: string
+  startX: number
+  startY: number
+  lastY: number
+  active: boolean
+}
+
+type ProviderDropHint = { kind: 'before' | 'after'; id: string }
+
+/** Locate the provider row under clientY and whether the drop lands before/after it. */
+function findProviderDropHint(listEl: HTMLElement, clientY: number): ProviderDropHint | null {
+  const items = listEl.querySelectorAll<HTMLElement>('.ai-agent-provider-item[data-provider-id]')
+  for (const item of items) {
+    const rect = item.getBoundingClientRect()
+    const id = item.dataset.providerId
+    if (!id) {
+      continue
+    }
+    if (clientY >= rect.top && clientY <= rect.bottom) {
+      const mid = rect.top + rect.height * PROVIDER_DROP_BEFORE_RATIO
+      return clientY < mid ? { kind: 'before', id } : { kind: 'after', id }
+    }
+  }
+  return null
+}
+
+/** Resolve the insertion index for a dragged provider id given a drop hint. */
+function providerTargetInsertIndex(
+  ids: string[],
+  draggedId: string,
+  hint: ProviderDropHint
+): number {
+  const without = ids.filter((id) => id !== draggedId)
+  const refIdx = without.indexOf(hint.id)
+  if (refIdx < 0) {
+    return without.length
+  }
+  return hint.kind === 'before' ? refIdx : refIdx + 1
+}
+
+function providerDropClass(hint: ProviderDropHint | null, id: string): string {
+  if (!hint || hint.id !== id) {
+    return ''
+  }
+  return hint.kind === 'before' ? ' drop-before' : ' drop-after'
 }
 
 function outcomeLabel(outcome: AiAgentConversationToolMsg['outcome']): string {
@@ -299,20 +370,34 @@ export default function AiAgentView({
   const [historyOpen, setHistoryOpen] = useState(false)
   const [drafts, setDrafts] = useState<DraftProvider[]>([])
   const [expandedDraftId, setExpandedDraftId] = useState<string | null>(null)
+  const [addProviderOpen, setAddProviderOpen] = useState(false)
   const [newTemplateId, setNewTemplateId] = useState(PROVIDER_TEMPLATES[0]?.id ?? '')
   const [rulesDraft, setRulesDraft] = useState('')
   const [toast, setToast] = useState<{ kind: 'error' | 'info'; text: string } | null>(null)
   const [queued, setQueued] = useState<QueuedMessage | null>(null)
   const [sudoPassword, setSudoPassword] = useState('')
+  const [draggingProviderId, setDraggingProviderId] = useState<string | null>(null)
+  const [providerDropHint, setProviderDropHint] = useState<ProviderDropHint | null>(null)
+  const [providerDragGhost, setProviderDragGhost] = useState<{
+    id: string
+    x: number
+    y: number
+  } | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sudoInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const promptInputRef = useRef<HTMLTextAreaElement>(null)
+  const providerListRef = useRef<HTMLDivElement>(null)
+  const providerDragRef = useRef<ProviderDragState | null>(null)
+  const providerDropHintRef = useRef<ProviderDropHint | null>(null)
+  const suppressProviderClickRef = useRef(false)
   const dragDepthRef = useRef(0)
-  /** After force-send: wait for stop to settle, then drain the queue */
+  /** Indicates that the queued message should replace the active run. */
   const forceAfterStopRef = useRef(false)
-  /** Prevents double-drain of the same queued message (Strict Mode / duplicate effects) */
+  /** Identifies the queued message that has already been dispatched. */
   const drainedQueueIdRef = useRef<string | null>(null)
+  /** Prevents repeated initial model refreshes for the Ollama preset. */
+  const mountedOllamaRefreshRef = useRef(false)
 
   const send = (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
     void window.wassh.sendPluginMessage(tabId, pluginId, payload)
@@ -382,6 +467,8 @@ export default function AiAgentView({
     send({ type: 'sync' })
   }, [tabId, pluginId])
 
+  providerDropHintRef.current = providerDropHint
+
   const conv = view.conversation
   const providers = view.providers
   const activeProvider =
@@ -389,6 +476,17 @@ export default function AiAgentView({
   const activeModel = conv?.activeModel || activeProvider?.models[0] || ''
   const busy =
     view.runPhase === 'running' || view.runPhase === 'ask' || view.runPhase === 'ask_sudo'
+
+  useEffect(() => {
+    if (mountedOllamaRefreshRef.current) {
+      return
+    }
+    const ollama = providers.find((p) => isOllamaLike(p))
+    if (ollama) {
+      mountedOllamaRefreshRef.current = true
+      send({ type: 'refreshModels', providerId: ollama.id })
+    }
+  }, [providers])
 
   const dispatchChat = (msg: Omit<QueuedMessage, 'id'>): void => {
     send({
@@ -401,7 +499,6 @@ export default function AiAgentView({
     })
   }
 
-  /** Send a queued message once the run is idle (auto) or settled after a forced stop */
   useEffect(() => {
     if (!queued) {
       return
@@ -489,6 +586,9 @@ export default function AiAgentView({
     const provider = providers.find((p) => p.id === providerId)
     const model = provider?.models[0] ?? ''
     send({ type: 'select', providerId, model })
+    if (provider && isOllamaLike(provider)) {
+      send({ type: 'refreshModels', providerId })
+    }
     if (conv) {
       setView((prev) =>
         prev.conversation
@@ -529,7 +629,6 @@ export default function AiAgentView({
 
     if (busy) {
       if (queued) {
-        // Enter again: stop the current run and send as soon as it settles
         const next =
           text || attachments.length > 0
             ? buildQueued(text, attach, attachments)
@@ -632,6 +731,7 @@ export default function AiAgentView({
       }))
     )
     setExpandedDraftId(null)
+    setAddProviderOpen(false)
     setRulesDraft(view.rules)
     setGearOpen(true)
   }
@@ -645,9 +745,18 @@ export default function AiAgentView({
     if (!template) {
       return
     }
+    if (BUILTIN_TEMPLATE_IDS.has(template.id)) {
+      const existing = drafts.find((d) => d.id === template.id)
+      if (existing) {
+        setExpandedDraftId(existing.id)
+        setAddProviderOpen(false)
+        return
+      }
+    }
     const draft = templateDraft(template)
     setDrafts((prev) => [...prev, draft])
     setExpandedDraftId(draft.id)
+    setAddProviderOpen(false)
   }
 
   const removeDraft = (index: number): void => {
@@ -658,15 +767,16 @@ export default function AiAgentView({
     setDrafts((prev) => prev.filter((_, i) => i !== index))
   }
 
-  const moveDraft = (index: number, delta: number): void => {
-    const target = index + delta
-    if (target < 0 || target >= drafts.length) {
-      return
-    }
+  const reorderDrafts = (draggedId: string, hint: ProviderDropHint): void => {
     setDrafts((prev) => {
-      const next = prev.slice()
-      const [item] = next.splice(index, 1)
-      next.splice(target, 0, item)
+      const ids = prev.map((d) => d.id)
+      const insertIndex = providerTargetInsertIndex(ids, draggedId, hint)
+      const next = prev.filter((d) => d.id !== draggedId)
+      const dragged = prev.find((d) => d.id === draggedId)
+      if (!dragged) {
+        return prev
+      }
+      next.splice(insertIndex, 0, dragged)
       return next
     })
   }
@@ -677,8 +787,6 @@ export default function AiAgentView({
     if (!key) {
       return
     }
-    // The key is handed to the main process once and stored there encrypted
-    // (safeStorage/DPAPI). The renderer never caches the plaintext.
     await window.wassh.setSecret(aiAgentVaultId(draft.id), key)
     updateDraft(index, { hasKey: true, draftKey: '' })
     send({ type: 'sync' })
@@ -706,6 +814,20 @@ export default function AiAgentView({
       models: d.models.map((m) => m.trim()).filter((m) => m.length > 0)
     }))
     send({ type: 'providersChanged', providers: next })
+    const ollama = next.find((p) => isOllamaLike(p))
+    if (ollama) {
+      send({ type: 'refreshModels', providerId: ollama.id })
+    }
+    setGearOpen(false)
+  }
+
+  const closeGear = (): void => {
+    if (gearOpen) {
+      const ollama = providers.find((p) => isOllamaLike(p))
+      if (ollama) {
+        send({ type: 'refreshModels', providerId: ollama.id })
+      }
+    }
     setGearOpen(false)
   }
 
@@ -832,8 +954,6 @@ export default function AiAgentView({
     }
   }, [messages.length, stream, view.runPhase, gearOpen, historyOpen])
 
-  // Auto-grow the prompt textarea as text is typed, up to the CSS max-height
-  // (which then falls back to internal scrolling).
   useEffect(() => {
     const el = promptInputRef.current
     if (!el) {
@@ -843,6 +963,65 @@ export default function AiAgentView({
     el.style.height = `${el.scrollHeight}px`
   }, [input])
 
+  useEffect(() => {
+    const onMove = (e: PointerEvent): void => {
+      const drag = providerDragRef.current
+      if (!drag) {
+        return
+      }
+      if (!drag.active) {
+        const dx = e.clientX - drag.startX
+        const dy = e.clientY - drag.startY
+        if (dx * dx + dy * dy < PROVIDER_DRAG_THRESHOLD_PX * PROVIDER_DRAG_THRESHOLD_PX) {
+          return
+        }
+        drag.active = true
+        setDraggingProviderId(drag.id)
+        setProviderDragGhost({ id: drag.id, x: e.clientX, y: e.clientY })
+      }
+      drag.lastY = e.clientY
+      setProviderDragGhost({ id: drag.id, x: e.clientX, y: e.clientY })
+      const list = providerListRef.current
+      if (!list) {
+        return
+      }
+      const hint = findProviderDropHint(list, e.clientY)
+      providerDropHintRef.current = hint
+      setProviderDropHint(hint)
+    }
+
+    const onUp = (): void => {
+      const drag = providerDragRef.current
+      if (drag) {
+        if (drag.active) {
+          suppressProviderClickRef.current = true
+          const list = providerListRef.current
+          const hint =
+            providerDropHintRef.current ?? (list ? findProviderDropHint(list, drag.lastY) : null)
+          if (hint) {
+            reorderDrafts(drag.id, hint)
+          }
+          window.setTimeout(() => {
+            suppressProviderClickRef.current = false
+          }, 0)
+        }
+        providerDragRef.current = null
+        setDraggingProviderId(null)
+        setProviderDragGhost(null)
+        setProviderDropHint(null)
+      }
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+    return () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+    }
+  }, [])
+
   const phaseClass = view.runPhase
   const providerOptions =
     providers.length > 0 ? (
@@ -851,10 +1030,28 @@ export default function AiAgentView({
           className="ai-agent-provider-select"
           value={activeProvider?.id ?? ''}
           onChange={(e) => selectProvider(e.target.value)}
+          onClick={() => {
+            if (activeProvider && isOllamaLike(activeProvider)) {
+              send({ type: 'refreshModels', providerId: activeProvider.id })
+            }
+          }}
+          onMouseDown={() => {
+            if (activeProvider && isOllamaLike(activeProvider)) {
+              send({ type: 'refreshModels', providerId: activeProvider.id })
+            }
+          }}
           title="Model provider"
         >
           {providers.map((p) => (
-            <option key={p.id} value={p.id}>
+            <option
+              key={p.id}
+              value={p.id}
+              onClick={() => {
+                if (isOllamaLike(p)) {
+                  send({ type: 'refreshModels', providerId: p.id })
+                }
+              }}
+            >
               {p.name}
             </option>
           ))}
@@ -874,28 +1071,46 @@ export default function AiAgentView({
       </>
     ) : null
 
+  const draggingDraft = draggingProviderId
+    ? drafts.find((d) => d.id === draggingProviderId)
+    : undefined
+
   return (
     <div className="plugin-panel ai-agent">
       {gearOpen ? (
         <div className="ai-agent-gear">
           <div className="ai-agent-pane-label">Model providers</div>
           <div className="ai-agent-provider-add">
-            <select
-              aria-label="Provider type"
-              value={newTemplateId}
-              onChange={(e) => setNewTemplateId(e.target.value)}
-            >
-              {PROVIDER_TEMPLATES.map((template) => (
-                <option key={template.id} value={template.id}>
-                  {template.name}
-                </option>
-              ))}
-            </select>
-            <button type="button" onClick={() => addDraft(newTemplateId)}>
-              Add provider
-            </button>
+            {addProviderOpen ? (
+              <>
+                <select
+                  aria-label="Provider type"
+                  value={newTemplateId}
+                  onChange={(e) => setNewTemplateId(e.target.value)}
+                >
+                  {PROVIDER_TEMPLATES.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" onClick={() => addDraft(newTemplateId)}>
+                  Add
+                </button>
+                <button type="button" onClick={() => setAddProviderOpen(false)}>
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button type="button" onClick={() => setAddProviderOpen(true)}>
+                + Add provider
+              </button>
+            )}
           </div>
-          <div className="ai-agent-provider-list">
+          <div
+            className={`ai-agent-provider-list${draggingProviderId ? ' is-dragging' : ''}`}
+            ref={providerListRef}
+          >
             {drafts.length === 0 ? (
               <div className="ai-agent-provider-empty">
                 No providers configured yet. Add an OpenAI-compatible or Anthropic provider.
@@ -903,20 +1118,54 @@ export default function AiAgentView({
             ) : (
               drafts.map((draft, index) => {
                 const open = expandedDraftId === draft.id
+                const dropClass = providerDropClass(providerDropHint, draft.id)
                 return (
-                  <div key={draft.id} className={`ai-agent-provider-item${open ? ' open' : ''}`}>
+                  <div
+                    key={draft.id}
+                    className={`ai-agent-provider-item${open ? ' open' : ''}${draggingProviderId === draft.id ? ' dragging' : ''}${dropClass}`}
+                    data-provider-id={draft.id}
+                  >
                     <div className="ai-agent-provider-item-row">
                       <div
                         className="ai-agent-provider-item-main"
                         role="button"
                         tabIndex={0}
-                        onClick={() => setExpandedDraftId(open ? null : draft.id)}
+                        onPointerDown={(e) => {
+                          if (e.button !== 0) {
+                            return
+                          }
+                          providerDragRef.current = {
+                            id: draft.id,
+                            startX: e.clientX,
+                            startY: e.clientY,
+                            lastY: e.clientY,
+                            active: false
+                          }
+                          e.currentTarget.setPointerCapture(e.pointerId)
+                        }}
+                        onPointerUp={(e) => {
+                          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                            e.currentTarget.releasePointerCapture(e.pointerId)
+                          }
+                        }}
+                        onPointerCancel={(e) => {
+                          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                            e.currentTarget.releasePointerCapture(e.pointerId)
+                          }
+                        }}
+                        onClick={() => {
+                          if (suppressProviderClickRef.current) {
+                            return
+                          }
+                          setExpandedDraftId(open ? null : draft.id)
+                        }}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault()
                             setExpandedDraftId(open ? null : draft.id)
                           }
                         }}
+                        title="Click to edit, drag to reorder"
                       >
                         <span className="ai-agent-provider-item-name">
                           {draft.name || 'Unnamed provider'}
@@ -930,22 +1179,6 @@ export default function AiAgentView({
                       <span className="ai-agent-provider-item-actions">
                         <button
                           type="button"
-                          title="Move up"
-                          disabled={index === 0}
-                          onClick={() => moveDraft(index, -1)}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          title="Move down"
-                          disabled={index === drafts.length - 1}
-                          onClick={() => moveDraft(index, 1)}
-                        >
-                          ↓
-                        </button>
-                        <button
-                          type="button"
                           className="ai-agent-danger"
                           title="Remove provider"
                           onClick={() => removeDraft(index)}
@@ -956,77 +1189,98 @@ export default function AiAgentView({
                     </div>
                     {open ? (
                       <div className="ai-agent-provider-editor">
-                <input
-                  aria-label="Name"
-                  value={draft.name}
-                  placeholder="Provider name"
-                  onChange={(e) => updateDraft(index, { name: e.target.value })}
-                />
-                <select
-                  aria-label="Protocol"
-                  value={draft.protocol}
-                  onChange={(e) =>
-                    updateDraft(index, {
-                      protocol:
-                        e.target.value === AI_AGENT_PROTOCOL_ANTHROPIC
-                          ? AI_AGENT_PROTOCOL_ANTHROPIC
-                          : AI_AGENT_PROTOCOL_OPENAI
-                    })
-                  }
-                >
-                  <option value={AI_AGENT_PROTOCOL_OPENAI}>OpenAI compatible</option>
-                  <option value={AI_AGENT_PROTOCOL_ANTHROPIC}>Anthropic</option>
-                </select>
-                <input
-                  aria-label="Base URL"
-                  value={draft.baseUrl}
-                  placeholder={
-                    draft.protocol === AI_AGENT_PROTOCOL_ANTHROPIC
-                      ? AI_AGENT_ANTHROPIC_BASE_URL
-                      : 'http://127.0.0.1:11434/v1'
-                  }
-                  onChange={(e) => updateDraft(index, { baseUrl: e.target.value })}
-                />
-                <textarea
-                  aria-label="Models"
-                  rows={2}
-                  value={draft.models.join('\n')}
-                  placeholder={'Model id, one per line'}
-                  onChange={(e) =>
-                    updateDraft(index, {
-                      models: e.target.value
-                        .split('\n')
-                        .map((l) => l.trim())
-                        .filter((l) => l.length > 0)
-                    })
-                  }
-                />
-                <div className="ai-agent-provider-key">
+                <div className="field-row">
+                  <label htmlFor={`ai-agent-provider-name-${draft.id}`}>Name</label>
                   <input
-                    aria-label="API key"
-                    type="password"
-                    value={draft.draftKey}
-                    placeholder={draft.hasKey ? 'Key stored — type to replace' : 'API key'}
-                    autoComplete="off"
-                    onChange={(e) => updateDraft(index, { draftKey: e.target.value })}
+                    id={`ai-agent-provider-name-${draft.id}`}
+                    value={draft.name}
+                    placeholder="Provider name"
+                    onChange={(e) => updateDraft(index, { name: e.target.value })}
                   />
-                  <button
-                    type="button"
-                    onClick={() => void saveDraftKey(index)}
-                    disabled={!draft.draftKey}
-                  >
-                    Save
-                  </button>
-                  {draft.hasKey ? (
-                    <button
-                      type="button"
-                      className="ai-agent-danger"
-                      onClick={() => void removeDraftKey(index)}
-                    >
-                      Clear key
-                    </button>
-                  ) : null}
                 </div>
+                {isOllamaDraft(draft) ? null : (
+                  <div className="field-row">
+                    <label htmlFor={`ai-agent-provider-protocol-${draft.id}`}>Protocol</label>
+                    <select
+                      id={`ai-agent-provider-protocol-${draft.id}`}
+                      value={draft.protocol}
+                      onChange={(e) =>
+                        updateDraft(index, {
+                          protocol:
+                            e.target.value === AI_AGENT_PROTOCOL_ANTHROPIC
+                              ? AI_AGENT_PROTOCOL_ANTHROPIC
+                              : AI_AGENT_PROTOCOL_OPENAI
+                        })
+                      }
+                    >
+                      <option value={AI_AGENT_PROTOCOL_OPENAI}>OpenAI compatible</option>
+                      <option value={AI_AGENT_PROTOCOL_ANTHROPIC}>Anthropic</option>
+                    </select>
+                  </div>
+                )}
+                <div className="field-row">
+                  <label htmlFor={`ai-agent-provider-baseurl-${draft.id}`}>Base URL</label>
+                  <input
+                    id={`ai-agent-provider-baseurl-${draft.id}`}
+                    value={draft.baseUrl}
+                    placeholder={
+                      draft.protocol === AI_AGENT_PROTOCOL_ANTHROPIC
+                        ? AI_AGENT_ANTHROPIC_BASE_URL
+                        : 'http://127.0.0.1:11434/v1'
+                    }
+                    onChange={(e) => updateDraft(index, { baseUrl: e.target.value })}
+                  />
+                </div>
+                {isOllamaDraft(draft) ? null : (
+                  <div className="field-row">
+                    <label htmlFor={`ai-agent-provider-models-${draft.id}`}>Models</label>
+                    <textarea
+                      id={`ai-agent-provider-models-${draft.id}`}
+                      rows={2}
+                      value={draft.models.join('\n')}
+                      placeholder={'Model id, one per line'}
+                      onChange={(e) =>
+                        updateDraft(index, {
+                          models: e.target.value
+                            .split('\n')
+                            .map((l) => l.trim())
+                            .filter((l) => l.length > 0)
+                        })
+                      }
+                    />
+                  </div>
+                )}
+                {isOllamaDraft(draft) ? null : (
+                  <div className="field-row">
+                    <label htmlFor={`ai-agent-provider-key-${draft.id}`}>API key</label>
+                    <div className="ai-agent-provider-key">
+                      <input
+                        id={`ai-agent-provider-key-${draft.id}`}
+                        type="password"
+                        value={draft.draftKey}
+                        placeholder={draft.hasKey ? 'Key stored — type to replace' : 'API key'}
+                        autoComplete="off"
+                        onChange={(e) => updateDraft(index, { draftKey: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void saveDraftKey(index)}
+                        disabled={!draft.draftKey}
+                      >
+                        Save
+                      </button>
+                      {draft.hasKey ? (
+                        <button
+                          type="button"
+                          className="ai-agent-danger"
+                          onClick={() => void removeDraftKey(index)}
+                        >
+                          Clear key
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                )}
                       </div>
                     ) : null}
                   </div>
@@ -1034,6 +1288,17 @@ export default function AiAgentView({
               })
             )}
           </div>
+          {providerDragGhost && draggingDraft ? (
+            <div
+              className="ai-agent-provider-drag-ghost"
+              style={{
+                left: providerDragGhost.x + PROVIDER_DRAG_GHOST_OFFSET_X_PX,
+                top: providerDragGhost.y + PROVIDER_DRAG_GHOST_OFFSET_Y_PX
+              }}
+            >
+              {draggingDraft.name || 'Unnamed provider'}
+            </div>
+          ) : null}
           <div className="ai-agent-rules">
             <div className="ai-agent-pane-label">Agent rules (all providers)</div>
             <textarea
@@ -1059,7 +1324,7 @@ export default function AiAgentView({
             <button type="button" onClick={saveProviders}>
               Done
             </button>
-            <button type="button" onClick={() => setGearOpen(false)}>
+            <button type="button" onClick={closeGear}>
               Cancel
             </button>
           </div>
@@ -1068,7 +1333,6 @@ export default function AiAgentView({
         <>
           <div className="ai-agent-header">
             <div className="ai-agent-header-controls">
-              {providerOptions}
               <button
                 type="button"
                 className="ai-agent-gear-btn"
@@ -1104,11 +1368,6 @@ export default function AiAgentView({
               >
                 New
               </button>
-              {busy ? (
-                <button type="button" className="ai-agent-danger" onClick={() => send({ type: 'stop' })}>
-                  Stop
-                </button>
-              ) : null}
             </div>
           </div>
 
@@ -1400,28 +1659,23 @@ export default function AiAgentView({
               />
               <button
                 type="button"
-                onClick={handleSend}
+                className={busy ? 'ai-agent-danger' : undefined}
+                onClick={busy ? () => send({ type: 'stop' }) : handleSend}
                 disabled={
-                  busy
-                    ? !queued && !input.trim() && attachments.length === 0
-                    : (!input.trim() && attachments.length === 0 && !queued) || !view.ssh
+                  busy ? false : (!input.trim() && attachments.length === 0 && !queued) || !view.ssh
                 }
-                title={
-                  busy
-                    ? queued
-                      ? 'Stop the current run and send the queued message now'
-                      : 'Queue this message until the agent finishes'
-                    : 'Send message'
-                }
+                title={busy ? 'Stop the current run' : 'Send message'}
               >
-                {busy ? (queued ? 'Send now' : 'Queue') : 'Send'}
+                {busy ? 'Stop' : 'Send'}
               </button>
             </div>
+            {providerOptions ? (
+              <div className="ai-agent-footer-controls">{providerOptions}</div>
+            ) : null}
           </div>
         </>
       )}
     </div>
   )
 }
-
 

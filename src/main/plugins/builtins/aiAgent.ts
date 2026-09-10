@@ -53,6 +53,7 @@ import type { PluginMainContext, PluginMainModule } from '../PluginHost'
 import { decideCommand } from '../aiAgent/permissions'
 import {
   complete,
+  listModels,
   RUN_COMMAND_TOOL_NAME,
   type ApiMessage,
   type ApiToolCallMsg
@@ -69,7 +70,8 @@ import {
   executeWebFetch,
   executeWebSearch,
   getActiveTools,
-  isMutatingTool
+  isMutatingTool,
+  type ToolDefinition
 } from '../aiAgent/tools'
 
 /** Max chained tool steps per run before we stop the loop */
@@ -145,6 +147,51 @@ const hostRefCount = new Map<string, number>()
 let dataFile: AiAgentDataFile | null = null
 let dataWriter: PluginMainContext | null = null
 
+function isProviderConfig(value: unknown): value is AiAgentProviderConfig {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+  const provider = value as Record<string, unknown>
+  return (
+    typeof provider.id === 'string' &&
+    provider.id.trim().length > 0 &&
+    typeof provider.name === 'string' &&
+    typeof provider.baseUrl === 'string' &&
+    Array.isArray(provider.models)
+  )
+}
+
+function normalizeProviders(raw: unknown): AiAgentProviderConfig[] {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+  const providerIds = new Set<string>()
+  const providers: AiAgentProviderConfig[] = []
+  for (const value of raw) {
+    if (!isProviderConfig(value)) {
+      continue
+    }
+    const id = value.id.trim()
+    if (providerIds.has(id)) {
+      continue
+    }
+    providerIds.add(id)
+    providers.push({
+      id,
+      name: value.name.trim() || 'Provider',
+      protocol:
+        value.protocol === AI_AGENT_PROTOCOL_ANTHROPIC
+          ? AI_AGENT_PROTOCOL_ANTHROPIC
+          : AI_AGENT_PROTOCOL_OPENAI,
+      baseUrl: value.baseUrl.trim(),
+      models: value.models
+        .filter((model): model is string => typeof model === 'string' && model.trim().length > 0)
+        .map((model) => model.trim())
+    })
+  }
+  return providers
+}
+
 function asDataFile(raw: unknown): AiAgentDataFile {
   const fallback: AiAgentDataFile = {
     version: AI_AGENT_DATA_VERSION,
@@ -157,23 +204,7 @@ function asDataFile(raw: unknown): AiAgentDataFile {
     return fallback
   }
   const src = raw as AiAgentDataFile & { conversations?: Record<string, unknown> }
-  const providers: AiAgentProviderConfig[] = Array.isArray(src.providers)
-    ? src.providers
-        .filter(
-          (p): p is AiAgentProviderConfig =>
-            !!p && typeof p === 'object' && typeof p.id === 'string' && typeof p.name === 'string'
-        )
-        .map((p) => ({
-          id: p.id,
-          name: p.name,
-          protocol:
-            p.protocol === AI_AGENT_PROTOCOL_ANTHROPIC
-              ? AI_AGENT_PROTOCOL_ANTHROPIC
-              : AI_AGENT_PROTOCOL_OPENAI,
-          baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
-          models: Array.isArray(p.models) ? p.models.filter((m) => typeof m === 'string') : []
-        }))
-    : []
+  const providers = normalizeProviders(src.providers)
   const { conversations, activeConversationId } = migrateConversations(
     src.conversations && typeof src.conversations === 'object' && !Array.isArray(src.conversations)
       ? (src.conversations as Record<string, unknown>)
@@ -590,20 +621,61 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
   }
 }
 
-function systemPrompt(host: HostState, projectRules: string): string {
+function systemPrompt(
+  host: HostState,
+  projectRules: string,
+  activeTools: ToolDefinition[]
+): string {
   const conv = host.conversation
   const cwd = conv?.cwd || '/'
+  const toolNames = new Set(activeTools.map((t) => t.name))
+
+  const toolDescriptions: string[] = []
+  if (toolNames.has(AI_AGENT_TOOL_RUN_COMMAND)) {
+    toolDescriptions.push(
+      '- run_command: Execute a single shell command on the remote host. Commands run non-interactively with persistent working directory. sudo is supported.'
+    )
+  }
+  if (toolNames.has(AI_AGENT_TOOL_GET_CURRENT_TIME)) {
+    toolDescriptions.push(
+      '- get_current_time: Query current real-time date, time, timezone, and Unix timestamp from the local system. Call this whenever the user asks for date, time, year, day, or temporal context.'
+    )
+  }
+  if (toolNames.has(AI_AGENT_TOOL_WEB_FETCH)) {
+    toolDescriptions.push(
+      '- web_fetch: Fetch and read the text/content of a web page URL.'
+    )
+  }
+  if (toolNames.has(AI_AGENT_TOOL_WEB_SEARCH)) {
+    toolDescriptions.push(
+      '- web_search: Search the web for current documentation, news, or answers.'
+    )
+  }
+  if (toolNames.has(AI_AGENT_TOOL_REMOTE_FS_READ)) {
+    toolDescriptions.push(
+      '- remote_read_file, remote_write_file, remote_list_dir, remote_delete_file: Read, write, list, or delete files directly on the remote SSH server via SFTP.'
+    )
+  }
+  if (toolNames.has(AI_AGENT_TOOL_LOCAL_FS_READ)) {
+    toolDescriptions.push(
+      '- local_read_file, local_write_file, local_list_dir: Read, write, or list files on the local client machine running WaSSH.'
+    )
+  }
+
   const base = [
     `You are an AI development agent connected to the remote host "${host.hostLabel}".`,
     `Current working directory: ${cwd}`,
     '',
-    'You can execute shell commands on that host with the run_command tool.',
-    'Commands run non-interactively in a fresh shell (your working directory is preserved between calls).',
-    'Avoid interactive commands (vim, top, less, tail -f). Prefer small, verifiable steps.',
-    'sudo is supported: the user may be prompted once for their password when needed.',
-    'After each command you see its combined stdout/stderr and exit code.',
-    'Never invent command output. If a step fails, diagnose from the real output and continue or report.',
-    'When the task is complete, reply with a concise plain-text summary; you do not need to call more tools.'
+    'You have access to tools to interact with the environment and system. Call tools whenever needed to gather facts or take actions.',
+    '',
+    'Available tools:',
+    ...toolDescriptions,
+    '',
+    'Guidelines:',
+    '- When asked about the current date or time, call get_current_time to obtain the exact current time.',
+    '- Avoid interactive commands (vim, top, less, tail -f). Prefer small, verifiable steps.',
+    '- After each command or tool call you see its actual result. Never invent output.',
+    '- When the task is complete, reply with a concise plain-text summary; you do not need to call more tools.'
   ]
   const userRules = (dataFile?.rules ?? '').trim()
   const remote = projectRules.trim()
@@ -641,7 +713,9 @@ function toApiMessages(conversation: AiAgentConversation): ApiMessage[] {
       const toolCalls: ApiToolCallMsg[] = (msg.toolCalls ?? []).map((tc) => ({
         id: tc.id,
         name: tc.name || RUN_COMMAND_TOOL_NAME,
-        arguments: tc.argumentsJson || JSON.stringify({ command: tc.command })
+        arguments:
+          tc.argumentsJson ||
+          (tc.name === RUN_COMMAND_TOOL_NAME ? JSON.stringify({ command: tc.command }) : '{}')
       }))
       out.push({
         role: 'assistant',
@@ -762,6 +836,19 @@ async function ensureSudoCredentials(host: HostState, command: string): Promise<
 function listSetting(settings: Record<string, unknown>, key: string): string[] {
   const value = settings[key]
   return Array.isArray(value) ? value.filter((s): s is string => typeof s === 'string') : []
+}
+
+function isToolEnabled(activeTools: ToolDefinition[], toolName: string): boolean {
+  return activeTools.some((tool) => tool.name === toolName)
+}
+
+function applyApprovalDecision(host: HostState, subject: string, decision: string): boolean {
+  if (decision === 'allowAlways') {
+    host.extraAllow.push(subject)
+  } else if (decision === 'denyAlways') {
+    host.extraDeny.push(subject)
+  }
+  return decision !== 'deny' && decision !== 'denyAlways'
 }
 
 interface ExecResult {
@@ -953,7 +1040,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         apiKey,
         protocol: provider.protocol,
         model: conv.activeModel,
-        system: systemPrompt(host, projectRules),
+        system: systemPrompt(host, projectRules, activeTools),
         messages: toApiMessages(conv),
         tools: activeTools,
         maxTokens: MAX_TOKENS,
@@ -1005,7 +1092,22 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         const toolArgs = parseJsonArgs(tc.arguments)
         const displayCommand = extractToolDisplayCommand(toolName, tc.arguments)
 
-        // Handle shell run_command specifically with approval & sudo flow
+        if (!isToolEnabled(activeTools, toolName)) {
+          conv.messages.push(
+            toolResultMessage(
+              tc.id,
+              toolName,
+              displayCommand,
+              `Tool "${toolName}" is disabled for this conversation.`,
+              'denied',
+              false
+            )
+          )
+          pushState(host)
+          persistConversation(host)
+          continue
+        }
+
         if (toolName === AI_AGENT_TOOL_RUN_COMMAND) {
           const command = typeof toolArgs.command === 'string' ? toolArgs.command.trim() : ''
           if (!command) {
@@ -1039,13 +1141,8 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
               keepRunning = false
               break
             }
-            if (action === 'allowAlways') {
-              host.extraAllow.push(command)
-            } else if (action === 'denyAlways') {
-              host.extraDeny.push(command)
-            }
           }
-          if (action === 'deny' || action === 'denyAlways') {
+          if (!applyApprovalDecision(host, command, action)) {
             conv.messages.push(toolResultMessage(tc.id, toolName, command, '', 'denied', false))
             pushState(host)
             persistConversation(host)
@@ -1117,14 +1214,22 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           continue
         }
 
-        // Handle Mutating Tools (Remote Write/Delete, Local Write) with Approval
         if (isMutatingTool(toolName)) {
-          const action = await askApproval(host, displayCommand)
+          const decision = decideCommand(
+            displayCommand,
+            hostAllow,
+            hostDeny,
+            appAllow,
+            appDeny,
+            host.extraAllow,
+            host.extraDeny
+          )
+          const action = decision === 'ask' ? await askApproval(host, displayCommand) : decision
           if (!host.inRun) {
             keepRunning = false
             break
           }
-          if (action === 'deny' || action === 'denyAlways') {
+          if (!applyApprovalDecision(host, displayCommand, action)) {
             conv.messages.push(
               toolResultMessage(tc.id, toolName, displayCommand, 'Action denied by user.', 'denied', false)
             )
@@ -1134,7 +1239,6 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           }
         }
 
-        // Execute non-command tools
         let toolOutput = ''
         let toolOutcome: AiAgentToolOutcome = 'ok'
         try {
@@ -1406,6 +1510,51 @@ function hostForCtx(ctx: PluginMainContext): HostState | null {
   return hosts.get(tab.hostKey) ?? null
 }
 
+/**
+ * Query a provider's own API for available models, update its models array
+ * with the reported models, and push state to the client. Refresh runs quietly
+ * without popup messages.
+ */
+async function handleRefreshModels(
+  ctx: PluginMainContext,
+  providerId: string
+): Promise<void> {
+  const host = hostForCtx(ctx)
+  const provider = findProvider(providerId)
+  if (!provider) {
+    if (host) {
+      pushState(host)
+    }
+    return
+  }
+  const apiKey = ctx.getSecret(aiAgentVaultId(provider.id)) ?? ''
+  if (!apiKey && provider.protocol === AI_AGENT_PROTOCOL_ANTHROPIC) {
+    if (host) {
+      pushState(host)
+    }
+    return
+  }
+  try {
+    const fetched = await listModels({
+      baseUrl: provider.baseUrl,
+      apiKey,
+      protocol: provider.protocol
+    })
+    if (fetched.length > 0) {
+      provider.models = fetched.slice().sort((a, b) =>
+        a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+      )
+      saveData()
+    }
+  } catch {
+    // Model refresh errors leave the configured model list unchanged.
+  } finally {
+    if (host) {
+      pushState(host)
+    }
+  }
+}
+
 function formatAttachmentForModel(attachment: AiAgentChatAttachment): string {
   if (attachment.binary || attachment.text == null) {
     return `--- file: ${attachment.name} (binary, content omitted) ---`
@@ -1436,10 +1585,81 @@ function chatMessageWithContext(
   return parts.join('\n\n')
 }
 
+function isChatAttachment(value: unknown): value is AiAgentChatAttachment {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+  const attachment = value as Record<string, unknown>
+  return (
+    typeof attachment.name === 'string' &&
+    typeof attachment.truncated === 'boolean' &&
+    typeof attachment.binary === 'boolean' &&
+    (attachment.mimeType === undefined || typeof attachment.mimeType === 'string') &&
+    (attachment.text === undefined || typeof attachment.text === 'string')
+  )
+}
+
+function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return false
+  }
+  const message = payload as Record<string, unknown>
+  if (typeof message.type !== 'string') {
+    return false
+  }
+  switch (message.type) {
+    case 'sync':
+    case 'probe':
+    case 'stop':
+    case 'resume':
+    case 'discardPaused':
+      return true
+    case 'providersChanged':
+      return Array.isArray(message.providers) && message.providers.every(isProviderConfig)
+    case 'refreshModels':
+      return typeof message.providerId === 'string'
+    case 'openChat':
+    case 'deleteChat':
+      return typeof message.conversationId === 'string'
+    case 'rulesChanged':
+      return typeof message.rules === 'string'
+    case 'select':
+    case 'newChat':
+      return typeof message.providerId === 'string' && typeof message.model === 'string'
+    case 'approval':
+      return (
+        typeof message.requestId === 'string' &&
+        (message.decision === 'allow' ||
+          message.decision === 'deny' ||
+          message.decision === 'allowAlways' ||
+          message.decision === 'denyAlways')
+      )
+    case 'sudoPassword':
+      return (
+        typeof message.requestId === 'string' &&
+        (typeof message.password === 'string' || message.password === null)
+      )
+    case 'chat':
+      return (
+        typeof message.providerId === 'string' &&
+        typeof message.model === 'string' &&
+        typeof message.text === 'string' &&
+        (message.attachTerminal === undefined || typeof message.attachTerminal === 'boolean') &&
+        (message.attachments === undefined ||
+          (Array.isArray(message.attachments) && message.attachments.every(isChatAttachment)))
+      )
+    default:
+      return false
+  }
+}
+
 async function handleRendererMessage(
   ctx: PluginMainContext,
-  payload: AiAgentRendererMessage
+  payload: unknown
 ): Promise<void> {
+  if (!isRendererMessage(payload)) {
+    throw new Error('Invalid AI agent renderer message')
+  }
   if (payload.type === 'sync') {
     const host = hostForCtx(ctx)
     if (host) {
@@ -1455,13 +1675,17 @@ async function handleRendererMessage(
   }
   if (payload.type === 'providersChanged') {
     if (dataFile) {
-      dataFile.providers = payload.providers
+      dataFile.providers = normalizeProviders(payload.providers)
       saveData()
     }
     const host = hostForCtx(ctx)
     if (host) {
       pushState(host)
     }
+    return
+  }
+  if (payload.type === 'refreshModels') {
+    await handleRefreshModels(ctx, payload.providerId)
     return
   }
   if (payload.type === 'rulesChanged') {
@@ -1663,8 +1887,6 @@ export const aiAgentMain: PluginMainModule = {
     }
   },
   async onMessage(ctx, payload) {
-    await handleRendererMessage(ctx, payload as AiAgentRendererMessage)
+    await handleRendererMessage(ctx, payload)
   }
 }
-
-
