@@ -4,6 +4,7 @@ import type {
   ServerMonitorProcess,
   ServerMonitorProcessSignal,
   ServerMonitorProcessSort,
+  ServerMonitorRendererMessage,
   ServerMonitorSnapshot,
   ServerMonitorTemp
 } from '@shared/plugins'
@@ -186,6 +187,17 @@ function pushHistory(prev: number[], value: number): number[] {
     prev.length >= HISTORY_POINTS ? prev.slice(prev.length - HISTORY_POINTS + 1) : prev.slice()
   next.push(value)
   return next
+}
+
+/** Appends a sample to a history state array, skipping samples not yet available */
+function appendIfPresent(
+  setHistory: Dispatch<SetStateAction<number[]>>,
+  value: number | null | undefined
+): void {
+  if (value == null) {
+    return
+  }
+  setHistory((h) => pushHistory(h, value))
 }
 
 function sparkCoords(values: number[], maxValue: number): Array<{ x: number; y: number }> {
@@ -1025,40 +1037,23 @@ export default function ServerMonitorView({
       if (ev.tabId !== tabId || ev.pluginId !== pluginId) {
         return
       }
-      const payload = ev.payload as { type?: string; snapshot?: ServerMonitorSnapshot }
-      if (payload?.type !== 'stats' || !payload.snapshot) {
+      if (!isServerMonitorStatsEvent(ev.payload)) {
         return
       }
-      const next = payload.snapshot
+      const next = ev.payload.snapshot
       setSnapshot(next)
       if (next.error || next.updatedAt === lastAt.current) {
         return
       }
       lastAt.current = next.updatedAt
-      if (next.cpuPercent != null) {
-        setCpuHistory((h) => pushHistory(h, next.cpuPercent as number))
-      }
-      const memPctNext = ratioPercent(next.memUsedBytes, next.memTotalBytes)
-      if (memPctNext != null) {
-        setMemHistory((h) => pushHistory(h, memPctNext))
-      }
-      const diskPctNext = ratioPercent(next.diskUsedBytes, next.diskTotalBytes)
-      if (diskPctNext != null) {
-        setDiskHistory((h) => pushHistory(h, diskPctNext))
-      }
-      if (next.diskReadRate != null) {
-        setDiskReadHistory((h) => pushHistory(h, next.diskReadRate as number))
-      }
-      if (next.diskWriteRate != null) {
-        setDiskWriteHistory((h) => pushHistory(h, next.diskWriteRate as number))
-      }
+      appendIfPresent(setCpuHistory, next.cpuPercent)
+      appendIfPresent(setMemHistory, ratioPercent(next.memUsedBytes, next.memTotalBytes))
+      appendIfPresent(setDiskHistory, ratioPercent(next.diskUsedBytes, next.diskTotalBytes))
+      appendIfPresent(setDiskReadHistory, next.diskReadRate)
+      appendIfPresent(setDiskWriteHistory, next.diskWriteRate)
       const totals = netTotals(next.network ?? [])
-      if (totals.rxRate != null) {
-        setNetRxHistory((h) => pushHistory(h, totals.rxRate as number))
-      }
-      if (totals.txRate != null) {
-        setNetTxHistory((h) => pushHistory(h, totals.txRate as number))
-      }
+      appendIfPresent(setNetRxHistory, totals.rxRate)
+      appendIfPresent(setNetTxHistory, totals.txRate)
     })
   }, [tabId, pluginId])
 
@@ -1075,7 +1070,7 @@ export default function ServerMonitorView({
       type: 'setProcessSort',
       sort: key,
       descending: nextDesc
-    })
+    } satisfies ServerMonitorRendererMessage)
   }
 
   const handleProcSignal = (
@@ -1089,11 +1084,12 @@ export default function ServerMonitorView({
         ? `${command.slice(0, PROC_STATUS_CMD_MAX)}…`
         : command
     void (async () => {
-      const result = (await window.wassh.sendPluginMessage(tabId, pluginId, {
+      const response = await window.wassh.sendPluginMessage(tabId, pluginId, {
         type: 'signalProcess',
         pid,
         signal
-      })) as { ok?: boolean; error?: string } | undefined
+      } satisfies ServerMonitorRendererMessage)
+      const result = isServerMonitorActionResult(response) ? response : null
       if (result?.ok) {
         showProcStatus(`${label} → ${pid} ${shortCmd}`, false)
         return
