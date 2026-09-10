@@ -368,28 +368,36 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
         id: 'plugins',
         title: 'Plugins',
         content: (
-          <>
-            {plugins.map((p) => (
-              <div key={p.id} className="settings-row">
-                <div className="settings-row-label">
-                  <strong>
-                    {p.name}
-                    {p.source === 'external' ? ' (external)' : ''}
-                  </strong>
-                  <span>{p.description}</span>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={draft.enabledPlugins.includes(p.id)}
-                  onChange={(e) => setPluginEnabled(p.id, e.target.checked)}
-                  aria-label={`Enable ${p.name}`}
-                />
+          <div className="plugin-settings-group">
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <strong>Enable plugins</strong>
+                <span>Turn built-in and installed plugins on or off.</span>
               </div>
-            ))}
-            <p className="plugin-settings-external-note">
-              External plugins: none loaded. Future versions can scan userData/plugins/.
-            </p>
-          </>
+            </div>
+            <div className="plugin-settings-group-children depth-1">
+              {plugins.map((p) => (
+                <div key={p.id} className="settings-row plugin-settings-row-nested depth-1">
+                  <div className="settings-row-label">
+                    <strong>
+                      {p.name}
+                      {p.source === 'external' ? ' (external)' : ''}
+                    </strong>
+                    <span>{p.description}</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={draft.enabledPlugins.includes(p.id)}
+                    onChange={(e) => setPluginEnabled(p.id, e.target.checked)}
+                    aria-label={`Enable ${p.name}`}
+                  />
+                </div>
+              ))}
+              <p className="plugin-settings-external-note">
+                External plugins: none loaded. Future versions can scan userData/plugins/.
+              </p>
+            </div>
+          </div>
         )
       }
     ]
