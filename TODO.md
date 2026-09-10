@@ -8,6 +8,9 @@
 - Topology view (plugin) built up autoamtically based on connections, tunnels, hops etc.
 - Workspaces
 - Tunnels guide: pre-defined common tunnels as templates.
+- Injectable server that can run things even when not connected
+    - scheduled tasks
+    - network and other resource monitoring
 
 ## Nice to have ##
 - Share settings easily
@@ -28,6 +31,9 @@
 - MQTT plugin: add basic triggers for activating commands and other things based on messagesw received
 - Add MCP capability to plugins - AI Agent can access MQTT and other things.
 - AI Agent: Add option to include (yaml) files with prompts
-- AI Agent: tool access to file system
-- AI Agent: web search and web access support
-- AI Agent: date_time access
+- [x] AI Agent: tool access to file system (remote SFTP and local client PC)
+- [x] AI Agent: web search and web access support (Bing default + Brave/Google/DuckDuckGo/Custom)
+- [x] AI Agent: date_time access
+- [x] SFTP plugin: Allow download entire folder as zip file
+- [x] AI Agent: ollama bug - doesn't show all models available (added a refresh button next to the model dropdown that fetches all models currently available from the provider, e.g. everything pulled into a local Ollama server, and merges them into the selectable list; also gave Ollama its own dedicated provider preset instead of a generic "Local" one)
+- [x] AI Agent: Allow the prompt input box to grow when more text is input
