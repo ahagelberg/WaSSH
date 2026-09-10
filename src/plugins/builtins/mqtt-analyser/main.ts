@@ -3,6 +3,7 @@ import type { Duplex } from 'stream'
 import {
   MQTT_ANALYSER_DEFAULT_HOST,
   MQTT_ANALYSER_DEFAULT_PORT,
+  MQTT_ANALYSER_HISTORY_LIMIT
 } from './defaults'
 import {
   type MqttAnalyserErrorKind,
@@ -120,10 +121,49 @@ function readBrokerSettings(ctx: PluginMainContext): {
   }
 }
 
+/** One recent message recorded for a topic, mirroring what the renderer already tracks. */
+interface MqttTopicMessage {
+  payloadText?: string
+  payloadBase64?: string
+  binary: boolean
+  qos: 0 | 1 | 2
+  retain: boolean
+  timestamp: number
+}
+
+/** Main-side mirror of a topic's last value + bounded history, for API calls. */
+interface MqttTopicRecord {
+  binary: boolean
+  payloadText?: string
+  payloadBase64?: string
+  timestamp: number
+  messageCount: number
+  history: MqttTopicMessage[]
+}
+
 interface SessionState {
   client: MqttClient | null
   stream: Duplex | null
   stopped: boolean
+  /** Bounded per-topic mirror of received messages, for `get_topics`/`get_topic_value`. */
+  topics: Map<string, MqttTopicRecord>
+}
+
+function recordTopicMessage(state: SessionState, topic: string, message: MqttTopicMessage): void {
+  let record = state.topics.get(topic)
+  if (!record) {
+    record = { binary: message.binary, timestamp: message.timestamp, messageCount: 0, history: [] }
+    state.topics.set(topic, record)
+  }
+  record.binary = message.binary
+  record.payloadText = message.payloadText
+  record.payloadBase64 = message.payloadBase64
+  record.timestamp = message.timestamp
+  record.messageCount += 1
+  record.history.push(message)
+  if (record.history.length > MQTT_ANALYSER_HISTORY_LIMIT) {
+    record.history.splice(0, record.history.length - MQTT_ANALYSER_HISTORY_LIMIT)
+  }
 }
 
 async function connectBroker(ctx: PluginMainContext, state: SessionState): Promise<void> {
@@ -219,13 +259,22 @@ async function connectBroker(ctx: PluginMainContext, state: SessionState): Promi
     }
     const encoded = encodePayload(payload)
     const qos = (packet.qos === 1 || packet.qos === 2 ? packet.qos : 0) as 0 | 1 | 2
+    const timestamp = Date.now()
+    const retain = Boolean(packet.retain)
+    // A zero-length payload signals the topic was cleared (typical retained-delete
+    // pattern); mirror the renderer's own tree, which drops it rather than recording it.
+    if (payload.length === 0) {
+      state.topics.delete(topicName)
+    } else {
+      recordTopicMessage(state, topicName, { ...encoded, qos, retain, timestamp })
+    }
     ctx.sendToRenderer({
       type: 'message',
       topic: topicName,
       ...encoded,
       qos,
-      retain: Boolean(packet.retain),
-      timestamp: Date.now()
+      retain,
+      timestamp
     } satisfies MqttAnalyserMessagePayload)
   })
 
@@ -279,7 +328,8 @@ export const mqttAnalyserMain: PluginMainModule = {
     const state: SessionState = {
       client: null,
       stream: null,
-      stopped: false
+      stopped: false,
+      topics: new Map()
     }
 
     sessionStates.set(instanceKey(ctx), state)
@@ -332,6 +382,70 @@ export const mqttAnalyserMain: PluginMainModule = {
       const qos = payload.qos === 1 || payload.qos === 2 ? payload.qos : 0
       return publishMqtt(client, topic, payload.payloadBase64, qos, Boolean(payload.retain))
     }
+  },
+
+  async onApiCall(ctx, method, params) {
+    const state = sessionStates.get(instanceKey(ctx))
+    if (!state) {
+      throw new Error('MQTT analyser is not active on this tab')
+    }
+
+    if (method === 'get_topics') {
+      return Array.from(state.topics.entries()).map(([topic, record]) => ({
+        topic,
+        value: record.binary ? '(binary)' : (record.payloadText ?? ''),
+        messageCount: record.messageCount,
+        timestamp: record.timestamp
+      }))
+    }
+
+    const args = params && typeof params === 'object' ? (params as Record<string, unknown>) : {}
+
+    if (method === 'get_topic_value') {
+      const topic = String(args.topic || '')
+      const record = state.topics.get(topic)
+      if (!record) {
+        return { topic, found: false }
+      }
+      const result: Record<string, unknown> = {
+        topic,
+        found: true,
+        value: record.binary ? '(binary)' : (record.payloadText ?? ''),
+        timestamp: record.timestamp,
+        messageCount: record.messageCount
+      }
+      if (args.includeHistory) {
+        result.history = record.history.map((m) => ({
+          value: m.binary ? '(binary)' : (m.payloadText ?? ''),
+          qos: m.qos,
+          retain: m.retain,
+          timestamp: m.timestamp
+        }))
+      }
+      return result
+    }
+
+    if (method === 'publish') {
+      const client = state.client
+      if (!client?.connected) {
+        throw new Error('Not connected to MQTT broker')
+      }
+      const topic = String(args.topic || '').trim()
+      if (!topic) {
+        throw new Error('Topic is required')
+      }
+      const payloadText = String(args.payload ?? '')
+      const qos = args.qos === 1 || args.qos === 2 ? args.qos : 0
+      const retain = Boolean(args.retain)
+      const payloadBase64 = Buffer.from(payloadText, 'utf8').toString('base64')
+      const error = await publishMqtt(client, topic, payloadBase64, qos as 0 | 1 | 2, retain)
+      if (error) {
+        throw new Error(error)
+      }
+      return { ok: true }
+    }
+
+    throw new Error(`Unknown mqtt-analyser API method: ${method}`)
   }
 }
 

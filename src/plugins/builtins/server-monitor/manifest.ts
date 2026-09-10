@@ -64,6 +64,16 @@ export const serverMonitorManifest: PluginManifest = {
         description: 'Network panel with rate history, totals, and per-interface stats.'
       }
     ],
-    views: [{ id: 'panel', placement: 'split-right', title: 'Server' }]
+    views: [{ id: 'panel', placement: 'split-right', title: 'Server' }],
+    api: {
+      methods: [
+        {
+          name: 'get_snapshot',
+          description:
+            'Return the latest sampled server-monitor stats snapshot for this session (CPU, memory, disk, network, processes, temperatures).',
+          parameters: { type: 'object', properties: {} }
+        }
+      ]
+    }
   }
 }

@@ -37,6 +37,21 @@ export const macroPadManifest: PluginManifest = {
         description: 'Whether the ungrouped macro section is collapsed.'
       }
     ],
-    views: [{ id: MACRO_PAD_VIEW_ID, placement: 'split-right', title: 'Macros' }]
+    views: [{ id: MACRO_PAD_VIEW_ID, placement: 'split-right', title: 'Macros' }],
+    api: {
+      methods: [
+        {
+          name: 'execute_macro',
+          description: 'Execute a configured macro-pad button by id or label, sending its text into the terminal.',
+          parameters: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Macro button id (preferred)' },
+              label: { type: 'string', description: 'Macro button label (used if id is not given)' }
+            }
+          }
+        }
+      ]
+    }
   }
 }

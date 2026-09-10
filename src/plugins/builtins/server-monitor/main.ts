@@ -94,6 +94,8 @@ interface MonitorSessionState {
   lastProcesses: ServerMonitorProcess[]
   /** Consecutive collapsed-list samples */
   shortSamples: number
+  /** Most recent snapshot pushed to the renderer, for `get_snapshot` API calls */
+  lastSnapshot: ServerMonitorSnapshot | null
 }
 
 const sessionStates = new Map<string, MonitorSessionState>()
@@ -946,8 +948,9 @@ async function signalRemoteProcess(
   }
 }
 
-/** Push a stats snapshot to the view (typed wire shape shared with the renderer) */
-function pushStats(ctx: PluginMainContext, snapshot: ServerMonitorSnapshot): void {
+/** Push a stats snapshot to the view and remember it for `get_snapshot` API calls. */
+function pushStats(ctx: PluginMainContext, state: MonitorSessionState, snapshot: ServerMonitorSnapshot): void {
+  state.lastSnapshot = snapshot
   const event: ServerMonitorStatsEvent = { type: 'stats', snapshot }
   ctx.sendToRenderer(event)
 }
@@ -1040,10 +1043,10 @@ async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): 
 
     parsed.snapshot.processes = stabilizeProcessList(state, parsed.snapshot.processes)
 
-    pushStats(ctx, parsed.snapshot)
+    pushStats(ctx, state, parsed.snapshot)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    pushStats(ctx, emptySnapshot({ error: message }))
+    pushStats(ctx, state, emptySnapshot({ error: message }))
   } finally {
     state.busy = false
   }
@@ -1079,6 +1082,7 @@ export const serverMonitorMain: PluginMainModule = {
       prevDiskIo: null,
       lastProcesses: [],
       shortSamples: 0,
+      lastSnapshot: null,
       timer: null,
       intervalMs: parseInterval(ctx.getSettings()),
       poll: async () => undefined
@@ -1139,5 +1143,13 @@ export const serverMonitorMain: PluginMainModule = {
     }
 
     return undefined
+  },
+
+  async onApiCall(ctx, method) {
+    if (method !== 'get_snapshot') {
+      throw new Error(`Unknown server-monitor API method: ${method}`)
+    }
+    const state = sessionStates.get(instanceKey(ctx))
+    return state?.lastSnapshot ?? emptySnapshot({ error: 'No snapshot sampled yet' })
   }
 }

@@ -43,6 +43,43 @@ export const mqttAnalyserManifest: PluginManifest = {
         description: 'Plain MQTT port (no TLS).'
       }
     ],
-    views: [{ id: 'panel', placement: 'split-right', title: 'MQTT' }]
+    views: [{ id: 'panel', placement: 'split-right', title: 'MQTT' }],
+    api: {
+      methods: [
+        {
+          name: 'get_topics',
+          description:
+            'List known MQTT topics for this session, each with its last known payload and message count.',
+          parameters: { type: 'object', properties: {} }
+        },
+        {
+          name: 'get_topic_value',
+          description: 'Get the latest value of one MQTT topic, optionally with its recent message history.',
+          parameters: {
+            type: 'object',
+            properties: {
+              topic: { type: 'string', description: 'Exact MQTT topic to read' },
+              includeHistory: { type: 'boolean', description: 'Include recent message history (default false)' }
+            },
+            required: ['topic']
+          }
+        },
+        {
+          name: 'publish',
+          description: 'Publish a text value to an MQTT topic.',
+          defaultPermission: 'ask',
+          parameters: {
+            type: 'object',
+            properties: {
+              topic: { type: 'string', description: 'MQTT topic to publish to' },
+              payload: { type: 'string', description: 'Text payload to publish' },
+              qos: { type: 'number', description: 'QoS level 0, 1, or 2 (default 0)' },
+              retain: { type: 'boolean', description: 'Whether to set the retain flag (default false)' }
+            },
+            required: ['topic', 'payload']
+          }
+        }
+      ]
+    }
   }
 }
