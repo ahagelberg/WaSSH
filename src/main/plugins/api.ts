@@ -1,9 +1,11 @@
 import type { Duplex } from 'stream'
 import type {
+  PluginApiListing,
   SideConnectionOpenRequest,
   StreamDirection,
   StreamMode
 } from '../../shared/pluginApi'
+export type { PluginApiListing } from '../../shared/pluginApi'
 import type { SessionStatus } from '../../shared/types'
 export type { SessionStatus } from '../../shared/types'
 import type { SftpSession } from './SftpSession'
@@ -48,6 +50,17 @@ export interface PluginMainContext {
   ) => void
   onDeactivateCleanup: (fn: () => void) => void
   writeToSession: (data: string) => void
+  /** Declared API methods of every other plugin currently active on this tab. */
+  listPluginApis: () => PluginApiListing[]
+  /**
+   * Call another plugin's declared API method on this same tab. Throws if the
+   * target plugin has no active instance on this tab, or doesn't declare
+   * `method`. Callers are responsible for their own permission checks -
+   * this performs no gating and does not auto-activate the target plugin.
+   */
+  callPluginApi: (pluginId: string, method: string, params: unknown) => Promise<unknown>
+  /** Persist one key of this plugin's own app-wide stored settings. */
+  setSettingValue: (key: string, value: unknown) => void
 }
 
 export interface PluginMainModule {
@@ -58,6 +71,8 @@ export interface PluginMainModule {
     ctx: PluginMainContext,
     event: PluginSessionStatusEvent
   ) => void | Promise<void>
+  /** Handle a `ctx.callPluginApi` invocation from another plugin (or self). */
+  onApiCall?: (ctx: PluginMainContext, method: string, params: unknown) => unknown | Promise<unknown>
 }
 
 export interface PluginMainRegistration {

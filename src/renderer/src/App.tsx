@@ -562,6 +562,9 @@ export default function App() {
       else sftpReadyRef.current.delete(ev.tabId)
       setSftpReadyTick((n) => n + 1)
     })
+    const offSettingsChanged = window.wassh.onSettingsChanged((next) => {
+      setSettings(next)
+    })
     return () => {
       offData()
       offStatus()
@@ -578,6 +581,7 @@ export default function App() {
       offSessionSettings()
       offPluginActive()
       offPluginMessage()
+      offSettingsChanged()
     }
   }, [refreshHosts, closeTab, cycleTab, reconnectTab, openSessionSettings, reopenLastClosedSession])
 

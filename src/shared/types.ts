@@ -626,6 +626,8 @@ export interface WasshApi {
   onPluginMessage: (cb: (ev: PluginMessageEvent) => void) => () => void
   onSideConnectionData: (cb: (ev: SideConnectionDataEvent) => void) => () => void
   onSideConnectionClosed: (cb: (ev: SideConnectionClosedEvent) => void) => () => void
+  /** Fired whenever app settings are persisted from any source (renderer or main-process plugin code). */
+  onSettingsChanged: (cb: (settings: AppSettings) => void) => () => void
   /** Open a URL in the OS default browser */
   openExternal: (url: string) => Promise<void>
 }

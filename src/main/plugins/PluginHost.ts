@@ -16,6 +16,7 @@ import { BUILTIN_MANIFESTS, BUILTIN_PLUGIN_DEFINITIONS } from './builtinRegistry
 import type { SessionDataPipeline } from './SessionDataPipeline'
 import type { SideConnectionBroker } from './SideConnectionBroker'
 import type {
+  PluginApiListing,
   PluginMainContext,
   PluginMainModule,
   PluginMainRegistration,
@@ -103,6 +104,62 @@ export class PluginHost {
   getActivePlugins(tabId: string): string[] {
     const map = this.instances.get(tabId)
     return map ? Array.from(map.keys()) : []
+  }
+
+  /** Declared API methods of every other plugin currently active on `tabId`. */
+  listPluginApis(tabId: string, callerPluginId: string): PluginApiListing[] {
+    const tabMap = this.instances.get(tabId)
+    if (!tabMap) {
+      return []
+    }
+    const out: PluginApiListing[] = []
+    for (const pluginId of tabMap.keys()) {
+      if (pluginId === callerPluginId) {
+        continue
+      }
+      const manifest = this.getManifest(pluginId)
+      const methods = manifest?.contributes.api?.methods
+      if (manifest && methods && methods.length > 0) {
+        out.push({ pluginId, pluginName: manifest.name, methods })
+      }
+    }
+    return out
+  }
+
+  /**
+   * Call another plugin's declared API method on the same tab. Throws if the
+   * target has no active instance on `tabId`, or doesn't declare `method`.
+   * Performs no permission gating - that is the caller's responsibility.
+   */
+  async callPluginApi(
+    tabId: string,
+    targetPluginId: string,
+    method: string,
+    params: unknown
+  ): Promise<unknown> {
+    const instance = this.instances.get(tabId)?.get(targetPluginId)
+    if (!instance) {
+      throw new Error(`Plugin "${targetPluginId}" is not active on this tab`)
+    }
+    const declared = this.getManifest(targetPluginId)?.contributes.api?.methods
+    if (!declared?.some((m) => m.name === method)) {
+      throw new Error(`Plugin "${targetPluginId}" does not declare API method "${method}"`)
+    }
+    if (!instance.module.onApiCall) {
+      throw new Error(`Plugin "${targetPluginId}" has no API call handler`)
+    }
+    return instance.module.onApiCall(instance.ctx, method, params)
+  }
+
+  /** Persist one key of `pluginId`'s own app-wide stored settings. */
+  setSettingValue(pluginId: string, key: string, value: unknown): void {
+    const current = this.settingsStore.get().pluginSettings
+    const nextPluginSettings = {
+      ...current,
+      [pluginId]: { ...(current[pluginId] ?? {}), [key]: value }
+    }
+    this.settingsStore.set({ pluginSettings: nextPluginSettings })
+    this.send('settings:changed', this.settingsStore.get())
   }
 
   async activate(tabId: string, pluginId: string, announce = true): Promise<void> {
@@ -205,6 +262,12 @@ export class PluginHost {
       },
       writeToSession: (data) => {
         this.writeSession(tabId, data)
+      },
+      listPluginApis: () => this.listPluginApis(tabId, pluginId),
+      callPluginApi: (targetPluginId, method, params) =>
+        this.callPluginApi(tabId, targetPluginId, method, params),
+      setSettingValue: (key, value) => {
+        this.setSettingValue(pluginId, key, value)
       }
     }
 

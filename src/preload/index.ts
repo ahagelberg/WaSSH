@@ -101,6 +101,7 @@ const api: WasshApi = {
     on('plugin:sideData', (ev) => cb(ev as SideConnectionDataEvent)),
   onSideConnectionClosed: (cb) =>
     on('plugin:sideClosed', (ev) => cb(ev as SideConnectionClosedEvent)),
+  onSettingsChanged: (cb) => on('settings:changed', (settings) => cb(settings as AppSettings)),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url)
 }
 

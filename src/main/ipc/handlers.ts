@@ -22,6 +22,7 @@ import { listSerialPorts } from '../serial/listSerialPorts'
 import type { PluginHost } from '../plugins/PluginHost'
 import { queuePluginRestore } from '../plugins/createPluginSystem'
 import type { PluginDataStore } from '../store/pluginDataStore'
+import { sendToWindow } from '../windowSend'
 
 /** Protocols the shell may open in the default browser */
 const EXTERNAL_URL_PROTOCOLS = new Set(['http:', 'https:'])
@@ -63,6 +64,7 @@ export function registerIpc(
     if (partial.enabledPlugins) {
       await pluginHost.onEnabledPluginsChanged(prev.enabledPlugins, next.enabledPlugins)
     }
+    sendToWindow(getWindow, 'settings:changed', next)
     return next
   })
 

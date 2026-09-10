@@ -49,10 +49,45 @@ export type PluginSettingsFieldType =
   | 'select'
   | 'stringList'
   | 'commandList'
+  /** Boolean master toggle with nested `children` fields. */
+  | 'group'
+  /** Trinary allow/deny/ask toggle; see `PluginPermissionDecision`. */
+  | 'permission'
 
 export interface PluginSettingsSelectOption {
   value: string
   label: string
+}
+
+/** Trinary decision for a single permission-type settings field. */
+export type PluginPermissionDecision = 'allow' | 'deny' | 'ask'
+
+/** JSON-schema-ish parameter shape, matching the AI Agent's tool-call format. */
+export interface PluginApiParameterSchema {
+  type: 'object'
+  properties: Record<string, unknown>
+  required?: string[]
+}
+
+/** One callable method a plugin exposes to other plugins via `ctx.callPluginApi`. */
+export interface PluginApiMethod {
+  name: string
+  label?: string
+  description: string
+  parameters?: PluginApiParameterSchema
+  /** Default permission once this method's group is enabled. Defaults to 'allow'. */
+  defaultPermission?: PluginPermissionDecision
+}
+
+export interface PluginApiContribution {
+  methods: PluginApiMethod[]
+}
+
+/** Declared API methods of one other plugin, as seen by `ctx.listPluginApis()`. */
+export interface PluginApiListing {
+  pluginId: string
+  pluginName: string
+  methods: PluginApiMethod[]
 }
 
 export interface PluginCommand {
@@ -102,6 +137,8 @@ export interface PluginSettingsField {
   secret?: boolean
   /** When type is select, the available dropdown options. */
   options?: PluginSettingsSelectOption[]
+  /** When type is 'group', the nested fields shown under the master toggle. */
+  children?: PluginSettingsField[]
 }
 
 export interface PluginToolbarContribution {
@@ -140,6 +177,8 @@ export interface PluginManifest {
     hostSettingsSchema?: PluginSettingsField[]
     views?: PluginViewContribution[]
     terminalFileDrop?: PluginTerminalFileDropContribution
+    /** Methods this plugin exposes to other plugins via `ctx.callPluginApi`. */
+    api?: PluginApiContribution
   }
 }
 
@@ -184,14 +223,55 @@ export interface SideConnectionClosedEvent {
   error?: string
 }
 
+/** Flatten a schema's fields and any nested `group` children into one flat list.
+ * Recurses to arbitrary depth - a `group`'s `children` may themselves contain
+ * `group` fields, nested as many levels deep as needed. */
+export function flattenFields(schema: PluginSettingsField[] | undefined): PluginSettingsField[] {
+  if (!schema) {
+    return []
+  }
+  const out: PluginSettingsField[] = []
+  for (const field of schema) {
+    out.push(field)
+    if (field.type === 'group' && field.children) {
+      out.push(...flattenFields(field.children))
+    }
+  }
+  return out
+}
+
+/**
+ * Return a new schema with `extraChildren` appended to the `children` of the
+ * `group` field whose `key` matches `groupKey`, searched at any depth. Lets a
+ * composition root inject fields into a specific nesting level (e.g. one
+ * shared "Permissions" group) without knowing or rebuilding the rest of the
+ * tree. Returns `schema` unchanged (new array, same fields) if no matching
+ * group is found.
+ */
+export function appendGroupChildren(
+  schema: PluginSettingsField[],
+  groupKey: string,
+  extraChildren: PluginSettingsField[]
+): PluginSettingsField[] {
+  return schema.map((field) => {
+    if (field.type !== 'group') {
+      return field
+    }
+    if (field.key === groupKey) {
+      return { ...field, children: [...(field.children ?? []), ...extraChildren] }
+    }
+    if (field.children) {
+      return { ...field, children: appendGroupChildren(field.children, groupKey, extraChildren) }
+    }
+    return field
+  })
+}
+
 export function defaultPluginSettingsFromSchema(
   schema: PluginSettingsField[] | undefined
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {}
-  if (!schema) {
-    return out
-  }
-  for (const field of schema) {
+  for (const field of flattenFields(schema)) {
     out[field.key] = field.default
   }
   return out
@@ -202,7 +282,8 @@ export function mergePluginSettings(
   stored: unknown
 ): Record<string, unknown> {
   const defaults = defaultPluginSettingsFromSchema(schema)
-  if (!schema || schema.length === 0) {
+  const fields = flattenFields(schema)
+  if (fields.length === 0) {
     return defaults
   }
   if (!stored || typeof stored !== 'object' || Array.isArray(stored)) {
@@ -210,7 +291,7 @@ export function mergePluginSettings(
   }
   const src = stored as Record<string, unknown>
   const out = { ...defaults }
-  for (const field of schema) {
+  for (const field of fields) {
     if (Object.prototype.hasOwnProperty.call(src, field.key)) {
       out[field.key] = src[field.key]
     }
@@ -224,6 +305,7 @@ export function mergePluginSessionSettings(
   hostStored: unknown
 ): Record<string, unknown> {
   const app = mergePluginSettings(manifest?.contributes.settingsSchema, appStored)
+  const hostFields = flattenFields(manifest?.contributes.hostSettingsSchema)
   const hostDefaults = defaultPluginSettingsFromSchema(manifest?.contributes.hostSettingsSchema)
   const hostSrc =
     hostStored && typeof hostStored === 'object' && !Array.isArray(hostStored)
@@ -236,7 +318,7 @@ export function mergePluginSessionSettings(
       result[key] = value
     }
   }
-  for (const field of manifest?.contributes.hostSettingsSchema ?? []) {
+  for (const field of hostFields) {
     if (Object.prototype.hasOwnProperty.call(hostSrc, field.key)) {
       result[field.key] = hostSrc[field.key]
     }
