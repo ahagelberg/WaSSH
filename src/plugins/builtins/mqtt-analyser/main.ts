@@ -8,6 +8,7 @@ import {
 import {
   type MqttAnalyserErrorKind,
   type MqttAnalyserMessagePayload,
+  type MqttAnalyserSnapshotPayload,
   type MqttAnalyserStatusPayload
 } from './protocol'
 import { isMqttAnalyserRendererMessage } from './protocol'
@@ -164,6 +165,17 @@ function recordTopicMessage(state: SessionState, topic: string, message: MqttTop
   if (record.history.length > MQTT_ANALYSER_HISTORY_LIMIT) {
     record.history.splice(0, record.history.length - MQTT_ANALYSER_HISTORY_LIMIT)
   }
+}
+
+function sendSnapshot(ctx: PluginMainContext, state: SessionState): void {
+  ctx.sendToRenderer({
+    type: 'snapshot',
+    topics: Array.from(state.topics.entries()).map(([topic, record]) => ({
+      topic,
+      messageCount: record.messageCount,
+      history: record.history.map((message) => ({ ...message }))
+    }))
+  } satisfies MqttAnalyserSnapshotPayload)
 }
 
 async function connectBroker(ctx: PluginMainContext, state: SessionState): Promise<void> {
@@ -364,6 +376,11 @@ export const mqttAnalyserMain: PluginMainModule = {
 
     if (payload.type === 'reconnect') {
       void connectBroker(ctx, state)
+      return
+    }
+
+    if (payload.type === 'sync') {
+      sendSnapshot(ctx, state)
       return
     }
 

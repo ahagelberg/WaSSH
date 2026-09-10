@@ -6,6 +6,7 @@ import {
 } from './defaults'
 import {
   type MqttAnalyserErrorKind,
+  type MqttAnalyserTopicSnapshot,
   type MqttAnalyserStatusState
 } from './protocol'
 import { isMqttAnalyserMainMessage } from './protocol'
@@ -143,6 +144,27 @@ function insertMessage(root: TopicNode, msg: TopicMessage, topic: string): Topic
   node.messages = [msg, ...node.messages].slice(0, MQTT_ANALYSER_HISTORY_LIMIT)
   recomputeCounts(next)
   return next
+}
+
+function treeFromSnapshot(topics: MqttAnalyserTopicSnapshot[]): TopicNode {
+  const root = createRoot()
+  for (const topic of topics) {
+    const segments = topicSegments(topic.topic)
+    if (segments.length === 0) {
+      continue
+    }
+    let node = root
+    for (let i = 0; i < segments.length; i++) {
+      node = ensureChild(node, segments[i], pathFromSegments(segments.slice(0, i + 1)))
+    }
+    node.hasOwnMessages = topic.history.length > 0
+    node.receivedCount = topic.messageCount
+    node.messages = topic.history
+      .map((message) => ({ id: nextMessageId(), ...message }))
+      .reverse()
+  }
+  recomputeCounts(root)
+  return root
 }
 
 function cloneTree(node: TopicNode): TopicNode {
@@ -423,7 +445,7 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
   }
 
   useEffect(() => {
-    return window.wassh.onPluginMessage((ev) => {
+    const unsubscribe = window.wassh.onPluginMessage((ev) => {
       if (ev.tabId !== tabId || ev.pluginId !== pluginId) {
         return
       }
@@ -435,6 +457,10 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
         setStatus(payload.state)
         setStatusReason(payload.reason)
         setErrorKind(payload.errorKind)
+        return
+      }
+      if (payload.type === 'snapshot') {
+        setRoot(treeFromSnapshot(payload.topics))
         return
       }
       if (payload.type === 'message') {
@@ -466,6 +492,8 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
         triggerBlink(toBlink)
       }
     })
+    void window.wassh.sendPluginMessage(tabId, pluginId, { type: 'sync' })
+    return unsubscribe
   }, [tabId, pluginId])
 
   useEffect(() => {

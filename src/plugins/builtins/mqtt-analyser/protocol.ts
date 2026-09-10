@@ -35,7 +35,29 @@ export interface MqttAnalyserMessagePayload {
   timestamp: number
 }
 
-export type MqttAnalyserMainMessage = MqttAnalyserStatusPayload | MqttAnalyserMessagePayload
+export interface MqttAnalyserTopicSnapshot {
+  topic: string
+  messageCount: number
+  history: Array<{
+    payloadText?: string
+    payloadBase64?: string
+    binary: boolean
+    qos: 0 | 1 | 2
+    retain: boolean
+    timestamp: number
+  }>
+}
+
+/** Main → renderer state snapshot used to recover messages received before the view mounted. */
+export interface MqttAnalyserSnapshotPayload {
+  type: 'snapshot'
+  topics: MqttAnalyserTopicSnapshot[]
+}
+
+export type MqttAnalyserMainMessage =
+  | MqttAnalyserStatusPayload
+  | MqttAnalyserMessagePayload
+  | MqttAnalyserSnapshotPayload
 
 /** Renderer → main */
 export type MqttAnalyserRendererMessage =
@@ -47,13 +69,14 @@ export type MqttAnalyserRendererMessage =
       retain: boolean
     }
   | { type: 'reconnect' }
+  | { type: 'sync' }
 
 export function isMqttAnalyserMainMessage(payload: unknown): payload is MqttAnalyserMainMessage {
   if (!payload || typeof payload !== 'object') {
     return false
   }
   const type = (payload as { type?: unknown }).type
-  return type === 'status' || type === 'message'
+  return type === 'status' || type === 'message' || type === 'snapshot'
 }
 
 export function isMqttAnalyserRendererMessage(
@@ -63,5 +86,5 @@ export function isMqttAnalyserRendererMessage(
     return false
   }
   const type = (payload as { type?: unknown }).type
-  return type === 'publish' || type === 'reconnect'
+  return type === 'publish' || type === 'reconnect' || type === 'sync'
 }
