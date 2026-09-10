@@ -1346,17 +1346,6 @@ export default function AiAgentView({
               </button>
               <button
                 type="button"
-                className="ai-agent-gear-btn"
-                title="Providers & API keys"
-                onClick={() => {
-                  setHistoryOpen(false)
-                  openGear()
-                }}
-              >
-                ⚙
-              </button>
-              <button
-                type="button"
                 onClick={() => {
                   if (activeProvider) {
                     setHistoryOpen(false)
@@ -1367,6 +1356,17 @@ export default function AiAgentView({
                 title="Start a new conversation"
               >
                 New
+              </button>
+              <button
+                type="button"
+                className="ai-agent-gear-btn ai-agent-config-btn"
+                title="Providers & API keys"
+                onClick={() => {
+                  setHistoryOpen(false)
+                  openGear()
+                }}
+              >
+                ⚙
               </button>
             </div>
           </div>
@@ -1678,4 +1678,3 @@ export default function AiAgentView({
     </div>
   )
 }
-
