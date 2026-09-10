@@ -9,8 +9,8 @@ import {
   type ReactNode
 } from 'react'
 import type { AppSettings } from '@shared/types'
-import type { PluginListItem } from '@shared/plugins'
-import { mergePluginSessionSettings } from '@shared/plugins'
+import type { PluginListItem } from '@shared/pluginApi'
+import { mergePluginSessionSettings } from '@shared/pluginApi'
 import {
   INNER_DROP_BAND_PX,
   MIN_DOCK_SIZE_PX,
@@ -30,7 +30,7 @@ import {
   type TabPluginLayout
 } from '@shared/pluginLayout'
 import { getPluginView } from './registry'
-import MacroPadView from './builtins/MacroPadView'
+import type { PluginViewProps } from './api'
 import PluginPanelShell from './PluginPanelShell'
 
 interface Props {
@@ -237,6 +237,7 @@ function LayoutTreeView({
     const props = {
       tabId,
       hostId,
+      active,
       pluginId: plugin.id,
       settings: pluginSettings,
       onSettingsPatch: (partial: Record<string, unknown>) =>
@@ -244,12 +245,7 @@ function LayoutTreeView({
     }
     const title =
       plugin.contributes.views?.[0]?.title || plugin.contributes.toolbar?.label || plugin.name
-    const body =
-      plugin.id === 'macro-pad' ? (
-        <MacroPadView {...props} activeTab={active} />
-      ) : (
-        <View {...props} />
-      )
+    const body = <View {...props} />
     const leafDrop =
       dropTarget?.kind === 'leaf' && dropTarget.pluginId === node.pluginId ? dropTarget.zone : null
 

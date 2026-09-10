@@ -81,7 +81,7 @@ import {
   type SshTunnel,
   type TunnelType
 } from './types'
-import { normalizeHostPluginSettings } from './plugins'
+import { normalizeHostPluginSettings } from './pluginApi'
 
 export interface SessionStyle {
   tabColor: string

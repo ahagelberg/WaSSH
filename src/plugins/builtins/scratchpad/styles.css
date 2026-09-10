@@ -1,0 +1,10 @@
+.plugin-scratchpad-input {
+  flex: 1;
+  min-height: 80px;
+  resize: none;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--gap);
+  user-select: text;
+}

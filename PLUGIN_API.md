@@ -1,14 +1,14 @@
 # WaSSH Plugin API
 
-Technical reference for the plugin system in `src/main/plugins` (main) and
-`src/renderer/src/plugins` (renderer). All plugin types live in
-`src/shared/plugins.ts`; the Electron bridge type lives in `src/shared/types.ts`
-(`WasshApi`).
+Technical reference for the plugin system. Stable contracts live in
+`src/shared/pluginApi.ts`, `src/main/plugins/api.ts`, and
+`src/renderer/src/plugins/api`; the Electron bridge type lives in
+`src/shared/types.ts` (`WasshApi`).
 
 External plugins (`userData/plugins/<id>/manifest.json` + `main.js` + `ui.js`)
-are **reserved but not loaded** — `loadExternalPlugins()` returns `[]`. All six
-current plugins are built-ins wired at compile time. The API below is the
-surface those modules and their React views use.
+are **reserved but not loaded** — `loadExternalPlugins()` returns `[]`. All
+current plugins are self-contained built-ins wired at compile time. The API
+below is the only application surface their modules and React views may use.
 
 ## 1. Architecture
 
@@ -39,18 +39,21 @@ A plugin is three things:
 
 | File | Role |
 |---|---|
-| `shared/plugins.ts` | Manifest/settings/event types, side-connection messages, per-builtin protocol types, constants, settings merge helpers |
-| `main/plugins/PluginHost.ts` | `PluginMainModule`, `PluginMainContext`, lifecycle (activate/deactivate/list) |
+| `shared/pluginApi.ts` | Stable manifest, settings, event, placement, side-connection, and settings merge contracts |
+| `main/plugins/api.ts` | `PluginMainModule`, `PluginMainContext`, lifecycle/session hooks, main registration metadata |
+| `renderer/src/plugins/api` | View contract, renderer registration, file-drop contract, neutral React UI components and styles |
+| `main/plugins/PluginHost.ts` | Private lifecycle and capability implementation |
 | `main/plugins/types.ts` | `PluginSessionHandle` (SessionManager→broker), `StreamTransform` |
 | `main/plugins/SessionDataPipeline.ts` | Ordered observe/intercept stream transforms |
 | `main/plugins/SideConnectionBroker.ts` | SSH-exec/shell/TCP side connections, raw TCP duplexes, SFTP channels |
 | `main/plugins/SftpSession.ts` | Promisified SFTP wrapper |
 | `main/plugins/createPluginSystem.ts` | Wiring, restore queue |
 | `main/plugins/externalLoader.ts` | Future external-plugin scanner (stub) |
-| `main/plugins/builtins/*` | The seven built-in plugins (manifest + main module) |
+| `plugins/builtins/<id>/*` | Self-contained built-ins: manifest, protocol, main module, view, helpers, and private CSS |
 | `main/store/pluginDataStore.ts` | `userData/plugin-<id>.json` storage |
 | `shared/pluginLayout.ts` | Per-tab dock/split layout model |
-| `renderer/src/plugins/registry.ts` | Plugin id → React component |
+| `main/plugins/builtinRegistry.ts` | Compile-time main-process composition root |
+| `renderer/src/plugins/builtinRegistry.ts` | Compile-time renderer composition root |
 | `preload/index.ts` | Exposes `window.wassh` |
 
 Built-in ids (`shared/plugins.ts`): `server-monitor`, `scratchpad`,
@@ -136,6 +139,7 @@ interface PluginMainModule {
   onActivate:      (ctx: PluginMainContext) => void | Promise<void>
   onDeactivate?:   (ctx: PluginMainContext) => void | Promise<void>
   onMessage?:      (ctx: PluginMainContext, payload: unknown) => void | Promise<unknown>
+  onSessionStatus?: (ctx: PluginMainContext, event: PluginSessionStatusEvent) => void | Promise<void>
 }
 ```
 
@@ -154,8 +158,8 @@ interface PluginMainModule {
 |---|---|
 | `tabId`, `pluginId` | Read-only identity of this instance |
 | `getSettings()` | Merged app+host settings (§4), snapshot at call time |
-| `getData(): unknown` | Reads this plugin's JSON file `userData/plugin-<id>.json`; `null` if missing/corrupt |
-| `setData(data)` | Synchronously writes that file (2-space JSON); id is sanitized to `[A-Za-z0-9_-]` |
+| `getData(scopeId?)` / `setData(data, scopeId?)` | Read/write plugin-owned JSON, optionally scoped to `plugin-<id>.<scope>.json` |
+| `getSessionScopeId()` | Saved host id, or a stable `tab:<id>` scope for an unsaved session |
 | `getSecret(vaultId): string \| null` | OS-encrypted secret (safeStorage/DPAPI); `null` when absent |
 | `sendToRenderer(payload)` | Push an event; renderer receives it as `{tabId, pluginId, payload}` on `onPluginMessage` |
 | `openSideConnection(req): Promise<connectionId>` | Open a side channel (§6) |
@@ -300,6 +304,8 @@ hosts, vault, dialogs, serial) is also reachable from views — see `WasshApi` i
 interface PluginViewProps {
   tabId: string
   pluginId: string
+  hostId: string | null
+  active: boolean                       // this tab is currently visible
   settings: Record<string, unknown>   // merged app+host (§4)
   onSettingsPatch: (partial: Record<string, unknown>) => void
 }
@@ -317,15 +323,56 @@ interface PluginViewProps {
   `LayoutNode` `leaf`/`split` with ratio) persisted in `tabs.json`; the
   manifest placement is used only at first activation. Toolbar entries come
   from `enabledToolbarPlugins(plugins)` (enabled + `contributes.toolbar`).
-- Macro-pad additionally receives `activeTab` so hotkeys fire only on the
-  visible tab; it writes by messaging its main module `{type:'send', text}`,
-  which calls `ctx.writeToSession`.
+- Plugins that register global shortcuts or timers must use `active` to suppress
+  work while their tab is not visible.
 
-## 11. Built-in plugin wire protocols
+## 11. Renderer UI kit
 
-Each built-in's payload shapes are concrete discriminated unions in
-`shared/plugins.ts` (constants and types per plugin). Summary of their
-main⇄renderer messages:
+Import renderer components from `@plugin-api/renderer` and load no application
+component directly. `plugin-ui.css` is loaded by the host and provides the
+stable, neutral styling contract below.
+
+| API | Purpose |
+|---|---|
+| `PluginButton` | Standard button; `variant="primary" \| "danger"` and `compact` |
+| `PluginField` | Label, control, and optional hint layout |
+| `PluginColorInput` | Validated six-digit hex color input |
+| `.plugin-ui-panel` | Full-height plugin view root |
+| `.plugin-ui-toolbar`, `.plugin-ui-actions`, `.plugin-ui-spacer` | Flexible action rows |
+| `.plugin-ui-button` with `--primary`, `--danger`, `--compact` | Button classes for non-component use |
+| `.plugin-ui-field`, `.plugin-ui-label`, `.plugin-ui-input`, `.plugin-ui-select`, `.plugin-ui-textarea` | Form controls |
+| `.plugin-ui-card`, `.plugin-ui-heading`, `.plugin-ui-muted`, `.plugin-ui-hint` | Content grouping and typography |
+| `.plugin-ui-error`, `.plugin-ui-success`, `.plugin-ui-warning`, `.plugin-ui-empty` | Semantic states |
+| `.plugin-ui-badge`, `.plugin-ui-table-wrap`, `.plugin-ui-table`, `.plugin-ui-progress` | Common data display |
+| `.plugin-ui-modal-backdrop`, `.plugin-ui-modal` | Accessible modal structure |
+| `.plugin-ui-visually-hidden` | Screen-reader-only text |
+
+Public custom properties use the `--plugin-ui-*` prefix. Public selectors must
+use `plugin-ui-*` and remain neutral; selectors, variables, animations, and
+responsive rules unique to a plugin belong in that plugin's `styles.css`.
+Host-owned dock, splitter, toolbar, and panel chrome styles are not part of the
+plugin styling API.
+
+```tsx
+import { PluginButton, PluginField } from '@plugin-api/renderer'
+
+<div className="plugin-ui-panel">
+  <PluginField label="Topic" hint="MQTT wildcard syntax is supported.">
+    <input className="plugin-ui-input" value={topic} onChange={onTopicChange} />
+  </PluginField>
+  <PluginButton variant="primary" onClick={submit}>Apply</PluginButton>
+</div>
+```
+
+Controls must retain a visible keyboard focus state, icon-only buttons need an
+accessible name, status updates should use an appropriate live region, and
+color must not be the only way state is communicated.
+
+## 12. Built-in plugin wire protocols
+
+Each built-in owns its concrete discriminated unions in
+`plugins/builtins/<id>/protocol.ts`. Those protocols are private to that plugin,
+not part of the shared plugin API. Summary of their main-renderer messages:
 
 | Plugin | Renderer→main (`sendPluginMessage`) | Main→renderer (`sendToRenderer`) |
 |---|---|---|
@@ -336,23 +383,24 @@ main⇄renderer messages:
 | sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `viewFile`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone`, `viewFileResult` → `SftpViewFilePayload` |
 | ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval`, `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `refreshModels`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
 
-`AiAgentRendererMessage`, `SftpRendererMessage`, `MqttAnalyserRendererMessage`
-(and their payload types) are exported from `shared/plugins.ts`.
+## 13. Adding a built-in plugin (checklist)
 
-## 12. Adding a built-in plugin (checklist)
-
-1. `shared/plugins.ts`: add `PLUGIN_ID_*`, message types, constants.
-2. `main/plugins/builtins/<name>.ts`: export a `PluginMainModule`.
-3. `main/plugins/builtins/manifests.ts`: manifest with contributes + defaults;
-   add to `BUILTIN_MANIFESTS`.
-4. `main/plugins/PluginHost.ts`: import and `registerBuiltins()` the module.
-5. `renderer/src/plugins/builtins/<Name>View.tsx` + `registry.ts` entry for a
-   view.
-6. Optional: settings fields are auto-rendered by `PluginFieldEditor`; no
-   dialog work needed.
-7. Add to `DEFAULT_ENABLED_PLUGINS` in `shared/plugins.ts` to ship enabled.
+1. Create `plugins/builtins/<id>/` with `manifest.ts`, `protocol.ts`, `main.ts`,
+   optional `View.tsx`, helpers, and `styles.css`.
+2. Import only local files, third-party packages, `@plugin-api/shared`,
+   `@plugin-api/main`, or `@plugin-api/renderer`. Never import another plugin,
+   `PluginHost`, application components, or private stores/brokers.
+3. Add the manifest and default-enabled metadata to the shared built-in
+   composition registry.
+4. Add the main module and any generic background activation metadata to
+   `main/plugins/builtinRegistry.ts`.
+5. Add the view and optional terminal file-drop handler to
+   `renderer/src/plugins/builtinRegistry.ts`; import the plugin's private CSS
+   from its renderer entry.
+6. Use manifest settings schemas for automatically rendered settings.
+   Set `settingsPresentation: 'view'` when the plugin owns a custom editor.
+7. Document any new generic capability before adding it to a stable API entry
+   point. Keep plugin protocols, defaults, and unique styles local.
 
 External plugins will follow the same manifest/main/ui split once the loader
 in `externalLoader.ts` is implemented.
-
-

@@ -83,7 +83,7 @@ import {
   mergePluginSettings,
   normalizeHostPluginSettings,
   type PluginListItem
-} from '@shared/plugins'
+} from '@shared/pluginApi'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
 import ColorHexInput from './ColorHexInput'

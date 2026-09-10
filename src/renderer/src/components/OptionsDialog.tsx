@@ -18,8 +18,8 @@ import {
   type CursorStyle,
   type SessionStyleDefaults
 } from '@shared/types'
-import type { PluginListItem } from '@shared/plugins'
-import { PLUGIN_ID_MACRO_PAD, mergePluginSettings } from '@shared/plugins'
+import type { PluginListItem } from '@shared/pluginApi'
+import { mergePluginSettings } from '@shared/pluginApi'
 import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
@@ -402,8 +402,7 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
       if (!schema || schema.length === 0) {
         continue
       }
-      // Macros are configured inside the macro pad pane itself, not here.
-      if (plugin.id === PLUGIN_ID_MACRO_PAD) {
+      if (plugin.contributes.settingsPresentation === 'view') {
         continue
       }
       const values = mergePluginSettings(schema, draft.pluginSettings[plugin.id])

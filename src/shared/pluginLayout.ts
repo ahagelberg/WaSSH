@@ -1,4 +1,4 @@
-import type { PluginListItem, PluginViewPlacement } from './plugins'
+import type { PluginListItem, PluginViewPlacement } from './pluginApi'
 
 /** Side-by-side (horizontal flex) */
 export const SPLIT_ROW = 'row'

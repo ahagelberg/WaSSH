@@ -5,7 +5,7 @@ import type {
   PluginViewPlacement,
   SideConnectionClosedEvent,
   SideConnectionDataEvent
-} from './plugins'
+} from './pluginApi'
 import { DEFAULT_ENABLED_PLUGINS } from './plugins'
 import type { TabPluginLayout } from './pluginLayout'
 import type { HostGroup, HostsOrganization } from './hostOrganization'

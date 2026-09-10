@@ -41,12 +41,13 @@ import HostSessionSettingsDialog, {
   type HostSessionMode
 } from './components/HostSessionSettingsDialog'
 import {
-  mergePluginSettings,
-  PLUGIN_ID_SFTP,
-  type PluginListItem,
-  type SftpRendererMessage,
-  type SftpStatusPayload
-} from '@shared/plugins'
+  PLUGIN_ID_SFTP
+} from '../../plugins/builtins/sftp/id'
+import type {
+  SftpRendererMessage,
+  SftpStatusPayload
+} from '../../plugins/builtins/sftp/protocol'
+import { mergePluginSettings, type PluginListItem } from '@shared/pluginApi'
 import {
   emptyTabPluginLayout,
   normalizeTabPluginLayout,
@@ -61,7 +62,7 @@ import {
   UNGROUPED_SECTION_ID
 } from '@shared/hostOrganization'
 import { sessionAccentStyle, sessionTerminalStyle } from './sessionStyleCss'
-import PluginToolbar from './plugins/PluginToolbar'
+import PluginToolbar from './plugins/host/PluginToolbar'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
 /** Closed session settings retained for Ctrl+Shift+T reopen */

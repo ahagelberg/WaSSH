@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react'
-import type { PluginMacroButton, PluginSettingsField } from '@shared/plugins'
+import type { PluginMacroButton, PluginSettingsField } from '@plugin-api/shared'
 
 function MacroListEditor({
   value,

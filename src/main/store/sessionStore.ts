@@ -18,7 +18,7 @@ import {
 } from '../../shared/types'
 import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
-import { normalizeHostPluginSettings } from '../../shared/plugins'
+import { normalizeHostPluginSettings } from '../../shared/pluginApi'
 import {
   appendHostToUngrouped,
   normalizeHostsOrganization,

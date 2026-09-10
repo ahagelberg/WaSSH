@@ -15,11 +15,20 @@
     "baseUrl": ".",
     "paths": {
       "@renderer/*": ["src/renderer/*"],
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "@plugin-api/shared": ["src/shared/pluginApi.ts"],
+      "@plugin-api/renderer": ["src/renderer/src/plugins/api/index.ts"]
     }
   },
   "include": [
     "src/renderer/**/*",
+    "src/plugins/builtins/**/View.tsx",
+    "src/plugins/builtins/**/fileDrop.ts",
+    "src/plugins/builtins/**/viewUtils.ts",
+    "src/plugins/builtins/**/protocol.ts",
+    "src/plugins/builtins/**/id.ts",
+    "src/plugins/builtins/**/defaults.ts",
+    "src/plugins/builtins/**/manifest.ts",
     "src/shared/**/*"
   ]
 }

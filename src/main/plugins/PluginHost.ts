@@ -1,92 +1,26 @@
 import { BrowserWindow } from 'electron'
-import type { Duplex } from 'stream'
 import type {
   PluginActiveStateEvent,
   PluginListItem,
   PluginManifest,
-  PluginMessageEvent,
-  SideConnectionOpenRequest,
-  StreamDirection,
-  StreamMode
-} from '../../shared/plugins'
-import {
-  mergePluginSessionSettings,
-  PLUGIN_ID_AI_AGENT,
-  PLUGIN_ID_CONNECTION_LOGGER,
-  PLUGIN_ID_MACRO_PAD,
-  PLUGIN_ID_MQTT_ANALYSER,
-  PLUGIN_ID_SCRATCHPAD,
-  PLUGIN_ID_SERVER_MONITOR,
-  PLUGIN_ID_SFTP,
-  CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES
-} from '../../shared/plugins'
+  PluginMessageEvent
+} from '../../shared/pluginApi'
+import { mergePluginSessionSettings } from '../../shared/pluginApi'
 import type { SessionStatus } from '../../shared/types'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import type { CredentialVault } from '../store/credentialVault'
-import { BUILTIN_MANIFESTS } from './builtins/manifests'
-import { aiAgentMain } from './builtins/aiAgent'
-import {
-  connectionLoggerMain,
-  connectionLoggerScopeId,
-  appendConnectionLog
-} from './builtins/connectionLogger'
-import { macroPadMain } from './builtins/macroPad'
-import { mqttAnalyserMain } from './builtins/mqttAnalyser'
-import { scratchpadMain } from './builtins/scratchpad'
-import { serverMonitorMain } from './builtins/serverMonitor'
-import { sftpMain } from './builtins/sftp'
 import { loadExternalPlugins } from './externalLoader'
+import { BUILTIN_MANIFESTS, BUILTIN_PLUGIN_DEFINITIONS } from './builtinRegistry'
 import type { SessionDataPipeline } from './SessionDataPipeline'
 import type { SideConnectionBroker } from './SideConnectionBroker'
-import type { SftpSession } from './SftpSession'
-import type { StreamTransform } from './types'
-
-export interface PluginMainContext {
-  tabId: string
-  pluginId: string
-  getSettings: () => Record<string, unknown>
-  /** Read this plugin's JSON file from userData */
-  getData: () => unknown
-  /** Write this plugin's JSON file under userData */
-  setData: (data: unknown) => void
-  /** Read a vault secret (DPAPI/safeStorage encrypted); null when absent */
-  getSecret: (vaultId: string) => string | null
-  sendToRenderer: (payload: unknown) => void
-  openSideConnection: (req: SideConnectionOpenRequest) => Promise<string>
-  closeSideConnection: (connectionId: string) => void
-  writeSideConnection: (connectionId: string, data: string) => void
-  onSideData: (connectionId: string, cb: (data: string) => void) => () => void
-  onSideClosed: (connectionId: string, cb: (error?: string) => void) => () => void
-  /** Whether the tab's live session is SSH (required for remote MQTT tunnel). */
-  isSshSession: () => boolean
-  /**
-   * Binary TCP duplex via SSH forwardOut (or direct TCP).
-   * Not UTF-8 side-data — for protocols like MQTT.
-   */
-  openTcpStream: (host: string, port: number) => Promise<Duplex>
-  /**
-   * Open an SFTP channel on the live SSH connection and wrap it in a
-   * promisified SftpSession (throws when the session is not SSH).
-   */
-  openSftp: () => Promise<SftpSession>
-  /** Run a quick capture command (e.g. `pwd`) and return trimmed stdout. */
-  execCapture: (command: string) => Promise<string>
-  registerStreamHandler: (
-    mode: StreamMode,
-    direction: StreamDirection,
-    handler: StreamTransform
-  ) => void
-  /** Register cleanup run on deactivate (in addition to onDeactivate) */
-  onDeactivateCleanup: (fn: () => void) => void
-  writeToSession: (data: string) => void
-}
-
-export interface PluginMainModule {
-  onActivate: (ctx: PluginMainContext) => void | Promise<void>
-  onDeactivate?: (ctx: PluginMainContext) => void | Promise<void>
-  onMessage?: (ctx: PluginMainContext, payload: unknown) => unknown | Promise<unknown>
-}
+import type {
+  PluginMainContext,
+  PluginMainModule,
+  PluginMainRegistration,
+  PluginSessionStatusEvent
+} from './api'
+export type { PluginMainContext, PluginMainModule } from './api'
 
 interface ActiveInstance {
   pluginId: string
@@ -102,7 +36,7 @@ export class PluginHost {
   private instances = new Map<string, Map<string, ActiveInstance>>()
   private sideDataListeners = new Map<string, Set<(data: string) => void>>()
   private sideClosedListeners = new Map<string, Set<(error?: string) => void>>()
-  private modules = new Map<string, PluginMainModule>()
+  private registrations = new Map<string, PluginMainRegistration>()
   private tabStatus = new Map<string, { status: SessionStatus; at: number }>()
 
   constructor(
@@ -118,13 +52,9 @@ export class PluginHost {
 
   /** Call after construction once builtin modules are registered */
   registerBuiltins(): void {
-    this.modules.set(PLUGIN_ID_SERVER_MONITOR, serverMonitorMain)
-    this.modules.set(PLUGIN_ID_SCRATCHPAD, scratchpadMain)
-    this.modules.set(PLUGIN_ID_MACRO_PAD, macroPadMain)
-    this.modules.set(PLUGIN_ID_MQTT_ANALYSER, mqttAnalyserMain)
-    this.modules.set(PLUGIN_ID_SFTP, sftpMain)
-    this.modules.set(PLUGIN_ID_AI_AGENT, aiAgentMain)
-    this.modules.set(PLUGIN_ID_CONNECTION_LOGGER, connectionLoggerMain)
+    this.registrations = new Map(
+      BUILTIN_PLUGIN_DEFINITIONS.map(({ registration }) => [registration.id, registration])
+    )
   }
 
   private send(channel: string, payload: unknown): void {
@@ -182,7 +112,7 @@ export class PluginHost {
     if (!this.isEnabled(pluginId)) {
       throw new Error(`Plugin "${pluginId}" is not enabled`)
     }
-    const mod = this.modules.get(pluginId)
+    const mod = this.registrations.get(pluginId)?.module
     if (!mod) {
       throw new Error(`Plugin "${pluginId}" has no main module`)
     }
@@ -215,27 +145,13 @@ export class PluginHost {
         const hostStored = this.resolveHostPluginSettings(tabId, pluginId)
         return mergePluginSessionSettings(manifest, appStored, hostStored)
       },
-      getData: () => {
-        if (pluginId === PLUGIN_ID_CONNECTION_LOGGER) {
-          const scopeId = connectionLoggerScopeId(
-            this.broker.getConnectionParams(tabId)?.hostId,
-            tabId
-          )
-          return this.pluginData.get(pluginId, scopeId)
-        }
-        return this.pluginData.get(pluginId)
+      getData: (scopeId) => {
+        return this.pluginData.get(pluginId, scopeId)
       },
-      setData: (data: unknown) => {
-        if (pluginId === PLUGIN_ID_CONNECTION_LOGGER) {
-          const scopeId = connectionLoggerScopeId(
-            this.broker.getConnectionParams(tabId)?.hostId,
-            tabId
-          )
-          this.pluginData.set(pluginId, data, scopeId)
-          return
-        }
-        this.pluginData.set(pluginId, data)
+      setData: (data: unknown, scopeId) => {
+        this.pluginData.set(pluginId, data, scopeId)
       },
+      getSessionScopeId: () => this.broker.getConnectionParams(tabId)?.hostId || `tab:${tabId}`,
       getSecret: (vaultId: string) => this.vault.get(vaultId),
       sendToRenderer: (payload: unknown) => {
         this.send('plugin:message', {
@@ -323,7 +239,12 @@ export class PluginHost {
     // Closing the SFTP Files browser must not disable terminal drop-upload:
     // keep the module running headless while the session is still SSH. The
     // renderer already removed the plugin from its view state locally.
-    if (!force && pluginId === PLUGIN_ID_SFTP && this.broker.isSshSession(tabId)) {
+    const registration = this.registrations.get(pluginId)
+    const retainBackground =
+      registration?.retainBackgroundOnViewClose &&
+      (registration.backgroundActivation === 'session' ||
+        (registration.backgroundActivation === 'ssh' && this.broker.isSshSession(tabId)))
+    if (!force && retainBackground) {
       instance.announced = false
       return
     }
@@ -368,64 +289,22 @@ export class PluginHost {
     const durationMs = prev ? Math.max(0, now - prev.at) : undefined
     this.tabStatus.set(tabId, { status, at: now })
 
-    if (!this.isEnabled(PLUGIN_ID_CONNECTION_LOGGER)) {
-      return
+    const statusEvent: PluginSessionStatusEvent = {
+      status,
+      previousStatus: prev?.status,
+      message,
+      timestamp: now,
+      previousDurationMs: durationMs
     }
-
-    let kind: 'connected' | 'disconnected' | 'reconnecting' | 'failed' | null = null
-    if (status === 'connected') {
-      kind = 'connected'
-    } else if (status === 'disconnected') {
-      kind = 'disconnected'
-    } else if (status === 'reconnecting') {
-      kind = 'reconnecting'
-    } else if (status === 'failed') {
-      kind = 'failed'
-    } else if (status === 'closed' && prev && prev.status === 'connected') {
-      kind = 'disconnected'
-    }
-
-    if (!kind) {
-      return
-    }
-
-    const connection = this.broker.getConnectionParams(tabId)
-    const appStored = this.settingsStore.get().pluginSettings[PLUGIN_ID_CONNECTION_LOGGER]
-    const hostStored = this.resolveHostPluginSettings(tabId, PLUGIN_ID_CONNECTION_LOGGER)
-    const manifest = this.getManifest(PLUGIN_ID_CONNECTION_LOGGER)
-    const settings = mergePluginSessionSettings(manifest, appStored, hostStored)
-    if (settings.enabled === false) {
-      return
-    }
-
-    const scopeId = connectionLoggerScopeId(connection?.hostId, tabId)
-    const maxEntries =
-      typeof settings.maxEntries === 'number' && settings.maxEntries > 0
-        ? settings.maxEntries
-        : CONNECTION_LOGGER_DEFAULT_MAX_ENTRIES
-
-    const entry = appendConnectionLog(
-      this.pluginData,
-      scopeId,
-      {
-        timestamp: now,
-        kind,
-        message: message || undefined,
-        durationMs
-      },
-      maxEntries
-    )
-
-    this.send('plugin:message', {
-      tabId,
-      pluginId: PLUGIN_ID_CONNECTION_LOGGER,
-      payload: {
-        type: 'event',
-        scopeId,
-        entry,
-        currentStatus: status
+    for (const instance of this.instances.get(tabId)?.values() ?? []) {
+      const result = instance.module.onSessionStatus?.(instance.ctx, statusEvent)
+      if (result instanceof Promise) {
+        void result.catch((error) => {
+          console.error(`Plugin ${instance.pluginId} session-status hook failed:`, error)
+        })
       }
-    } satisfies PluginMessageEvent)
+    }
+
   }
 
   async onSessionConnected(tabId: string, restoreIds?: string[]): Promise<void> {
@@ -451,17 +330,18 @@ export class PluginHost {
       }
     }
 
-    // SFTP powers drop-to-upload on the terminal, so keep it running (headless)
-    // for every SSH session — even while the Files browser is closed.
-    if (
-      enabled.some((p) => p.id === PLUGIN_ID_SFTP) &&
-      this.broker.isSshSession(tabId) &&
-      !this.instances.get(tabId)?.has(PLUGIN_ID_SFTP)
-    ) {
+    for (const plugin of enabled) {
+      const registration = this.registrations.get(plugin.id)
+      const shouldRunInBackground =
+        registration?.backgroundActivation === 'session' ||
+        (registration?.backgroundActivation === 'ssh' && this.broker.isSshSession(tabId))
+      if (!shouldRunInBackground || this.instances.get(tabId)?.has(plugin.id)) {
+        continue
+      }
       try {
-        await this.activate(tabId, PLUGIN_ID_SFTP, false)
+        await this.activate(tabId, plugin.id, false)
       } catch (err) {
-        console.error(`Failed to activate plugin ${PLUGIN_ID_SFTP}:`, err)
+        console.error(`Failed to activate background plugin ${plugin.id}:`, err)
       }
     }
   }

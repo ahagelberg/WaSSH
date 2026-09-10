@@ -1,4 +1,4 @@
-import type { PluginManifest } from '../../shared/plugins'
+import type { PluginManifest } from '../../shared/pluginApi'
 
 /**
  * Future: scan `userData/plugins/<id>/` for manifest.json + main entry.

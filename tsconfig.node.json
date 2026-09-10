@@ -13,13 +13,22 @@
     "types": ["node"],
     "baseUrl": ".",
     "paths": {
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "@plugin-api/shared": ["src/shared/pluginApi.ts"],
+      "@plugin-api/main": ["src/main/plugins/api.ts"]
     }
   },
   "include": [
     "electron.vite.config.ts",
     "src/main/**/*",
+    "src/plugins/**/*",
     "src/preload/**/*",
     "src/shared/**/*"
+  ],
+  "exclude": [
+    "src/plugins/**/View.tsx",
+    "src/plugins/**/fileDrop.ts",
+    "src/plugins/**/viewUtils.ts",
+    "src/plugins/**/styles.css"
   ]
 }

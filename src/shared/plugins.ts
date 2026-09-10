@@ -118,6 +118,8 @@ export interface PluginManifest {
     settingsHeading?: string
     /** App-wide settings (Options dialog) */
     settingsSchema?: PluginSettingsField[]
+    /** Where app-wide settings are edited. Defaults to the options dialog. */
+    settingsPresentation?: 'options' | 'view'
     /** Host dialog section heading for per-host plugin settings */
     hostSettingsHeading?: string
     /** Per-host settings (Host / session settings dialog) */
