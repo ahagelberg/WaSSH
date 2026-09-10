@@ -1,5 +1,39 @@
 import type { ReactElement } from 'react'
-import type { PluginCommand, PluginSettingsField } from '@plugin-api/shared'
+import type { PluginCommand, PluginPermissionDecision, PluginSettingsField } from '@plugin-api/shared'
+
+const PERMISSION_OPTIONS: Array<{ value: PluginPermissionDecision; label: string }> = [
+  { value: 'allow', label: 'Allow' },
+  { value: 'ask', label: 'Ask' },
+  { value: 'deny', label: 'Deny' }
+]
+
+function PermissionControl({
+  value,
+  onChange
+}: {
+  value: unknown
+  onChange: (value: PluginPermissionDecision) => void
+}): ReactElement {
+  const current: PluginPermissionDecision =
+    value === 'allow' || value === 'deny' || value === 'ask' ? value : 'allow'
+  return (
+    <div className="plugin-settings-permission" role="group" aria-label="Permission">
+      {PERMISSION_OPTIONS.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          className={`plugin-settings-permission-btn plugin-settings-permission-${opt.value}${
+            current === opt.value ? ' is-active' : ''
+          }`}
+          aria-pressed={current === opt.value}
+          onClick={() => onChange(opt.value)}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 function MacroListEditor({
   value,
@@ -79,7 +113,7 @@ export default function PluginFieldEditor({
   value: unknown
   onChange: (value: unknown) => void
 }): ReactElement {
-  if (field.type === 'boolean') {
+  if (field.type === 'boolean' || field.type === 'group') {
     return (
       <input
         type="checkbox"
@@ -115,6 +149,9 @@ export default function PluginFieldEditor({
   if (field.type === 'commandList') {
     const list = Array.isArray(value) ? (value as PluginCommand[]) : []
     return <MacroListEditor value={list} onChange={onChange} />
+  }
+  if (field.type === 'permission') {
+    return <PermissionControl value={value} onChange={onChange} />
   }
   if (field.type === 'stringList') {
     const text = Array.isArray(value) ? (value as string[]).join('\n') : ''

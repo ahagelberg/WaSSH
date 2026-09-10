@@ -201,6 +201,97 @@
   align-items: start;
 }
 
+.plugin-settings-group-children {
+  display: grid;
+  gap: 0;
+  padding-left: 20px;
+  border-left: 2px solid color-mix(in srgb, var(--border) 60%, transparent);
+  margin-left: 4px;
+}
+
+.plugin-settings-group-children.depth-2 {
+  padding-left: 14px;
+  border-left-width: 1px;
+  margin-left: 2px;
+}
+
+.plugin-settings-group-children.is-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* Second-level (depth-1) and third-level+ (depth-2) nested rows render more
+   compactly than top-level settings rows, so deep option trees (e.g.
+   Permissions > category > method) stay scannable. */
+.settings-row.plugin-settings-row-nested {
+  padding: 6px 0;
+  gap: 12px;
+  grid-template-columns: 1fr minmax(130px, 200px);
+}
+
+.settings-row.plugin-settings-row-nested .settings-row-label {
+  gap: 2px;
+}
+
+.settings-row.plugin-settings-row-nested .settings-row-label strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.settings-row.plugin-settings-row-nested .settings-row-label span {
+  font-size: 11px;
+}
+
+.settings-row.plugin-settings-row-nested .plugin-settings-permission-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.settings-row.plugin-settings-row-nested.depth-2 {
+  padding: 3px 0;
+}
+
+.settings-row.plugin-settings-row-nested.depth-2 .settings-row-label strong {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.plugin-settings-permission {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  justify-self: start;
+}
+
+.plugin-settings-permission-btn {
+  padding: 4px 12px;
+  border: none;
+  background: var(--bg-panel-2);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.plugin-settings-permission-btn + .plugin-settings-permission-btn {
+  border-left: 1px solid var(--border);
+}
+
+.plugin-settings-permission-btn.is-active.plugin-settings-permission-allow {
+  background: var(--ok);
+  color: #fff;
+}
+
+.plugin-settings-permission-btn.is-active.plugin-settings-permission-ask {
+  background: var(--warn);
+  color: #fff;
+}
+
+.plugin-settings-permission-btn.is-active.plugin-settings-permission-deny {
+  background: var(--danger);
+  color: #fff;
+}
+
 .settings-tunnel-list {
   display: grid;
   gap: var(--gap);

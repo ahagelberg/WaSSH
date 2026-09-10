@@ -35,3 +35,4 @@ export interface PluginRendererRegistration {
 export { default as PluginColorInput } from './PluginColorInput'
 export { default as PluginButton } from './PluginButton'
 export { default as PluginField } from './PluginField'
+export { default as PluginSettingsFieldList } from '../PluginSettingsFieldList'

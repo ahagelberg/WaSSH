@@ -89,7 +89,7 @@ import ClampedNumberInput from './ClampedNumberInput'
 import ColorHexInput from './ColorHexInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
-import PluginFieldEditor from '../plugins/PluginFieldEditor'
+import PluginSettingsFieldList from '../plugins/PluginSettingsFieldList'
 import TagInput from './TagInput'
 import TunnelBuilder from './TunnelBuilder'
 
@@ -1090,21 +1090,11 @@ export default function HostSessionSettingsDialog({
         id: `plugin-host-${plugin.id}`,
         title: plugin.contributes.hostSettingsHeading || plugin.name,
         content: (
-          <>
-            {schema.map((field) => (
-              <div key={field.key} className="settings-row">
-                <div className="settings-row-label">
-                  <strong>{field.label}</strong>
-                  {field.description ? <span>{field.description}</span> : null}
-                </div>
-                <PluginFieldEditor
-                  field={field}
-                  value={values[field.key]}
-                  onChange={(value) => patchPluginHostSetting(plugin.id, field.key, value)}
-                />
-              </div>
-            ))}
-          </>
+          <PluginSettingsFieldList
+            schema={schema}
+            values={values}
+            onChange={(key, value) => patchPluginHostSetting(plugin.id, key, value)}
+          />
         )
       })
     }

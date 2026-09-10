@@ -25,7 +25,7 @@ import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
 import ColorHexInput from './ColorHexInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
-import PluginFieldEditor from '../plugins/PluginFieldEditor'
+import PluginSettingsFieldList from '../plugins/PluginSettingsFieldList'
 
 interface Props {
   settings: AppSettings
@@ -410,21 +410,11 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
         id: `plugin-${plugin.id}`,
         title: plugin.contributes.settingsHeading || plugin.name,
         content: (
-          <>
-            {schema.map((field) => (
-              <div key={field.key} className="settings-row">
-                <div className="settings-row-label">
-                  <strong>{field.label}</strong>
-                  {field.description ? <span>{field.description}</span> : null}
-                </div>
-                <PluginFieldEditor
-                  field={field}
-                  value={values[field.key]}
-                  onChange={(value) => patchPluginSetting(plugin.id, field.key, value)}
-                />
-              </div>
-            ))}
-          </>
+          <PluginSettingsFieldList
+            schema={schema}
+            values={values}
+            onChange={(key, value) => patchPluginSetting(plugin.id, key, value)}
+          />
         )
       })
     }
