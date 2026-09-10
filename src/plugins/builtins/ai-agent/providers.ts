@@ -7,7 +7,7 @@ import {
   AI_AGENT_PROTOCOL_ANTHROPIC,
   type AiAgentProviderProtocol
 } from './protocol'
-import type { ToolDefinition } from './tools'
+import type { PluginApiMethod } from '@plugin-api/shared'
 
 /** Cap on provider error text attached to thrown errors */
 const MAX_ERROR_BODY_CHARS = 500
@@ -37,7 +37,7 @@ export interface CompletionOptions {
   model: string
   system: string
   messages: ApiMessage[]
-  tools?: ToolDefinition[]
+  tools?: PluginApiMethod[]
   maxTokens: number
   signal: AbortSignal
   /** Called as assistant text streams in */
@@ -47,7 +47,7 @@ export interface CompletionOptions {
 /** The default shell command tool name */
 export const RUN_COMMAND_TOOL_NAME = 'run_command'
 
-function toOpenAiTool(tool: ToolDefinition): Record<string, unknown> {
+function toOpenAiTool(tool: PluginApiMethod): Record<string, unknown> {
   return {
     type: 'function',
     function: {
@@ -58,7 +58,7 @@ function toOpenAiTool(tool: ToolDefinition): Record<string, unknown> {
   }
 }
 
-function toAnthropicTool(tool: ToolDefinition): Record<string, unknown> {
+function toAnthropicTool(tool: PluginApiMethod): Record<string, unknown> {
   return {
     name: tool.name,
     description: tool.description,

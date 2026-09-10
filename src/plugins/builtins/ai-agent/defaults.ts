@@ -14,12 +14,7 @@ export const AI_AGENT_SEARCH_PROVIDER_OPTIONS: PluginSettingsSelectOption[] = [
   { value: 'custom', label: 'Custom Endpoint' }
 ]
 
-export const AI_AGENT_DEFAULT_WEB_ACCESS = true
-export const AI_AGENT_DEFAULT_WEB_SEARCH = true
 export const AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER: AiAgentWebSearchProvider = 'bing'
-export const AI_AGENT_DEFAULT_REMOTE_FS_ACCESS = true
-export const AI_AGENT_DEFAULT_LOCAL_FS_ACCESS = true
-export const AI_AGENT_DEFAULT_DATETIME_ACCESS = true
 
 export const AI_AGENT_OLLAMA_PROVIDER_ID = 'ollama'
 export const AI_AGENT_OPENROUTER_PROVIDER_ID = 'openrouter'

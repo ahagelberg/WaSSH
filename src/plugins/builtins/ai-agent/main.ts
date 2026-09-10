@@ -3,25 +3,35 @@ import {
   AI_AGENT_CONVERSATIONS_PER_HOST_MAX,
   AI_AGENT_DATA_VERSION,
   AI_AGENT_DEFAULT_CHAT_TITLE,
-  AI_AGENT_DEFAULT_DATETIME_ACCESS,
-  AI_AGENT_DEFAULT_LOCAL_FS_ACCESS,
-  AI_AGENT_DEFAULT_REMOTE_FS_ACCESS,
-  AI_AGENT_DEFAULT_WEB_ACCESS,
-  AI_AGENT_DEFAULT_WEB_SEARCH,
   AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
   AI_AGENT_TITLE_MAX_CHARS
 } from './defaults'
-import { aiAgentVaultId } from './id'
+import { PLUGIN_ID_AI_AGENT, aiAgentVaultId } from './id'
+import {
+  AI_AGENT_GROUP_LOCAL_FS,
+  AI_AGENT_GROUP_REMOTE_FS,
+  AI_AGENT_GROUP_WEB_ACCESS,
+  AI_AGENT_GROUP_WEB_SEARCH,
+  AI_AGENT_DATETIME_METHOD,
+  AI_AGENT_LOCAL_FS_METHODS,
+  AI_AGENT_REMOTE_FS_METHODS,
+  AI_AGENT_WEB_ACCESS_METHODS,
+  AI_AGENT_WEB_SEARCH_METHODS,
+  TOOL_DEF_RUN_COMMAND
+} from './apiMethods'
+import {
+  allExternalApiTools,
+  allowedGroupMethods,
+  isMethodAllowed,
+  permissionSettingKey,
+  resolvePermission,
+  resolveToolTarget
+} from './pluginApiTools'
 import {
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
-  AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS,
-  AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS,
-  AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS,
-  AI_AGENT_SETTING_ENABLE_WEB_ACCESS,
-  AI_AGENT_SETTING_ENABLE_WEB_SEARCH,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
@@ -37,6 +47,7 @@ import {
   AI_AGENT_TOOL_RUN_COMMAND,
   AI_AGENT_TOOL_WEB_FETCH,
   AI_AGENT_TOOL_WEB_SEARCH,
+  type AiAgentApprovalKind,
   type AiAgentApprovalRequest,
   type AiAgentChatAttachment,
   type AiAgentConversation,
@@ -52,6 +63,7 @@ import {
   type AiAgentToolOutcome
 } from './protocol'
 import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
+import type { PluginApiMethod } from '@plugin-api/shared'
 import { decideCommand } from './permissions'
 import {
   complete,
@@ -70,11 +82,12 @@ import {
   executeRemoteFsRead,
   executeRemoteFsWrite,
   executeWebFetch,
-  executeWebSearch,
-  getActiveTools,
-  isMutatingTool,
-  type ToolDefinition
+  executeWebSearch
 } from './tools'
+
+/** Cap on a plugin-API tool result before it's fed back to the model (generous - not a token limit). */
+const MAX_PLUGIN_API_RESULT_CHARS = 1_000_000
+
 
 /** Max chained tool steps per run before we stop the loop */
 const MAX_RUN_STEPS = 50
@@ -626,43 +639,11 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
 function systemPrompt(
   host: HostState,
   projectRules: string,
-  activeTools: ToolDefinition[]
+  activeTools: PluginApiMethod[]
 ): string {
   const conv = host.conversation
   const cwd = conv?.cwd || '/'
-  const toolNames = new Set(activeTools.map((t) => t.name))
-
-  const toolDescriptions: string[] = []
-  if (toolNames.has(AI_AGENT_TOOL_RUN_COMMAND)) {
-    toolDescriptions.push(
-      '- run_command: Execute a single shell command on the remote host. Commands run non-interactively with persistent working directory. sudo is supported.'
-    )
-  }
-  if (toolNames.has(AI_AGENT_TOOL_GET_CURRENT_TIME)) {
-    toolDescriptions.push(
-      '- get_current_time: Query current real-time date, time, timezone, and Unix timestamp from the local system. Call this whenever the user asks for date, time, year, day, or temporal context.'
-    )
-  }
-  if (toolNames.has(AI_AGENT_TOOL_WEB_FETCH)) {
-    toolDescriptions.push(
-      '- web_fetch: Fetch and read the text/content of a web page URL.'
-    )
-  }
-  if (toolNames.has(AI_AGENT_TOOL_WEB_SEARCH)) {
-    toolDescriptions.push(
-      '- web_search: Search the web for current documentation, news, or answers.'
-    )
-  }
-  if (toolNames.has(AI_AGENT_TOOL_REMOTE_FS_READ)) {
-    toolDescriptions.push(
-      '- remote_read_file, remote_write_file, remote_list_dir, remote_delete_file: Read, write, list, or delete files directly on the remote SSH server via SFTP.'
-    )
-  }
-  if (toolNames.has(AI_AGENT_TOOL_LOCAL_FS_READ)) {
-    toolDescriptions.push(
-      '- local_read_file, local_write_file, local_list_dir: Read, write, or list files on the local client machine running WaSSH.'
-    )
-  }
+  const toolDescriptions = activeTools.map((t) => `- ${t.name}: ${t.description}`)
 
   const base = [
     `You are an AI development agent connected to the remote host "${host.hostLabel}".`,
@@ -840,7 +821,7 @@ function listSetting(settings: Record<string, unknown>, key: string): string[] {
   return Array.isArray(value) ? value.filter((s): s is string => typeof s === 'string') : []
 }
 
-function isToolEnabled(activeTools: ToolDefinition[], toolName: string): boolean {
+function isToolEnabled(activeTools: PluginApiMethod[], toolName: string): boolean {
   return activeTools.some((tool) => tool.name === toolName)
 }
 
@@ -872,8 +853,13 @@ function toolResultMessage(
   return { role: 'tool', toolCallId, name, command, content, outcome, truncated }
 }
 
-async function askApproval(host: HostState, command: string): Promise<string> {
-  host.pendingApproval = { requestId: randomUUID(), command, cwd: host.conversation?.cwd || '/' }
+async function askApproval(host: HostState, kind: AiAgentApprovalKind, subject: string): Promise<string> {
+  host.pendingApproval = {
+    requestId: randomUUID(),
+    kind,
+    subject,
+    cwd: host.conversation?.cwd || '/'
+  }
   host.phase = 'ask'
   pushState(host)
   const decision = await new Promise<string>((resolve) => {
@@ -988,42 +974,15 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   const appDeny = listSetting(settings, AI_AGENT_SETTING_DEFAULT_DENY_RULES)
   const projectRules = await readProjectRules(ctx)
 
-  const enableWebAccess =
-    typeof settings[AI_AGENT_SETTING_ENABLE_WEB_ACCESS] === 'boolean'
-      ? (settings[AI_AGENT_SETTING_ENABLE_WEB_ACCESS] as boolean)
-      : AI_AGENT_DEFAULT_WEB_ACCESS
-  const enableWebSearch =
-    typeof settings[AI_AGENT_SETTING_ENABLE_WEB_SEARCH] === 'boolean'
-      ? (settings[AI_AGENT_SETTING_ENABLE_WEB_SEARCH] as boolean)
-      : AI_AGENT_DEFAULT_WEB_SEARCH
-  const webSearchProvider =
-    typeof settings[AI_AGENT_SETTING_WEB_SEARCH_PROVIDER] === 'string'
-      ? (settings[AI_AGENT_SETTING_WEB_SEARCH_PROVIDER] as string)
-      : AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER
-  const webSearchApiKey =
-    typeof settings[AI_AGENT_SETTING_WEB_SEARCH_API_KEY] === 'string'
-      ? (settings[AI_AGENT_SETTING_WEB_SEARCH_API_KEY] as string)
-      : ''
-  const enableRemoteFsAccess =
-    typeof settings[AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS] === 'boolean'
-      ? (settings[AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS] as boolean)
-      : AI_AGENT_DEFAULT_REMOTE_FS_ACCESS
-  const enableLocalFsAccess =
-    typeof settings[AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS] === 'boolean'
-      ? (settings[AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS] as boolean)
-      : AI_AGENT_DEFAULT_LOCAL_FS_ACCESS
-  const enableDateTimeAccess =
-    typeof settings[AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS] === 'boolean'
-      ? (settings[AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS] as boolean)
-      : AI_AGENT_DEFAULT_DATETIME_ACCESS
-
-  const activeTools = getActiveTools({
-    enableWebAccess,
-    enableWebSearch,
-    enableRemoteFsAccess,
-    enableLocalFsAccess,
-    enableDateTimeAccess
-  })
+  const activeTools: PluginApiMethod[] = [
+    TOOL_DEF_RUN_COMMAND,
+    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_ACCESS, AI_AGENT_WEB_ACCESS_METHODS, settings),
+    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_SEARCH, AI_AGENT_WEB_SEARCH_METHODS, settings),
+    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_REMOTE_FS, AI_AGENT_REMOTE_FS_METHODS, settings),
+    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_LOCAL_FS, AI_AGENT_LOCAL_FS_METHODS, settings),
+    ...(isMethodAllowed(settings, PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD) ? [AI_AGENT_DATETIME_METHOD] : []),
+    ...allExternalApiTools(ctx, settings)
+  ]
 
   host.runCtx = ctx
   host.inRun = true
@@ -1138,7 +1097,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           )
           let action: string = decision
           if (decision === 'ask') {
-            action = await askApproval(host, command)
+            action = await askApproval(host, 'command', command)
             if (!host.inRun) {
               keepRunning = false
               break
@@ -1176,22 +1135,13 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             sudoStdin = hasCachedSudoPassword(host) ? (host.sudoPassword ?? '') : ''
           }
 
-          const execResult = await execCommand(host, command, sudoStdin)
+          const execResult = (await ctx.callPluginApi(PLUGIN_ID_AI_AGENT, AI_AGENT_TOOL_RUN_COMMAND, {
+            command,
+            sudoStdin
+          })) as ExecResult
           if (!host.inRun) {
             keepRunning = false
             break
-          }
-          if (execResult.content.includes(SUDO_AUTH_FAILED_MARKER)) {
-            clearSudoCache(host)
-          } else if (sudoStdin !== undefined && execResult.outcome === 'ok') {
-            if (hasCachedSudoPassword(host)) {
-              host.sudoPasswordExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
-            } else {
-              host.sudoNopassExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
-            }
-          }
-          if (execResult.pwd) {
-            conv.cwd = execResult.pwd
           }
           const outcome: AiAgentConversationToolMsg['outcome'] =
             execResult.outcome === 'ok'
@@ -1216,22 +1166,26 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           continue
         }
 
-        if (isMutatingTool(toolName)) {
-          const decision = decideCommand(
-            displayCommand,
-            hostAllow,
-            hostDeny,
-            appAllow,
-            appDeny,
-            host.extraAllow,
-            host.extraDeny
+        const target = resolveToolTarget(toolName)
+        const permission = resolvePermission(settings, target.pluginId, target.method)
+        if (permission === 'deny') {
+          conv.messages.push(
+            toolResultMessage(tc.id, toolName, displayCommand, 'This action is not permitted.', 'denied', false)
           )
-          const action = decision === 'ask' ? await askApproval(host, displayCommand) : decision
+          pushState(host)
+          persistConversation(host)
+          continue
+        }
+        if (permission === 'ask') {
+          const decision = await askApproval(host, 'permission', displayCommand)
           if (!host.inRun) {
             keepRunning = false
             break
           }
-          if (!applyApprovalDecision(host, displayCommand, action)) {
+          if (decision === 'allowAlways') {
+            ctx.setSettingValue(permissionSettingKey(target.pluginId, target.method), 'allow')
+          }
+          if (decision === 'deny' || decision === 'denyAlways') {
             conv.messages.push(
               toolResultMessage(tc.id, toolName, displayCommand, 'Action denied by user.', 'denied', false)
             )
@@ -1244,44 +1198,10 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         let toolOutput = ''
         let toolOutcome: AiAgentToolOutcome = 'ok'
         try {
-          if (toolName === AI_AGENT_TOOL_GET_CURRENT_TIME) {
-            toolOutput = executeDateTime()
-          } else if (toolName === AI_AGENT_TOOL_WEB_FETCH) {
-            const url = String(toolArgs.url || '')
-            const maxChars = typeof toolArgs.maxChars === 'number' ? toolArgs.maxChars : undefined
-            toolOutput = await executeWebFetch(url, maxChars)
-          } else if (toolName === AI_AGENT_TOOL_WEB_SEARCH) {
-            const query = String(toolArgs.query || '')
-            const limit = typeof toolArgs.limit === 'number' ? toolArgs.limit : undefined
-            toolOutput = await executeWebSearch(query, webSearchProvider, webSearchApiKey, limit)
-          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_READ) {
-            const filePath = String(toolArgs.path || '')
-            const maxChars = typeof toolArgs.maxChars === 'number' ? toolArgs.maxChars : undefined
-            toolOutput = await executeRemoteFsRead(ctx, filePath, maxChars)
-          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_WRITE) {
-            const filePath = String(toolArgs.path || '')
-            const content = String(toolArgs.content || '')
-            toolOutput = await executeRemoteFsWrite(ctx, filePath, content)
-          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_LIST) {
-            const dirPath = typeof toolArgs.path === 'string' ? toolArgs.path : '.'
-            toolOutput = await executeRemoteFsList(ctx, dirPath)
-          } else if (toolName === AI_AGENT_TOOL_REMOTE_FS_DELETE) {
-            const targetPath = String(toolArgs.path || '')
-            toolOutput = await executeRemoteFsDelete(ctx, targetPath)
-          } else if (toolName === AI_AGENT_TOOL_LOCAL_FS_READ) {
-            const filePath = String(toolArgs.path || '')
-            const maxChars = typeof toolArgs.maxChars === 'number' ? toolArgs.maxChars : undefined
-            toolOutput = await executeLocalFsRead(filePath, maxChars)
-          } else if (toolName === AI_AGENT_TOOL_LOCAL_FS_WRITE) {
-            const filePath = String(toolArgs.path || '')
-            const content = String(toolArgs.content || '')
-            toolOutput = await executeLocalFsWrite(filePath, content)
-          } else if (toolName === AI_AGENT_TOOL_LOCAL_FS_LIST) {
-            const dirPath = String(toolArgs.path || '.')
-            toolOutput = await executeLocalFsList(dirPath)
-          } else {
-            toolOutput = `Unknown tool: ${toolName}`
-            toolOutcome = 'error'
+          const raw = await ctx.callPluginApi(target.pluginId, target.method, toolArgs)
+          toolOutput = typeof raw === 'string' ? raw : JSON.stringify(raw)
+          if (toolOutput.length > MAX_PLUGIN_API_RESULT_CHARS) {
+            toolOutput = `${toolOutput.slice(0, MAX_PLUGIN_API_RESULT_CHARS)}\n\n[Result truncated at ${MAX_PLUGIN_API_RESULT_CHARS} characters]`
           }
         } catch (err) {
           toolOutput = `Error running tool "${toolName}": ${err instanceof Error ? err.message : String(err)}`
@@ -1877,6 +1797,88 @@ async function handleRendererMessage(
   }
 }
 
+/**
+ * Handle `ctx.callPluginApi(PLUGIN_ID_AI_AGENT, method, params)` for every
+ * method AI Agent declares in `contributes.api` - the same execution path
+ * used whether the call originates from the LLM tool-dispatch loop (which
+ * gates permissions before calling this) or, in principle, another plugin.
+ * Performs no permission checks itself; see `AI_AGENT_API_METHODS` doc.
+ */
+async function handleApiCall(
+  ctx: PluginMainContext,
+  method: string,
+  params: unknown
+): Promise<unknown> {
+  const args = params && typeof params === 'object' ? (params as Record<string, unknown>) : {}
+
+  if (method === AI_AGENT_TOOL_RUN_COMMAND) {
+    const host = hostForCtx(ctx)
+    if (!host) {
+      throw new Error('No active AI Agent conversation on this tab')
+    }
+    const command = typeof args.command === 'string' ? args.command : ''
+    const sudoStdin = typeof args.sudoStdin === 'string' ? args.sudoStdin : undefined
+    const result = await execCommand(host, command, sudoStdin)
+    if (result.content.includes(SUDO_AUTH_FAILED_MARKER)) {
+      clearSudoCache(host)
+    } else if (sudoStdin !== undefined && result.outcome === 'ok') {
+      if (hasCachedSudoPassword(host)) {
+        host.sudoPasswordExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+      } else {
+        host.sudoNopassExpiresAt = Date.now() + SUDO_PASSWORD_CACHE_MS
+      }
+    }
+    if (result.pwd && host.conversation) {
+      host.conversation.cwd = result.pwd
+    }
+    return result
+  }
+  if (method === AI_AGENT_TOOL_GET_CURRENT_TIME) {
+    return executeDateTime()
+  }
+  if (method === AI_AGENT_TOOL_WEB_FETCH) {
+    const maxChars = typeof args.maxChars === 'number' ? args.maxChars : undefined
+    return executeWebFetch(String(args.url || ''), maxChars)
+  }
+  if (method === AI_AGENT_TOOL_WEB_SEARCH) {
+    const settings = ctx.getSettings()
+    const provider =
+      typeof settings[AI_AGENT_SETTING_WEB_SEARCH_PROVIDER] === 'string'
+        ? (settings[AI_AGENT_SETTING_WEB_SEARCH_PROVIDER] as string)
+        : AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER
+    const apiKey =
+      typeof settings[AI_AGENT_SETTING_WEB_SEARCH_API_KEY] === 'string'
+        ? (settings[AI_AGENT_SETTING_WEB_SEARCH_API_KEY] as string)
+        : ''
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+    return executeWebSearch(String(args.query || ''), provider, apiKey, limit)
+  }
+  if (method === AI_AGENT_TOOL_REMOTE_FS_READ) {
+    const maxChars = typeof args.maxChars === 'number' ? args.maxChars : undefined
+    return executeRemoteFsRead(ctx, String(args.path || ''), maxChars)
+  }
+  if (method === AI_AGENT_TOOL_REMOTE_FS_WRITE) {
+    return executeRemoteFsWrite(ctx, String(args.path || ''), String(args.content || ''))
+  }
+  if (method === AI_AGENT_TOOL_REMOTE_FS_LIST) {
+    return executeRemoteFsList(ctx, typeof args.path === 'string' ? args.path : '.')
+  }
+  if (method === AI_AGENT_TOOL_REMOTE_FS_DELETE) {
+    return executeRemoteFsDelete(ctx, String(args.path || ''))
+  }
+  if (method === AI_AGENT_TOOL_LOCAL_FS_READ) {
+    const maxChars = typeof args.maxChars === 'number' ? args.maxChars : undefined
+    return executeLocalFsRead(String(args.path || ''), maxChars)
+  }
+  if (method === AI_AGENT_TOOL_LOCAL_FS_WRITE) {
+    return executeLocalFsWrite(String(args.path || ''), String(args.content || ''))
+  }
+  if (method === AI_AGENT_TOOL_LOCAL_FS_LIST) {
+    return executeLocalFsList(String(args.path || '.'))
+  }
+  throw new Error(`Unknown AI Agent API method: ${method}`)
+}
+
 export const aiAgentMain: PluginMainModule = {
   async onActivate(ctx) {
     await setupForTab(ctx, true)
@@ -1890,5 +1892,6 @@ export const aiAgentMain: PluginMainModule = {
   },
   async onMessage(ctx, payload) {
     await handleRendererMessage(ctx, payload)
-  }
+  },
+  onApiCall: handleApiCall
 }

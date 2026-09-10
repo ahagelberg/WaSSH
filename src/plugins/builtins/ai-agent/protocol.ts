@@ -3,13 +3,8 @@ export const AI_AGENT_SETTING_DEFAULT_DENY_RULES = 'defaultDenyRules'
 export const AI_AGENT_SETTING_HOST_ALLOW_RULES = 'allowRules'
 export const AI_AGENT_SETTING_HOST_DENY_RULES = 'denyRules'
 
-export const AI_AGENT_SETTING_ENABLE_WEB_ACCESS = 'enableWebAccess'
-export const AI_AGENT_SETTING_ENABLE_WEB_SEARCH = 'enableWebSearch'
 export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
 export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'
-export const AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS = 'enableRemoteFsAccess'
-export const AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS = 'enableLocalFsAccess'
-export const AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS = 'enableDateTimeAccess'
 
 export type AiAgentWebSearchProvider = 'bing' | 'brave' | 'google' | 'duckduckgo' | 'custom'
 
@@ -117,9 +112,13 @@ export interface AiAgentConversationSummary {
 
 export type AiAgentRunPhase = 'no_session' | 'idle' | 'running' | 'ask' | 'ask_sudo' | 'paused'
 
+/** 'command' = run_command's own allow/deny rule-list gate; 'permission' = a trinary tool permission. */
+export type AiAgentApprovalKind = 'command' | 'permission'
+
 export interface AiAgentApprovalRequest {
   requestId: string
-  command: string
+  kind: AiAgentApprovalKind
+  subject: string
   cwd: string
 }
 
@@ -127,6 +126,7 @@ export interface AiAgentSudoRequest {
   requestId: string
   command: string
 }
+
 
 export interface AiAgentStateSnapshot {
   type: 'state'

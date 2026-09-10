@@ -698,10 +698,12 @@ export default function AiAgentView({
     if (!request) {
       return
     }
-    if (decision === 'allowAlways') {
-      patchHostRules(AI_AGENT_SETTING_HOST_ALLOW_RULES, request.command)
-    } else if (decision === 'denyAlways') {
-      patchHostRules(AI_AGENT_SETTING_HOST_DENY_RULES, request.command)
+    if (request.kind === 'command') {
+      if (decision === 'allowAlways') {
+        patchHostRules(AI_AGENT_SETTING_HOST_ALLOW_RULES, request.subject)
+      } else if (decision === 'denyAlways') {
+        patchHostRules(AI_AGENT_SETTING_HOST_DENY_RULES, request.subject)
+      }
     }
     send({ type: 'approval', requestId: request.requestId, decision })
   }
@@ -1445,8 +1447,10 @@ export default function AiAgentView({
 
           {view.runPhase === 'ask' && view.pendingApproval ? (
             <div className="ai-agent-approval">
-              <div className="ai-agent-approval-title">Approve command?</div>
-              <pre className="ai-agent-approval-command">{view.pendingApproval.command}</pre>
+              <div className="ai-agent-approval-title">
+                {view.pendingApproval.kind === 'command' ? 'Approve command?' : 'Approve action?'}
+              </div>
+              <pre className="ai-agent-approval-command">{view.pendingApproval.subject}</pre>
               <div className="ai-agent-approval-actions">
                 <button type="button" onClick={() => handleApproval('allow')}>
                   Approve once

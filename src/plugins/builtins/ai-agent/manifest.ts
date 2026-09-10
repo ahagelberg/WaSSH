@@ -1,28 +1,38 @@
 import type { PluginManifest } from '@plugin-api/shared'
 import {
-  AI_AGENT_DEFAULT_DATETIME_ACCESS,
-  AI_AGENT_DEFAULT_LOCAL_FS_ACCESS,
-  AI_AGENT_DEFAULT_REMOTE_FS_ACCESS,
-  AI_AGENT_DEFAULT_WEB_ACCESS,
-  AI_AGENT_DEFAULT_WEB_SEARCH,
-  AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
   AI_AGENT_SAFE_RULES,
-  AI_AGENT_SEARCH_PROVIDER_OPTIONS
+  AI_AGENT_SEARCH_PROVIDER_OPTIONS,
+  AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER
 } from './defaults'
 import { PLUGIN_ID_AI_AGENT } from './id'
+import { AI_AGENT_API_METHODS, buildAiAgentBuiltinApiFields } from './apiMethods'
 import {
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
-  AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS,
-  AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS,
-  AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS,
-  AI_AGENT_SETTING_ENABLE_WEB_ACCESS,
-  AI_AGENT_SETTING_ENABLE_WEB_SEARCH,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER
 } from './protocol'
+
+const WEB_SEARCH_EXTRA_CHILDREN = [
+  {
+    key: AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
+    label: 'Web search provider',
+    type: 'select' as const,
+    default: AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
+    options: AI_AGENT_SEARCH_PROVIDER_OPTIONS,
+    description: 'Search engine used for web searches.'
+  },
+  {
+    key: AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
+    label: 'Web search API key',
+    type: 'string' as const,
+    default: '',
+    secret: true,
+    description: 'Optional API key for search engine provider (Brave, Google, or Bing API).'
+  }
+]
 
 export const aiAgentManifest: PluginManifest = {
   id: PLUGIN_ID_AI_AGENT,
@@ -52,57 +62,7 @@ export const aiAgentManifest: PluginManifest = {
         description:
           'App-wide command patterns that are always blocked. Deny always wins over allow.'
       },
-      {
-        key: AI_AGENT_SETTING_ENABLE_WEB_ACCESS,
-        label: 'Enable web access / download',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_WEB_ACCESS,
-        description: 'Allow agent to fetch web pages, convert to text/markdown, and download resources.'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_WEB_SEARCH,
-        label: 'Enable web search',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_WEB_SEARCH,
-        description: 'Allow agent to search the web (Bing by default).'
-      },
-      {
-        key: AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
-        label: 'Web search provider',
-        type: 'select',
-        default: AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
-        options: AI_AGENT_SEARCH_PROVIDER_OPTIONS,
-        description: 'Default search engine used for web searches.'
-      },
-      {
-        key: AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
-        label: 'Web search API key',
-        type: 'string',
-        default: '',
-        secret: true,
-        description: 'Optional API key for search engine provider (Brave, Google, or Bing API).'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS,
-        label: 'Enable remote filesystem access',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_REMOTE_FS_ACCESS,
-        description: 'Allow agent to read/list files on the connected remote SSH server via SFTP (destructive edits ask for approval).'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS,
-        label: 'Enable local filesystem access',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_LOCAL_FS_ACCESS,
-        description: 'Allow agent to read/list files on your local computer running WaSSH (writes ask for approval).'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS,
-        label: 'Enable date & time access',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_DATETIME_ACCESS,
-        description: 'Allow agent to query the current local time, date, and timezone.'
-      }
+      ...buildAiAgentBuiltinApiFields(WEB_SEARCH_EXTRA_CHILDREN)
     ],
     hostSettingsHeading: 'AI agent',
     hostSettingsSchema: [
@@ -122,50 +82,10 @@ export const aiAgentManifest: PluginManifest = {
         description:
           'Command patterns for this host that are always blocked. Deny always wins over allow.'
       },
-      {
-        key: AI_AGENT_SETTING_ENABLE_WEB_ACCESS,
-        label: 'Enable web access / download',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_WEB_ACCESS,
-        description: 'Allow agent to fetch web pages and resources for this host/session.'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_WEB_SEARCH,
-        label: 'Enable web search',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_WEB_SEARCH,
-        description: 'Allow agent to search the web for this host/session.'
-      },
-      {
-        key: AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
-        label: 'Web search provider',
-        type: 'select',
-        default: AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
-        options: AI_AGENT_SEARCH_PROVIDER_OPTIONS,
-        description: 'Search engine for this host/session.'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_REMOTE_FS_ACCESS,
-        label: 'Enable remote filesystem access',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_REMOTE_FS_ACCESS,
-        description: 'Allow agent to read/list files on this remote server via SFTP.'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_LOCAL_FS_ACCESS,
-        label: 'Enable local filesystem access',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_LOCAL_FS_ACCESS,
-        description: 'Allow agent to read/list files on your local computer.'
-      },
-      {
-        key: AI_AGENT_SETTING_ENABLE_DATETIME_ACCESS,
-        label: 'Enable date & time access',
-        type: 'boolean',
-        default: AI_AGENT_DEFAULT_DATETIME_ACCESS,
-        description: 'Allow agent to query current date/time.'
-      }
+      ...buildAiAgentBuiltinApiFields(WEB_SEARCH_EXTRA_CHILDREN)
     ],
-    views: [{ id: 'panel', placement: 'split-right', title: 'AI agent' }]
+    views: [{ id: 'panel', placement: 'split-right', title: 'AI agent' }],
+    api: { methods: AI_AGENT_API_METHODS }
   }
 }
+

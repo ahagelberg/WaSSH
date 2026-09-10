@@ -29,6 +29,8 @@
     "src/plugins/builtins/**/id.ts",
     "src/plugins/builtins/**/defaults.ts",
     "src/plugins/builtins/**/manifest.ts",
+    "src/plugins/builtins/ai-agent/apiMethods.ts",
+    "src/plugins/builtins/ai-agent/pluginApiTools.ts",
     "src/shared/**/*"
   ]
 }
