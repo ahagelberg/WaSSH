@@ -9,6 +9,7 @@ import type {
   SideConnectionOpenRequest
 } from '../../shared/pluginApi'
 import type { ConnectionParams } from '../../shared/types'
+import { sendToWindow } from '../windowSend'
 import { SftpSession } from './SftpSession'
 import type { PluginSessionHandle } from './types'
 
@@ -147,12 +148,10 @@ export class SideConnectionBroker {
 
   /** Close every SFTP channel a plugin holds on a tab. */
   closeSftp(tabId: string, pluginId: string): void {
-    for (const [id, entry] of Array.from(this.sftpSessions.entries())) {
-      if (entry.tabId === tabId && entry.pluginId === pluginId) {
-        this.sftpSessions.delete(id)
-        entry.dispose()
-      }
-    }
+    this.closeMatching(
+      this.sftpSessions,
+      (entry) => entry.tabId === tabId && entry.pluginId === pluginId
+    )
   }
 
   /** Run a quick capture command on the session (e.g. `pwd`). */
@@ -165,11 +164,7 @@ export class SideConnectionBroker {
   }
 
   private send(channel: string, payload: unknown): void {
-    const win = this.getWindow()
-    if (!win || win.isDestroyed()) {
-      return
-    }
-    win.webContents.send(channel, payload)
+    sendToWindow(this.getWindow, channel, payload)
   }
 
   private emitData(connectionId: string, data: string): void {
@@ -267,54 +262,119 @@ export class SideConnectionBroker {
     this.emitClosed(connectionId)
   }
 
-  closeForPlugin(tabId: string, pluginId: string): void {
-    for (const [id, conn] of Array.from(this.connections.entries())) {
-      if (conn.tabId === tabId && conn.pluginId === pluginId) {
-        this.close(id)
+  /**
+   * Iterate `map`, matching entries with `predicate`, and close each one.
+   * Without an explicit `close` action, entries are removed from `map` and
+   * disposed directly (used for maps with no extra close-event bookkeeping).
+   */
+  private closeMatching<T extends { dispose: () => void }>(
+    map: Map<string, T>,
+    predicate: (entry: T) => boolean,
+    close?: (id: string, entry: T) => void
+  ): void {
+    for (const [id, entry] of Array.from(map.entries())) {
+      if (!predicate(entry)) {
+        continue
       }
-    }
-    for (const [id, raw] of Array.from(this.rawStreams.entries())) {
-      if (raw.tabId === tabId && raw.pluginId === pluginId) {
-        this.closeTcpStream(id)
-      }
-    }
-    this.closeSftp(tabId, pluginId)
-  }
-
-  private closeSftpForTab(tabId: string): void {
-    for (const [id, entry] of Array.from(this.sftpSessions.entries())) {
-      if (entry.tabId === tabId) {
-        this.sftpSessions.delete(id)
+      if (close) {
+        close(id, entry)
+      } else {
+        map.delete(id)
         entry.dispose()
       }
     }
   }
 
+  private byTabAndPlugin(tabId: string, pluginId: string) {
+    return (entry: { tabId: string; pluginId: string }): boolean =>
+      entry.tabId === tabId && entry.pluginId === pluginId
+  }
+
+  private byTab(tabId: string) {
+    return (entry: { tabId: string }): boolean => entry.tabId === tabId
+  }
+
+  closeForPlugin(tabId: string, pluginId: string): void {
+    const matches = this.byTabAndPlugin(tabId, pluginId)
+    this.closeMatching(this.connections, matches, (id) => this.close(id))
+    this.closeMatching(this.rawStreams, matches, (id) => this.closeTcpStream(id))
+    this.closeSftp(tabId, pluginId)
+  }
+
+  private closeSftpForTab(tabId: string): void {
+    this.closeMatching(this.sftpSessions, this.byTab(tabId))
+  }
+
   closeForTab(tabId: string): void {
-    for (const [id, conn] of Array.from(this.connections.entries())) {
-      if (conn.tabId === tabId) {
-        this.close(id)
-      }
-    }
-    for (const [id, raw] of Array.from(this.rawStreams.entries())) {
-      if (raw.tabId === tabId) {
-        this.closeTcpStream(id)
-      }
-    }
+    const matches = this.byTab(tabId)
+    this.closeMatching(this.connections, matches, (id) => this.close(id))
+    this.closeMatching(this.rawStreams, matches, (id) => this.closeTcpStream(id))
     this.closeSftpForTab(tabId)
   }
 
   disposeAll(): void {
-    for (const id of Array.from(this.connections.keys())) {
-      this.close(id)
+    const all = (): boolean => true
+    this.closeMatching(this.connections, all, (id) => this.close(id))
+    this.closeMatching(this.rawStreams, all, (id) => this.closeTcpStream(id))
+    this.closeMatching(this.sftpSessions, all)
+  }
+
+  /**
+   * Common id/data/close/error wiring shared by every transport
+   * (`ClientChannel` or `Socket`) side connections are attached to.
+   * `bind` hooks the transport's own events to the emitted callbacks;
+   * `onTeardown` runs only when the transport closes/errors on its own
+   * (not on a manual `close(connectionId)`, which uses `dispose` instead).
+   */
+  private registerConnection(params: {
+    tabId: string
+    pluginId: string
+    bind: (
+      onData: (chunk: Buffer) => void,
+      onClose: () => void,
+      onError: (err: Error) => void
+    ) => void
+    write: (data: string) => void
+    dispose: () => void
+    onTeardown?: () => void
+  }): string {
+    const id = randomUUID()
+    const forget = (): boolean => {
+      if (!this.connections.has(id)) {
+        return false
+      }
+      this.connections.delete(id)
+      return true
     }
-    for (const id of Array.from(this.rawStreams.keys())) {
-      this.closeTcpStream(id)
-    }
-    for (const [id, entry] of Array.from(this.sftpSessions.entries())) {
-      this.sftpSessions.delete(id)
-      entry.dispose()
-    }
+    params.bind(
+      (chunk) => this.emitData(id, chunk.toString('utf8')),
+      () => {
+        if (forget()) {
+          params.onTeardown?.()
+          this.emitClosed(id)
+        }
+      },
+      (err) => {
+        if (forget()) {
+          params.onTeardown?.()
+          this.emitClosed(id, err.message)
+        }
+      }
+    )
+    this.connections.set(id, {
+      id,
+      tabId: params.tabId,
+      pluginId: params.pluginId,
+      dispose: params.dispose,
+      write: (data: string) => {
+        try {
+          params.write(data)
+        } catch {
+          /* ignore */
+        }
+      }
+    })
+    return id
   }
 
   private attachChannel(
@@ -323,93 +383,46 @@ export class SideConnectionBroker {
     channel: ClientChannel,
     extraDispose?: () => void
   ): string {
-    const id = randomUUID()
-    const dispose = (): void => {
-      try {
-        channel.close()
-      } catch {
-        /* ignore */
-      }
-      extraDispose?.()
-    }
-    channel.on('data', (buf: Buffer) => {
-      this.emitData(id, buf.toString('utf8'))
-    })
-    channel.stderr?.on('data', (buf: Buffer) => {
-      this.emitData(id, buf.toString('utf8'))
-    })
-    channel.on('close', () => {
-      if (!this.connections.has(id)) {
-        return
-      }
-      this.connections.delete(id)
-      extraDispose?.()
-      this.emitClosed(id)
-    })
-    channel.on('error', (err: Error) => {
-      if (!this.connections.has(id)) {
-        return
-      }
-      this.connections.delete(id)
-      extraDispose?.()
-      this.emitClosed(id, err.message)
-    })
-    this.connections.set(id, {
-      id,
+    return this.registerConnection({
       tabId,
       pluginId,
-      dispose,
-      write: (data: string) => {
+      bind: (onData, onClose, onError) => {
+        channel.on('data', onData)
+        channel.stderr?.on('data', onData)
+        channel.on('close', onClose)
+        channel.on('error', onError)
+      },
+      write: (data) => channel.write(data),
+      dispose: () => {
         try {
-          channel.write(data)
+          channel.close()
         } catch {
           /* ignore */
         }
-      }
+        extraDispose?.()
+      },
+      onTeardown: extraDispose
     })
-    return id
   }
 
   private attachSocket(tabId: string, pluginId: string, socket: Socket): string {
-    const id = randomUUID()
-    const dispose = (): void => {
-      try {
-        socket.destroy()
-      } catch {
-        /* ignore */
-      }
-    }
-    socket.on('data', (buf: Buffer) => {
-      this.emitData(id, buf.toString('utf8'))
-    })
-    socket.on('close', () => {
-      if (!this.connections.has(id)) {
-        return
-      }
-      this.connections.delete(id)
-      this.emitClosed(id)
-    })
-    socket.on('error', (err: Error) => {
-      if (!this.connections.has(id)) {
-        return
-      }
-      this.connections.delete(id)
-      this.emitClosed(id, err.message)
-    })
-    this.connections.set(id, {
-      id,
+    return this.registerConnection({
       tabId,
       pluginId,
-      dispose,
-      write: (data: string) => {
+      bind: (onData, onClose, onError) => {
+        socket.on('data', onData)
+        socket.on('close', onClose)
+        socket.on('error', onError)
+      },
+      write: (data) => socket.write(data),
+      dispose: () => {
         try {
-          socket.write(data)
+          socket.destroy()
         } catch {
           /* ignore */
         }
       }
     })
-    return id
   }
 }
 

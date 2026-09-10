@@ -17,6 +17,7 @@ import { SshConnection } from './SshConnection'
 import type { SessionDataPipeline } from '../plugins/SessionDataPipeline'
 import type { PluginSessionHandle } from '../plugins/types'
 import { openDirectTcpSocket } from '../plugins/SideConnectionBroker'
+import { sendToWindow } from '../windowSend'
 
 type LiveSession = SshConnection | TelnetConnection | SerialConnection
 
@@ -49,11 +50,7 @@ export class SessionManager {
   }
 
   private send(channel: string, ...args: unknown[]): void {
-    const win = this.getWindow()
-    if (!win || win.isDestroyed()) {
-      return
-    }
-    win.webContents.send(channel, ...args)
+    sendToWindow(this.getWindow, channel, ...args)
   }
 
   private wire(conn: LiveSession): void {

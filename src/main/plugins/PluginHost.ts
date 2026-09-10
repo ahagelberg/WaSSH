@@ -10,6 +10,7 @@ import type { SessionStatus } from '../../shared/types'
 import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import type { CredentialVault } from '../store/credentialVault'
+import { sendToWindow } from '../windowSend'
 import { loadExternalPlugins } from './externalLoader'
 import { BUILTIN_MANIFESTS, BUILTIN_PLUGIN_DEFINITIONS } from './builtinRegistry'
 import type { SessionDataPipeline } from './SessionDataPipeline'
@@ -58,11 +59,7 @@ export class PluginHost {
   }
 
   private send(channel: string, payload: unknown): void {
-    const win = this.getWindow()
-    if (!win || win.isDestroyed()) {
-      return
-    }
-    win.webContents.send(channel, payload)
+    sendToWindow(this.getWindow, channel, payload)
   }
 
   listPlugins(): PluginListItem[] {
