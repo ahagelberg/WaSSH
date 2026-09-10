@@ -2921,7 +2921,8 @@
   flex: 1;
   resize: none;
   min-height: 54px;
-  max-height: 120px;
+  max-height: 200px;
+  overflow-y: auto;
   font-family: inherit;
   font-size: 12px;
   line-height: 1.4;

@@ -307,6 +307,7 @@ export default function AiAgentView({
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sudoInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const promptInputRef = useRef<HTMLTextAreaElement>(null)
   const dragDepthRef = useRef(0)
   /** After force-send: wait for stop to settle, then drain the queue */
   const forceAfterStopRef = useRef(false)
@@ -830,6 +831,17 @@ export default function AiAgentView({
       el.scrollTop = el.scrollHeight
     }
   }, [messages.length, stream, view.runPhase, gearOpen, historyOpen])
+
+  // Auto-grow the prompt textarea as text is typed, up to the CSS max-height
+  // (which then falls back to internal scrolling).
+  useEffect(() => {
+    const el = promptInputRef.current
+    if (!el) {
+      return
+    }
+    el.style.height = 'auto'
+    el.style.height = `${el.scrollHeight}px`
+  }, [input])
 
   const phaseClass = view.runPhase
   const providerOptions =
@@ -1367,7 +1379,9 @@ export default function AiAgentView({
                 </button>
               </div>
               <textarea
+                ref={promptInputRef}
                 className="ai-agent-input"
+                rows={1}
                 value={input}
                 placeholder={
                   busy
