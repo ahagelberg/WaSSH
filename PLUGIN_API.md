@@ -52,7 +52,7 @@ A plugin is three things:
 | `plugins/builtins/<id>/*` | Self-contained built-ins: manifest, protocol, main module, view, helpers, and private CSS |
 | `main/store/pluginDataStore.ts` | `userData/plugin-<id>.json` storage |
 | `shared/pluginLayout.ts` | Per-tab dock/split layout model |
-| `main/plugins/builtinRegistry.ts` | Compile-time main-process composition root |
+| `main/plugins/builtinRegistry.ts` | Compile-time main-process composition root; also the one place that aggregates every other plugin's `contributes.api` into AI Agent's settings (§7) |
 | `renderer/src/plugins/builtinRegistry.ts` | Compile-time renderer composition root |
 | `preload/index.ts` | Exposes `window.wassh` |
 
@@ -80,6 +80,7 @@ interface PluginManifest {
     hostSettingsHeading?: string                    // Host/session dialog section title
     hostSettingsSchema?: PluginSettingsField[]      // per-host settings
     views?: PluginViewContribution[]                // [{ id, placement, title? }]
+    api?: { methods: PluginApiMethod[] }            // methods callable via ctx.callPluginApi (§7)
   }
 }
 ```
@@ -93,13 +94,26 @@ interface PluginManifest {
 |---|---|
 | `key` | Unique within its schema; stored object key |
 | `label`, `description?` | UI text |
-| `type` | `boolean` \| `number` \| `string` \| `select` \| `stringList` \| `commandList` |
+| `type` | `boolean` \| `number` \| `string` \| `select` \| `stringList` \| `commandList` \| `group` \| `permission` |
 | `default` | Used when no stored value exists |
 | `secret?` | `string` fields render as a password input (value is **not** vault-encrypted; only input masking) |
+| `children?` | Only for `type: 'group'` - nested fields shown under the master boolean toggle |
 
 `commandList` values are `PluginCommand[]` = `{ id, label, text, hotkey }`
 (hotkey e.g. `"Ctrl+Shift+1"`, empty = none). `stringList` UI is one-per-line
 text; stored as `string[]`.
+
+`group` is a boolean master toggle (its own `default` is `boolean`) whose
+`children` are rendered indented underneath, visible but disabled while the
+master is off. `permission` is a trinary control with a fixed value space
+`PluginPermissionDecision = 'allow' | 'deny' | 'ask'` (its `default` is one of
+those three strings) - used for AI Agent's own and other plugins' API-method
+permissions (§7). Both are generic, reusable field types, not private to any
+one plugin. `renderer/src/plugins/PluginSettingsFieldList.tsx` (exported as
+`PluginSettingsFieldList` from `@plugin-api/renderer`) renders a whole schema
+recursively, including `group` nesting; `PluginFieldEditor` renders one field's
+control (used internally by `PluginSettingsFieldList`, and directly by plugins
+with a custom settings view).
 
 ### View placement (`PluginViewPlacement`)
 
@@ -122,7 +136,10 @@ Resolution order (both in the main `ctx.getSettings()` and the view's
 
 Schemas must not overlap keys between app and host scope; host wins on
 collision. Helpers: `defaultPluginSettingsFromSchema`, `mergePluginSettings`,
-`mergePluginSessionSettings`, `normalizeHostPluginSettings`.
+`mergePluginSessionSettings`, `normalizeHostPluginSettings`, `flattenFields`.
+`flattenFields` recurses into `group` fields' `children` so nested keys are
+read/written/merged exactly like top-level ones in the flat stored settings
+map - schemas with `group` fields need no special-casing elsewhere.
 
 Persistence:
 - `settings.json` → `enabledPlugins: string[]`,
@@ -138,6 +155,12 @@ the connection(s) via `session:updateConnection` (all open tabs sharing the
 same `hostId`) and, when the connection belongs to a saved host, also persisted
 to the `HostProfile` via `hosts:save`.
 
+A main-process module can also persist one of its own app-wide settings keys
+directly with `ctx.setSettingValue(key, value)` (e.g. AI Agent's "Approve
+always" flipping a permission from `ask` to `allow`). This calls
+`SettingsStore.set` the same way `settings:set` does, and both paths broadcast
+`settings:changed` to the renderer (§10) so any open dialog stays in sync.
+
 ## 5. Main-process plugin module
 
 ```ts
@@ -146,6 +169,7 @@ interface PluginMainModule {
   onDeactivate?:   (ctx: PluginMainContext) => void | Promise<void>
   onMessage?:      (ctx: PluginMainContext, payload: unknown) => void | Promise<unknown>
   onSessionStatus?: (ctx: PluginMainContext, event: PluginSessionStatusEvent) => void | Promise<void>
+  onApiCall?:      (ctx: PluginMainContext, method: string, params: unknown) => unknown | Promise<unknown>
 }
 ```
 
@@ -156,7 +180,10 @@ interface PluginMainModule {
 - `onDeactivate` runs on shutdown; **always** pair long-lived work with
   `ctx.onDeactivateCleanup(fn)` for hard cleanup (timers, sockets, intervals),
   because the SFTP module can be demoted to "headless" without `onDeactivate`
-  being called (see §7).
+  being called (see §8).
+- `onApiCall` handles `ctx.callPluginApi(...)` invocations from another plugin
+  (or from this plugin's own module) targeting one of the methods declared in
+  `contributes.api.methods` (§7). Required only if the manifest declares `api`.
 
 ### `PluginMainContext` — every member
 
@@ -175,11 +202,14 @@ interface PluginMainModule {
 | `onSideClosed(connectionId, cb(error?)): unsubscribe` | Channel closed; both listener maps are cleared |
 | `isSshSession(): boolean` | True only when the live session is SSH (not telnet/serial) |
 | `openTcpStream(host, port): Promise<Duplex>` | Raw binary duplex for non-UTF-8 protocols; SSH `forwardOut` when SSH, else direct TCP. No side-data events |
-| `openSftp(): Promise<SftpSession>` | SFTP channel on the live SSH connection (§8); throws for non-SSH |
+| `openSftp(): Promise<SftpSession>` | SFTP channel on the live SSH connection (§9); throws for non-SSH |
 | `execCapture(command): Promise<string>` | Run on the live SSH session and return trimmed stdout (e.g. `pwd`); throws for non-SSH |
 | `registerStreamHandler(mode, direction, handler)` | PTY stream transform (§6); auto-removed on deactivate |
 | `onDeactivateCleanup(fn)` | Register cleanup; always runs on deactivate/disable/tab close |
 | `writeToSession(data)` | Write raw bytes into the session PTY, **bypassing the outbound pipeline** (no recursion into own interceptors) |
+| `listPluginApis(): PluginApiListing[]` | Declared API methods of every *other* plugin currently active on this tab (§7) |
+| `callPluginApi(pluginId, method, params): Promise<unknown>` | Call another plugin's (or, for uniformity, this plugin's own) declared API method on this tab (§7) |
+| `setSettingValue(key, value)` | Persist one key of this plugin's own app-wide stored settings (§4) |
 
 ## 6. Side connections, streams, transforms
 
@@ -228,7 +258,80 @@ Note: `ctx.writeToSession` does **not** re-enter the outbound pipeline.
 `forwardOut(host,port)`, `openDuplicateClient()` (`{client, dispose}`),
 `openDirectTcp(host,port)`.
 
-## 7. Lifecycle and activation
+## 7. Plugin-to-plugin API calls
+
+A plugin can expose callable methods for *other* plugins to use (this is also
+how the AI Agent turns capabilities into LLM tools - it is not AI-Agent
+specific). Declare them statically in the manifest, and handle them at
+runtime:
+
+```ts
+contributes: {
+  api: {
+    methods: [
+      {
+        name: 'get_snapshot',
+        description: 'Return the latest sampled stats snapshot.',
+        parameters: { type: 'object', properties: {} }   // optional, JSON-schema-ish
+      }
+    ]
+  }
+}
+```
+```ts
+onApiCall(ctx, method, params) {
+  if (method === 'get_snapshot') { return currentSnapshotFor(ctx) }
+  throw new Error(`Unknown method: ${method}`)
+}
+```
+
+- `ctx.listPluginApis()` returns the declared methods of every *other* plugin
+  **currently active on the same tab** (the caller's own plugin id is
+  excluded, and inactive plugins are not listed - the list changes live as
+  panels open/close).
+- `ctx.callPluginApi(pluginId, method, params)` calls that plugin's
+  `onApiCall`. It throws if `pluginId` has no active instance on this tab, or
+  doesn't declare `method` - there is **no auto-activation** of the target.
+- `callPluginApi` performs **no permission gating of its own** - gating (if
+  any) is entirely the caller's responsibility. The AI Agent gates in its own
+  run loop before calling; a plugin that calls another plugin's API directly
+  bypasses whatever gating the target would otherwise apply to that action
+  through its own UI/renderer path. Keep this in mind before declaring
+  mutating/destructive methods.
+- Manifests only ever reference their **own** methods; nothing here requires
+  importing another plugin's module (the checklist rule in §14 still holds).
+
+### AI Agent as a consumer (and how its own tools reuse the same shape)
+
+The AI Agent plugin turns every declared method - both other plugins' and its
+own built-ins (`run_command`, `web_fetch`, `web_search`, `remote_fs_*`,
+`local_fs_*`, `get_current_time`) - into an LLM tool, and dispatches **all**
+of them through `ctx.callPluginApi(pluginId, method, args)`, including calls
+to itself (`pluginId === PLUGIN_ID_AI_AGENT`, always active while its own run
+loop executes). This keeps one code path and one declaration shape
+(`PluginApiMethod`) for every tool the model can call, instead of a separate
+ad hoc mechanism for "built-in" vs "other plugin" capabilities.
+
+- Every method except `run_command` is gated by a `permission` settings field
+  (`allow | deny | ask`, §3); `run_command` keeps its own, more granular
+  allow/deny command-pattern rule lists (unchanged) since a single per-tool
+  toggle would be coarser than what it already has.
+- `ask` triggers an approval prompt in the AI Agent view; choosing "Approve
+  always" calls `ctx.setSettingValue` to flip that permission to `allow`
+  going forward (§4).
+- Tool results are stringified (`JSON.stringify` for non-string returns) and
+  capped at a generous size before being fed back to the model.
+- Other plugins' methods are exposed under a wire tool name
+  `plugin_api__<pluginId>__<method>` (parsed back to route the call); AI
+  Agent's own built-in tools keep their original unprefixed names for
+  backward compatibility with existing conversations.
+- `main/plugins/builtinRegistry.ts` is the one place allowed to aggregate
+  every *other* plugin's `contributes.api` into a generated permission
+  section appended to AI Agent's `settingsSchema` (one `group` per plugin,
+  default off, one `permission` child per method) - see §2's note on that
+  file. Individual plugins never reference each other directly.
+
+## 8. Lifecycle and activation
 
 - **Global enable** = `AppSettings.enabledPlugins`. Change it with
   `setSettings({ enabledPlugins })`; the host deactivates removed plugins on
@@ -255,7 +358,7 @@ Note: `ctx.writeToSession` does **not** re-enter the outbound pipeline.
   demand; modules needing a connection gate on `isSshSession()` and re-check on
   each activation after reconnect.
 
-## 8. SFTP (`SftpSession`)
+## 9. SFTP (`SftpSession`)
 
 `ctx.openSftp()` throws unless the live session is SSH. The wrapper is
 promisified over one ssh2 `SFTPWrapper` (`entry.sftp`):
@@ -275,7 +378,7 @@ connection | cancelled | other` (`classifySftpError`). `SftpEntry` rows:
 modeSymbolic, mtime (epoch ms), uid?, gid? }`. Helper:
 `joinRemotePath(parent, name)`.
 
-## 9. Renderer API (`window.wassh`)
+## 10. Renderer API (`window.wassh`)
 
 ### Plugin calls (renderer→main, `invoke`)
 
@@ -298,13 +401,14 @@ modeSymbolic, mtime (epoch ms), uid?, gid? }`. Helper:
 | `onPluginMessage(cb)` | `plugin:message` | `{ tabId, pluginId, payload }` |
 | `onSideConnectionData(cb)` | `plugin:sideData` | `{ connectionId, data }` |
 | `onSideConnectionClosed(cb)` | `plugin:sideClosed` | `{ connectionId, error? }` |
+| `onSettingsChanged(cb)` | `settings:changed` | `AppSettings` - fired whenever settings are persisted from any source (renderer `setSettings` or a main-process plugin's `ctx.setSettingValue`) |
 
 Every `on*` returns an unsubscribe function. Views filter events by their own
 `tabId` + `pluginId`. The full app API (session write/data/status, settings,
 hosts, vault, dialogs, serial) is also reachable from views — see `WasshApi` in
 `shared/types.ts`.
 
-## 10. Renderer view contract
+## 11. Renderer view contract
 
 ```ts
 interface PluginViewProps {
@@ -332,7 +436,7 @@ interface PluginViewProps {
 - Plugins that register global shortcuts or timers must use `active` to suppress
   work while their tab is not visible.
 
-## 11. Renderer UI kit
+## 12. Renderer UI kit
 
 Import renderer components from `@plugin-api/renderer` and load no application
 component directly. `plugin-ui.css` is loaded by the host and provides the
@@ -343,6 +447,7 @@ stable, neutral styling contract below.
 | `PluginButton` | Standard button; `variant="primary" \| "danger"` and `compact` |
 | `PluginField` | Label, control, and optional hint layout |
 | `PluginColorInput` | Validated six-digit hex color input |
+| `PluginSettingsFieldList` | Recursively renders a `PluginSettingsField[]` schema (including `group`/`permission` nesting, §3); used by the Options and Host dialogs, and available to a plugin's own custom settings view |
 | `.plugin-ui-panel` | Full-height plugin view root |
 | `.plugin-ui-toolbar`, `.plugin-ui-actions`, `.plugin-ui-spacer` | Flexible action rows |
 | `.plugin-ui-button` with `--primary`, `--danger`, `--compact` | Button classes for non-component use |
@@ -374,7 +479,7 @@ Controls must retain a visible keyboard focus state, icon-only buttons need an
 accessible name, status updates should use an appropriate live region, and
 color must not be the only way state is communicated.
 
-## 12. Built-in plugin wire protocols
+## 13. Built-in plugin wire protocols
 
 Each built-in owns its concrete discriminated unions in
 `plugins/builtins/<id>/protocol.ts`. Those protocols are private to that plugin,
@@ -387,9 +492,15 @@ not part of the shared plugin API. Summary of their main-renderer messages:
 | scratchpad | — (renderer-driven; main is a no-op hook) | — |
 | mqtt-analyser | `publish` / `reconnect` | `status` → `MqttAnalyserStatusPayload`; `message` → `MqttAnalyserMessagePayload` |
 | sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `viewFile`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone`, `viewFileResult` → `SftpViewFilePayload` |
-| ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval`, `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `refreshModels`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
+| ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval` (`{requestId, kind: 'command'\|'permission', decision}`), `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `refreshModels`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
 
-## 13. Adding a built-in plugin (checklist)
+`contributes.api` methods (§7) declared by server-monitor (`get_snapshot`),
+mqtt-analyser (`get_topics`, `get_topic_value`, `publish`), macro-pad
+(`execute_macro`), scratchpad (`read_notes`, `write_notes`, `append_notes`),
+and AI Agent's own built-in tools are called via `ctx.callPluginApi`, not
+`sendPluginMessage` - they are a separate, cross-plugin call surface.
+
+## 14. Adding a built-in plugin (checklist)
 
 1. Create `plugins/builtins/<id>/` with `manifest.ts`, `protocol.ts`, `main.ts`,
    optional `View.tsx`, helpers, and `styles.css`.
@@ -405,7 +516,11 @@ not part of the shared plugin API. Summary of their main-renderer messages:
    from its renderer entry.
 6. Use manifest settings schemas for automatically rendered settings.
    Set `settingsPresentation: 'view'` when the plugin owns a custom editor.
-7. Document any new generic capability before adding it to a stable API entry
+7. To expose methods to other plugins, declare `contributes.api.methods` and
+   implement `onApiCall` (§7). Keep the method's own `parameters`/description
+   self-sufficient - never import a consuming plugin (e.g. AI Agent) to learn
+   its shape.
+8. Document any new generic capability before adding it to a stable API entry
    point. Keep plugin protocols, defaults, and unique styles local.
 
 External plugins will follow the same manifest/main/ui split once the loader
