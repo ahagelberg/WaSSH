@@ -2783,6 +2783,10 @@
   flex-shrink: 0;
 }
 
+.ai-agent-config-btn {
+  margin-left: auto;
+}
+
 .ai-agent-phase-bar {
   flex-shrink: 0;
   padding: 4px var(--gap);
@@ -4135,5 +4139,4 @@
   font-size: 12px;
   text-align: center;
 }
-
 
