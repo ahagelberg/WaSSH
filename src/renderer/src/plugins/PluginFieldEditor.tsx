@@ -1,12 +1,12 @@
 import type { ReactElement } from 'react'
-import type { PluginMacroButton, PluginSettingsField } from '@plugin-api/shared'
+import type { PluginCommand, PluginSettingsField } from '@plugin-api/shared'
 
 function MacroListEditor({
   value,
   onChange
 }: {
-  value: PluginMacroButton[]
-  onChange: (next: PluginMacroButton[]) => void
+  value: PluginCommand[]
+  onChange: (next: PluginCommand[]) => void
 }): ReactElement {
   return (
     <div className="plugin-settings-macros">
@@ -112,8 +112,8 @@ export default function PluginFieldEditor({
       </select>
     )
   }
-  if (field.type === 'macroList') {
-    const list = Array.isArray(value) ? (value as PluginMacroButton[]) : []
+  if (field.type === 'commandList') {
+    const list = Array.isArray(value) ? (value as PluginCommand[]) : []
     return <MacroListEditor value={list} onChange={onChange} />
   }
   if (field.type === 'stringList') {

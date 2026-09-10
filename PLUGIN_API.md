@@ -39,7 +39,7 @@ A plugin is three things:
 
 | File | Role |
 |---|---|
-| `shared/pluginApi.ts` | Stable manifest, settings, event, placement, side-connection, and settings merge contracts |
+| `shared/pluginApi.ts` | Neutral contracts used across process boundaries or by more than one plugin: manifests, settings, events, placement, side connections, remote-file metadata, and settings merging |
 | `main/plugins/api.ts` | `PluginMainModule`, `PluginMainContext`, lifecycle/session hooks, main registration metadata |
 | `renderer/src/plugins/api` | View contract, renderer registration, file-drop contract, neutral React UI components and styles |
 | `main/plugins/PluginHost.ts` | Private lifecycle and capability implementation |
@@ -56,9 +56,15 @@ A plugin is three things:
 | `renderer/src/plugins/builtinRegistry.ts` | Compile-time renderer composition root |
 | `preload/index.ts` | Exposes `window.wassh` |
 
-Built-in ids (`shared/plugins.ts`): `server-monitor`, `scratchpad`,
-`macro-pad`, `mqtt-analyser`, `sftp`, `ai-agent`, `connection-logger`. All seven are enabled by
-default (`DEFAULT_ENABLED_PLUGINS`) and declared `activation: 'manual'`.
+Built-in ids are owned by each plugin's `id.ts`. The main composition root
+derives the default enabled-id list from the registered manifests instead of
+duplicating plugin ids in shared code.
+
+`shared/` is not a second home for plugin implementations. It contains
+process-neutral application models and stable plugin API contracts consumed by
+the main process, preload, renderer, or multiple plugins. Plugin ids, defaults,
+wire messages, feature helpers, and feature-specific types belong under
+`plugins/builtins/<id>/`.
 
 ## 3. Manifest (`PluginManifest`)
 
@@ -87,11 +93,11 @@ interface PluginManifest {
 |---|---|
 | `key` | Unique within its schema; stored object key |
 | `label`, `description?` | UI text |
-| `type` | `boolean` \| `number` \| `string` \| `stringList` \| `macroList` |
+| `type` | `boolean` \| `number` \| `string` \| `select` \| `stringList` \| `commandList` |
 | `default` | Used when no stored value exists |
 | `secret?` | `string` fields render as a password input (value is **not** vault-encrypted; only input masking) |
 
-`macroList` values are `PluginMacroButton[]` = `{ id, label, text, hotkey }`
+`commandList` values are `PluginCommand[]` = `{ id, label, text, hotkey }`
 (hotkey e.g. `"Ctrl+Shift+1"`, empty = none). `stringList` UI is one-per-line
 text; stored as `string[]`.
 

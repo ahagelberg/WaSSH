@@ -7,7 +7,7 @@ import type {
   SideConnectionClosedEvent,
   SideConnectionDataEvent,
   SideConnectionOpenRequest
-} from '../../shared/plugins'
+} from '../../shared/pluginApi'
 import type { ConnectionParams } from '../../shared/types'
 import { SftpSession } from './SftpSession'
 import type { PluginSessionHandle } from './types'

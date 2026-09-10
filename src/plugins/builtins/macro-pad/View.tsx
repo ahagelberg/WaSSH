@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
-import type { PluginMacroButton } from '@plugin-api/shared'
+import type { PluginCommand } from '@plugin-api/shared'
 import { PluginColorInput, type PluginViewProps } from '@plugin-api/renderer'
 import type { MacroPadRendererMessage } from './protocol'
 import './styles.css'
@@ -174,9 +174,9 @@ function uniqueGroupName(groups: MacroGroup[]): string {
 
 /** Place `macro` at the end of its group within the stored button list */
 function placedForGroup(
-  buttons: PluginMacroButton[],
-  macro: PluginMacroButton
-): PluginMacroButton[] {
+  buttons: PluginCommand[],
+  macro: PluginCommand
+): PluginCommand[] {
   const list = buttons.filter((b) => b.id !== macro.id)
   let index = list.length
   for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -191,13 +191,13 @@ function placedForGroup(
 
 interface MacroEditorDialogProps {
   title: string
-  macro: PluginMacroButton | null
+  macro: PluginCommand | null
   /** Initial group for a new macro, or the macro's current group */
   groupId: string
   groups: MacroGroup[]
   /** Other macros, used to reject duplicate hotkeys */
-  siblings: PluginMacroButton[]
-  onSave: (macro: PluginMacroButton) => void
+  siblings: PluginCommand[]
+  onSave: (macro: PluginCommand) => void
   onCancel: () => void
 }
 
@@ -344,7 +344,7 @@ export default function MacroPadView({
   active
 }: PluginViewProps) {
   const storedButtons = Array.isArray(settings.buttons)
-    ? (settings.buttons as PluginMacroButton[])
+    ? (settings.buttons as PluginCommand[])
     : []
   const groups = normalizeGroups(settings.groups)
   const ungroupedCollapsed = settings.ungroupedCollapsed === true
@@ -401,7 +401,7 @@ export default function MacroPadView({
     setColorMenu(null)
   }
 
-  const persistButtons = (next: PluginMacroButton[]): void => {
+  const persistButtons = (next: PluginCommand[]): void => {
     onSettingsPatch({ buttons: next })
     setDialog(null)
     closeMenus()
@@ -545,7 +545,7 @@ export default function MacroPadView({
     )
   }
 
-  const saveMacro = (macro: PluginMacroButton): void => {
+  const saveMacro = (macro: PluginCommand): void => {
     const editing = dialog?.mode === 'edit' ? buttons.find((b) => b.id === dialog.id) : undefined
     const base = editing ? buttons.map((b) => (b.id === macro.id ? macro : b)) : buttons
     const moved = editing ? (editing.groupId || '') !== (macro.groupId || '') : true
@@ -570,7 +570,7 @@ export default function MacroPadView({
     color?: string
     collapsed: boolean
     named: boolean
-    members: PluginMacroButton[]
+    members: PluginCommand[]
   }> = [
     ...groups.map((g) => ({
       key: g.id,
@@ -884,6 +884,5 @@ export default function MacroPadView({
     </div>
   )
 }
-
 
 

@@ -1,34 +1,12 @@
-/** SFTP entry kind derived from the remote mode bits */
-export type SftpEntryType = 'file' | 'directory' | 'symlink' | 'other'
+import type {
+  RemoteFileEntry,
+  RemoteFileEntryType,
+  RemoteFileErrorKind
+} from '@plugin-api/shared'
 
-/** One row in the remote file manager listing */
-export interface SftpEntry {
-  name: string
-  /** Full remote path (parent + name) */
-  path: string
-  type: SftpEntryType
-  size: number
-  /** Numeric permission bits (e.g. 0o755) */
-  mode: number
-  /** Human-readable permission string (e.g. "-rw-r--r--") */
-  modeSymbolic: string
-  /** Last modified time (epoch ms) */
-  mtime: number
-  uid?: number
-  gid?: number
-}
-
-export type SftpErrorKind =
-  | 'not_ssh'
-  | 'not_found'
-  | 'permission'
-  | 'not_dir'
-  | 'exists'
-  | 'name_in_use'
-  | 'io'
-  | 'connection'
-  | 'cancelled'
-  | 'other'
+export type SftpEntry = RemoteFileEntry
+export type SftpEntryType = RemoteFileEntryType
+export type SftpErrorKind = RemoteFileErrorKind
 
 export type SftpStatusState = 'idle' | 'connecting' | 'connected' | 'error'
 

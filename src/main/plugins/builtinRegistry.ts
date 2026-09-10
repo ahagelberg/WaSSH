@@ -46,3 +46,4 @@ export const BUILTIN_PLUGIN_DEFINITIONS: BuiltinPluginDefinition[] = [
 ]
 
 export const BUILTIN_MANIFESTS = BUILTIN_PLUGIN_DEFINITIONS.map(({ manifest }) => manifest)
+export const DEFAULT_ENABLED_PLUGIN_IDS = BUILTIN_MANIFESTS.map(({ id }) => id)

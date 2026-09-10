@@ -18,14 +18,14 @@ export const macroPadManifest: PluginManifest = {
       {
         key: 'buttons',
         label: 'Buttons',
-        type: 'macroList',
+        type: 'commandList',
         default: DEFAULT_MACRO_BUTTONS,
         description: 'Label, text to send, and optional hotkey per button.'
       },
       {
         key: 'groups',
         label: 'Groups',
-        type: 'macroList',
+        type: 'commandList',
         default: [],
         description: 'Macro groups (name, color, collapsed state).'
       },

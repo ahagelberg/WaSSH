@@ -48,14 +48,14 @@ export type PluginSettingsFieldType =
   | 'string'
   | 'select'
   | 'stringList'
-  | 'macroList'
+  | 'commandList'
 
 export interface PluginSettingsSelectOption {
   value: string
   label: string
 }
 
-export interface PluginMacroButton {
+export interface PluginCommand {
   id: string
   label: string
   text: string
@@ -64,6 +64,33 @@ export interface PluginMacroButton {
   /** Macro pad group id; empty or absent means ungrouped. */
   groupId?: string
 }
+
+/** Neutral remote filesystem entry exposed to plugins by host file APIs. */
+export type RemoteFileEntryType = 'file' | 'directory' | 'symlink' | 'other'
+
+export interface RemoteFileEntry {
+  name: string
+  path: string
+  type: RemoteFileEntryType
+  size: number
+  mode: number
+  modeSymbolic: string
+  mtime: number
+  uid?: number
+  gid?: number
+}
+
+export type RemoteFileErrorKind =
+  | 'not_ssh'
+  | 'not_found'
+  | 'permission'
+  | 'not_dir'
+  | 'exists'
+  | 'name_in_use'
+  | 'io'
+  | 'connection'
+  | 'cancelled'
+  | 'other'
 
 export interface PluginSettingsField {
   key: string

@@ -1,6 +1,6 @@
-import type { PluginMacroButton } from '@plugin-api/shared'
+import type { PluginCommand } from '@plugin-api/shared'
 
-export const DEFAULT_MACRO_BUTTONS: PluginMacroButton[] = [
+export const DEFAULT_MACRO_BUTTONS: PluginCommand[] = [
   {
     id: 'm1',
     label: 'syslog',

@@ -6,7 +6,6 @@ import type {
   SideConnectionClosedEvent,
   SideConnectionDataEvent
 } from './pluginApi'
-import { DEFAULT_ENABLED_PLUGINS } from './plugins'
 import type { TabPluginLayout } from './pluginLayout'
 import type { HostGroup, HostsOrganization } from './hostOrganization'
 export type { HostGroup, HostsOrganization } from './hostOrganization'
@@ -521,7 +520,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   sidebarCollapsed: false,
   windowBounds: null,
   theme: DEFAULT_THEME,
-  enabledPlugins: [...DEFAULT_ENABLED_PLUGINS],
+  enabledPlugins: [],
   pluginSettings: {},
   pluginPanelPlacements: {},
   pluginPanelOrder: [],

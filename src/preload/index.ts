@@ -18,7 +18,7 @@ import type {
   PluginMessageEvent,
   SideConnectionClosedEvent,
   SideConnectionDataEvent
-} from '../shared/plugins'
+} from '../shared/pluginApi'
 
 function on(
   channel: string,

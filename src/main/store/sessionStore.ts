@@ -19,6 +19,7 @@ import {
 import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 import { normalizeHostPluginSettings } from '../../shared/pluginApi'
+import { DEFAULT_ENABLED_PLUGIN_IDS } from '../plugins/builtinRegistry'
 import {
   appendHostToUngrouped,
   normalizeHostsOrganization,
@@ -377,7 +378,7 @@ export class SettingsStore {
     const theme: AppTheme = rest.theme === 'light' ? 'light' : DEFAULT_THEME
     const enabledPlugins = Array.isArray(rest.enabledPlugins)
       ? rest.enabledPlugins
-      : DEFAULT_SETTINGS.enabledPlugins
+      : DEFAULT_ENABLED_PLUGIN_IDS
     const pluginSettings =
       rest.pluginSettings && typeof rest.pluginSettings === 'object' && !Array.isArray(rest.pluginSettings)
         ? rest.pluginSettings

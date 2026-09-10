@@ -6,7 +6,11 @@ import type {
   WriteStreamOptions,
   Stats
 } from 'ssh2'
-import type { SftpEntry, SftpEntryType, SftpErrorKind } from '../../shared/plugins'
+import type {
+  RemoteFileEntry as SftpEntry,
+  RemoteFileEntryType as SftpEntryType,
+  RemoteFileErrorKind as SftpErrorKind
+} from '../../shared/pluginApi'
 
 /** OpenSSH SFTPv3 status codes (superset of the base protocol) */
 const SFTP_STATUS = {
