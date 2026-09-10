@@ -48,8 +48,7 @@ export const mqttAnalyserManifest: PluginManifest = {
       methods: [
         {
           name: 'get_topics',
-          description:
-            'List known MQTT topics for this session, each with its last known payload and message count.',
+          description: 'List known MQTT topic names for this session without payload data.',
           parameters: { type: 'object', properties: {} }
         },
         {
