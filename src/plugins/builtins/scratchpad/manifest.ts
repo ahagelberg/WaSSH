@@ -21,6 +21,7 @@ export const scratchpadManifest: PluginManifest = {
         {
           name: 'write_notes',
           description: 'Overwrite the scratchpad notes with new text.',
+          defaultPermission: 'ask',
           parameters: {
             type: 'object',
             properties: { content: { type: 'string', description: 'Full replacement notes text' } },
@@ -30,6 +31,7 @@ export const scratchpadManifest: PluginManifest = {
         {
           name: 'append_notes',
           description: 'Append a line of text to the end of the existing scratchpad notes.',
+          defaultPermission: 'ask',
           parameters: {
             type: 'object',
             properties: { text: { type: 'string', description: 'Text to append' } },

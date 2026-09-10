@@ -212,6 +212,7 @@ export const TOOL_DEF_LOCAL_FS_LIST: PluginApiMethod = {
   name: AI_AGENT_TOOL_LOCAL_FS_LIST,
   description:
     'List files and directories in a folder on the LOCAL client machine running WaSSH (NOT the remote SSH server).',
+  defaultPermission: 'ask',
   parameters: {
     type: 'object',
     properties: {
