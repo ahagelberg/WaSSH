@@ -331,9 +331,105 @@
 
 .ai-agent-user-text,
 .ai-agent-assistant-text {
-  white-space: pre-wrap;
   word-break: break-word;
   user-select: text;
+}
+
+.ai-agent-user-text > :first-child,
+.ai-agent-assistant-text > :first-child {
+  margin-top: 0;
+}
+
+.ai-agent-user-text > :last-child,
+.ai-agent-assistant-text > :last-child {
+  margin-bottom: 0;
+}
+
+.ai-agent-user-text p,
+.ai-agent-assistant-text p {
+  margin: 0 0 8px;
+}
+
+.ai-agent-user-text h1,
+.ai-agent-user-text h2,
+.ai-agent-user-text h3,
+.ai-agent-user-text h4,
+.ai-agent-user-text h5,
+.ai-agent-user-text h6,
+.ai-agent-assistant-text h1,
+.ai-agent-assistant-text h2,
+.ai-agent-assistant-text h3,
+.ai-agent-assistant-text h4,
+.ai-agent-assistant-text h5,
+.ai-agent-assistant-text h6 {
+  margin: 12px 0 6px;
+  font-size: 1em;
+  line-height: 1.35;
+}
+
+.ai-agent-user-text ul,
+.ai-agent-user-text ol,
+.ai-agent-assistant-text ul,
+.ai-agent-assistant-text ol {
+  margin: 4px 0 8px;
+  padding-left: 22px;
+}
+
+.ai-agent-user-text li + li,
+.ai-agent-assistant-text li + li {
+  margin-top: 3px;
+}
+
+.ai-agent-user-text blockquote,
+.ai-agent-assistant-text blockquote {
+  margin: 6px 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+  color: var(--text-muted);
+}
+
+.ai-agent-user-text a,
+.ai-agent-assistant-text a {
+  color: var(--accent);
+}
+
+.ai-agent-user-text code,
+.ai-agent-assistant-text code {
+  padding: 1px 3px;
+  border-radius: 3px;
+  background: var(--bg-input);
+  font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  font-size: 0.92em;
+}
+
+.ai-agent-user-text table,
+.ai-agent-assistant-text table {
+  display: block;
+  max-width: 100%;
+  margin: 6px 0;
+  border-collapse: collapse;
+  overflow-x: auto;
+}
+
+.ai-agent-user-text th,
+.ai-agent-user-text td,
+.ai-agent-assistant-text th,
+.ai-agent-assistant-text td {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.ai-agent-user-text hr,
+.ai-agent-assistant-text hr {
+  margin: 8px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.ai-agent-user-text input[type="checkbox"],
+.ai-agent-assistant-text input[type="checkbox"] {
+  margin: 0 4px 0 0;
 }
 
 .ai-agent-user-text {
@@ -370,6 +466,13 @@
   font-size: 11px;
   overflow: auto;
   max-height: 220px;
+}
+
+.ai-agent-code code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: inherit;
 }
 
 .ai-agent-interrupted {

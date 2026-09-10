@@ -26,6 +26,8 @@
     "mqtt": "^5.15.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "serialport": "^13.0.0",
     "ssh2": "^1.16.0",
     "yazl": "^3.3.1"

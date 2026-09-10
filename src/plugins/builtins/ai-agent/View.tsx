@@ -5,6 +5,8 @@ import {
   type DragEvent as ReactDragEvent,
   type ReactElement
 } from 'react'
+import Markdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import './styles.css'
 
 import {
@@ -232,22 +234,21 @@ function toolBadge(name?: string): { label: string; className: string } {
   return { label: 'Tool', className: 'tool-badge-generic' }
 }
 
-/** Render simple inline code / code fences without a markdown dependency */
-function formatText(text: string): ReactElement[] {
-  const parts = text.split(/```/)
-  const out: ReactElement[] = []
-  for (let i = 0; i < parts.length; i += 1) {
-    if (i % 2 === 1) {
-      out.push(
-        <pre key={i} className="ai-agent-code">
-          {parts[i]}
-        </pre>
-      )
-    } else if (parts[i]) {
-      out.push(<span key={i}>{parts[i]}</span>)
-    }
+const MARKDOWN_COMPONENTS: Components = {
+  a({ node: _node, ...props }) {
+    return <a {...props} target="_blank" rel="noreferrer" />
+  },
+  pre({ node: _node, ...props }) {
+    return <pre {...props} className="ai-agent-code" />
   }
-  return out
+}
+
+function MarkdownText({ text }: { text: string }): ReactElement {
+  return (
+    <Markdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS} skipHtml>
+      {text}
+    </Markdown>
+  )
 }
 
 interface ViewState {
@@ -863,7 +864,7 @@ export default function AiAgentView({
               </span>
             ) : null}
           </div>
-          <div className="ai-agent-user-text">{formatText(msg.text)}</div>
+          <div className="ai-agent-user-text"><MarkdownText text={msg.text} /></div>
         </div>
       )
       continue
@@ -914,7 +915,7 @@ export default function AiAgentView({
       }
       messageRows.push(
         <div key={i} className="ai-agent-msg ai-agent-assistant">
-          {msg.text ? <div className="ai-agent-assistant-text">{formatText(msg.text)}</div> : null}
+          {msg.text ? <div className="ai-agent-assistant-text"><MarkdownText text={msg.text} /></div> : null}
           {toolChildren}
           {msg.stopped ? <div className="ai-agent-interrupted">interrupted</div> : null}
         </div>
@@ -937,7 +938,7 @@ export default function AiAgentView({
   if (running && stream) {
     messageRows.push(
       <div key="stream" className="ai-agent-msg ai-agent-assistant">
-        <div className="ai-agent-assistant-text">{formatText(stream)}</div>
+        <div className="ai-agent-assistant-text"><MarkdownText text={stream} /></div>
       </div>
     )
   } else if (running) {
