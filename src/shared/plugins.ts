@@ -484,6 +484,14 @@ export interface SftpViewFilePayload {
   errorKind?: SftpErrorKind
 }
 
+export type SftpMainPayload =
+  | SftpStatusPayload
+  | SftpListPayload
+  | SftpOpResultPayload
+  | SftpTransferProgressPayload
+  | SftpTransferDonePayload
+  | SftpViewFilePayload
+
 /** Renderer → main SFTP commands */
 export type SftpRendererMessage =
   | { type: 'getStatus' }

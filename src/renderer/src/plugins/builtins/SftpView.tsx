@@ -9,64 +9,22 @@ import {
 } from 'react'
 import type {
   SftpEntry,
-  SftpErrorKind,
+  SftpMainPayload,
   SftpRendererMessage,
   SftpStatusState
 } from '@shared/plugins'
 import type { PluginViewProps } from '../registry'
-
-type SftpMainPayload =
-  | {
-      type: 'status'
-      state: SftpStatusState
-      cwd?: string
-      reason?: string
-      errorKind?: SftpErrorKind
-    }
-  | {
-      type: 'listResult'
-      path: string
-      cwd: string
-      entries: SftpEntry[]
-      error?: string
-      errorKind?: SftpErrorKind
-    }
-  | {
-      type: 'opResult'
-      op: 'mkdir' | 'rename' | 'chmod' | 'delete'
-      path: string
-      ok: boolean
-      error?: string
-      errorKind?: SftpErrorKind
-    }
-  | {
-      type: 'transferProgress'
-      direction: 'upload' | 'download' | 'download-zip'
-      remotePath: string
-      transferredBytes: number
-      totalBytes: number
-    }
-  | {
-      type: 'transferDone'
-      direction: 'upload' | 'download' | 'download-zip'
-      remotePath: string
-      state: 'done' | 'error' | 'cancelled'
-      error?: string
-      errorKind?: SftpErrorKind
-    }
-  | {
-      type: 'viewFileResult'
-      path: string
-      ok: boolean
-      kind?: 'text' | 'binary'
-      text?: string
-      contentBase64?: string
-      bytesRead: number
-      totalBytes?: number
-      truncated: boolean
-      error?: string
-      errorKind?: SftpErrorKind
-    }
+import {
+  base64ToBytes,
+  baseName,
+  formatBytes,
+  formatDate,
+  hexDump,
+  joinPath,
+  octalMode,
+  parentPath,
+  typeIcon
+} from './sftpViewUtils'
 
 interface TransferProgress {
   direction: 'upload' | 'download' | 'download-zip'
@@ -99,97 +57,6 @@ interface SftpContextMenu {
   y: number
   /** Entry the menu was opened on; null = opened on empty folder space. */
   entry: SftpEntry | null
-}
-
-function joinPath(parent: string, name: string): string {
-  if (parent === '/' || parent === '') {
-    return `/${name}`
-  }
-  return `${parent.replace(/\/+$/, '')}/${name}`
-}
-
-function parentPath(path: string): string | null {
-  if (path === '/' || path === '') {
-    return null
-  }
-  const trimmed = path.replace(/\/+$/, '')
-  const idx = trimmed.lastIndexOf('/')
-  if (idx <= 0) {
-    return '/'
-  }
-  return trimmed.slice(0, idx)
-}
-
-function baseName(path: string): string {
-  return path.slice(path.lastIndexOf('/') + 1)
-}
-
-function formatBytes(n: number): string {
-  if (!n || n <= 0) {
-    return '—'
-  }
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let v = n
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`
-}
-
-function formatDate(ms: number): string {
-  if (!ms) {
-    return '—'
-  }
-  const d = new Date(ms)
-  const pad = (x: number): string => String(x).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64)
-  const out = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) {
-    out[i] = bin.charCodeAt(i)
-  }
-  return out
-}
-
-const HEX_BYTES_PER_ROW = 16
-
-/** Total-Commander-style hex dump: offset · two 8-byte groups · ASCII column. */
-function hexDump(bytes: Uint8Array): string {
-  const lines: string[] = []
-  for (let off = 0; off < bytes.length; off += HEX_BYTES_PER_ROW) {
-    const hex: string[] = []
-    const ascii: string[] = []
-    const end = Math.min(off + HEX_BYTES_PER_ROW, bytes.length)
-    for (let i = off; i < end; i++) {
-      const b = bytes[i]
-      hex.push(b.toString(16).padStart(2, '0'))
-      ascii.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.')
-    }
-    while (hex.length < HEX_BYTES_PER_ROW) {
-      hex.push('  ')
-    }
-    const half = HEX_BYTES_PER_ROW / 2
-    const hexText = `${hex.slice(0, half).join(' ')}  ${hex.slice(half).join(' ')}`
-    const addr = off.toString(16).padStart(8, '0')
-    lines.push(`${addr}  ${hexText}  ${ascii.join('').padEnd(HEX_BYTES_PER_ROW)}`)
-  }
-  return lines.join('\n')
-}
-
-function octalMode(mode: number): string {
-  return (mode & 0o777).toString(8).padStart(3, '0')
-}
-
-function typeIcon(entry: SftpEntry): string {
-  if (entry.type === 'directory') return '📁'
-  if (entry.type === 'symlink') return '🔗'
-  if (entry.type === 'file') return '📄'
-  return '❓'
 }
 
 const UPLOAD_CHUNK_SIZE = 256 * 1024

@@ -146,84 +146,58 @@ function compareListEntries(a: SftpEntry, b: SftpEntry): number {
 
 /** Promisified wrapper around an ssh2 SFTPWrapper (one per live SSH client). */
 export class SftpSession {
-  readonly sftp: SFTPWrapper
+  private readonly sftp: SFTPWrapper
 
   constructor(sftp: SFTPWrapper) {
     this.sftp = sftp
   }
 
-  /** List a directory, mapping entries to renderer-friendly SftpEntry rows. */
-  list(path: string): Promise<SftpEntry[]> {
+  private run<T>(
+    fn: (callback: (err: Error | null | undefined, value: T) => void) => void
+  ): Promise<T> {
     return new Promise((resolve, reject) => {
-      this.sftp.readdir(path, (err, list) => {
+      fn((err, value) => {
         if (err) {
           reject(classifySftpError(err))
           return
         }
-        const parent = path === '/' ? '' : path.replace(/\/+$/, '')
-        resolve(list.map((entry) => entryToSftpEntry(entry, parent)).sort(compareListEntries))
+        resolve(value)
       })
     })
+  }
+
+  private runVoid(fn: (callback: (err?: Error | null) => void) => void): Promise<void> {
+    return this.run<void>((callback) => fn((err) => callback(err, undefined)))
+  }
+
+  /** List a directory, mapping entries to renderer-friendly SftpEntry rows. */
+  list(path: string): Promise<SftpEntry[]> {
+    return this.run<FileEntryWithStats[]>((callback) => this.sftp.readdir(path, callback)).then(
+      (list) => {
+        const parent = path === '/' ? '' : path.replace(/\/+$/, '')
+        return list.map((entry) => entryToSftpEntry(entry, parent)).sort(compareListEntries)
+      }
+    )
   }
 
   mkdir(path: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.sftp.mkdir(path, (err) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve()
-      })
-    })
+    return this.runVoid((callback) => this.sftp.mkdir(path, callback))
   }
 
   rename(oldPath: string, newPath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.sftp.rename(oldPath, newPath, (err) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve()
-      })
-    })
+    return this.runVoid((callback) => this.sftp.rename(oldPath, newPath, callback))
   }
 
   chmod(path: string, mode: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.sftp.chmod(path, mode, (err) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve()
-      })
-    })
+    return this.runVoid((callback) => this.sftp.chmod(path, mode, callback))
   }
 
   unlink(path: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.sftp.unlink(path, (err) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve()
-      })
-    })
+    return this.runVoid((callback) => this.sftp.unlink(path, callback))
   }
 
   rmdir(path: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.sftp.rmdir(path, (err) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve()
-      })
-    })
+    return this.runVoid((callback) => this.sftp.rmdir(path, callback))
   }
 
   /**
@@ -244,27 +218,11 @@ export class SftpSession {
   }
 
   stat(path: string): Promise<Stats> {
-    return new Promise((resolve, reject) => {
-      this.sftp.stat(path, (err, stats) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve(stats)
-      })
-    })
+    return this.run<Stats>((callback) => this.sftp.stat(path, callback))
   }
 
   lstat(path: string): Promise<Stats> {
-    return new Promise((resolve, reject) => {
-      this.sftp.lstat(path, (err, stats) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve(stats)
-      })
-    })
+    return this.run<Stats>((callback) => this.sftp.lstat(path, callback))
   }
 
   /** stat() that resolves null instead of rejecting (e.g. existence checks). */
@@ -311,15 +269,7 @@ export class SftpSession {
 
   /** Explicitly close a remote file handle, waiting for the server's reply. */
   close(handle: Buffer): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.sftp.close(handle, (err) => {
-        if (err) {
-          reject(classifySftpError(err))
-          return
-        }
-        resolve()
-      })
-    })
+    return this.runVoid((callback) => this.sftp.close(handle, callback))
   }
 
   end(): void {

@@ -1,93 +1,42 @@
-import { once } from 'events'
-import {
-  createReadStream as fsCreateReadStream,
-  createWriteStream as fsCreateWriteStream,
-  statSync as fsStatSync,
-  unlink as fsUnlink
-} from 'fs'
-import { basename } from 'path'
-import { BrowserWindow, dialog, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
-import { ZipFile } from 'yazl'
 import type {
   SftpErrorKind,
   SftpListPayload,
   SftpOpResultPayload,
   SftpRendererMessage,
-  SftpStatusPayload,
-  SftpTransferDonePayload,
-  SftpTransferProgressPayload,
-  SftpViewFilePayload
+  SftpStatusPayload
 } from '../../../shared/plugins'
 import type { PluginMainContext, PluginMainModule } from '../PluginHost'
+import { classifySftpError, joinRemotePath, type SftpSession } from '../SftpSession'
+import { handleViewFile } from './sftpFileView'
 import {
-  classifySftpError,
-  joinRemotePath,
-  type SftpError,
-  type SftpSession
-} from '../SftpSession'
-import type { ReadStream as SftpReadStream, WriteStream as SftpWriteStream } from 'ssh2'
-import type { ReadStream as FsReadStream, WriteStream as FsWriteStream } from 'fs'
+  cancelTransfers,
+  handleChunkUploadChunk,
+  handleChunkUploadEnd,
+  handleChunkUploadStart,
+  handleDownload,
+  handleDownloadZip,
+  handleUploadDialog,
+  type SftpChunkUploadState,
+  type SftpDownloadState,
+  type SftpTransferState,
+  type SftpUploadState
+} from './sftpTransfers'
 
-/** Transfer running through a remote SSH read/write stream + local fs stream. */
-interface FileTransferState {
-  cancelled: boolean
-  done: boolean
-  remotePath: string
-  localPath: string
-}
-
-interface DownloadState extends FileTransferState {
-  remote: SftpReadStream | null
-  local: FsWriteStream
-  transferred: number
-  archive?: ZipFile
-}
-
-interface UploadState extends FileTransferState {
-  remote: SftpWriteStream
-  local: FsReadStream
-  transferred: number
-}
-
-/** Drop-upload fed by renderer in chunks (uploadStart / uploadChunk / uploadEnd). */
-interface ChunkUploadState {
-  cancelled: boolean
-  done: boolean
-  name: string
-  remotePath: string
-  total: number
-  received: number
-  write: SftpWriteStream | null
-  /** Serializes chunk writes + finalization so chunks never interleave. */
-  queue: Promise<void>
-}
-
-interface SessionState {
+interface SessionState extends SftpTransferState {
   sftp: SftpSession | null
-  /** Remote upload target directory (pwd, Downloads, home, tmp). */
   cwd: string | null
   home: string
   stopped: boolean
-  /** Last activation/reset error, so a late-mounting view can replay status. */
   error: string | null
   errorKind: SftpErrorKind | null
-  download: DownloadState | null
-  upload: UploadState | null
-  chunkUpload: ChunkUploadState | null
+  download: SftpDownloadState | null
+  upload: SftpUploadState | null
+  chunkUpload: SftpChunkUploadState | null
 }
+
+type SftpOpMessage = Extract<SftpRendererMessage, { type: 'mkdir' | 'rename' | 'chmod' | 'delete' }>
 
 const sessionStates = new Map<string, SessionState>()
-
-/** Viewer cap: at most this many bytes are fetched from a remote file. */
-const SFTP_VIEW_MAX_BYTES = 1024 * 1024
-
-function instanceKey(ctx: PluginMainContext): string {
-  return `${ctx.tabId}::${ctx.pluginId}`
-}
-
-function stateFor(ctx: PluginMainContext): SessionState | undefined {
-  return sessionStates.get(instanceKey(ctx))
-}
 
 const SFTP_MESSAGE_TYPES = new Set<string>([
   'getStatus',
@@ -107,6 +56,14 @@ const SFTP_MESSAGE_TYPES = new Set<string>([
   'viewFile'
 ])
 
+function instanceKey(ctx: PluginMainContext): string {
+  return `${ctx.tabId}::${ctx.pluginId}`
+}
+
+function stateFor(ctx: PluginMainContext): SessionState | undefined {
+  return sessionStates.get(instanceKey(ctx))
+}
+
 function isRendererMessage(payload: unknown): payload is SftpRendererMessage {
   if (!payload || typeof payload !== 'object') {
     return false
@@ -115,26 +72,17 @@ function isRendererMessage(payload: unknown): payload is SftpRendererMessage {
   return typeof type === 'string' && SFTP_MESSAGE_TYPES.has(type)
 }
 
-function focusedWindow(): BrowserWindow | null {
-  const win = BrowserWindow.getFocusedWindow()
-  if (win && !win.isDestroyed()) {
-    return win
-  }
-  const all = BrowserWindow.getAllWindows()
-  for (const w of all) {
-    if (!w.isDestroyed()) {
-      return w
-    }
-  }
-  return null
+function sendStatus(ctx: PluginMainContext, payload: Omit<SftpStatusPayload, 'type'>): void {
+  ctx.sendToRenderer({ type: 'status', ...payload } satisfies SftpStatusPayload)
 }
 
-/**
- * Resolve the upload target directory.
- * 1. Live SSH session cwd (pwd) when available.
- * 2. Remote ~/Downloads (then ~/Download) when it exists.
- * 3. Remote home directory.
- */
+function sendOpResult(
+  ctx: PluginMainContext,
+  payload: Omit<SftpOpResultPayload, 'type'>
+): void {
+  ctx.sendToRenderer({ type: 'opResult', ...payload } satisfies SftpOpResultPayload)
+}
+
 async function resolveCwd(ctx: PluginMainContext, state: SessionState): Promise<string> {
   try {
     const pwd = (await ctx.execCapture('pwd')).trim()
@@ -176,11 +124,20 @@ async function handleList(
   state: SessionState,
   path?: string
 ): Promise<void> {
+  const target = path && path.trim() !== '' ? path.trim() : state.cwd || '/'
   const sftp = state.sftp
   if (!sftp) {
+    ctx.sendToRenderer({
+      type: 'listResult',
+      path: target,
+      cwd: state.cwd || '/',
+      entries: [],
+      error: 'SFTP session is not connected',
+      errorKind: 'connection'
+    } satisfies SftpListPayload)
     return
   }
-  const target = path && path.trim() !== '' ? path.trim() : state.cwd || '/'
+
   try {
     const entries = await sftp.list(target)
     ctx.sendToRenderer({
@@ -202,145 +159,29 @@ async function handleList(
   }
 }
 
-/**
- * Total-Commander-style sniff: text when no unprintable control bytes appear
- * in the fetched bytes (tab, LF, FF and CR are tolerated). High-bit bytes are
- * allowed so UTF-8 / latin-1 text stays readable.
- */
-function isLikelyTextView(buf: Buffer): boolean {
-  for (const b of buf) {
-    if (b === 0x09 || b === 0x0a || b === 0x0c || b === 0x0d) {
-      continue
-    }
-    if (b < 0x20 || b === 0x7f) {
-      return false
-    }
-  }
-  return true
+function opSubject(payload: SftpOpMessage): string {
+  return payload.type === 'rename' ? payload.newPath : payload.path
 }
-
-/** Best-effort text decode: UTF-8 when valid, otherwise byte-per-char (latin-1). */
-function decodeViewText(buf: Buffer): string {
-  try {
-    const utf8 = buf.toString('utf8')
-    if (Buffer.from(utf8, 'utf8').equals(buf)) {
-      return utf8
-    }
-  } catch {
-    /* fall through to single-byte decode */
-  }
-  return buf.toString('latin1')
-}
-
-/** Read up to SFTP_VIEW_MAX_BYTES from a remote file; cut the stream at the cap. */
-function readViewBytes(sftp: SftpSession, path: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const remote = sftp.createReadStream(path)
-    const chunks: Buffer[] = []
-    let received = 0
-    let settled = false
-    const finish = (err?: Error): void => {
-      if (settled) {
-        return
-      }
-      settled = true
-      try {
-        remote.destroy()
-      } catch {
-        /* ignore */
-      }
-      if (err) {
-        reject(classifySftpError(err))
-      } else {
-        resolve(Buffer.concat(chunks, received))
-      }
-    }
-    remote.on('error', (err: Error) => finish(err))
-    remote.on('end', () => finish())
-    remote.on('data', (chunk: Buffer) => {
-      if (settled) {
-        return
-      }
-      const remaining = SFTP_VIEW_MAX_BYTES - received
-      const take = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)
-      chunks.push(take)
-      received += take.length
-      if (received >= SFTP_VIEW_MAX_BYTES) {
-        finish()
-      }
-    })
-  })
-}
-
-async function handleViewFile(ctx: PluginMainContext, state: SessionState, path: string): Promise<void> {
-  const sftp = state.sftp
-  if (!sftp) {
-    return
-  }
-  let totalBytes = 0
-  try {
-    totalBytes = (await sftp.stat(path)).size
-  } catch {
-    totalBytes = 0
-  }
-
-  let buf: Buffer
-  try {
-    buf = await readViewBytes(sftp, path)
-  } catch (err) {
-    const e = classifySftpError(err)
-    ctx.sendToRenderer({
-      type: 'viewFileResult',
-      path,
-      ok: false,
-      bytesRead: 0,
-      truncated: false,
-      error: e.message,
-      errorKind: e.kind
-    } satisfies SftpViewFilePayload)
-    return
-  }
-
-  const truncated =
-    totalBytes > 0 ? buf.length < totalBytes : buf.length >= SFTP_VIEW_MAX_BYTES
-  if (isLikelyTextView(buf)) {
-    ctx.sendToRenderer({
-      type: 'viewFileResult',
-      path,
-      ok: true,
-      kind: 'text',
-      text: decodeViewText(buf),
-      bytesRead: buf.length,
-      totalBytes,
-      truncated
-    } satisfies SftpViewFilePayload)
-  } else {
-    ctx.sendToRenderer({
-      type: 'viewFileResult',
-      path,
-      ok: true,
-      kind: 'binary',
-      contentBase64: buf.toString('base64'),
-      bytesRead: buf.length,
-      totalBytes,
-      truncated
-    } satisfies SftpViewFilePayload)
-  }
-}
-
-type SftpOpMessage = Extract<SftpRendererMessage, { type: 'mkdir' | 'rename' | 'chmod' | 'delete' }>
 
 async function runOp(
   ctx: PluginMainContext,
   state: SessionState,
   payload: SftpOpMessage
 ): Promise<void> {
+  const op = payload.type
+  const subject = opSubject(payload)
   const sftp = state.sftp
   if (!sftp) {
+    sendOpResult(ctx, {
+      op,
+      path: subject,
+      ok: false,
+      error: 'SFTP session is not connected',
+      errorKind: 'connection'
+    })
     return
   }
-  const op = payload.type
-  const subject = op === 'rename' ? payload.newPath : payload.path
+
   try {
     switch (op) {
       case 'mkdir':
@@ -356,749 +197,56 @@ async function runOp(
         await sftp.delete(payload.path)
         break
     }
-    ctx.sendToRenderer({
-      type: 'opResult',
-      op,
-      path: subject,
-      ok: true
-    } satisfies SftpOpResultPayload)
+    sendOpResult(ctx, { op, path: subject, ok: true })
   } catch (err) {
     const e = classifySftpError(err)
-    ctx.sendToRenderer({
-      type: 'opResult',
+    sendOpResult(ctx, {
       op,
       path: subject,
       ok: false,
       error: e.message,
       errorKind: e.kind
-    } satisfies SftpOpResultPayload)
-  }
-}
-
-async function handleDownload(ctx: PluginMainContext, state: SessionState, path: string): Promise<void> {
-  const sftp = state.sftp
-  if (!sftp) {
-    return
-  }
-
-  if (state.download && !state.download.done) {
-    return
-  }
-  const opts: SaveDialogOptions = {
-    title: 'Save downloaded file',
-    defaultPath: basename(path),
-    buttonLabel: 'Download'
-  }
-  const win = focusedWindow()
-  const result = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts)
-  if (result.canceled || !result.filePath) {
-    ctx.sendToRenderer({
-      type: 'transferDone',
-      direction: 'download',
-      remotePath: path,
-      state: 'cancelled'
-    } satisfies SftpTransferDonePayload)
-    return
-  }
-
-  let total = 0
-  try {
-    const stats = await sftp.stat(path)
-    total = stats.size
-  } catch {
-    total = 0
-  }
-
-  const localPath = result.filePath
-  const remote = sftp.createReadStream(path)
-  const local = fsCreateWriteStream(localPath)
-  const dl: DownloadState = {
-    cancelled: false,
-    done: false,
-    remotePath: path,
-    localPath,
-    remote,
-    local,
-    transferred: 0
-  }
-  state.download = dl
-
-  const outcome = await new Promise<{ state: 'done' | 'error' | 'cancelled'; error?: SftpError }>(
-    (resolve) => {
-      let settled = false
-      const settle = (
-        s: 'done' | 'error' | 'cancelled',
-        error?: SftpError
-      ): void => {
-        if (settled) {
-          return
-        }
-        settled = true
-        resolve({ state: s, error })
-      }
-
-      remote.on('error', (err: Error) => settle('error', classifySftpError(err)))
-      local.on('error', (err: Error) =>
-        settle(dl.cancelled ? 'cancelled' : 'error', dl.cancelled ? undefined : classifySftpError(err))
-      )
-      remote.on('data', (chunk: Buffer) => {
-        if (dl.cancelled) {
-          return
-        }
-        dl.transferred += chunk.length
-        ctx.sendToRenderer({
-          type: 'transferProgress',
-          direction: 'download',
-          remotePath: path,
-          transferredBytes: dl.transferred,
-          totalBytes: total
-        } satisfies SftpTransferProgressPayload)
-        if (!local.write(chunk)) {
-          remote.pause()
-          local.once('drain', () => {
-            if (!dl.cancelled) {
-              remote.resume()
-            }
-          })
-        }
-      })
-      remote.on('end', () => {
-        local.end(() => settle(dl.cancelled ? 'cancelled' : 'done'))
-      })
-      remote.on('close', () => {
-        if (dl.cancelled) {
-          settle('cancelled')
-        }
-      })
-    }
-  )
-
-  dl.done = true
-  state.download = null
-  if (outcome.state === 'error') {
-    try {
-      fsUnlink(localPath, () => {
-        /* ignore */
-      })
-    } catch {
-      /* ignore */
-    }
-  }
-  ctx.sendToRenderer({
-    type: 'transferDone',
-    direction: 'download',
-    remotePath: path,
-    state: outcome.state,
-    error: outcome.error?.message,
-    errorKind: outcome.error?.kind
-  } satisfies SftpTransferDonePayload)
-}
-
-const ARCHIVE_EMPTY_SIZE = 0
-const ARCHIVE_ROOT_MTIME = 0
-
-interface ArchiveEntry {
-  remotePath: string
-  archivePath: string
-  size: number
-  mtime: number
-  mode: number
-  directory: boolean
-}
-
-function archiveRootName(path: string): string {
-  return basename(path.replace(/\/+$/, '')) || 'archive'
-}
-
-async function collectArchiveEntries(
-  sftp: SftpSession,
-  remotePath: string,
-  archivePath: string
-): Promise<ArchiveEntry[]> {
-  const entries: ArchiveEntry[] = [
-    {
-      remotePath,
-      archivePath: `${archivePath}/`,
-      size: ARCHIVE_EMPTY_SIZE,
-      mtime: ARCHIVE_ROOT_MTIME,
-      mode: ARCHIVE_EMPTY_SIZE,
-      directory: true
-    }
-  ]
-  for (const child of await sftp.list(remotePath)) {
-    if (child.type === 'symlink' || child.type === 'other') {
-      continue
-    }
-    const childArchivePath = `${archivePath}/${child.name}`
-    if (child.type === 'directory') {
-      entries.push(...(await collectArchiveEntries(sftp, child.path, childArchivePath)))
-    } else {
-      entries.push({
-        remotePath: child.path,
-        archivePath: childArchivePath,
-        size: child.size,
-        mtime: child.mtime,
-        mode: child.mode,
-        directory: false
-      })
-    }
-  }
-  return entries
-}
-
-async function handleDownloadZip(
-  ctx: PluginMainContext,
-  state: SessionState,
-  path: string
-): Promise<void> {
-  const sftp = state.sftp
-  if (!sftp || (state.download && !state.download.done)) {
-    return
-  }
-  const rootName = archiveRootName(path)
-  const opts: SaveDialogOptions = {
-    title: 'Save folder as ZIP',
-    defaultPath: `${rootName}.zip`,
-    buttonLabel: 'Download',
-    filters: [{ name: 'ZIP archive (*.zip)', extensions: ['zip'] }]
-  }
-  const win = focusedWindow()
-  const result = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts)
-  if (result.canceled || !result.filePath) {
-    ctx.sendToRenderer({
-      type: 'transferDone',
-      direction: 'download-zip',
-      remotePath: path,
-      state: 'cancelled'
-    } satisfies SftpTransferDonePayload)
-    return
-  }
-
-  const local = fsCreateWriteStream(result.filePath)
-  const archive = new ZipFile()
-  const download: DownloadState = {
-    cancelled: false,
-    done: false,
-    remotePath: path,
-    localPath: result.filePath,
-    remote: null,
-    local,
-    transferred: ARCHIVE_EMPTY_SIZE,
-    archive
-  }
-  state.download = download
-
-  let outcome: 'done' | 'error' | 'cancelled' = 'done'
-  let error: SftpError | undefined
-  try {
-    const entries = await collectArchiveEntries(sftp, path, rootName)
-    const totalBytes = entries.reduce((total, entry) => total + entry.size, ARCHIVE_EMPTY_SIZE)
-    const archiveDone = new Promise<void>((resolve, reject) => {
-      archive.on('error', reject)
-      local.on('error', reject)
-      local.on('finish', resolve)
     })
-    archive.outputStream.pipe(local)
-
-    for (const entry of entries) {
-      if (entry.directory) {
-        archive.addEmptyDirectory(entry.archivePath, {
-          mtime: entry.mtime > 0 ? new Date(entry.mtime) : new Date(),
-          mode: entry.mode > 0 ? entry.mode : undefined
-        })
-      } else {
-        archive.addReadStreamLazy(
-          entry.archivePath,
-          {
-            size: entry.size,
-            mtime: entry.mtime > 0 ? new Date(entry.mtime) : new Date(),
-            mode: entry.mode > 0 ? entry.mode : undefined
-          },
-          (cb) => {
-            if (download.cancelled) {
-              cb(new Error('Transfer cancelled'), null as unknown as SftpReadStream)
-              return
-            }
-            const remote = sftp.createReadStream(entry.remotePath)
-            download.remote = remote
-            remote.on('error', (err: Error) => {
-              archive.emit('error', err)
-            })
-            remote.on('data', (chunk: Buffer) => {
-              if (download.cancelled) {
-                return
-              }
-              download.transferred += chunk.length
-              ctx.sendToRenderer({
-                type: 'transferProgress',
-                direction: 'download-zip',
-                remotePath: path,
-                transferredBytes: download.transferred,
-                totalBytes
-              } satisfies SftpTransferProgressPayload)
-            })
-            cb(null, remote)
-          }
-        )
-      }
-    }
-
-    archive.end()
-    await archiveDone
-  } catch (err) {
-    outcome = download.cancelled ? 'cancelled' : 'error'
-    if (outcome === 'error') {
-      error = classifySftpError(err)
-    }
-  }
-
-  download.done = true
-  state.download = null
-  if (outcome !== 'done') {
-    try {
-      download.remote?.destroy()
-    } catch {
-      /* ignore */
-    }
-    try {
-      download.local.destroy()
-    } catch {
-      /* ignore */
-    }
-    fsUnlink(download.localPath, () => {
-      /* ignore */
-    })
-  }
-  ctx.sendToRenderer({
-    type: 'transferDone',
-    direction: 'download-zip',
-    remotePath: path,
-    state: outcome,
-    error: error?.message,
-    errorKind: error?.kind
-  } satisfies SftpTransferDonePayload)
-}
-
-async function uploadFile(
-  ctx: PluginMainContext,
-  state: SessionState,
-  localPath: string,
-  targetDir: string
-): Promise<boolean> {
-  const sftp = state.sftp
-  if (!sftp) {
-    return false
-  }
-  if (state.upload && !state.upload.done) {
-    return false
-  }
-  let size = 0
-  try {
-    size = fsStatSync(localPath).size
-  } catch {
-    size = 0
-  }
-  const name = basename(localPath)
-  const remotePath = joinRemotePath(targetDir, name)
-  const remote = sftp.createWriteStream(remotePath)
-  const local = fsCreateReadStream(localPath)
-  const up: UploadState = {
-    cancelled: false,
-    done: false,
-    remotePath,
-    localPath,
-    remote,
-    local,
-    transferred: 0
-  }
-  state.upload = up
-
-  const outcome = await new Promise<{ state: 'done' | 'error' | 'cancelled'; error?: SftpError }>(
-    (resolve) => {
-      let settled = false
-      const settle = (
-        s: 'done' | 'error' | 'cancelled',
-        error?: SftpError
-      ): void => {
-        if (settled) {
-          return
-        }
-        settled = true
-        resolve({ state: s, error })
-      }
-
-      local.on('error', (err: Error) => settle('error', classifySftpError(err)))
-      remote.on('error', (err: Error) =>
-        settle(up.cancelled ? 'cancelled' : 'error', up.cancelled ? undefined : classifySftpError(err))
-      )
-      local.on('data', (chunk: Buffer) => {
-        if (up.cancelled) {
-          return
-        }
-        up.transferred += chunk.length
-        ctx.sendToRenderer({
-          type: 'transferProgress',
-          direction: 'upload',
-          remotePath,
-          transferredBytes: up.transferred,
-          totalBytes: size
-        } satisfies SftpTransferProgressPayload)
-        if (!remote.write(chunk)) {
-          local.pause()
-          remote.once('drain', () => {
-            if (!up.cancelled) {
-              local.resume()
-            }
-          })
-        }
-      })
-      local.on('end', () => {
-        remote.end(() => settle(up.cancelled ? 'cancelled' : 'done'))
-      })
-      remote.on('close', () => {
-        if (up.cancelled) {
-          settle('cancelled')
-        }
-      })
-    }
-  )
-
-  up.done = true
-  state.upload = null
-  ctx.sendToRenderer({
-    type: 'transferDone',
-    direction: 'upload',
-    remotePath,
-    state: outcome.state,
-    error: outcome.error?.message,
-    errorKind: outcome.error?.kind
-  } satisfies SftpTransferDonePayload)
-  return outcome.state === 'done'
-}
-
-async function handleUploadDialog(
-  ctx: PluginMainContext,
-  state: SessionState,
-  path?: string
-): Promise<number> {
-  const sftp = state.sftp
-  if (!sftp) {
-    return 0
-  }
-  const opts: OpenDialogOptions = {
-    title: 'Upload files',
-    properties: ['openFile', 'multiSelections'],
-    buttonLabel: 'Upload'
-  }
-  const win = focusedWindow()
-  const result = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
-  if (result.canceled || result.filePaths.length === 0) {
-    return 0
-  }
-  const targetDir = path && path.trim() !== '' ? path.trim() : state.cwd || '/'
-  let uploaded = 0
-  for (const localPath of result.filePaths) {
-    if (state.stopped) {
-      break
-    }
-    if (await uploadFile(ctx, state, localPath, targetDir)) {
-      uploaded += 1
-    }
-  }
-  return uploaded
-}
-
-async function handleChunkUploadStart(
-  ctx: PluginMainContext,
-  state: SessionState,
-  payload: { name: string; size: number; path?: string }
-): Promise<void> {
-  const sftp = state.sftp
-  if (!sftp) {
-    return
-  }
-  const existing = state.chunkUpload
-  if (existing && !existing.done && !existing.cancelled) {
-    // A previous chunk upload never finished (interrupted flow / write error).
-    // Tear it down so this fresh start is never silently ignored.
-    existing.cancelled = true
-    try {
-      existing.write?.destroy()
-    } catch {
-      /* ignore */
-    }
-  }
-  const targetDir =
-    payload.path && payload.path.trim() !== '' ? payload.path.trim() : state.cwd || '/tmp'
-  const remotePath = joinRemotePath(targetDir, payload.name)
-  // autoClose:false keeps the remote handle open after end() so finalize can
-  // close it explicitly and wait for the server's reply (see handleChunkUploadEnd).
-  const write = sftp.createWriteStream(remotePath, { autoClose: false })
-  const cu: ChunkUploadState = {
-    cancelled: false,
-    done: false,
-    name: payload.name,
-    remotePath,
-    total: payload.size,
-    received: 0,
-    write,
-    queue: Promise.resolve()
-  }
-  write.on('error', (err: Error) => {
-    if (cu.done || cu.cancelled) {
-      return
-    }
-    cu.cancelled = true
-    if (state.chunkUpload === cu) {
-      state.chunkUpload = null
-    }
-    try {
-      write.destroy()
-    } catch {
-      /* ignore */
-    }
-    const e = classifySftpError(err)
-    ctx.sendToRenderer({
-      type: 'transferDone',
-      direction: 'upload',
-      remotePath,
-      state: 'error',
-      error: e.message,
-      errorKind: e.kind
-    } satisfies SftpTransferDonePayload)
-  })
-  state.chunkUpload = cu
-  ctx.sendToRenderer({
-    type: 'transferProgress',
-    direction: 'upload',
-    remotePath,
-    transferredBytes: 0,
-    totalBytes: payload.size
-  } satisfies SftpTransferProgressPayload)
-}
-
-async function handleChunkUploadChunk(
-  ctx: PluginMainContext,
-  state: SessionState,
-  data: Uint8Array
-): Promise<void> {
-  const cu = state.chunkUpload
-  if (!cu || cu.cancelled || cu.done) {
-    return
-  }
-  const buf = Buffer.from(data)
-  const prev = cu.queue
-  cu.queue = prev
-    .catch(() => {
-      /* continue after prior error */
-    })
-    .then(async () => {
-      if (cu.cancelled || cu.done || !cu.write) {
-        return
-      }
-      if (!cu.write.write(buf)) {
-        await once(cu.write, 'drain')
-        if (cu.cancelled || cu.done || !cu.write) {
-          return
-        }
-      }
-      cu.received += buf.length
-      ctx.sendToRenderer({
-        type: 'transferProgress',
-        direction: 'upload',
-        remotePath: cu.remotePath,
-        transferredBytes: cu.received,
-        totalBytes: cu.total
-      } satisfies SftpTransferProgressPayload)
-    })
-  await prev.catch(() => {
-    /* ignore */
-  })
-}
-
-async function handleChunkUploadEnd(ctx: PluginMainContext, state: SessionState): Promise<void> {
-  const cu = state.chunkUpload
-  if (!cu || cu.cancelled) {
-    return
-  }
-  const write = cu.write
-  const sftp = state.sftp
-  const prev = cu.queue
-  cu.queue = prev
-    .catch(() => {
-      /* continue after prior error */
-    })
-    .then(async () => {
-      if (!write || cu.done) {
-        return
-      }
-      await new Promise<void>((resolve) => {
-        write.end(() => resolve())
-      })
-      if (cu.cancelled) {
-        return
-      }
-      // ssh2's WriteStream auto-close does not wait for the server to finish
-      // closing the file, so a follow-up listing can race the close and miss
-      // the new file. Close the handle explicitly and wait for the reply
-      // before signalling the transfer as done.
-      const handle = (write as unknown as { handle?: Buffer | null }).handle
-      if (sftp && handle) {
-        try {
-          await sftp.close(handle)
-        } catch (err) {
-          if (cu.cancelled) {
-            return
-          }
-          const e = classifySftpError(err)
-          cu.cancelled = true
-          if (state.chunkUpload === cu) {
-            state.chunkUpload = null
-          }
-          ctx.sendToRenderer({
-            type: 'transferDone',
-            direction: 'upload',
-            remotePath: cu.remotePath,
-            state: 'error',
-            error: e.message,
-            errorKind: e.kind
-          } satisfies SftpTransferDonePayload)
-          return
-        }
-        // Already closed remotely; make sure a later destroy() does not try a
-        // second remote close.
-        ;(write as unknown as { handle?: Buffer | null }).handle = null
-      }
-      try {
-        write.destroy()
-      } catch {
-        /* ignore */
-      }
-      if (cu.cancelled) {
-        return
-      }
-      cu.done = true
-      ctx.sendToRenderer({
-        type: 'transferDone',
-        direction: 'upload',
-        remotePath: cu.remotePath,
-        state: 'done'
-      } satisfies SftpTransferDonePayload)
-    })
-  await cu.queue.catch(() => {
-    /* ignore */
-  })
-  state.chunkUpload = null
-}
-
-function cancelDownload(state: SessionState): void {
-  const dl = state.download
-  if (!dl) {
-    return
-  }
-  dl.cancelled = true
-  try {
-    dl.remote?.destroy()
-  } catch {
-    /* ignore */
-  }
-  try {
-    dl.local.destroy()
-  } catch {
-    /* ignore */
-  }
-}
-
-function cancelUpload(state: SessionState): void {
-  const up = state.upload
-  if (!up) {
-    return
-  }
-  up.cancelled = true
-  try {
-    up.local.destroy()
-  } catch {
-    /* ignore */
-  }
-  try {
-    up.remote.destroy()
-  } catch {
-    /* ignore */
-  }
-}
-
-function handleCancel(state: SessionState): void {
-  cancelDownload(state)
-  cancelUpload(state)
-  const cu = state.chunkUpload
-  if (cu) {
-    cu.cancelled = true
-    try {
-      cu.write?.destroy()
-    } catch {
-      /* ignore */
-    }
   }
 }
 
 async function handleResetCwd(ctx: PluginMainContext, state: SessionState): Promise<void> {
-  const sftp = state.sftp
-  if (!sftp) {
+  if (!state.sftp) {
+    sendStatus(ctx, {
+      state: 'error',
+      reason: 'SFTP session is not connected',
+      errorKind: 'connection'
+    })
     return
   }
   try {
     state.cwd = await resolveCwd(ctx, state)
     state.error = null
     state.errorKind = null
-    ctx.sendToRenderer({
-      type: 'status',
-      state: 'connected',
-      cwd: state.cwd
-    } satisfies SftpStatusPayload)
+    sendStatus(ctx, { state: 'connected', cwd: state.cwd })
   } catch (err) {
     const e = classifySftpError(err)
     state.error = e.message
     state.errorKind = e.kind
-    ctx.sendToRenderer({
-      type: 'status',
-      state: 'error',
-      reason: e.message,
-      errorKind: e.kind
-    } satisfies SftpStatusPayload)
+    sendStatus(ctx, { state: 'error', reason: e.message, errorKind: e.kind })
   }
 }
 
-/** Replay the latest connection status for a late-mounting view. */
 function handleGetStatus(ctx: PluginMainContext, state: SessionState): void {
   if (state.sftp) {
-    ctx.sendToRenderer({
-      type: 'status',
-      state: 'connected',
-      cwd: state.cwd || '/'
-    } satisfies SftpStatusPayload)
+    sendStatus(ctx, { state: 'connected', cwd: state.cwd || '/' })
     return
   }
-  ctx.sendToRenderer({
-    type: 'status',
+  sendStatus(ctx, {
     state: 'error',
     reason: state.error || 'SFTP session is not connected',
     errorKind: state.errorKind || 'other'
-  } satisfies SftpStatusPayload)
+  })
 }
 
 function teardown(state: SessionState): void {
   state.stopped = true
-  cancelDownload(state)
-  cancelUpload(state)
-  const cu = state.chunkUpload
-  if (cu) {
-    cu.cancelled = true
-    try {
-      cu.write?.destroy()
-    } catch {
-      /* ignore */
-    }
-  }
+  cancelTransfers(state)
   try {
     state.sftp?.end()
   } catch {
@@ -1132,7 +280,7 @@ async function handleMessage(
       await handleDownloadZip(ctx, state, payload.path)
       break
     case 'viewFile':
-      await handleViewFile(ctx, state, payload.path)
+      await handleViewFile(ctx, state.sftp, payload.path)
       break
     case 'uploadDialog':
       return handleUploadDialog(ctx, state, payload.path)
@@ -1146,7 +294,7 @@ async function handleMessage(
       await handleChunkUploadEnd(ctx, state)
       break
     case 'cancel':
-      handleCancel(state)
+      cancelTransfers(state)
       break
     case 'resetCwd':
       await handleResetCwd(ctx, state)
@@ -1177,19 +325,15 @@ export const sftpMain: PluginMainModule = {
     if (!ctx.isSshSession()) {
       state.error = 'SFTP requires an SSH session'
       state.errorKind = 'not_ssh'
-      ctx.sendToRenderer({
-        type: 'status',
+      sendStatus(ctx, {
         state: 'error',
         errorKind: 'not_ssh',
         reason: 'SFTP requires an SSH session'
-      } satisfies SftpStatusPayload)
+      })
       return
     }
 
-    ctx.sendToRenderer({
-      type: 'status',
-      state: 'connecting'
-    } satisfies SftpStatusPayload)
+    sendStatus(ctx, { state: 'connecting' })
 
     try {
       const sftp = await ctx.openSftp()
@@ -1202,21 +346,12 @@ export const sftpMain: PluginMainModule = {
       state.cwd = await resolveCwd(ctx, state)
       state.error = null
       state.errorKind = null
-      ctx.sendToRenderer({
-        type: 'status',
-        state: 'connected',
-        cwd: state.cwd
-      } satisfies SftpStatusPayload)
+      sendStatus(ctx, { state: 'connected', cwd: state.cwd })
     } catch (err) {
       const e = classifySftpError(err)
       state.error = e.message
       state.errorKind = e.kind
-      ctx.sendToRenderer({
-        type: 'status',
-        state: 'error',
-        reason: e.message,
-        errorKind: e.kind
-      } satisfies SftpStatusPayload)
+      sendStatus(ctx, { state: 'error', reason: e.message, errorKind: e.kind })
     }
   },
 
