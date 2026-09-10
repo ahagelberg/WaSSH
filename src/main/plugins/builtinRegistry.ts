@@ -42,17 +42,20 @@ const externalApiFields = OTHER_MANIFESTS.filter(
   (m) => (m.contributes.api?.methods.length ?? 0) > 0
 ).map((m) => buildExternalApiPermissionField(m.id, m.name, m.contributes.api!.methods))
 
+const appendExternalApiFields = (
+  schema: PluginManifest['contributes']['settingsSchema']
+): NonNullable<PluginManifest['contributes']['settingsSchema']> =>
+  appendGroupChildren(schema ?? [], AI_AGENT_PERMISSIONS_ROOT_KEY, externalApiFields)
+
 // Nest every other plugin's API group as a child of AI Agent's own root
-// "Permissions" group, so its single master toggle also gates them.
+// "Permissions" group in both app and host/session settings. This is built
+// from loaded manifests and does not depend on any plugin being active.
 const aiAgentManifestWithExternalApis: PluginManifest = {
   ...aiAgentManifest,
   contributes: {
     ...aiAgentManifest.contributes,
-    settingsSchema: appendGroupChildren(
-      aiAgentManifest.contributes.settingsSchema ?? [],
-      AI_AGENT_PERMISSIONS_ROOT_KEY,
-      externalApiFields
-    )
+    settingsSchema: appendExternalApiFields(aiAgentManifest.contributes.settingsSchema),
+    hostSettingsSchema: appendExternalApiFields(aiAgentManifest.contributes.hostSettingsSchema)
   }
 }
 
@@ -86,4 +89,3 @@ export const BUILTIN_PLUGIN_DEFINITIONS: BuiltinPluginDefinition[] = [
 
 export const BUILTIN_MANIFESTS = BUILTIN_PLUGIN_DEFINITIONS.map(({ manifest }) => manifest)
 export const DEFAULT_ENABLED_PLUGIN_IDS = BUILTIN_MANIFESTS.map(({ id }) => id)
-
