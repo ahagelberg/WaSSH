@@ -234,6 +234,14 @@ export const SERVER_MONITOR_PROCESS_SORT_KEYS: ServerMonitorProcessSort[] = [
   'command'
 ]
 
+export function isServerMonitorProcessSort(value: unknown): value is ServerMonitorProcessSort {
+  return typeof value === 'string' && SERVER_MONITOR_PROCESS_SORT_KEYS.some((key) => key === value)
+}
+
+export function isServerMonitorProcessSignal(value: unknown): value is ServerMonitorProcessSignal {
+  return value === 'TERM' || value === 'KILL'
+}
+
 /** One row from remote `ps` */
 export interface ServerMonitorProcess {
   pid: number
@@ -314,6 +322,57 @@ export interface ServerMonitorSnapshot {
   processes: ServerMonitorProcess[]
   network: ServerMonitorNetIface[]
   error?: string
+}
+
+/** `plugin:message` push from the server-monitor main module to its view */
+export interface ServerMonitorStatsEvent {
+  type: 'stats'
+  snapshot: ServerMonitorSnapshot
+}
+
+export function isServerMonitorStatsEvent(value: unknown): value is ServerMonitorStatsEvent {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const { type, snapshot } = value as Partial<ServerMonitorStatsEvent>
+  return type === 'stats' && typeof snapshot === 'object' && snapshot !== null
+}
+
+/** Discriminant of requests the server-monitor view sends to its main module */
+export type ServerMonitorRendererMessageType = 'refresh' | 'setProcessSort' | 'signalProcess'
+
+/**
+ * Requests the server-monitor view sends via `sendPluginMessage`. Field types
+ * reflect renderer-side intent only — the main module still validates every
+ * field at runtime since the payload crosses the IPC boundary as `unknown`.
+ */
+export type ServerMonitorRendererMessage =
+  | { type: 'refresh' }
+  | { type: 'setProcessSort'; sort: ServerMonitorProcessSort; descending?: boolean }
+  | { type: 'signalProcess'; pid: number; signal: ServerMonitorProcessSignal }
+
+/** Narrows to a message with a recognized `type`; per-field values are still `unknown`. */
+export function isServerMonitorRendererMessageEnvelope(
+  value: unknown
+): value is { type: ServerMonitorRendererMessageType } & Record<string, unknown> {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const type = (value as Record<string, unknown>).type
+  return type === 'refresh' || type === 'setProcessSort' || type === 'signalProcess'
+}
+
+/** Result of a `setProcessSort` / `signalProcess` / `refresh` request */
+export interface ServerMonitorActionResult {
+  ok: boolean
+  error?: string
+}
+
+export function isServerMonitorActionResult(value: unknown): value is ServerMonitorActionResult {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  return typeof (value as Partial<ServerMonitorActionResult>).ok === 'boolean'
 }
 
 /** Default MQTT broker host on the remote machine */

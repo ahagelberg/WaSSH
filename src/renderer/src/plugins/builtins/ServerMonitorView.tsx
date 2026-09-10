@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactElement } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react'
 import type {
   ServerMonitorNetIface,
   ServerMonitorProcess,
@@ -10,6 +10,8 @@ import type {
 import {
   BITS_PER_BYTE,
   BYTES_PER_KIB,
+  isServerMonitorActionResult,
+  isServerMonitorStatsEvent,
   SERVER_MONITOR_MEGABIT_BITS,
   SERVER_MONITOR_PROCESS_SORT_DEFAULT,
   SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,

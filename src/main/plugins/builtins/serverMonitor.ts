@@ -1,14 +1,19 @@
 import type { PluginMainContext, PluginMainModule } from '../PluginHost'
 import type {
+  ServerMonitorActionResult,
   ServerMonitorNetIface,
   ServerMonitorProcess,
   ServerMonitorProcessSignal,
   ServerMonitorProcessSort,
   ServerMonitorSnapshot,
+  ServerMonitorStatsEvent,
   ServerMonitorTemp
 } from '../../../shared/plugins'
 import {
   BYTES_PER_KIB,
+  isServerMonitorProcessSignal,
+  isServerMonitorProcessSort,
+  isServerMonitorRendererMessageEnvelope,
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
   SERVER_MONITOR_DISK_SECTOR_BYTES,
   SERVER_MONITOR_LOOPBACK_IFACE,
@@ -16,7 +21,6 @@ import {
   SERVER_MONITOR_MIN_INTERVAL_MS,
   SERVER_MONITOR_PROCESS_SORT_DEFAULT,
   SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
-  SERVER_MONITOR_PROCESS_SORT_KEYS,
   SERVER_MONITOR_TEMP_MILLI_PER_C,
   SERVER_MONITOR_TOP_PROCESS_COUNT
 } from '../../../shared/plugins'
@@ -88,14 +92,6 @@ interface MonitorSessionState {
   lastProcesses: ServerMonitorProcess[]
   /** Consecutive collapsed-list samples */
   shortSamples: number
-}
-
-interface RendererMessage {
-  type: 'setProcessSort' | 'signalProcess' | 'refresh'
-  sort?: ServerMonitorProcessSort
-  descending?: boolean
-  pid?: number
-  signal?: ServerMonitorProcessSignal
 }
 
 const sessionStates = new Map<string, MonitorSessionState>()
@@ -656,6 +652,53 @@ function parseBsdProcesses(block: string): ServerMonitorProcess[] {
   return rows
 }
 
+/** Fields shared by every sample format (Linux + BSD/macOS META/OS blocks) */
+interface CommonMeta {
+  hostname: string
+  uptimeSec: number
+  load1: number
+  load5: number
+  load15: number
+  procsRunning: number
+  procsTotal: number
+  distro: string
+  kernel: string
+  cpuCount: number
+  ips: string[]
+}
+
+/** Parse the META/OS/IP sections shared verbatim by the Linux and BSD/macOS samples */
+function parseCommonMeta(raw: string): CommonMeta {
+  const meta = section(raw, 'META')
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  const loadParts = (meta[2] || '0 0 0 0/0 0').split(/\s+/)
+  const procs = parseLoadProcs(loadParts[3] || '0/0')
+  return {
+    hostname: meta[0] || 'unknown',
+    uptimeSec: Number(meta[1]) || 0,
+    load1: Number(loadParts[0]) || 0,
+    load5: Number(loadParts[1]) || 0,
+    load15: Number(loadParts[2]) || 0,
+    procsRunning: procs.running,
+    procsTotal: procs.total,
+    distro: parseDistroName(section(raw, 'OS')),
+    kernel: meta[3] || '',
+    cpuCount: Number(meta[4]) || 0,
+    ips: parseIps(section(raw, 'IP'))
+  }
+}
+
+/** Common return shape for the Linux and BSD/macOS sample parsers */
+interface SampleParseResult {
+  snapshot: ServerMonitorSnapshot
+  cpu: CpuJiffies | null
+  cores: CpuJiffies[]
+  net: NetCounters
+  diskIo: DiskIoCounters
+}
+
 /**
  * Assemble a snapshot for macOS/FreeBSD samples. Data not available without
  * root (macOS temps, per-core CPU, disk IO) degrades to empty/null.
@@ -665,26 +708,10 @@ function parseUnixSample(
   family: MonitorFamily,
   prevCpu: CpuJiffies | null,
   prevNet: NetCounters | null
-): {
-  snapshot: ServerMonitorSnapshot
-  cpu: CpuJiffies | null
-  cores: CpuJiffies[]
-  net: NetCounters
-  diskIo: DiskIoCounters
-} {
+): SampleParseResult {
   const now = Date.now()
-  const meta = section(raw, 'META').split(/\n/).map((l) => l.trim()).filter(Boolean)
-  const hostname = meta[0] || 'unknown'
-  const uptimeSec = Number(meta[1]) || 0
-  const loadParts = (meta[2] || '0 0 0 0/0 0').split(/\s+/)
-  const load1 = Number(loadParts[0]) || 0
-  const load5 = Number(loadParts[1]) || 0
-  const load15 = Number(loadParts[2]) || 0
-  const procs = parseLoadProcs(loadParts[3] || '0/0')
-  const distro = parseDistroName(section(raw, 'OS'))
-  const kernel = meta[3] || ''
-  const cpuCount = Number(meta[4]) || 0
-  const ips = parseIps(section(raw, 'IP'))
+  const { hostname, uptimeSec, load1, load5, load15, procsRunning, procsTotal, distro, kernel, cpuCount, ips } =
+    parseCommonMeta(raw)
 
   let cpu: CpuJiffies | null = null
   let cpuPercent: number | null = null
@@ -733,8 +760,8 @@ function parseUnixSample(
       distro,
       kernel,
       cpuCount,
-      procsRunning: procs.running,
-      procsTotal: procs.total,
+      procsRunning,
+      procsTotal,
       cpuPercent,
       cpuCores: [] as Array<number | null>,
       memTotalBytes: memTotal,
@@ -802,26 +829,10 @@ function parseSample(
   prevCores: CpuJiffies[],
   prevNet: NetCounters | null,
   prevDiskIo: DiskIoCounters | null
-): {
-  snapshot: ServerMonitorSnapshot
-  cpu: CpuJiffies | null
-  cores: CpuJiffies[]
-  net: NetCounters
-  diskIo: DiskIoCounters
-} {
+): SampleParseResult {
   const now = Date.now()
-  const meta = section(raw, 'META').split(/\n/).map((l) => l.trim()).filter(Boolean)
-  const hostname = meta[0] || 'unknown'
-  const uptimeSec = Number(meta[1]) || 0
-  const loadParts = (meta[2] || '0 0 0 0/0 0').split(/\s+/)
-  const load1 = Number(loadParts[0]) || 0
-  const load5 = Number(loadParts[1]) || 0
-  const load15 = Number(loadParts[2]) || 0
-  const procs = parseLoadProcs(loadParts[3] || '0/0')
-  const distro = parseDistroName(section(raw, 'OS'))
-  const kernel = meta[3] || ''
-  const cpuCount = Number(meta[4]) || 0
-  const ips = parseIps(section(raw, 'IP'))
+  const { hostname, uptimeSec, load1, load5, load15, procsRunning, procsTotal, distro, kernel, cpuCount, ips } =
+    parseCommonMeta(raw)
 
   const { aggregate: cpu, cores } = parseCpuBlock(section(raw, 'CPU'))
   let cpuPercent: number | null = null
@@ -873,8 +884,8 @@ function parseSample(
       distro,
       kernel,
       cpuCount,
-      procsRunning: procs.running,
-      procsTotal: procs.total,
+      procsRunning,
+      procsTotal,
       cpuPercent,
       cpuCores,
       memTotalBytes: memTotal,
@@ -903,30 +914,11 @@ function isValidPid(pid: unknown): pid is number {
   return typeof pid === 'number' && Number.isInteger(pid) && pid > 0
 }
 
-function isProcessSort(value: unknown): value is ServerMonitorProcessSort {
-  return (
-    typeof value === 'string' &&
-    (SERVER_MONITOR_PROCESS_SORT_KEYS as string[]).includes(value)
-  )
-}
-
-function isProcessSignal(value: unknown): value is ServerMonitorProcessSignal {
-  return value === 'TERM' || value === 'KILL'
-}
-
-function isRendererMessage(payload: unknown): payload is RendererMessage {
-  if (!payload || typeof payload !== 'object') {
-    return false
-  }
-  const type = (payload as { type?: unknown }).type
-  return type === 'setProcessSort' || type === 'signalProcess' || type === 'refresh'
-}
-
 async function signalRemoteProcess(
   ctx: PluginMainContext,
   pid: number,
   signal: ServerMonitorProcessSignal
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<ServerMonitorActionResult> {
   const sig = signal === 'KILL' ? 'KILL' : 'TERM'
   try {
     const out = await ctx.execCapture(
@@ -949,6 +941,109 @@ async function signalRemoteProcess(
     return { ok: false, error: `kill failed (exit ${Number.isFinite(code) ? code : '?'})` }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** Push a stats snapshot to the view (typed wire shape shared with the renderer) */
+function pushStats(ctx: PluginMainContext, snapshot: ServerMonitorSnapshot): void {
+  const event: ServerMonitorStatsEvent = { type: 'stats', snapshot }
+  ctx.sendToRenderer(event)
+}
+
+/**
+ * Run one `ssh-exec` sample: open a side connection, buffer its output until
+ * the remote command exits (connection closes) or `EXEC_WAIT_MS` elapses,
+ * then close it and resolve with everything captured.
+ */
+async function runExecSample(ctx: PluginMainContext, command: string): Promise<string> {
+  const connectionId = await ctx.openSideConnection({ kind: 'ssh-exec', command })
+  let buf = ''
+  const offData = ctx.onSideData(connectionId, (chunk) => {
+    buf += chunk
+  })
+  await new Promise<void>((resolve) => {
+    const finish = (): void => resolve()
+    const offClose = ctx.onSideClosed(connectionId, () => {
+      offClose()
+      finish()
+    })
+    setTimeout(() => {
+      offClose()
+      ctx.closeSideConnection(connectionId)
+      finish()
+    }, EXEC_WAIT_MS)
+  })
+  offData()
+  return buf
+}
+
+/**
+ * A sample that comes back with far fewer process rows than the last full
+ * list is usually a cut/partial `ps` output; hold the stable list briefly so
+ * the table does not jump between sizes every poll.
+ */
+function stabilizeProcessList(
+  state: MonitorSessionState,
+  sampledProcs: ServerMonitorProcess[]
+): ServerMonitorProcess[] {
+  const lastProcs = state.lastProcesses
+  let procs = sampledProcs
+  if (lastProcs.length >= PROC_LIST_STABLE_MIN && sampledProcs.length * 2 < lastProcs.length) {
+    state.shortSamples += 1
+    if (state.shortSamples <= PROC_LIST_STALE_LIMIT) {
+      procs = lastProcs
+    } else {
+      state.shortSamples = 0
+    }
+  } else {
+    state.shortSamples = 0
+  }
+  state.lastProcesses = procs
+  return procs
+}
+
+/** One poll cycle: sample the remote host, update deltas, and push a snapshot. */
+async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): Promise<void> {
+  if (state.busy || state.stopped) {
+    return
+  }
+  state.busy = true
+  try {
+    const buf = await runExecSample(
+      ctx,
+      buildSampleCommand(state.family, state.processSort, state.processSortDesc)
+    )
+
+    // The first sample may have run the Linux command against a BSD/macOS
+    // host; switch family and clear cross-family deltas for the next poll.
+    const family = detectFamilyFromSample(buf)
+    if (family !== state.family) {
+      state.family = family
+      state.prevCpu = null
+      state.prevCores = []
+      state.prevNet = null
+      state.prevDiskIo = null
+    }
+
+    const parsed =
+      family === 'linux'
+        ? parseSample(buf, state.prevCpu, state.prevCores, state.prevNet, state.prevDiskIo)
+        : parseUnixSample(buf, family, state.prevCpu, state.prevNet)
+    if (parsed.cpu) {
+      state.prevCpu = parsed.cpu
+    }
+    state.prevCores = parsed.cores
+    state.prevNet = parsed.net
+    state.prevDiskIo = parsed.diskIo
+
+    parsed.snapshot.processes = stabilizeProcessList(state, parsed.snapshot.processes)
+
+    pushStats(ctx, parsed.snapshot)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    pushStats(ctx, emptySnapshot({ error: message }))
+  } finally {
+    state.busy = false
   }
 }
 
@@ -986,93 +1081,7 @@ export const serverMonitorMain: PluginMainModule = {
       intervalMs: parseInterval(ctx.getSettings()),
       poll: async () => undefined
     }
-
-    state.poll = async (): Promise<void> => {
-      if (state.busy || state.stopped) {
-        return
-      }
-      state.busy = true
-      try {
-        const connectionId = await ctx.openSideConnection({
-          kind: 'ssh-exec',
-          command: buildSampleCommand(state.family, state.processSort, state.processSortDesc)
-        })
-        let buf = ''
-        const offData = ctx.onSideData(connectionId, (chunk) => {
-          buf += chunk
-        })
-        await new Promise<void>((resolve) => {
-          const finish = (): void => resolve()
-          const offClose = ctx.onSideClosed(connectionId, () => {
-            offClose()
-            finish()
-          })
-          setTimeout(() => {
-            offClose()
-            ctx.closeSideConnection(connectionId)
-            finish()
-          }, EXEC_WAIT_MS)
-        })
-        offData()
-
-        // The first sample may have run the Linux command against a BSD/macOS
-        // host; switch family and clear cross-family deltas for the next poll.
-        const family = detectFamilyFromSample(buf)
-        if (family !== state.family) {
-          state.family = family
-          state.prevCpu = null
-          state.prevCores = []
-          state.prevNet = null
-          state.prevDiskIo = null
-        }
-
-        const parsed =
-          family === 'linux'
-            ? parseSample(buf, state.prevCpu, state.prevCores, state.prevNet, state.prevDiskIo)
-            : parseUnixSample(buf, family, state.prevCpu, state.prevNet)
-        if (parsed.cpu) {
-          state.prevCpu = parsed.cpu
-        }
-        state.prevCores = parsed.cores
-        state.prevNet = parsed.net
-        state.prevDiskIo = parsed.diskIo
-
-        // A sample that comes back with far fewer process rows than the last full
-        // list is usually a cut/partial ps output; hold the stable list briefly so
-        // the table does not jump between sizes every poll.
-        const lastProcs = state.lastProcesses
-        const sampledProcs = parsed.snapshot.processes
-        let procs = sampledProcs
-        if (
-          lastProcs.length >= PROC_LIST_STABLE_MIN &&
-          sampledProcs.length * 2 < lastProcs.length
-        ) {
-          state.shortSamples += 1
-          if (state.shortSamples <= PROC_LIST_STALE_LIMIT) {
-            procs = lastProcs
-          } else {
-            state.shortSamples = 0
-          }
-        } else {
-          state.shortSamples = 0
-        }
-        state.lastProcesses = procs
-        parsed.snapshot.processes = procs
-
-        ctx.sendToRenderer({
-          type: 'stats',
-          snapshot: parsed.snapshot
-        })
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        ctx.sendToRenderer({
-          type: 'stats',
-          snapshot: emptySnapshot({ error: message })
-        })
-      } finally {
-        state.busy = false
-      }
-    }
+    state.poll = () => pollSession(ctx, state)
 
     sessionStates.set(instanceKey(ctx), state)
     ctx.onDeactivateCleanup(() => {
@@ -1088,8 +1097,8 @@ export const serverMonitorMain: PluginMainModule = {
     armTimer(ctx, state)
   },
 
-  async onMessage(ctx, payload) {
-    if (!isRendererMessage(payload)) {
+  async onMessage(ctx, payload): Promise<ServerMonitorActionResult | undefined> {
+    if (!isServerMonitorRendererMessageEnvelope(payload)) {
       return undefined
     }
     const state = sessionStates.get(instanceKey(ctx))
@@ -1103,7 +1112,7 @@ export const serverMonitorMain: PluginMainModule = {
     }
 
     if (payload.type === 'setProcessSort') {
-      if (!isProcessSort(payload.sort)) {
+      if (!isServerMonitorProcessSort(payload.sort)) {
         return { ok: false, error: 'Invalid sort' }
       }
       const descending =
@@ -1117,7 +1126,7 @@ export const serverMonitorMain: PluginMainModule = {
     }
 
     if (payload.type === 'signalProcess') {
-      if (!isValidPid(payload.pid) || !isProcessSignal(payload.signal)) {
+      if (!isValidPid(payload.pid) || !isServerMonitorProcessSignal(payload.signal)) {
         return { ok: false, error: 'Invalid pid or signal' }
       }
       const result = await signalRemoteProcess(ctx, payload.pid, payload.signal)
