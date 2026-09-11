@@ -85,6 +85,7 @@ const api: WasshApi = {
   onCloseActiveTab: (cb) => on('tabs:closeActive', () => cb()),
   onReopenClosedTab: (cb) => on('tabs:reopenClosed', () => cb()),
   onOpenPreferences: (cb) => on('app:openPreferences', () => cb()),
+  onOpenCommandPalette: (cb) => on('app:openCommandPalette', () => cb()),
   onOpenAbout: (cb) => on('app:openAbout', () => cb()),
   onOpenFind: (cb) => on('app:openFind', () => cb()),
   onReconnectActive: (cb) => on('session:reconnectActive', () => cb()),

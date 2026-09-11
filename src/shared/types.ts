@@ -616,6 +616,7 @@ export interface WasshApi {
   onCloseActiveTab: (cb: () => void) => () => void
   onReopenClosedTab: (cb: () => void) => () => void
   onOpenPreferences: (cb: () => void) => () => void
+  onOpenCommandPalette: (cb: () => void) => () => void
   onOpenAbout: (cb: () => void) => () => void
   onOpenFind: (cb: () => void) => () => void
   onReconnectActive: (cb: () => void) => () => void

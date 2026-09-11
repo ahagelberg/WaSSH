@@ -30,6 +30,9 @@ import { checkForUpdatesManually, setupAutoUpdater } from './updater'
 /** Accelerator for File > Preferences */
 const PREFERENCES_ACCELERATOR = 'CommandOrControl+,'
 
+/** Accelerator for File > Command Palette */
+const COMMAND_PALETTE_ACCELERATOR = 'CommandOrControl+Shift+P'
+
 /** Accelerator for Edit > Find */
 const FIND_ACCELERATOR = 'CommandOrControl+Shift+F'
 
@@ -302,6 +305,11 @@ function installAppMenu(): void {
           click: () => {
             sendToRenderer('app:openPreferences')
           }
+        },
+        {
+          label: 'Command Palette',
+          accelerator: COMMAND_PALETTE_ACCELERATOR,
+          click: () => sendToRenderer('app:openCommandPalette')
         },
         { type: 'separator' },
         isMac ? { role: 'close' } : { role: 'quit' }

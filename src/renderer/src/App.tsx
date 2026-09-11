@@ -600,6 +600,7 @@ export default function App() {
       setOptionsFieldKey(undefined)
       setShowOptions(true)
     })
+    const offCommandPalette = window.wassh.onOpenCommandPalette(openPalette)
     const offAbout = window.wassh.onOpenAbout(() => {
       setShowAbout(true)
     })
@@ -653,6 +654,7 @@ export default function App() {
       offCloseActive()
       offReopenClosed()
       offPrefs()
+      offCommandPalette()
       offAbout()
       offFind()
       offReconnectActive()
@@ -668,7 +670,8 @@ export default function App() {
     cycleTab,
     reconnectTab,
     openSessionSettings,
-    reopenLastClosedSession
+    reopenLastClosedSession,
+    openPalette
   ])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
