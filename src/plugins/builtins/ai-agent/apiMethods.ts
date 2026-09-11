@@ -11,7 +11,9 @@ import {
   AI_AGENT_TOOL_LOCAL_FS_LIST,
   AI_AGENT_TOOL_LOCAL_FS_READ,
   AI_AGENT_TOOL_LOCAL_FS_WRITE,
+  AI_AGENT_TOOL_LOCAL_FS_EDIT,
   AI_AGENT_TOOL_REMOTE_FS_DELETE,
+  AI_AGENT_TOOL_REMOTE_FS_EDIT,
   AI_AGENT_TOOL_REMOTE_FS_LIST,
   AI_AGENT_TOOL_REMOTE_FS_READ,
   AI_AGENT_TOOL_REMOTE_FS_WRITE,
@@ -166,6 +168,33 @@ export const TOOL_DEF_REMOTE_FS_DELETE: PluginApiMethod = {
   }
 }
 
+export const TOOL_DEF_REMOTE_FS_EDIT: PluginApiMethod = {
+  name: AI_AGENT_TOOL_REMOTE_FS_EDIT,
+  description:
+    'Edit a text file on the REMOTE SSH host filesystem via SFTP by replacing an exact block of existing text with new text. ' +
+    'The oldText must match exactly once in the file (including whitespace/indentation); use enough surrounding context to make it unique. ' +
+    'Use this instead of rewriting whole files for small changes. Mutating files may require user approval.',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'Absolute or relative path on the remote SSH host'
+      },
+      oldText: {
+        type: 'string',
+        description: 'The exact, unique block of existing text to find and replace'
+      },
+      newText: {
+        type: 'string',
+        description: 'The text to replace oldText with'
+      }
+    },
+    required: ['path', 'oldText', 'newText']
+  }
+}
+
 export const TOOL_DEF_LOCAL_FS_READ: PluginApiMethod = {
   name: AI_AGENT_TOOL_LOCAL_FS_READ,
   description:
@@ -225,6 +254,33 @@ export const TOOL_DEF_LOCAL_FS_LIST: PluginApiMethod = {
   }
 }
 
+export const TOOL_DEF_LOCAL_FS_EDIT: PluginApiMethod = {
+  name: AI_AGENT_TOOL_LOCAL_FS_EDIT,
+  description:
+    'Edit a text file on the LOCAL client machine running WaSSH by replacing an exact block of existing text with new text. ' +
+    'The oldText must match exactly once in the file (including whitespace/indentation); use enough surrounding context to make it unique. ' +
+    'Use this instead of rewriting whole files for small changes. This mutating action requires user approval.',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'File path on the local user machine'
+      },
+      oldText: {
+        type: 'string',
+        description: 'The exact, unique block of existing text to find and replace'
+      },
+      newText: {
+        type: 'string',
+        description: 'The text to replace oldText with'
+      }
+    },
+    required: ['path', 'oldText', 'newText']
+  }
+}
+
 export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
 export const AI_AGENT_GROUP_WEB_SEARCH = 'web-search'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
@@ -236,12 +292,14 @@ export const AI_AGENT_REMOTE_FS_METHODS = [
   TOOL_DEF_REMOTE_FS_READ,
   TOOL_DEF_REMOTE_FS_LIST,
   TOOL_DEF_REMOTE_FS_WRITE,
+  TOOL_DEF_REMOTE_FS_EDIT,
   TOOL_DEF_REMOTE_FS_DELETE
 ]
 export const AI_AGENT_LOCAL_FS_METHODS = [
   TOOL_DEF_LOCAL_FS_READ,
   TOOL_DEF_LOCAL_FS_LIST,
-  TOOL_DEF_LOCAL_FS_WRITE
+  TOOL_DEF_LOCAL_FS_WRITE,
+  TOOL_DEF_LOCAL_FS_EDIT
 ]
 export const AI_AGENT_DATETIME_METHOD = TOOL_DEF_GET_CURRENT_TIME
 
