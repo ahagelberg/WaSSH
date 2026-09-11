@@ -451,6 +451,39 @@ export async function executeRemoteFsDelete(
   }
 }
 
+/** Apply a unique old-text -> new-text replacement, or return an error string on failure */
+function applyTextReplacement(content: string, oldText: string, newText: string): string | { error: string } {
+  const firstIndex = content.indexOf(oldText)
+  if (firstIndex === -1) {
+    return { error: 'oldText was not found in the file. Ensure it matches the file content exactly, including whitespace.' }
+  }
+  const lastIndex = content.lastIndexOf(oldText)
+  if (firstIndex !== lastIndex) {
+    return { error: 'oldText matches multiple locations in the file. Include more surrounding context to make it unique.' }
+  }
+  return content.slice(0, firstIndex) + newText + content.slice(firstIndex + oldText.length)
+}
+
+/** Execute Remote SFTP Edit (exact text block replace) */
+export async function executeRemoteFsEdit(
+  ctx: PluginMainContext,
+  filePath: string,
+  oldText: string,
+  newText: string
+): Promise<string> {
+  const current = await executeRemoteFsRead(ctx, filePath, MAX_FILE_READ_CHARS)
+  if (current.startsWith('Error') || current.startsWith('Failed to open SFTP') || current === 'Remote SFTP is not available on this session.') {
+    return current
+  }
+  const result = applyTextReplacement(current, oldText, newText)
+  if (typeof result !== 'string') {
+    return `Error editing remote file "${filePath}": ${result.error}`
+  }
+  return executeRemoteFsWrite(ctx, filePath, result).then((writeResult) =>
+    writeResult.startsWith('Successfully') ? `Successfully edited remote file "${filePath}".` : writeResult
+  )
+}
+
 /** Execute Local FS Read */
 export async function executeLocalFsRead(
   filePath: string,
@@ -516,3 +549,27 @@ export async function executeLocalFsList(dirPath: string): Promise<string> {
     return `Error listing local directory "${dirPath}": ${err instanceof Error ? err.message : String(err)}`
   }
 }
+
+/** Execute Local FS Edit (exact text block replace) */
+export async function executeLocalFsEdit(
+  filePath: string,
+  oldText: string,
+  newText: string
+): Promise<string> {
+  try {
+    const resolvedPath = path.resolve(filePath)
+    if (!fs.existsSync(resolvedPath)) {
+      return `Error: Local file does not exist at "${resolvedPath}"`
+    }
+    const content = await fs.promises.readFile(resolvedPath, 'utf-8')
+    const result = applyTextReplacement(content, oldText, newText)
+    if (typeof result !== 'string') {
+      return `Error editing local file "${resolvedPath}": ${result.error}`
+    }
+    await fs.promises.writeFile(resolvedPath, result, 'utf-8')
+    return `Successfully edited local file "${resolvedPath}".`
+  } catch (err) {
+    return `Error editing local file "${filePath}": ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+

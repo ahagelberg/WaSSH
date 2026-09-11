@@ -408,7 +408,10 @@ export const mqttAnalyserMain: PluginMainModule = {
     }
 
     if (method === 'get_topics') {
-      return Array.from(state.topics.keys())
+      return Array.from(state.topics.entries()).map(([topic, record]) => ({
+        topic,
+        messageCount: record.messageCount
+      }))
     }
 
     const args = params && typeof params === 'object' ? (params as Record<string, unknown>) : {}

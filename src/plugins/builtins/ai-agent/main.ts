@@ -40,7 +40,9 @@ import {
   AI_AGENT_TOOL_LOCAL_FS_LIST,
   AI_AGENT_TOOL_LOCAL_FS_READ,
   AI_AGENT_TOOL_LOCAL_FS_WRITE,
+  AI_AGENT_TOOL_LOCAL_FS_EDIT,
   AI_AGENT_TOOL_REMOTE_FS_DELETE,
+  AI_AGENT_TOOL_REMOTE_FS_EDIT,
   AI_AGENT_TOOL_REMOTE_FS_LIST,
   AI_AGENT_TOOL_REMOTE_FS_READ,
   AI_AGENT_TOOL_REMOTE_FS_WRITE,
@@ -77,7 +79,9 @@ import {
   executeLocalFsList,
   executeLocalFsRead,
   executeLocalFsWrite,
+  executeLocalFsEdit,
   executeRemoteFsDelete,
+  executeRemoteFsEdit,
   executeRemoteFsList,
   executeRemoteFsRead,
   executeRemoteFsWrite,
@@ -899,6 +903,9 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
   if (name === AI_AGENT_TOOL_REMOTE_FS_WRITE) {
     return `remote_write ${String(args.path || '')}`
   }
+  if (name === AI_AGENT_TOOL_REMOTE_FS_EDIT) {
+    return `remote_edit ${String(args.path || '')}`
+  }
   if (name === AI_AGENT_TOOL_REMOTE_FS_LIST) {
     return `remote_ls ${String(args.path || '.')}`
   }
@@ -910,6 +917,9 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
   }
   if (name === AI_AGENT_TOOL_LOCAL_FS_WRITE) {
     return `local_write ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_LOCAL_FS_EDIT) {
+    return `local_edit ${String(args.path || '')}`
   }
   if (name === AI_AGENT_TOOL_LOCAL_FS_LIST) {
     return `local_ls ${String(args.path || '.')}`
@@ -1860,6 +1870,9 @@ async function handleApiCall(
   if (method === AI_AGENT_TOOL_REMOTE_FS_WRITE) {
     return executeRemoteFsWrite(ctx, String(args.path || ''), String(args.content || ''))
   }
+  if (method === AI_AGENT_TOOL_REMOTE_FS_EDIT) {
+    return executeRemoteFsEdit(ctx, String(args.path || ''), String(args.oldText || ''), String(args.newText || ''))
+  }
   if (method === AI_AGENT_TOOL_REMOTE_FS_LIST) {
     return executeRemoteFsList(ctx, typeof args.path === 'string' ? args.path : '.')
   }
@@ -1872,6 +1885,9 @@ async function handleApiCall(
   }
   if (method === AI_AGENT_TOOL_LOCAL_FS_WRITE) {
     return executeLocalFsWrite(String(args.path || ''), String(args.content || ''))
+  }
+  if (method === AI_AGENT_TOOL_LOCAL_FS_EDIT) {
+    return executeLocalFsEdit(String(args.path || ''), String(args.oldText || ''), String(args.newText || ''))
   }
   if (method === AI_AGENT_TOOL_LOCAL_FS_LIST) {
     return executeLocalFsList(String(args.path || '.'))

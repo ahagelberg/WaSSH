@@ -7,9 +7,7 @@
 - Topology view (plugin) built up autoamtically based on connections, tunnels, hops etc.
 - Workspaces
 - Tunnels guide: pre-defined common tunnels as templates.
-- Injectable server that can run things even when not connected
-    - scheduled tasks
-    - network and other resource monitoring
+
 - Share settings easily
 - Overview of all open sessions with thumbnails
 - Global command history with quick search
@@ -21,11 +19,12 @@
 - Octopy-plugin:
     - shows sub-tabs for each screen (possibly with different username)
     - show node info
-    - show Ink in browser window?
-- Monitor all hosts - including not connected
+    - show Ink in browser window
+- Daemon monitor: Monitor all hosts with daemon - including not connected
 - SCP/SFTP plugin: add edit function (text files using builtin editor) etc.
 - SCP/SFTP plugin: Allow tansfer between hosts?
 - MQTT plugin: Add history for published messages.
 - MQTT plugin: Add option to have a list of common messages for publishing
-- MQTT plugin: add basic triggers for activating commands and other things based on messagesw received
+- MQTT plugin: add basic triggers for activating commands and other things based on messages received
 - AI Agent: Add option to include (yaml) files with prompts
+- Daemon monitor: triggers
