@@ -1,0 +1,233 @@
+.daemon-monitor {
+  box-sizing: border-box;
+  height: 100%;
+  overflow: auto;
+  padding: 14px;
+  color: var(--text-color, #d7dde8);
+}
+
+.daemon-monitor h2,
+.daemon-monitor h3,
+.daemon-monitor p {
+  margin: 0;
+}
+
+.daemon-monitor-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 12px;
+  min-height: 220px;
+}
+
+.daemon-monitor-header,
+.daemon-monitor-header > div,
+.daemon-monitor-legend,
+.daemon-monitor-footer,
+.daemon-monitor-actions,
+.daemon-monitor-sudo > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.daemon-monitor-header {
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.daemon-monitor-header select,
+.daemon-monitor-sudo input {
+  border: 1px solid var(--border-color, #394150);
+  border-radius: 4px;
+  background: var(--input-background, #151a22);
+  color: inherit;
+  padding: 6px 8px;
+}
+
+.daemon-monitor-version {
+  color: var(--muted-color, #8993a4);
+}
+
+.is-up {
+  color: #3fb950;
+}
+
+.is-down,
+.daemon-monitor-error {
+  color: #f85149;
+}
+
+.daemon-monitor-error {
+  margin: 8px 0;
+}
+
+.daemon-monitor-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.daemon-monitor-cards article,
+.daemon-monitor-chart-panel,
+.daemon-monitor-grid article {
+  border: 1px solid var(--border-color, #303846);
+  border-radius: 6px;
+  background: var(--panel-background, #11161d);
+}
+
+.daemon-monitor-cards article {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px;
+}
+
+.daemon-monitor-cards strong {
+  font-size: 22px;
+}
+
+.daemon-monitor-cards small,
+.daemon-monitor-states small {
+  color: var(--muted-color, #8993a4);
+}
+
+.daemon-monitor-chart-panel {
+  margin-top: 8px;
+  padding: 10px;
+}
+
+.daemon-monitor-legend {
+  justify-content: flex-end;
+  font-size: 12px;
+}
+
+.daemon-monitor-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 4px;
+  border-radius: 50%;
+}
+
+.daemon-monitor-chart {
+  width: 100%;
+  min-height: 180px;
+}
+
+.daemon-monitor-chart line {
+  stroke: #303846;
+  stroke-width: 1;
+}
+
+.daemon-monitor-chart text {
+  fill: #8993a4;
+  font-size: 10px;
+  text-anchor: end;
+}
+
+.daemon-monitor-chart polyline {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.daemon-monitor-chart-axis {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted-color, #8993a4);
+  font-size: 11px;
+}
+
+.daemon-monitor-network-chart {
+  width: 100%;
+  min-height: 60px;
+}
+
+.daemon-monitor-network-chart text {
+  fill: #8993a4;
+  font-size: 11px;
+  text-anchor: end;
+  dominant-baseline: middle;
+}
+
+.daemon-monitor-network-chart rect.is-up-fill {
+  fill: #3fb950;
+}
+
+.daemon-monitor-network-chart rect.is-down-fill {
+  fill: #f85149;
+}
+
+.daemon-monitor-network-chart rect.is-unknown-fill {
+  fill: #303846;
+}
+
+.daemon-monitor-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(280px, 2fr);
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.daemon-monitor-grid-stacked {
+  grid-template-columns: 1fr;
+}
+
+.daemon-monitor-grid article {
+  min-height: 160px;
+  padding: 10px;
+}
+
+.daemon-monitor-grid h3 {
+  margin-bottom: 8px;
+}
+
+.daemon-monitor-states,
+.daemon-monitor-events {
+  max-height: 240px;
+  overflow: auto;
+}
+
+.daemon-monitor-states > div {
+  display: grid;
+  grid-template-columns: 42px 1fr auto;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.daemon-monitor-events > div {
+  display: grid;
+  grid-template-columns: 150px 42px 1fr;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border-color, #303846);
+  font-size: 12px;
+}
+
+.daemon-monitor-footer {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.daemon-monitor-sudo {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  width: min(420px, 100%);
+}
+
+.daemon-monitor-sudo label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+@media (max-width: 700px) {
+  .daemon-monitor-cards,
+  .daemon-monitor-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -8,6 +8,8 @@ import {
 } from '../../plugins/builtins/ai-agent/pluginApiTools'
 import { connectionLoggerMain } from '../../plugins/builtins/connection-logger/main'
 import { connectionLoggerManifest } from '../../plugins/builtins/connection-logger/manifest'
+import { daemonMonitorMain } from '../../plugins/builtins/daemon-monitor/main'
+import { daemonMonitorManifest } from '../../plugins/builtins/daemon-monitor/manifest'
 import { macroPadMain } from '../../plugins/builtins/macro-pad/main'
 import { macroPadManifest } from '../../plugins/builtins/macro-pad/manifest'
 import { mqttAnalyserMain } from '../../plugins/builtins/mqtt-analyser/main'
@@ -31,6 +33,7 @@ export interface BuiltinPluginDefinition {
  */
 const OTHER_MANIFESTS: PluginManifest[] = [
   serverMonitorManifest,
+  daemonMonitorManifest,
   scratchpadManifest,
   macroPadManifest,
   mqttAnalyserManifest,
@@ -61,6 +64,7 @@ const aiAgentManifestWithExternalApis: PluginManifest = {
 
 export const BUILTIN_PLUGIN_DEFINITIONS: BuiltinPluginDefinition[] = [
   { manifest: serverMonitorManifest, registration: { id: serverMonitorManifest.id, module: serverMonitorMain } },
+  { manifest: daemonMonitorManifest, registration: { id: daemonMonitorManifest.id, module: daemonMonitorMain } },
   { manifest: scratchpadManifest, registration: { id: scratchpadManifest.id, module: scratchpadMain } },
   { manifest: macroPadManifest, registration: { id: macroPadManifest.id, module: macroPadMain } },
   { manifest: mqttAnalyserManifest, registration: { id: mqttAnalyserManifest.id, module: mqttAnalyserMain } },

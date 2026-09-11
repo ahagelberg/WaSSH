@@ -7,10 +7,12 @@ import MqttAnalyserView from '../../../plugins/builtins/mqtt-analyser/View'
 import SftpView from '../../../plugins/builtins/sftp/View'
 import AiAgentView from '../../../plugins/builtins/ai-agent/View'
 import ConnectionLoggerView from '../../../plugins/builtins/connection-logger/View'
+import DaemonMonitorView from '../../../plugins/builtins/daemon-monitor/View'
 import { sftpFileDropHandler } from '../../../plugins/builtins/sftp/fileDrop'
 
 export const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
   { id: 'server-monitor', view: ServerMonitorView },
+  { id: 'daemon-monitor', view: DaemonMonitorView },
   { id: 'scratchpad', view: ScratchpadView },
   { id: 'macro-pad', view: MacroPadView },
   { id: 'mqtt-analyser', view: MqttAnalyserView },
