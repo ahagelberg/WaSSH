@@ -24,8 +24,7 @@ import {
 
 const BYTES_PER_KIB = 1024
 const EPOCH_MS = 1000
-const RECORD_FIELD_COUNT_SAMPLE = 8
-const RECORD_FIELD_COUNT_STATE = 6
+const RECORD_FIELD_COUNT_EVENT = 5
 
 interface DaemonMonitorSession {
   status: DaemonMonitorServiceStatus
@@ -79,53 +78,50 @@ function parseRecord(
   cutoffMs: number
 ): { sample?: DaemonMonitorSample; event?: DaemonMonitorStateEvent } | null {
   const fields = line.split('\t')
-  const version = parseInteger(fields[0] || '')
-  const epoch = parseInteger(fields[1] || '')
-  if (version !== REMOTE_SERVICE_VERSION || epoch === null) {
+  const epoch = parseInteger(fields[0] || '')
+  if (epoch === null) {
     return null
   }
   const timestamp = epoch * EPOCH_MS
-  if (fields[2] === 'sample' && fields.length === RECORD_FIELD_COUNT_SAMPLE) {
-    if (timestamp < cutoffMs) {
-      return null
-    }
-    const values = fields.slice(3).map(parseInteger)
-    if (values.some((value) => value === null)) {
-      return null
-    }
-    const [cpuTenths, memoryUsedKib, memoryTotalKib, diskUsedKib, diskTotalKib] =
-      values as number[]
-    return {
-      sample: {
-        timestamp,
-        cpuPercent: cpuTenths / 10,
-        memoryUsedBytes: memoryUsedKib * BYTES_PER_KIB,
-        memoryTotalBytes: memoryTotalKib * BYTES_PER_KIB,
-        diskUsedBytes: diskUsedKib * BYTES_PER_KIB,
-        diskTotalBytes: diskTotalKib * BYTES_PER_KIB
-      }
-    }
-  }
   if (
-    (fields[2] === 'event' || fields[2] === 'current') &&
-    fields.length === RECORD_FIELD_COUNT_STATE &&
-    (fields[3] === 'interface' || fields[3] === 'ping') &&
-    (fields[5] === 'up' || fields[5] === 'down')
+    (fields[1] === 'event' || fields[1] === 'current') &&
+    fields.length >= RECORD_FIELD_COUNT_EVENT &&
+    (fields[2] === 'interface' || fields[2] === 'ping') &&
+    (fields[4] === 'up' || fields[4] === 'down')
   ) {
-    if (fields[2] === 'event' && timestamp < cutoffMs) {
+    if (fields[1] === 'event' && timestamp < cutoffMs) {
       return null
     }
     return {
       event: {
         timestamp,
-        kind: fields[3],
-        name: fields[4],
-        state: fields[5],
-        transition: fields[2] === 'event'
+        kind: fields[2],
+        name: fields[3],
+        state: fields[4],
+        transition: fields[1] === 'event'
       }
     }
   }
-  return null
+
+  if (timestamp < cutoffMs) {
+    return null
+  }
+  const values = fields.slice(1).map(parseInteger)
+  if (values.length === 0 || values.some((value) => value === null)) {
+    return null
+  }
+  const [cpuTenths = 0, memoryUsedKib = 0, memoryTotalKib = 0, diskUsedKib = 0, diskTotalKib = 0] =
+    values as number[]
+  return {
+    sample: {
+      timestamp,
+      cpuPercent: cpuTenths / 10,
+      memoryUsedBytes: memoryUsedKib * BYTES_PER_KIB,
+      memoryTotalBytes: memoryTotalKib * BYTES_PER_KIB,
+      diskUsedBytes: diskUsedKib * BYTES_PER_KIB,
+      diskTotalBytes: diskTotalKib * BYTES_PER_KIB
+    }
+  }
 }
 
 function closeStream(ctx: PluginMainContext, session: DaemonMonitorSession): void {

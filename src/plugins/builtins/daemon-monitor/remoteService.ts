@@ -1,6 +1,6 @@
 import { DAEMON_MONITOR_MAX_PING_TARGETS } from './defaults'
 
-export const REMOTE_SERVICE_VERSION = 2
+export const REMOTE_SERVICE_VERSION = 1
 export const REMOTE_OPERATION_SUCCESS = '__WASSH_SERVICE_OK__'
 export const REMOTE_BASE_PATH = '/usr/local/lib/wassh-service'
 export const REMOTE_EXECUTABLE_PATH = `${REMOTE_BASE_PATH}/wassh-service`
@@ -48,14 +48,14 @@ STATE_DIR=${REMOTE_STATE_PATH}
 RECORDS=${REMOTE_RECORDS_PATH}
 
 record() {
-  printf '%s\\t%s' "$VERSION" "$(date +%s)" >> "$RECORDS"
+  printf '%s' "$(date +%s)" >> "$RECORDS"
   for field in "$@"; do printf '\\t%s' "$field" >> "$RECORDS"; done
   printf '\\n' >> "$RECORDS"
 }
 
 prune() {
   cutoff=$(($(date +%s) - RETENTION_SECONDS))
-  awk -F '\\t' -v cutoff="$cutoff" '$2 >= cutoff' "$RECORDS" > "$RECORDS.new"
+  awk -F '\\t' -v cutoff="$cutoff" '$1 >= cutoff' "$RECORDS" > "$RECORDS.new"
   mv "$RECORDS.new" "$RECORDS"
   size=$(wc -c < "$RECORDS")
   if [ "$size" -gt "$MAX_BYTES" ]; then
@@ -110,7 +110,7 @@ while :; do
   memory_total=$1 memory_used=$2
   set -- $(df -Pk / | awk 'NR == 2 { print $2, $3 }')
   disk_total=$1 disk_used=$2
-  record sample "$cpu_tenths" "$memory_used" "$memory_total" "$disk_used" "$disk_total"
+  record "$cpu_tenths" "$memory_used" "$memory_total" "$disk_used" "$disk_total"
 
   seen_dir="$STATE_DIR/interfaces-seen"
   rm -rf "$seen_dir"
@@ -223,10 +223,11 @@ export function buildStreamCommand(sinceEpochSeconds: number): string {
   ) {
     throw new Error('Stream epoch must be a non-negative integer')
   }
-  // Stamp the initial snapshot with max(since, monitoring start time): if
-  // monitoring began after the requested "since", the state is only known
-  // from when monitoring started, not further back, so the client can
-  // correctly grey out the earlier, genuinely unknown period.
-  const current = `since=${sinceEpochSeconds}; started=$(cat ${REMOTE_STARTED_AT_PATH} 2>/dev/null || date +%s); anchor=$since; [ "$started" -gt "$anchor" ] && anchor=$started; for file in ${REMOTE_STATE_PATH}/interfaces/*; do [ -f "$file" ] || continue; name=\${file##*/}; state=$(cat "$file"); printf '${REMOTE_SERVICE_VERSION}\\t%s\\tcurrent\\tinterface\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done; for file in ${REMOTE_STATE_PATH}/pings/*; do [ -f "$file" ] || continue; name=$(sed -n '1p' "$file"); state=$(sed -n '2p' "$file"); printf '${REMOTE_SERVICE_VERSION}\\t%s\\tcurrent\\tping\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done`
+  // Stamp the initial snapshot with max(since, earliest record/start time):
+  // If records exist, use the timestamp of the first recorded sample/event as
+  // the earliest known time boundary. If no records exist yet, fall back to
+  // started_at or current time. This prevents displaying reachability across
+  // spans where data was not yet recorded or has been purged.
+  const current = `since=${sinceEpochSeconds}; first_record=$(head -n 1 ${REMOTE_RECORDS_PATH} 2>/dev/null | cut -f 1 || true); [ -n "$first_record" ] && [ "$first_record" -ge 0 ] 2>/dev/null || first_record=$(cat ${REMOTE_STARTED_AT_PATH} 2>/dev/null || date +%s); anchor=$since; [ "$first_record" -gt "$anchor" ] && anchor=$first_record; for file in ${REMOTE_STATE_PATH}/interfaces/*; do [ -f "$file" ] || continue; name=\${file##*/}; state=$(cat "$file"); printf '%s\\tcurrent\\tinterface\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done; for file in ${REMOTE_STATE_PATH}/pings/*; do [ -f "$file" ] || continue; name=$(sed -n '1p' "$file"); state=$(sed -n '2p' "$file"); printf '%s\\tcurrent\\tping\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done`
   return `{ ${current}; exec tail -n +1 -F ${REMOTE_RECORDS_PATH}; }`
 }
