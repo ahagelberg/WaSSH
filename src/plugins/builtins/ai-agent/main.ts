@@ -1,4 +1,6 @@
 import { randomUUID } from 'crypto'
+import { readdir, readFile } from 'fs/promises'
+import { extname, join } from 'path'
 import {
   AI_AGENT_CONVERSATIONS_PER_HOST_MAX,
   AI_AGENT_DATA_VERSION,
@@ -32,8 +34,11 @@ import {
   AI_AGENT_PROTOCOL_OPENAI,
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
+  AI_AGENT_SETTING_GLOBAL_PROMPT,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
+  AI_AGENT_SETTING_HOST_PROMPT,
+  AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
   AI_AGENT_TOOL_GET_CURRENT_TIME,
@@ -119,6 +124,9 @@ const HISTORY_MAX = 160
 
 /** Remote project rules file read from the working directory */
 const PROJECT_RULES_FILE = '.wasshrules'
+
+/** Local prompt file extensions loaded from the configured folder. */
+const PROMPT_FILE_EXTENSIONS = new Set(['.txt', '.yaml', '.yml'])
 
 /** How long a successful sudo password / NOPASSWD probe stays cached in memory (ms) */
 const SUDO_PASSWORD_CACHE_MS = 5 * 60 * 1000
@@ -640,15 +648,21 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
   }
 }
 
+interface PromptAdditions {
+  globalText: string
+  hostText: string
+  localFiles: string
+  projectRules: string
+}
+
 function systemPrompt(
   host: HostState,
-  projectRules: string,
+  additions: PromptAdditions,
   activeTools: PluginApiMethod[]
 ): string {
   const conv = host.conversation
   const cwd = conv?.cwd || '/'
   const toolDescriptions = activeTools.map((t) => `- ${t.name}: ${t.description}`)
-
   const base = [
     `You are an AI development agent connected to the remote host "${host.hostLabel}".`,
     `Current working directory: ${cwd}`,
@@ -664,8 +678,23 @@ function systemPrompt(
     '- After each command or tool call you see its actual result. Never invent output.',
     '- When the task is complete, reply with a concise plain-text summary; you do not need to call more tools.'
   ]
+  const globalText = additions.globalText.trim()
+  const hostText = additions.hostText.trim()
+  const localFiles = additions.localFiles.trim()
+  if (globalText || hostText || localFiles) {
+    base.push('', 'Additional prompt instructions and context:', '')
+    if (globalText) {
+      base.push(`[Global prompt]\n${globalText}`, '')
+    }
+    if (hostText) {
+      base.push(`[Host prompt]\n${hostText}`, '')
+    }
+    if (localFiles) {
+      base.push(localFiles)
+    }
+  }
   const userRules = (dataFile?.rules ?? '').trim()
-  const remote = projectRules.trim()
+  const remote = additions.projectRules.trim()
   if (userRules || remote) {
     base.push('', 'Rules you must follow:', '')
     if (userRules) {
@@ -676,6 +705,40 @@ function systemPrompt(
     }
   }
   return base.join('\n')
+}
+
+function stringSetting(settings: Record<string, unknown>, key: string): string {
+  return typeof settings[key] === 'string' ? settings[key].trim() : ''
+}
+
+async function readLocalPromptFiles(folder: string): Promise<string> {
+  if (!folder) {
+    return ''
+  }
+  let names: string[]
+  try {
+    const entries = await readdir(folder, { withFileTypes: true })
+    names = entries
+      .filter(
+        (entry) =>
+          entry.isFile() && PROMPT_FILE_EXTENSIONS.has(extname(entry.name).toLowerCase())
+      )
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right))
+  } catch {
+    return ''
+  }
+  const sections = await Promise.all(
+    names.map(async (name) => {
+      try {
+        const content = (await readFile(join(folder, name), 'utf8')).trim()
+        return content ? `[Prompt file: ${name}]\n${content}` : ''
+      } catch {
+        return ''
+      }
+    })
+  )
+  return sections.filter(Boolean).join('\n\n')
 }
 
 async function readProjectRules(ctx: PluginMainContext): Promise<string> {
@@ -983,6 +1046,14 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   const appAllow = listSetting(settings, AI_AGENT_SETTING_DEFAULT_ALLOW_RULES)
   const appDeny = listSetting(settings, AI_AGENT_SETTING_DEFAULT_DENY_RULES)
   const projectRules = await readProjectRules(ctx)
+  const promptAdditions: PromptAdditions = {
+    globalText: stringSetting(settings, AI_AGENT_SETTING_GLOBAL_PROMPT),
+    hostText: stringSetting(settings, AI_AGENT_SETTING_HOST_PROMPT),
+    localFiles: await readLocalPromptFiles(
+      stringSetting(settings, AI_AGENT_SETTING_PROMPT_FILES_FOLDER)
+    ),
+    projectRules
+  }
 
   const activeTools: PluginApiMethod[] = [
     TOOL_DEF_RUN_COMMAND,
@@ -1011,7 +1082,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         apiKey,
         protocol: provider.protocol,
         model: conv.activeModel,
-        system: systemPrompt(host, projectRules, activeTools),
+        system: systemPrompt(host, promptAdditions, activeTools),
         messages: toApiMessages(conv),
         tools: activeTools,
         maxTokens: MAX_TOKENS,

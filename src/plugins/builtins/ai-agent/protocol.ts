@@ -1,7 +1,10 @@
 export const AI_AGENT_SETTING_DEFAULT_ALLOW_RULES = 'defaultAllowRules'
 export const AI_AGENT_SETTING_DEFAULT_DENY_RULES = 'defaultDenyRules'
+export const AI_AGENT_SETTING_GLOBAL_PROMPT = 'globalPrompt'
+export const AI_AGENT_SETTING_PROMPT_FILES_FOLDER = 'promptFilesFolder'
 export const AI_AGENT_SETTING_HOST_ALLOW_RULES = 'allowRules'
 export const AI_AGENT_SETTING_HOST_DENY_RULES = 'denyRules'
+export const AI_AGENT_SETTING_HOST_PROMPT = 'hostPrompt'
 
 export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
 export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'

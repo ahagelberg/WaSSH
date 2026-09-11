@@ -593,6 +593,7 @@ export interface WasshApi {
     hostName?: string
   ) => Promise<void>
   pickPrivateKeyFile: () => Promise<string | null>
+  pickDirectory: () => Promise<string | null>
   listSerialPorts: () => Promise<SerialPortInfo[]>
   beep: () => Promise<void>
   listPlugins: () => Promise<PluginListItem[]>

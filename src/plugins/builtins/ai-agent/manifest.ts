@@ -9,8 +9,11 @@ import { AI_AGENT_API_METHODS, buildAiAgentBuiltinApiFields } from './apiMethods
 import {
   AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
   AI_AGENT_SETTING_DEFAULT_DENY_RULES,
+  AI_AGENT_SETTING_GLOBAL_PROMPT,
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
+  AI_AGENT_SETTING_HOST_PROMPT,
+  AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER
 } from './protocol'
@@ -47,6 +50,21 @@ export const aiAgentManifest: PluginManifest = {
     settingsHeading: 'AI agent',
     settingsSchema: [
       {
+        key: AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
+        label: 'Prompt files folder',
+        type: 'directory',
+        default: '',
+        description:
+          'Local folder whose top-level YAML and text files are included in every AI agent prompt.'
+      },
+      {
+        key: AI_AGENT_SETTING_GLOBAL_PROMPT,
+        label: 'Global prompt text',
+        type: 'textArea',
+        default: '',
+        description: 'Text included in every AI agent prompt.'
+      },
+      {
         key: AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
         label: 'Default allow rules',
         type: 'stringList',
@@ -66,6 +84,13 @@ export const aiAgentManifest: PluginManifest = {
     ],
     hostSettingsHeading: 'AI agent',
     hostSettingsSchema: [
+      {
+        key: AI_AGENT_SETTING_HOST_PROMPT,
+        label: 'Host prompt text',
+        type: 'textArea',
+        default: '',
+        description: 'Text included in AI agent prompts for this host or session.'
+      },
       {
         key: AI_AGENT_SETTING_HOST_ALLOW_RULES,
         label: 'Allow rules',

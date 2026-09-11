@@ -170,6 +170,40 @@ export default function PluginFieldEditor({
       />
     )
   }
+  if (field.type === 'textArea') {
+    return (
+      <textarea
+        rows={6}
+        value={typeof value === 'string' ? value : String(value ?? '')}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    )
+  }
+  if (field.type === 'directory') {
+    const path = typeof value === 'string' ? value : String(value ?? '')
+    return (
+      <div className="plugin-settings-directory">
+        <input type="text" value={path} readOnly />
+        <button
+          type="button"
+          onClick={() => {
+            void window.wassh.pickDirectory().then((selected) => {
+              if (selected) {
+                onChange(selected)
+              }
+            })
+          }}
+        >
+          Browse
+        </button>
+        {path ? (
+          <button type="button" onClick={() => onChange('')}>
+            Clear
+          </button>
+        ) : null}
+      </div>
+    )
+  }
   return (
     <input
       type={field.secret ? 'password' : 'text'}

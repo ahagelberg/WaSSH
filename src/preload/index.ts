@@ -59,6 +59,7 @@ const api: WasshApi = {
   respondSavePassword: (tabId: string, decision: SavePasswordDecision, hostName?: string) =>
     ipcRenderer.invoke('session:respondSavePassword', tabId, decision, hostName),
   pickPrivateKeyFile: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
+  pickDirectory: () => ipcRenderer.invoke('dialog:pickDirectory'),
   listSerialPorts: () => ipcRenderer.invoke('serial:listPorts'),
   beep: () => ipcRenderer.invoke('app:beep'),
   listPlugins: () => ipcRenderer.invoke('plugins:list'),

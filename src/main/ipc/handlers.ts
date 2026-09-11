@@ -143,6 +143,18 @@ export function registerIpc(
     return result.filePaths[0]
   })
 
+  ipcMain.handle('dialog:pickDirectory', async () => {
+    const win = getWindow()
+    const options: Electron.OpenDialogOptions = {
+      title: 'Select folder',
+      properties: ['openDirectory']
+    }
+    const result = win
+      ? await dialog.showOpenDialog(win, options)
+      : await dialog.showOpenDialog(options)
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
+  })
+
   ipcMain.handle('serial:listPorts', () => listSerialPorts())
 
   ipcMain.handle('shell:openExternal', async (_e, url: string) => {

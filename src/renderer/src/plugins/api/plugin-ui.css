@@ -100,6 +100,20 @@
   resize: vertical;
 }
 
+.plugin-settings-directory {
+  display: flex;
+  gap: var(--plugin-ui-space-1);
+  min-width: 0;
+}
+
+.plugin-settings-directory input {
+  min-width: 0;
+}
+
+.plugin-settings-directory button {
+  flex-shrink: 0;
+}
+
 .plugin-ui-input:focus,
 .plugin-ui-select:focus,
 .plugin-ui-textarea:focus {

@@ -46,6 +46,8 @@ export type PluginSettingsFieldType =
   | 'boolean'
   | 'number'
   | 'string'
+  | 'textArea'
+  | 'directory'
   | 'select'
   | 'stringList'
   | 'commandList'
