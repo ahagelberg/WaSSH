@@ -134,3 +134,64 @@ jobs:
             release/*.dmg
             release/*.zip
           if-no-files-found: error
+
+  release-linux:
+    needs: release-windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x64
+            expected_uname: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            expected_uname: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify runner architecture
+        run: |
+          actual_uname="$(uname -m)"
+          if [ "${actual_uname}" != "${{ matrix.expected_uname }}" ]; then
+            echo "::error::Runner architecture mismatch: expected ${{ matrix.expected_uname }}, got ${actual_uname}"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build native modules
+        run: npm run setup-native
+        env:
+          npm_config_arch: ${{ matrix.arch }}
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build Linux artifacts
+        run: npm run dist:linux -- --${{ matrix.arch }}
+
+      - name: Attach Linux assets to GitHub release
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" release/*.AppImage release/*.deb release/*.rpm --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload Linux workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wassh-${{ github.ref_name }}-linux-${{ matrix.arch }}
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+          if-no-files-found: error
