@@ -94,6 +94,7 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "res/WaSSH.icns",
+      "artifactName": "WaSSH-${version}-mac-${arch}.${ext}",
       "target": [
         "dmg",
         "zip"
@@ -101,9 +102,6 @@
       "identity": null
     },
     "dmg": {
-      "artifactName": "WaSSH-${version}-mac-${arch}.${ext}"
-    },
-    "zip": {
       "artifactName": "WaSSH-${version}-mac-${arch}.${ext}"
     },
     "linux": {
