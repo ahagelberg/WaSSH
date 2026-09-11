@@ -23,8 +23,11 @@ let checkInProgress = false
 let manualCheckPending = false
 let getWindow: () => BrowserWindow | null = () => null
 
-/** Auto-update only works for NSIS-installed builds. */
+/** Auto-update is currently supported on Windows (NSIS-installed builds). macOS is deferred until signed releases. */
 function canAutoUpdate(): boolean {
+  if (process.platform !== 'win32') {
+    return false
+  }
   if (!app.isPackaged) {
     return false
   }

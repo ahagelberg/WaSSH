@@ -119,10 +119,16 @@ function rebuildSerialport() {
   if (!existsSync(ELECTRON_REBUILD)) {
     return
   }
-  const result = spawnSync(ELECTRON_REBUILD, ['-f', '-w', 'serialport'], {
+  const args = ['-f', '-w', 'serialport']
+  const targetArch = process.env.npm_config_arch || process.env.TARGET_ARCH
+  if (targetArch) {
+    args.push('-a', targetArch)
+  }
+  const result = spawnSync(ELECTRON_REBUILD, args, {
     cwd: ROOT,
     stdio: 'inherit',
-    shell: platform() === 'win32'
+    shell: platform() === 'win32',
+    env: process.env
   })
   if (result.status !== 0) {
     console.warn('electron-rebuild serialport failed; serial connections may not work until rebuild succeeds')
