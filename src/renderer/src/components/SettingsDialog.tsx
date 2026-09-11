@@ -12,6 +12,8 @@ interface Props {
   sections: SettingsSection[]
   onClose: () => void
   footer?: ReactNode
+  initialSectionId?: string
+  initialFieldKey?: string
 }
 
 /** Offset from the scroll viewport top before a section counts as current; keep in sync with .settings-section scroll-margin-top */
@@ -20,11 +22,19 @@ const SECTION_ACTIVE_OFFSET_PX = 16
 /** Keyboard key that dismisses the dialog like Cancel */
 const DIALOG_DISMISS_KEY = 'Escape'
 
-export default function SettingsDialog({ title, sections, onClose, footer }: Props) {
-  const [activeId, setActiveId] = useState(sections[0]?.id ?? '')
+export default function SettingsDialog({
+  title,
+  sections,
+  onClose,
+  footer,
+  initialSectionId,
+  initialFieldKey
+}: Props) {
+  const [activeId, setActiveId] = useState(initialSectionId || sections[0]?.id || '')
   const contentRef = useRef<HTMLDivElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
   const sectionRefs = useRef<Record<string, HTMLElement | null>>({})
+  const appliedTargetRef = useRef('')
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
 
@@ -91,6 +101,39 @@ export default function SettingsDialog({ title, sections, onClose, footer }: Pro
       root.removeEventListener('scrollend', updateActiveSection)
     }
   }, [updateActiveSection])
+
+  useEffect(() => {
+    if (!initialSectionId) {
+      return
+    }
+    const targetKey = `${initialSectionId}\n${initialFieldKey ?? ''}`
+    if (appliedTargetRef.current === targetKey) {
+      return
+    }
+    const root = contentRef.current
+    const section = sectionRefs.current[initialSectionId]
+    if (!root || !section) {
+      return
+    }
+    const field = initialFieldKey
+      ? Array.from(section.querySelectorAll<HTMLElement>('[data-plugin-setting-key]')).find(
+          (element) => element.dataset.pluginSettingKey === initialFieldKey
+        )
+      : null
+    if (initialFieldKey && !field) {
+      return
+    }
+    const target = field ?? section
+    const rootRect = root.getBoundingClientRect()
+    const targetRect = target.getBoundingClientRect()
+    const targetTop = root.scrollTop + targetRect.top - rootRect.top
+    root.scrollTop = field
+      ? Math.max(0, targetTop - (root.clientHeight - targetRect.height) / 2)
+      : targetTop
+    field?.querySelector<HTMLElement>('input, select, textarea, button')?.focus({ preventScroll: true })
+    setActiveId(initialSectionId)
+    appliedTargetRef.current = targetKey
+  }, [initialFieldKey, initialSectionId, sections])
 
   const scrollTo = (id: string): void => {
     sectionRefs.current[id]?.scrollIntoView({ behavior: 'smooth', block: 'start' })

@@ -32,7 +32,7 @@ export default function PluginSettingsFieldList({ schema, values, onChange, dept
           const childTier = Math.min(depth + 1, MAX_COMPACT_DEPTH)
           return (
             <div key={field.key} className="plugin-settings-group">
-              <div className={rowClassName}>
+              <div className={rowClassName} data-plugin-setting-key={field.key}>
                 <div className="settings-row-label">
                   <strong>{field.label}</strong>
                   {field.description ? <span>{field.description}</span> : null}
@@ -58,7 +58,7 @@ export default function PluginSettingsFieldList({ schema, values, onChange, dept
           )
         }
         return (
-          <div key={field.key} className={rowClassName}>
+          <div key={field.key} className={rowClassName} data-plugin-setting-key={field.key}>
             <div className="settings-row-label">
               <strong>{field.label}</strong>
               {field.description ? <span>{field.description}</span> : null}

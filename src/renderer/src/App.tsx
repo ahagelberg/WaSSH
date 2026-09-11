@@ -47,7 +47,11 @@ import type {
   SftpRendererMessage,
   SftpStatusPayload
 } from '../../plugins/builtins/sftp/protocol'
-import { mergePluginSettings, type PluginListItem } from '@shared/pluginApi'
+import {
+  mergePluginSettings,
+  type PluginListItem,
+  type PluginSettingsField
+} from '@shared/pluginApi'
 import {
   emptyTabPluginLayout,
   normalizeTabPluginLayout,
@@ -67,6 +71,55 @@ import PluginSessionFrame from './plugins/PluginSessionFrame'
 
 /** Closed session settings retained for Ctrl+Shift+T reopen */
 const CLOSED_SESSION_RETENTION_MS = 60 * 60 * 1000
+
+const PLUGIN_ACTIVATE_COMMAND_PREFIX = 'plugin-activate:'
+const PLUGIN_DEACTIVATE_COMMAND_PREFIX = 'plugin-deactivate:'
+const PLUGIN_TOGGLE_COMMAND_PREFIX = 'plugin-toggle:'
+const PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX = 'plugin-global-option:'
+const PLUGIN_HOST_OPTION_COMMAND_PREFIX = 'plugin-host-option:'
+
+interface PaletteCommand {
+  id: string
+  title: string
+  needsArgument?: boolean
+  argOptions?: Array<{ value: string; label: string }>
+}
+
+interface PluginSettingPath {
+  key: string
+  path: string
+}
+
+interface PluginSettingTarget {
+  pluginId: string
+  fieldKey: string
+}
+
+function pluginSettingPaths(
+  fields: PluginSettingsField[],
+  parentLabels: string[] = []
+): PluginSettingPath[] {
+  return fields.flatMap((field) => {
+    const labels = [...parentLabels, field.label]
+    const path = labels.join(' > ')
+    const current = { key: field.key, path }
+    return field.children?.length
+      ? [current, ...pluginSettingPaths(field.children, labels)]
+      : [current]
+  })
+}
+
+function commandPluginId(commandId: string, prefix: string): string {
+  return decodeURIComponent(commandId.slice(prefix.length).split(':')[0])
+}
+
+function commandPluginSetting(commandId: string, prefix: string): PluginSettingTarget {
+  const [pluginId, fieldKey] = commandId.slice(prefix.length).split(':')
+  return {
+    pluginId: decodeURIComponent(pluginId),
+    fieldKey: decodeURIComponent(fieldKey)
+  }
+}
 
 /** Max closed sessions kept for reopen */
 const CLOSED_SESSION_STACK_MAX = 20
@@ -162,6 +215,8 @@ export default function App() {
   const [tabs, setTabs] = useState<TabState[]>([])
   const [activeTabId, setActiveTabId] = useState<string | null>(null)
   const [showOptions, setShowOptions] = useState(false)
+  const [optionsSectionId, setOptionsSectionId] = useState<string>()
+  const [optionsFieldKey, setOptionsFieldKey] = useState<string>()
   const [showAbout, setShowAbout] = useState(false)
   const [showFind, setShowFind] = useState(false)
   const [findQuery, setFindQuery] = useState('')
@@ -176,6 +231,8 @@ export default function App() {
     linkTabId?: string
     /** Group to place a newly created host into on save */
     groupId?: string
+    initialSectionId?: string
+    initialFieldKey?: string
   } | null>(null)
   const [saveAsHostName, setSaveAsHostName] = useState('')
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
@@ -217,6 +274,20 @@ export default function App() {
   settingsRef.current = settings
   findQueryRef.current = findQuery
   findCaseRef.current = findCaseSensitive
+
+  const closePalette = useCallback(() => {
+    setPaletteOpen(false)
+    setTermFocusNonce((n) => n + 1)
+  }, [])
+
+  const openPalette = useCallback(() => {
+    setPaletteQuery('')
+    setPaletteIndex(0)
+    setPaletteArgMode(false)
+    setPaletteArgCommand(null)
+    setPaletteArgValue('')
+    setPaletteOpen(true)
+  }, [])
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme || DEFAULT_THEME
@@ -310,7 +381,11 @@ export default function App() {
     [connectTab]
   )
 
-  const openSessionSettings = useCallback((id: string): void => {
+  const openSessionSettings = useCallback((
+    id: string,
+    initialSectionId?: string,
+    initialFieldKey?: string
+  ): void => {
     const tab = tabsRef.current.find((t) => t.id === id)
     if (!tab) return
     setActiveTabId(id)
@@ -318,7 +393,9 @@ export default function App() {
       mode: 'editOpenSession',
       initial: tab.connection,
       connected: tab.status === 'connected',
-      linkTabId: id
+      linkTabId: id,
+      initialSectionId,
+      initialFieldKey
     })
   }, [])
 
@@ -519,6 +596,8 @@ export default function App() {
       reopenLastClosedSession()
     })
     const offPrefs = window.wassh.onOpenPreferences(() => {
+      setOptionsSectionId(undefined)
+      setOptionsFieldKey(undefined)
       setShowOptions(true)
     })
     const offAbout = window.wassh.onOpenAbout(() => {
@@ -583,7 +662,14 @@ export default function App() {
       offPluginMessage()
       offSettingsChanged()
     }
-  }, [refreshHosts, closeTab, cycleTab, reconnectTab, openSessionSettings, reopenLastClosedSession])
+  }, [
+    refreshHosts,
+    closeTab,
+    cycleTab,
+    reconnectTab,
+    openSessionSettings,
+    reopenLastClosedSession
+  ])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
     void window.wassh.setSettings(partial).then((next) => {
@@ -850,20 +936,6 @@ export default function App() {
     [hostsOrganization, saveHostsOrganization, refreshHosts]
   )
 
-  const closePalette = useCallback(() => {
-    setPaletteOpen(false)
-    setTermFocusNonce((n) => n + 1)
-  }, [])
-
-  const openPalette = useCallback(() => {
-    setPaletteQuery('')
-    setPaletteIndex(0)
-    setPaletteArgMode(false)
-    setPaletteArgCommand(null)
-    setPaletteArgValue('')
-    setPaletteOpen(true)
-  }, [])
-
   const pluginArgOptions = plugins.map((p) => ({ value: p.id, label: p.name }))
   const activePluginArgOptions = (
     activeTabId
@@ -875,7 +947,56 @@ export default function App() {
   )
   const fontArgOptions = BUNDLED_FONT_FAMILIES.map((f) => ({ value: f, label: f }))
 
-  const paletteCommands = [
+  const activePluginIds = new Set(
+    activeTabId
+      ? (tabs.find((tab) => tab.id === activeTabId)?.activePluginIds ?? [])
+      : []
+  )
+  const pluginPaletteCommands: PaletteCommand[] = []
+  for (const plugin of plugins) {
+    if (!plugin.enabled) {
+      continue
+    }
+    const encodedId = encodeURIComponent(plugin.id)
+    if (plugin.contributes.toolbar && activeTabId) {
+      pluginPaletteCommands.push(
+        {
+          id: `${PLUGIN_ACTIVATE_COMMAND_PREFIX}${encodedId}`,
+          title: `Plugin: Activate ${plugin.name}`
+        },
+        {
+          id: `${PLUGIN_TOGGLE_COMMAND_PREFIX}${encodedId}`,
+          title: `Plugin: Toggle ${plugin.name}`
+        }
+      )
+      if (activePluginIds.has(plugin.id)) {
+        pluginPaletteCommands.push({
+          id: `${PLUGIN_DEACTIVATE_COMMAND_PREFIX}${encodedId}`,
+          title: `Plugin: Deactivate ${plugin.name}`
+        })
+      }
+    }
+    const globalSchema = plugin.contributes.settingsSchema
+    if (globalSchema?.length && plugin.contributes.settingsPresentation !== 'view') {
+      for (const setting of pluginSettingPaths(globalSchema)) {
+        pluginPaletteCommands.push({
+          id: `${PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX}${encodedId}:${encodeURIComponent(setting.key)}`,
+          title: `Plugin option: ${plugin.name} > ${setting.path}`
+        })
+      }
+    }
+    const hostSchema = plugin.contributes.hostSettingsSchema
+    if (hostSchema?.length && activeTabId) {
+      for (const setting of pluginSettingPaths(hostSchema)) {
+        pluginPaletteCommands.push({
+          id: `${PLUGIN_HOST_OPTION_COMMAND_PREFIX}${encodedId}:${encodeURIComponent(setting.key)}`,
+          title: `Plugin host option: ${plugin.name} > ${setting.path}`
+        })
+      }
+    }
+  }
+
+  const paletteCommands: PaletteCommand[] = [
     { id: 'open-settings', title: 'Open Settings' },
     { id: 'toggle-theme', title: 'Toggle Dark/Light Theme' },
     { id: 'new-host', title: 'New Host' },
@@ -913,7 +1034,8 @@ export default function App() {
     },
     { id: 'set-term-background', title: 'Set Terminal Background Color', needsArgument: true },
     { id: 'set-term-foreground', title: 'Set Terminal Foreground Color', needsArgument: true },
-    { id: 'set-tab-accent', title: 'Set Tab Accent Color', needsArgument: true }
+    { id: 'set-tab-accent', title: 'Set Tab Accent Color', needsArgument: true },
+    ...pluginPaletteCommands
   ]
 
   const filteredPaletteCommands = paletteCommands.filter((cmd) => {
@@ -949,8 +1071,53 @@ export default function App() {
   const executeCommand = useCallback(
     async (commandId: string, rawArgs: string) => {
       const args = rawArgs.trim()
+      if (commandId.startsWith(PLUGIN_ACTIVATE_COMMAND_PREFIX)) {
+        if (activeTabId) {
+          await window.wassh.activatePlugin(
+            activeTabId,
+            commandPluginId(commandId, PLUGIN_ACTIVATE_COMMAND_PREFIX)
+          )
+        }
+        setPaletteOpen(false)
+        return
+      }
+      if (commandId.startsWith(PLUGIN_DEACTIVATE_COMMAND_PREFIX)) {
+        if (activeTabId) {
+          const pluginId = commandPluginId(commandId, PLUGIN_DEACTIVATE_COMMAND_PREFIX)
+          await togglePlugin(activeTabId, pluginId, false)
+        }
+        setPaletteOpen(false)
+        return
+      }
+      if (commandId.startsWith(PLUGIN_TOGGLE_COMMAND_PREFIX)) {
+        if (activeTabId) {
+          const pluginId = commandPluginId(commandId, PLUGIN_TOGGLE_COMMAND_PREFIX)
+          const tab = tabsRef.current.find((item) => item.id === activeTabId)
+          await togglePlugin(activeTabId, pluginId, !tab?.activePluginIds.includes(pluginId))
+        }
+        setPaletteOpen(false)
+        return
+      }
+      if (commandId.startsWith(PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX)) {
+        const target = commandPluginSetting(commandId, PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX)
+        setOptionsSectionId(`plugin-${target.pluginId}`)
+        setOptionsFieldKey(target.fieldKey)
+        setShowOptions(true)
+        setPaletteOpen(false)
+        return
+      }
+      if (commandId.startsWith(PLUGIN_HOST_OPTION_COMMAND_PREFIX)) {
+        if (activeTabId) {
+          const target = commandPluginSetting(commandId, PLUGIN_HOST_OPTION_COMMAND_PREFIX)
+          openSessionSettings(activeTabId, `plugin-host-${target.pluginId}`, target.fieldKey)
+        }
+        setPaletteOpen(false)
+        return
+      }
       switch (commandId) {
         case 'open-settings':
+          setOptionsSectionId(undefined)
+          setOptionsFieldKey(undefined)
           setShowOptions(true)
           break
         case 'toggle-theme':
@@ -1047,7 +1214,16 @@ export default function App() {
       }
       setPaletteOpen(false)
     },
-    [settings, activeTabId, updateSettings, reconnectTab, closeTab, reopenLastClosedSession, togglePlugin]
+    [
+      settings,
+      activeTabId,
+      updateSettings,
+      reconnectTab,
+      closeTab,
+      reopenLastClosedSession,
+      togglePlugin,
+      openSessionSettings
+    ]
   )
 
   useEffect(() => {
@@ -1505,7 +1681,13 @@ export default function App() {
         <OptionsDialog
           settings={settings}
           onChange={updateSettings}
-          onClose={() => setShowOptions(false)}
+          initialSectionId={optionsSectionId}
+          initialFieldKey={optionsFieldKey}
+          onClose={() => {
+            setShowOptions(false)
+            setOptionsSectionId(undefined)
+            setOptionsFieldKey(undefined)
+          }}
         />
       ) : null}
 
@@ -1515,6 +1697,8 @@ export default function App() {
         <HostSessionSettingsDialog
           mode={hostEditor.mode}
           connected={hostEditor.connected}
+          initialSectionId={hostEditor.initialSectionId}
+          initialFieldKey={hostEditor.initialFieldKey}
           hosts={hosts}
           initial={hostEditor.initial}
           styleDefaults={styleDefaults}

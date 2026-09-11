@@ -98,6 +98,8 @@ export type HostSessionMode = 'editHost' | 'editOpenSession'
 interface Props {
   mode: HostSessionMode
   connected: boolean
+  initialSectionId?: string
+  initialFieldKey?: string
   hosts: HostProfile[]
   initial: ConnectionParams | HostProfile
   /** App-level defaults used when a field is set to “Use default” */
@@ -259,6 +261,8 @@ function DefaultableControl({
 export default function HostSessionSettingsDialog({
   mode,
   connected,
+  initialSectionId,
+  initialFieldKey,
   hosts,
   initial,
   styleDefaults,
@@ -1182,6 +1186,8 @@ export default function HostSessionSettingsDialog({
     <SettingsDialog
       title={mode === 'editHost' ? 'Host settings' : 'Session settings'}
       sections={sections}
+      initialSectionId={initialSectionId}
+      initialFieldKey={initialFieldKey}
       onClose={onClose}
       footer={
         <>

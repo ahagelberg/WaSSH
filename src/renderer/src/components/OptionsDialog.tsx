@@ -31,6 +31,8 @@ interface Props {
   settings: AppSettings
   onChange: (partial: Partial<AppSettings>) => void
   onClose: () => void
+  initialSectionId?: string
+  initialFieldKey?: string
 }
 
 function optionsPayload(draft: AppSettings): Partial<AppSettings> {
@@ -119,7 +121,13 @@ function DefaultsColorRow({
   )
 }
 
-export default function OptionsDialog({ settings, onChange, onClose }: Props) {
+export default function OptionsDialog({
+  settings,
+  onChange,
+  onClose,
+  initialSectionId,
+  initialFieldKey
+}: Props) {
   const [draft, setDraft] = useState<AppSettings>(() => ({
     ...settings,
     sessionStyleDefaults: sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
@@ -434,6 +442,8 @@ export default function OptionsDialog({ settings, onChange, onClose }: Props) {
     <SettingsDialog
       title="Options"
       sections={sections}
+      initialSectionId={initialSectionId}
+      initialFieldKey={initialFieldKey}
       onClose={handleCancel}
       footer={
         <>
