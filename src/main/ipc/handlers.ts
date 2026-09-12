@@ -164,6 +164,7 @@ export function registerIpc(
     await shell.openExternal(url)
   })
 
+
   ipcMain.handle('plugins:list', () => pluginHost.listPlugins())
   ipcMain.handle('plugins:activate', async (_e, tabId: string, pluginId: string) => {
     await pluginHost.activate(tabId, pluginId)
