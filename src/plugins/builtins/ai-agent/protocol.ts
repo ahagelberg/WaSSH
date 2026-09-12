@@ -155,6 +155,12 @@ export interface AiAgentDeltaPayload {
   text: string
 }
 
+export interface AiAgentToolOutputPayload {
+  type: 'toolOutput'
+  toolCallId: string
+  text: string
+}
+
 export interface AiAgentToastPayload {
   type: 'toast'
   kind: 'error' | 'info'

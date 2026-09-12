@@ -33,12 +33,16 @@ import {
   type AiAgentProviderConfig,
   type AiAgentProviderProtocol,
   type AiAgentStateSnapshot,
-  type AiAgentToastPayload
+  type AiAgentToastPayload,
+  type AiAgentToolOutputPayload
 } from './protocol'
 import type { PluginViewProps } from '@plugin-api/renderer'
 
 /** Streaming rows rendered between two state snapshots may not exceed this */
 const STREAM_PLACEHOLDER_LIMIT = 1_000_000
+
+/** Streaming command output rendered before the final tool result is available. */
+const TOOL_OUTPUT_STREAM_LIMIT = 64_000
 
 /** Max characters shown in the queued-message preview strip */
 const QUEUE_PREVIEW_MAX_CHARS = 120
@@ -254,6 +258,7 @@ export default function AiAgentView({
 }: PluginViewProps): ReactElement {
   const [view, setView] = useState<ViewState>(emptyViewState)
   const [stream, setStream] = useState('')
+  const [toolOutput, setToolOutput] = useState<Record<string, string>>({})
   const [input, setInput] = useState('')
   const [attach, setAttach] = useState(false)
   const [attachments, setAttachments] = useState<AiAgentChatAttachment[]>([])
@@ -298,6 +303,7 @@ export default function AiAgentView({
         | AiAgentStateSnapshot
         | AiAgentDeltaPayload
         | AiAgentToastPayload
+        | AiAgentToolOutputPayload
         | null
       if (!payload || typeof payload !== 'object' || !('type' in payload)) {
         return
@@ -317,6 +323,7 @@ export default function AiAgentView({
           lastError: payload.lastError
         })
         setStream('')
+        setToolOutput({})
         if (payload.runPhase !== 'ask_sudo') {
           setSudoPassword('')
         }
@@ -324,6 +331,14 @@ export default function AiAgentView({
       }
       if (payload.type === 'delta') {
         setStream((prev) => (prev + payload.text).slice(0, STREAM_PLACEHOLDER_LIMIT))
+        return
+      }
+      if (payload.type === 'toolOutput') {
+        setToolOutput((current) => ({
+          ...current,
+          [payload.toolCallId]: ((current[payload.toolCallId] ?? '') + payload.text)
+            .slice(0, TOOL_OUTPUT_STREAM_LIMIT)
+        }))
         return
       }
       if (payload.type === 'toast') {
@@ -662,7 +677,16 @@ export default function AiAgentView({
         }
         const body =
           outputs.length === 0 ? (
-            <span className="ai-agent-tool-status">ran</span>
+            toolOutput[tc.id] ? (
+              <div className="ai-agent-tool-out">
+                <div className="ai-agent-tool-meta">
+                  <span className="ai-agent-tool-status">running</span>
+                </div>
+                <pre className="ai-agent-out">{toolOutput[tc.id]}</pre>
+              </div>
+            ) : (
+              <span className="ai-agent-tool-status">ran</span>
+            )
           ) : (
             outputs.map((out, k) => (
               <div key={k} className="ai-agent-tool-out">
@@ -739,7 +763,7 @@ export default function AiAgentView({
     if (el) {
       el.scrollTop = el.scrollHeight
     }
-  }, [messages.length, stream, view.runPhase, historyOpen])
+  }, [messages.length, stream, toolOutput, view.runPhase, historyOpen])
 
   useEffect(() => {
     const el = promptInputRef.current

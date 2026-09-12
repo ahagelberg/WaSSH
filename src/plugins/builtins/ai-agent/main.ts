@@ -163,6 +163,7 @@ interface HostState {
   connectionId: string | null
   /** The tab ctx that started the current run (used to close exec channels) */
   runCtx: PluginMainContext | null
+  streamingToolCallId: string | null
   stopped: boolean
   inRun: boolean
   lastError?: string
@@ -627,6 +628,7 @@ function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext):
       controller: null,
       connectionId: null,
       runCtx: null,
+      streamingToolCallId: null,
       stopped: false,
       inRun: false
     }
@@ -636,6 +638,14 @@ function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext):
   }
   hostRefCount.set(hostKey, (hostRefCount.get(hostKey) ?? 0) + 1)
   return host
+}
+
+function pushToolOutput(host: HostState, toolCallId: string, text: string): void {
+  for (const tab of tabs.values()) {
+    if (tab.hostKey === host.hostKey) {
+      tab.ctx.sendToRenderer({ type: 'toolOutput', toolCallId, text })
+    }
+  }
 }
 
 function releaseHost(hostKey: string, ctx: PluginMainContext): void {
@@ -1233,10 +1243,12 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             sudoStdin = hasCachedSudoPassword(host) ? (host.sudoPassword ?? '') : ''
           }
 
+          host.streamingToolCallId = tc.id
           const execResult = (await ctx.callPluginApi(PLUGIN_ID_AI_AGENT, AI_AGENT_TOOL_RUN_COMMAND, {
             command,
             sudoStdin
           })) as ExecResult
+          host.streamingToolCallId = null
           if (!host.inRun) {
             keepRunning = false
             break
@@ -1343,6 +1355,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     if (host.inRun) {
       host.inRun = false
       host.runCtx = null
+      host.streamingToolCallId = null
       // A user-initiated stop parks the run in 'paused' so the view can offer
       // a Continue action; anything else returns to idle.
       host.phase = host.stopped ? 'paused' : 'idle'
@@ -1403,6 +1416,7 @@ async function execCommand(
   return await new Promise<ExecResult>((resolve) => {
     let settled = false
     let raw = ''
+    let streamedOutputLength = 0
     let truncated = false
     let timer: ReturnType<typeof setTimeout> | null = null
 
@@ -1466,6 +1480,14 @@ async function execCommand(
             return
           }
           raw += chunk
+          const statusStart = raw.indexOf(`\n${statusTag}:`)
+          const visibleOutput = statusStart === -1 ? raw : raw.slice(0, statusStart)
+          const toolCallId = host.streamingToolCallId
+          const streamEnd = Math.min(visibleOutput.length, MAX_OUTPUT_CHARS)
+          if (toolCallId && streamEnd > streamedOutputLength) {
+            pushToolOutput(host, toolCallId, visibleOutput.slice(streamedOutputLength, streamEnd))
+            streamedOutputLength = streamEnd
+          }
           const limit = MAX_OUTPUT_CHARS + MARKER_TAIL_CHARS
           if (raw.length > limit) {
             raw = raw.slice(-limit)
