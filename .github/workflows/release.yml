@@ -118,7 +118,7 @@ jobs:
         run: npm run typecheck
 
       - name: Build macOS artifacts
-        run: npm run dist:mac -- --${{ matrix.arch }}
+        run: npm run dist:mac -- --${{ matrix.arch }} --publish never
 
       - name: Attach macOS assets to GitHub release
         run: |
@@ -178,7 +178,7 @@ jobs:
         run: npm run typecheck
 
       - name: Build Linux artifacts
-        run: npm run dist:linux -- --${{ matrix.arch }}
+        run: npm run dist:linux -- --${{ matrix.arch }} --publish never
 
       - name: Attach Linux assets to GitHub release
         run: |
