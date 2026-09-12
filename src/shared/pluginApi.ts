@@ -51,8 +51,12 @@ export type PluginSettingsFieldType =
   | 'select'
   | 'stringList'
   | 'commandList'
+  /** Repeatable records edited from a nested item schema. */
+  | 'itemList'
   /** Boolean master toggle with nested `children` fields. */
   | 'group'
+  /** Button that invokes a host-defined settings action. */
+  | 'action'
   /** Trinary allow/deny/ask toggle; see `PluginPermissionDecision`. */
   | 'permission'
 
@@ -141,6 +145,12 @@ export interface PluginSettingsField {
   options?: PluginSettingsSelectOption[]
   /** When type is 'group', the nested fields shown under the master toggle. */
   children?: PluginSettingsField[]
+  /** When type is 'itemList', the fields shown for each list item. */
+  itemSchema?: PluginSettingsField[]
+  /** Optional label used for each item in an item list. */
+  itemLabel?: string
+  /** Host-defined action identifier for button fields. */
+  action?: string
 }
 
 export interface PluginToolbarContribution {

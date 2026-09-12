@@ -32,6 +32,157 @@
   font-size: 16px;
 }
 
+.ai-agent-provider-dialog-body {
+  grid-template-columns: 220px minmax(0, 1fr);
+}
+
+.ai-agent-provider-dialog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: auto;
+  padding: 12px;
+  background: var(--bg-panel-2);
+  border-right: 1px solid var(--border);
+}
+
+.ai-agent-provider-dialog-list button {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 11px;
+  text-align: left;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+}
+
+.ai-agent-provider-dialog-list button strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.ai-agent-provider-dialog-list button span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ai-agent-provider-dialog-list button:hover {
+  background: var(--bg-panel);
+  border-color: var(--border);
+}
+
+.ai-agent-provider-dialog-list button.active {
+  background: var(--bg-app);
+  border-color: var(--accent);
+  color: var(--text);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.ai-agent-provider-dialog-editor {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+  overflow: auto;
+  padding: 20px 24px 28px;
+}
+
+.ai-agent-provider-dialog-editor > label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ai-agent-provider-dialog-editor > label input,
+.ai-agent-provider-dialog-editor > label select,
+.ai-agent-provider-dialog-editor > label output {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.ai-agent-provider-dialog-editor > label input,
+.ai-agent-provider-dialog-editor > label select {
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 9px;
+}
+
+.ai-agent-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  margin-top: 2px;
+}
+
+.ai-agent-provider-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--gap);
+}
+
+.ai-agent-provider-model-row > label {
+  min-width: 0;
+}
+
+.ai-agent-provider-model-row > button {
+  margin-bottom: 0;
+}
+
+.ai-agent-provider-check-message {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.ai-agent-provider-check-message.is-checking {
+  color: var(--text-muted);
+}
+
+.ai-agent-provider-check-message.is-success {
+  color: var(--accent);
+}
+
+.ai-agent-provider-check-message.is-error {
+  color: var(--danger, #e06c75);
+  overflow-wrap: anywhere;
+}
+
+.ai-agent-provider-models {
+  display: block;
+  min-height: 34px;
+  padding: 8px 9px;
+  color: var(--text-muted);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.ai-agent-provider-dialog-editor > .ai-agent-danger {
+  justify-self: start;
+}
+
+.ai-agent-provider-authenticate,
+.ai-agent-provider-check {
+  align-self: flex-start;
+  margin-top: 8px;
+}
+
+.ai-agent-provider-check-message {
+  display: block;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
 .settings-dialog-body {
   flex: 1;
   display: grid;
@@ -199,6 +350,50 @@
 .settings-row-block {
   grid-template-columns: 1fr;
   align-items: start;
+}
+
+.plugin-settings-items {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+}
+
+.plugin-settings-item {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel-2);
+}
+
+.plugin-settings-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.plugin-settings-item-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.plugin-settings-item-fields {
+  display: grid;
+  gap: 6px;
+}
+
+.plugin-settings-item-field {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(160px, 280px);
+  gap: 12px;
+  align-items: center;
 }
 
 .plugin-settings-group-children {

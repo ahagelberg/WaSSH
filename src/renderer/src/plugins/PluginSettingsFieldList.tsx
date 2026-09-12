@@ -6,6 +6,7 @@ interface Props {
   schema: PluginSettingsField[]
   values: Record<string, unknown>
   onChange: (key: string, value: unknown) => void
+  onAction?: (field: PluginSettingsField) => void
   /** Nesting depth; 0 = top-level fields in the schema, incremented per `group` level. */
   depth?: number
 }
@@ -21,7 +22,7 @@ const MAX_COMPACT_DEPTH = 2
  * per depth up to `MAX_COMPACT_DEPTH`, so deeply nested option trees (e.g.
  * Permissions > category > method) stay scannable.
  */
-export default function PluginSettingsFieldList({ schema, values, onChange, depth = 0 }: Props): ReactElement {
+export default function PluginSettingsFieldList({ schema, values, onChange, onAction, depth = 0 }: Props): ReactElement {
   const tier = Math.min(depth, MAX_COMPACT_DEPTH)
   const rowClassName = depth > 0 ? `settings-row plugin-settings-row-nested depth-${tier}` : 'settings-row'
   return (
@@ -41,6 +42,7 @@ export default function PluginSettingsFieldList({ schema, values, onChange, dept
                   field={field}
                   value={values[field.key]}
                   onChange={(value) => onChange(field.key, value)}
+                  onAction={() => onAction?.(field)}
                 />
               </div>
               <div
@@ -58,7 +60,11 @@ export default function PluginSettingsFieldList({ schema, values, onChange, dept
           )
         }
         return (
-          <div key={field.key} className={rowClassName} data-plugin-setting-key={field.key}>
+          <div
+            key={field.key}
+            className={`${rowClassName}${field.type === 'itemList' ? ' settings-row-block' : ''}`}
+            data-plugin-setting-key={field.key}
+          >
             <div className="settings-row-label">
               <strong>{field.label}</strong>
               {field.description ? <span>{field.description}</span> : null}
@@ -67,6 +73,7 @@ export default function PluginSettingsFieldList({ schema, values, onChange, dept
               field={field}
               value={values[field.key]}
               onChange={(value) => onChange(field.key, value)}
+                  onAction={() => onAction?.(field)}
             />
           </div>
         )

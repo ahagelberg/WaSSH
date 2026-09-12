@@ -1,4 +1,4 @@
-import type { ReactElement } from 'react'
+import { useState, type ReactElement } from 'react'
 import type { PluginCommand, PluginPermissionDecision, PluginSettingsField } from '@plugin-api/shared'
 
 const PERMISSION_OPTIONS: Array<{ value: PluginPermissionDecision; label: string }> = [
@@ -104,15 +104,116 @@ function MacroListEditor({
   )
 }
 
-export default function PluginFieldEditor({
+function ItemListEditor({
   field,
   value,
-  onChange
+  onChange,
+  onAction
 }: {
   field: PluginSettingsField
   value: unknown
   onChange: (value: unknown) => void
+  onAction?: () => void
 }): ReactElement {
+  if (field.type === 'action') {
+    return (
+      <button type="button" className="primary" onClick={onAction}>
+        {field.label}
+      </button>
+    )
+  }
+  const items = Array.isArray(value) ? value : []
+  const schema = field.itemSchema ?? []
+  const [expandedItems, setExpandedItems] = useState<Set<number>>(() => new Set())
+  const newItem = (): Record<string, unknown> =>
+    Object.fromEntries(schema.map((child) => [child.key, child.default]))
+  const updateItem = (index: number, key: string, nextValue: unknown): void => {
+    const next = items.map((item, itemIndex) =>
+      itemIndex === index && item && typeof item === 'object' && !Array.isArray(item)
+        ? { ...(item as Record<string, unknown>), [key]: nextValue }
+        : item
+    )
+    onChange(next)
+  }
+
+  return (
+    <div className="plugin-settings-items">
+      {items.map((item, index) => {
+        const values = item && typeof item === 'object' && !Array.isArray(item)
+          ? (item as Record<string, unknown>)
+          : newItem()
+        const expanded = expandedItems.has(index)
+        return (
+          <div key={index} className="plugin-settings-item">
+            <div className="plugin-settings-item-header">
+              <button
+                type="button"
+                className="plugin-settings-item-toggle"
+                aria-expanded={expanded}
+                onClick={() => {
+                  setExpandedItems((previous) => {
+                    const next = new Set(previous)
+                    if (next.has(index)) {
+                      next.delete(index)
+                    } else {
+                      next.add(index)
+                    }
+                    return next
+                  })
+                }}
+              >
+                <span aria-hidden="true">{expanded ? '-' : '+'}</span>
+                <strong>{field.itemLabel || 'Item'} {index + 1}</strong>
+              </button>
+              <button type="button" onClick={() => onChange(items.filter((_, i) => i !== index))}>
+                Remove
+              </button>
+            </div>
+            {expanded ? (
+              <div className="plugin-settings-item-fields">
+                {schema.map((child) => (
+                  <div key={child.key} className="plugin-settings-item-field">
+                    <div className="settings-row-label">
+                      <strong>{child.label}</strong>
+                      {child.description ? <span>{child.description}</span> : null}
+                    </div>
+                    <PluginFieldEditor
+                      field={child}
+                      value={values[child.key]}
+                      onChange={(nextValue) => updateItem(index, child.key, nextValue)}
+                    />
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        )
+      })}
+      <button type="button" onClick={() => onChange([...items, newItem()])}>
+        Add {field.itemLabel || 'item'}
+      </button>
+    </div>
+  )
+}
+
+export default function PluginFieldEditor({
+  field,
+  value,
+  onChange,
+  onAction
+}: {
+  field: PluginSettingsField
+  value: unknown
+  onChange: (value: unknown) => void
+  onAction?: () => void
+}): ReactElement {
+  if (field.type === 'action') {
+    return (
+      <button type="button" className="primary" onClick={onAction}>
+        {field.label}
+      </button>
+    )
+  }
   if (field.type === 'boolean' || field.type === 'group') {
     return (
       <input
@@ -149,6 +250,9 @@ export default function PluginFieldEditor({
   if (field.type === 'commandList') {
     const list = Array.isArray(value) ? (value as PluginCommand[]) : []
     return <MacroListEditor value={list} onChange={onChange} />
+  }
+  if (field.type === 'itemList') {
+    return <ItemListEditor field={field} value={value} onChange={onChange} />
   }
   if (field.type === 'permission') {
     return <PermissionControl value={value} onChange={onChange} />
