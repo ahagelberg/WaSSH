@@ -80,7 +80,6 @@
   font-size: 10px;
   color: var(--text-muted);
 }
-
 .ai-agent-history-delete {
   flex-shrink: 0;
   align-self: stretch;
