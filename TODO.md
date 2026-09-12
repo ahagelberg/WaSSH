@@ -7,7 +7,6 @@
 - Topology view (plugin) built up autoamtically based on connections, tunnels, hops etc.
 - Workspaces
 - Tunnels guide: pre-defined common tunnels as templates.
-
 - Share settings easily
 - Overview of all open sessions with thumbnails
 - Global command history with quick search
@@ -28,3 +27,4 @@
 - MQTT plugin: add basic triggers for activating commands and other things based on messages received
 - AI Agent: Add option to include (yaml) files with prompts
 - Daemon monitor: triggers
+- AI Agent: better approval system - detect individual commands in long command list, classify them as already approved or not depending on arguments.
