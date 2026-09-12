@@ -567,6 +567,68 @@ export interface ConnectRequest {
 export type HostKeyDecision = 'accept' | 'reject'
 export type SavePasswordDecision = 'save' | 'skip' | 'save_as_host'
 
+export type SshKeyAlgorithm = 'ed25519' | 'rsa'
+
+export interface SshKeyInfo {
+  exists: boolean
+  publicKey?: string
+  keyType?: string
+  comment?: string
+  hasPassphrase?: boolean
+}
+
+export interface SshKeyLocalItem {
+  name: string
+  path: string
+  type: string
+  publicKey?: string
+}
+
+export interface SshKeyGenerateOptions {
+  type: SshKeyAlgorithm
+  filename?: string
+  passphrase?: string
+  comment?: string
+}
+
+export interface SshKeyGenerateResult {
+  privateKeyPath: string
+  publicKeyPath: string
+  publicKey: string
+}
+
+export interface SshKeyDeployOptions {
+  host: string
+  port: number
+  username: string
+  password?: string
+  passwordVaultId?: string
+  proxyHostId?: string
+  publicKey: string
+}
+
+export interface SshKeyDeployResult {
+  success: boolean
+  message: string
+}
+
+export interface SshKeyRetrieveOptions {
+  host: string
+  port: number
+  username: string
+  password?: string
+  passwordVaultId?: string
+  proxyHostId?: string
+}
+
+export interface SshKeyRetrieveResult {
+  success: boolean
+  message: string
+  privateKeyPath?: string
+  publicKey?: string
+  keyType?: string
+}
+
 export interface WasshApi {
   getSettings: () => Promise<AppSettings>
   setSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
@@ -594,6 +656,11 @@ export interface WasshApi {
   ) => Promise<void>
   pickPrivateKeyFile: () => Promise<string | null>
   pickDirectory: () => Promise<string | null>
+  getSshKeyInfo: (privateKeyPath: string, passphrase?: string) => Promise<SshKeyInfo>
+  listLocalSshKeys: () => Promise<SshKeyLocalItem[]>
+  generateSshKey: (options: SshKeyGenerateOptions) => Promise<SshKeyGenerateResult>
+  deploySshKey: (options: SshKeyDeployOptions) => Promise<SshKeyDeployResult>
+  retrieveSshKey: (options: SshKeyRetrieveOptions) => Promise<SshKeyRetrieveResult>
   listSerialPorts: () => Promise<SerialPortInfo[]>
   beep: () => Promise<void>
   listPlugins: () => Promise<PluginListItem[]>

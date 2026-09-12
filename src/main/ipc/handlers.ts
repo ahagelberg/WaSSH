@@ -6,6 +6,9 @@ import {
   HostKeyDecision,
   HostProfile,
   SavePasswordDecision,
+  SshKeyDeployOptions,
+  SshKeyGenerateOptions,
+  SshKeyRetrieveOptions,
   TabSnapshot,
   THEME_WINDOW_BACKGROUND,
   type HostsOrganization
@@ -18,6 +21,7 @@ import {
   TabStore
 } from '../store/sessionStore'
 import { SessionManager } from '../ssh/SessionManager'
+import { SshKeyManager } from '../ssh/SshKeyManager'
 import { listSerialPorts } from '../serial/listSerialPorts'
 import type { PluginHost } from '../plugins/PluginHost'
 import { queuePluginRestore } from '../plugins/createPluginSystem'
@@ -56,6 +60,22 @@ export function registerIpc(
   pluginHost: PluginHost,
   pluginData: PluginDataStore
 ): void {
+  const sshKeyManager = new SshKeyManager(vault, sessionStore)
+
+  ipcMain.handle('sshKey:getInfo', (_e, privateKeyPath: string, passphrase?: string) =>
+    sshKeyManager.getSshKeyInfo(privateKeyPath, passphrase)
+  )
+  ipcMain.handle('sshKey:listLocal', () => sshKeyManager.listLocalSshKeys())
+  ipcMain.handle('sshKey:generate', (_e, options: SshKeyGenerateOptions) =>
+    sshKeyManager.generateSshKey(options)
+  )
+  ipcMain.handle('sshKey:deploy', (_e, options: SshKeyDeployOptions) =>
+    sshKeyManager.deploySshKey(options)
+  )
+  ipcMain.handle('sshKey:retrieve', (_e, options: SshKeyRetrieveOptions) =>
+    sshKeyManager.retrieveSshKey(options)
+  )
+
   ipcMain.handle('settings:get', () => settingsStore.get())
   ipcMain.handle('settings:set', async (_e, partial: Partial<AppSettings>) => {
     const prev = settingsStore.get()

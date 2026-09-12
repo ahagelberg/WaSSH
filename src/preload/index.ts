@@ -60,6 +60,12 @@ const api: WasshApi = {
     ipcRenderer.invoke('session:respondSavePassword', tabId, decision, hostName),
   pickPrivateKeyFile: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
   pickDirectory: () => ipcRenderer.invoke('dialog:pickDirectory'),
+  getSshKeyInfo: (privateKeyPath, passphrase) =>
+    ipcRenderer.invoke('sshKey:getInfo', privateKeyPath, passphrase),
+  listLocalSshKeys: () => ipcRenderer.invoke('sshKey:listLocal'),
+  generateSshKey: (options) => ipcRenderer.invoke('sshKey:generate', options),
+  deploySshKey: (options) => ipcRenderer.invoke('sshKey:deploy', options),
+  retrieveSshKey: (options) => ipcRenderer.invoke('sshKey:retrieve', options),
   listSerialPorts: () => ipcRenderer.invoke('serial:listPorts'),
   beep: () => ipcRenderer.invoke('app:beep'),
   listPlugins: () => ipcRenderer.invoke('plugins:list'),
