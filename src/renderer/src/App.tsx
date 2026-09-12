@@ -1682,6 +1682,7 @@ export default function App() {
 
       {showOptions ? (
         <OptionsDialog
+          activeTabId={activeTabId}
           settings={settings}
           onChange={updateSettings}
           initialSectionId={optionsSectionId}

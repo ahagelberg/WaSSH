@@ -50,6 +50,14 @@ export const aiAgentManifest: PluginManifest = {
     settingsHeading: 'AI agent',
     settingsSchema: [
       {
+        key: 'configureProviders',
+        label: 'Configure providers',
+        type: 'action',
+        default: null,
+        action: 'configureProviders',
+        description: 'Add, remove, and configure AI model providers.'
+      },
+      {
         key: AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
         label: 'Prompt files folder',
         type: 'directory',

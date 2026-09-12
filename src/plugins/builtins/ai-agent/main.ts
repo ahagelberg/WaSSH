@@ -198,6 +198,12 @@ function normalizeProviders(raw: unknown): AiAgentProviderConfig[] {
     if (!isProviderConfig(value)) {
       continue
     }
+    if (
+      value.protocol !== AI_AGENT_PROTOCOL_OPENAI &&
+      value.protocol !== AI_AGENT_PROTOCOL_ANTHROPIC
+    ) {
+      continue
+    }
     const id = value.id.trim()
     if (providerIds.has(id)) {
       continue
@@ -289,14 +295,25 @@ function normalizeConversation(
     typeof raw.title === 'string' && raw.title.trim().length > 0
       ? raw.title.trim()
       : titleFromMessages(messages)
+  const lastSelectedModelByProvider = Object.fromEntries(
+    Object.entries(raw.lastSelectedModelByProvider ?? {}).filter(
+      ([providerId, model]) => typeof providerId === 'string' && typeof model === 'string'
+    )
+  ) as Record<string, string>
+  const activeProviderId = typeof raw.activeProviderId === 'string' ? raw.activeProviderId : ''
+  const activeModel = typeof raw.activeModel === 'string' ? raw.activeModel : ''
+  if (activeProviderId && activeModel && !lastSelectedModelByProvider[activeProviderId]) {
+    lastSelectedModelByProvider[activeProviderId] = activeModel
+  }
   return {
     id,
     hostKey,
     title,
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
     version: AI_AGENT_DATA_VERSION,
-    activeProviderId: typeof raw.activeProviderId === 'string' ? raw.activeProviderId : '',
-    activeModel: typeof raw.activeModel === 'string' ? raw.activeModel : '',
+    activeProviderId,
+    activeModel,
+    lastSelectedModelByProvider,
     hostLabel: typeof raw.hostLabel === 'string' ? raw.hostLabel : '',
     cwd: typeof raw.cwd === 'string' ? raw.cwd : '/',
     messages
@@ -349,6 +366,7 @@ function createConversation(
     version: AI_AGENT_DATA_VERSION,
     activeProviderId: providerId,
     activeModel: model,
+    lastSelectedModelByProvider: providerId && model ? { [providerId]: model } : {},
     hostLabel,
     cwd,
     messages: []
@@ -1025,7 +1043,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   }
   const provider = findProvider(conv.activeProviderId)
   if (!provider) {
-    pushToast(host, 'error', 'No model provider configured — open the gear menu and pick one.')
+    pushToast(host, 'error', 'No model provider configured — configure one in Options.')
     return
   }
   if (!conv.activeModel) {
@@ -1035,11 +1053,10 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   // Read the key from the encrypted vault (safeStorage/DPAPI) for every run so
   // keys survive restarts without any renderer round-trip or in-memory cache.
   const apiKey = ctx.getSecret(aiAgentVaultId(provider.id)) ?? ''
-  if (!apiKey && provider.protocol === 'anthropic') {
+  if (!apiKey && provider.protocol === AI_AGENT_PROTOCOL_ANTHROPIC) {
     pushToast(host, 'error', `No API key set for provider "${provider.name}".`)
     return
   }
-
   const settings = ctx.getSettings()
   const hostAllow = listSetting(settings, AI_AGENT_SETTING_HOST_ALLOW_RULES)
   const hostDeny = listSetting(settings, AI_AGENT_SETTING_HOST_DENY_RULES)
@@ -1484,6 +1501,7 @@ async function setupForTab(ctx: PluginMainContext, forceProbe: boolean): Promise
       host = ensureHost(hostKey, hostLabel, ctx)
     }
     pushState(host)
+    void refreshAllModels(ctx)
     return
   }
   if (existing) {
@@ -1503,6 +1521,12 @@ async function setupForTab(ctx: PluginMainContext, forceProbe: boolean): Promise
     }
   }
   pushState(host)
+  void refreshAllModels(ctx)
+}
+
+async function refreshAllModels(ctx: PluginMainContext): Promise<void> {
+  const providers = dataFile?.providers ?? []
+  await Promise.all(providers.map((provider) => handleRefreshModels(ctx, provider.id)))
 }
 
 function hostForCtx(ctx: PluginMainContext): HostState | null {
@@ -1619,6 +1643,10 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
       return true
     case 'providersChanged':
       return Array.isArray(message.providers) && message.providers.every(isProviderConfig)
+    case 'checkProvider':
+      return isProviderConfig(message.provider)
+    case 'refreshProvider':
+      return isProviderConfig(message.provider)
     case 'refreshModels':
       return typeof message.providerId === 'string'
     case 'openChat':
@@ -1659,7 +1687,7 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
 async function handleRendererMessage(
   ctx: PluginMainContext,
   payload: unknown
-): Promise<void> {
+): Promise<unknown> {
   if (!isRendererMessage(payload)) {
     throw new Error('Invalid AI agent renderer message')
   }
@@ -1684,8 +1712,41 @@ async function handleRendererMessage(
     const host = hostForCtx(ctx)
     if (host) {
       pushState(host)
+      void refreshAllModels(ctx)
     }
     return
+  }
+  if (payload.type === 'checkProvider') {
+    try {
+      const models = await listModels({
+        baseUrl: payload.provider.baseUrl,
+        apiKey: ctx.getSecret(aiAgentVaultId(payload.provider.id)) ?? '',
+        protocol: payload.provider.protocol
+      })
+      return { ok: true, models }
+    } catch (error) {
+      return {
+        ok: false,
+        models: [],
+        message: error instanceof Error ? error.message : String(error)
+      }
+    }
+  }
+  if (payload.type === 'refreshProvider') {
+    try {
+      const models = await listModels({
+        baseUrl: payload.provider.baseUrl,
+        apiKey: ctx.getSecret(aiAgentVaultId(payload.provider.id)) ?? '',
+        protocol: payload.provider.protocol
+      })
+      return { ok: true, models }
+    } catch (error) {
+      return {
+        ok: false,
+        models: [],
+        message: error instanceof Error ? error.message : String(error)
+      }
+    }
   }
   if (payload.type === 'refreshModels') {
     await handleRefreshModels(ctx, payload.providerId)
@@ -1754,6 +1815,9 @@ async function handleRendererMessage(
   if (payload.type === 'select') {
     host.conversation.activeProviderId = payload.providerId
     host.conversation.activeModel = payload.model
+    if (payload.providerId && payload.model) {
+      host.conversation.lastSelectedModelByProvider[payload.providerId] = payload.model
+    }
     persistConversation(host)
     pushState(host)
     return
@@ -1766,6 +1830,9 @@ async function handleRendererMessage(
     if (host.conversation.messages.length === 0) {
       host.conversation.activeProviderId = payload.providerId
       host.conversation.activeModel = payload.model
+      if (payload.providerId && payload.model) {
+        host.conversation.lastSelectedModelByProvider[payload.providerId] = payload.model
+      }
       host.conversation.title = AI_AGENT_DEFAULT_CHAT_TITLE
       persistConversation(host)
       pushState(host)
@@ -1846,6 +1913,9 @@ async function handleRendererMessage(
     pruneUnresolvedTail(host.conversation)
     host.conversation.activeProviderId = payload.providerId
     host.conversation.activeModel = payload.model
+    if (payload.providerId && payload.model) {
+      host.conversation.lastSelectedModelByProvider[payload.providerId] = payload.model
+    }
     const displayText = payload.text.trim()
     const attachments = Array.isArray(payload.attachments) ? payload.attachments : []
     const modelText = chatMessageWithContext(
@@ -1978,7 +2048,7 @@ export const aiAgentMain: PluginMainModule = {
     }
   },
   async onMessage(ctx, payload) {
-    await handleRendererMessage(ctx, payload)
+    return handleRendererMessage(ctx, payload)
   },
   onApiCall: handleApiCall
 }

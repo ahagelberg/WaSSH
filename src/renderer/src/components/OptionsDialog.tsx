@@ -26,8 +26,10 @@ import ClampedNumberInput from './ClampedNumberInput'
 import ColorHexInput from './ColorHexInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import PluginSettingsFieldList from '../plugins/PluginSettingsFieldList'
+import AiAgentProviderDialog from './AiAgentProviderDialog'
 
 interface Props {
+  activeTabId: string | null
   settings: AppSettings
   onChange: (partial: Partial<AppSettings>) => void
   onClose: () => void
@@ -122,6 +124,7 @@ function DefaultsColorRow({
 }
 
 export default function OptionsDialog({
+  activeTabId,
   settings,
   onChange,
   onClose,
@@ -133,6 +136,7 @@ export default function OptionsDialog({
     sessionStyleDefaults: sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
   }))
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
+  const [providerDialogOpen, setProviderDialogOpen] = useState(false)
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
 
   const patch = (partial: Partial<AppSettings>): void => {
@@ -430,6 +434,11 @@ export default function OptionsDialog({
             schema={schema}
             values={values}
             onChange={(key, value) => patchPluginSetting(plugin.id, key, value)}
+            onAction={(field) => {
+              if (plugin.id === 'ai-agent' && field.action === 'configureProviders') {
+                setProviderDialogOpen(true)
+              }
+            }}
           />
         )
       })
@@ -439,22 +448,21 @@ export default function OptionsDialog({
   }, [draft, plugins, fontFamilies])
 
   return (
-    <SettingsDialog
-      title="Options"
-      sections={sections}
-      initialSectionId={initialSectionId}
-      initialFieldKey={initialFieldKey}
-      onClose={handleCancel}
-      footer={
-        <>
-          <button type="button" onClick={handleCancel}>
-            Cancel
-          </button>
-          <button type="button" className="primary" onClick={handleSave}>
-            Save
-          </button>
-        </>
-      }
-    />
+    <>
+      <SettingsDialog
+        title="Options"
+        sections={sections}
+        initialSectionId={initialSectionId}
+        initialFieldKey={initialFieldKey}
+        onClose={handleCancel}
+        footer={
+          <>
+            <button type="button" onClick={handleCancel}>Cancel</button>
+            <button type="button" className="primary" onClick={handleSave}>Save</button>
+          </>
+        }
+      />
+      {providerDialogOpen ? <AiAgentProviderDialog tabId={activeTabId} onClose={() => setProviderDialogOpen(false)} /> : null}
+    </>
   )
 }

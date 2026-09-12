@@ -104,6 +104,7 @@ export interface AiAgentConversation {
   version: number
   activeProviderId: string
   activeModel: string
+  lastSelectedModelByProvider: Record<string, string>
   hostLabel: string
   cwd: string
   messages: AiAgentConversationMsg[]
@@ -189,6 +190,8 @@ export type AiAgentRendererMessage =
   | { type: 'rulesChanged'; rules: string }
   | { type: 'select'; providerId: string; model: string }
   | { type: 'providersChanged'; providers: AiAgentProviderConfig[] }
+  | { type: 'checkProvider'; provider: AiAgentProviderConfig }
+  | { type: 'refreshProvider'; provider: AiAgentProviderConfig }
   | { type: 'refreshModels'; providerId: string; silent?: boolean }
   | { type: 'newChat'; providerId: string; model: string }
   | { type: 'openChat'; conversationId: string }
