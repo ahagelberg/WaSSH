@@ -89,7 +89,8 @@
         "portable"
       ],
       "icon": "res/WaSSH program icon.png",
-      "verifyUpdateCodeSignature": false
+      "verifyUpdateCodeSignature": false,
+      "artifactName": "WaSSH-${version}-win-${arch}.${ext}"
     },
     "mac": {
       "category": "public.app-category.developer-tools",
@@ -114,10 +115,10 @@
       "category": "Development"
     },
     "portable": {
-      "artifactName": "WaSSH-Portable-${version}.${ext}"
+      "artifactName": "WaSSH-${version}-win-portable-${arch}.${ext}"
     },
     "nsis": {
-      "artifactName": "WaSSH-Setup-${version}.${ext}",
+      "artifactName": "WaSSH-${version}-win-setup-${arch}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     }
