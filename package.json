@@ -3,6 +3,7 @@
   "version": "1.1.2",
   "description": "WaSSH — advanced multi-tab SSH client",
   "main": "./out/main/index.js",
+  "desktopName": "wassh.desktop",
   "author": {
     "name": "Andreas Hagelberg",
     "email": "andreas@hagelberg.name"
@@ -21,6 +22,7 @@
     "dist:win": "npm run build && electron-builder --win",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:linux": "npm run build && electron-builder --linux",
+    "dist:check": "npm run typecheck && npm run build && electron-builder --win --linux dir --publish never",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
   },
   "dependencies": {
@@ -117,7 +119,6 @@
       "artifactName": "WaSSH-${version}-linux-${arch}.${ext}",
       "category": "Development",
       "maintainer": "Andreas Hagelberg <andreas@hagelberg.name>",
-      "desktopName": "wassh.desktop",
       "syncDesktopName": true
     },
     "portable": {
