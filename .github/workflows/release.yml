@@ -119,6 +119,8 @@ jobs:
 
       - name: Build macOS artifacts
         run: npm run dist:mac -- --${{ matrix.arch }} --publish never
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Attach macOS assets to GitHub release
         run: |
@@ -179,6 +181,8 @@ jobs:
 
       - name: Build Linux artifacts
         run: npm run dist:linux -- --${{ matrix.arch }} --publish never
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Attach Linux assets to GitHub release
         run: |

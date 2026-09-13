@@ -1,9 +1,12 @@
 {
   "name": "wassh",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "WaSSH — advanced multi-tab SSH client",
   "main": "./out/main/index.js",
-  "author": "Andreas Hagelberg <andreas@hagelberg.name>",
+  "author": {
+    "name": "Andreas Hagelberg",
+    "email": "andreas@hagelberg.name"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=24.21.0 <25"
@@ -112,7 +115,10 @@
         "rpm"
       ],
       "artifactName": "WaSSH-${version}-linux-${arch}.${ext}",
-      "category": "Development"
+      "category": "Development",
+      "maintainer": "Andreas Hagelberg <andreas@hagelberg.name>",
+      "desktopName": "wassh.desktop",
+      "syncDesktopName": true
     },
     "portable": {
       "artifactName": "WaSSH-${version}-win-portable-${arch}.${ext}"

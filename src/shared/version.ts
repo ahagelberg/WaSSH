@@ -15,4 +15,7 @@ export const APP_DESCRIPTION: string = packageJson.description
 
 export const APP_LICENSE: string = packageJson.license
 
-export const APP_AUTHOR: string = packageJson.author
+export const APP_AUTHOR: string =
+  typeof packageJson.author === 'string'
+    ? packageJson.author
+    : `${packageJson.author.name} <${packageJson.author.email}>`
