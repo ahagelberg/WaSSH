@@ -635,7 +635,7 @@ export default function HostSessionSettingsDialog({
     )
 
     const screenRows = (
-      <>
+      <div className="plugin-settings-group">
         <div className="settings-row">
           <div className="settings-row-label">
             <strong>Open in remote session</strong>
@@ -660,8 +660,8 @@ export default function HostSessionSettingsDialog({
           />
         </div>
         {form.openInScreen ? (
-          <>
-            <div className="settings-row">
+          <div className="plugin-settings-group-children depth-1">
+            <div className="settings-row plugin-settings-row-nested depth-1">
               <div className="settings-row-label">
                 <strong>Session type</strong>
                 <span>Multiplexer used for the remote session.</span>
@@ -676,7 +676,7 @@ export default function HostSessionSettingsDialog({
                 <option value={REMOTE_SESSION_KIND_TMUX}>tmux</option>
               </select>
             </div>
-            <div className="settings-row">
+            <div className="settings-row plugin-settings-row-nested depth-1">
               <div className="settings-row-label">
                 <strong>Session name</strong>
                 <span>Remote session name used with screen -S / tmux -s and attach.</span>
@@ -687,7 +687,7 @@ export default function HostSessionSettingsDialog({
                 placeholder={DEFAULT_SCREEN_SESSION_NAME}
               />
             </div>
-            <div className="settings-row">
+            <div className="settings-row plugin-settings-row-nested depth-1">
               <div className="settings-row-label">
                 <strong>Session busy handling</strong>
                 <span>
@@ -706,9 +706,9 @@ export default function HostSessionSettingsDialog({
                 <option value={SCREEN_BUSY_FORCE_DETACH}>Force detach</option>
               </select>
             </div>
-          </>
+          </div>
         ) : null}
-      </>
+      </div>
     )
 
     const fontHint =
@@ -1020,17 +1020,15 @@ export default function HostSessionSettingsDialog({
         content: authRows
       })
       list.push({
-        id: 'proxy',
-        title: 'Jump host',
-        content: proxyRows
+        id: 'advanced',
+        title: 'Advanced',
+        content: (
+          <>
+            {proxyRows}
+            {mode === 'editHost' ? screenRows : null}
+          </>
+        )
       })
-      if (mode === 'editHost') {
-        list.push({
-          id: 'remoteSession',
-          title: 'Remote session',
-          content: screenRows
-        })
-      }
       list.push({
         id: 'tunnels',
         title: 'Tunnels',
@@ -1168,7 +1166,11 @@ export default function HostSessionSettingsDialog({
     <SettingsDialog
       title={mode === 'editHost' ? 'Host settings' : 'Session settings'}
       sections={sections}
-      initialSectionId={initialSectionId}
+      initialSectionId={
+        initialSectionId === 'proxy' || initialSectionId === 'remoteSession'
+          ? 'advanced'
+          : initialSectionId
+      }
       initialFieldKey={initialFieldKey}
       onClose={onClose}
       footer={
