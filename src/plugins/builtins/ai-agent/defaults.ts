@@ -106,3 +106,38 @@ export const AI_AGENT_TITLE_MAX_CHARS = 48
 export const AI_AGENT_MAX_ATTACHMENTS = 8
 export const AI_AGENT_MAX_ATTACHMENT_BYTES = 200_000
 export const AI_AGENT_MAX_ATTACHMENT_CHARS = 100_000
+
+/** File extensions indexed by the RAG knowledge base. */
+export const AI_AGENT_RAG_FILE_EXTENSIONS = new Set([
+  '.txt',
+  '.md',
+  '.markdown',
+  '.yaml',
+  '.yml',
+  '.json',
+  '.csv'
+])
+
+/** Directory names never descended into while scanning a knowledge base folder. */
+export const AI_AGENT_RAG_IGNORED_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules'])
+
+/** Skip files larger than this (bytes) when indexing - keeps embedding cost bounded. */
+export const AI_AGENT_RAG_MAX_FILE_BYTES = 200_000
+/** Max files indexed per knowledge base folder. */
+export const AI_AGENT_RAG_MAX_FILES = 200
+/** Max chunks kept per knowledge base folder index (stops indexing once reached). */
+export const AI_AGENT_RAG_MAX_CHUNKS = 20_000
+
+/** Chunk size and overlap (characters) used to split indexed file text. */
+export const AI_AGENT_RAG_CHUNK_CHARS = 1_200
+export const AI_AGENT_RAG_CHUNK_OVERLAP_CHARS = 150
+
+/** Texts sent per /embeddings request while indexing. */
+export const AI_AGENT_RAG_EMBEDDING_BATCH_SIZE = 64
+
+/** rag_search result count (matches web_search's default/max convention). */
+export const AI_AGENT_RAG_DEFAULT_RESULT_LIMIT = 5
+export const AI_AGENT_RAG_MAX_RESULT_LIMIT = 10
+
+/** Fixed scope id for the app-wide knowledge base index (per-host indices are scoped by hostKey). */
+export const AI_AGENT_RAG_GLOBAL_SCOPE_ID = 'rag-global'

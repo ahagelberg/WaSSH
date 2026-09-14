@@ -17,6 +17,7 @@ import {
   AI_AGENT_TOOL_REMOTE_FS_LIST,
   AI_AGENT_TOOL_REMOTE_FS_READ,
   AI_AGENT_TOOL_REMOTE_FS_WRITE,
+  AI_AGENT_TOOL_RAG_SEARCH,
   AI_AGENT_TOOL_RUN_COMMAND,
   AI_AGENT_TOOL_WEB_FETCH,
   AI_AGENT_TOOL_WEB_SEARCH
@@ -50,6 +51,26 @@ export const TOOL_DEF_GET_CURRENT_TIME: PluginApiMethod = {
   parameters: {
     type: 'object',
     properties: {}
+  }
+}
+
+export const TOOL_DEF_RAG_SEARCH: PluginApiMethod = {
+  name: AI_AGENT_TOOL_RAG_SEARCH,
+  description:
+    'Search the local knowledge base (app-wide and/or per-host folders configured in AI agent settings) for text chunks relevant to a query, using embeddings from the active provider. Returns the most relevant chunks with their source file and similarity score.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        description: 'The search query to find relevant knowledge base content for'
+      },
+      limit: {
+        type: 'number',
+        description: 'Optional maximum number of chunks to return (default 5, max 10)'
+      }
+    },
+    required: ['query']
   }
 }
 
@@ -285,6 +306,7 @@ export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
 export const AI_AGENT_GROUP_WEB_SEARCH = 'web-search'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
 export const AI_AGENT_GROUP_LOCAL_FS = 'local-fs'
+export const AI_AGENT_GROUP_KNOWLEDGE_BASE = 'knowledge-base'
 
 export const AI_AGENT_WEB_ACCESS_METHODS = [TOOL_DEF_WEB_FETCH]
 export const AI_AGENT_WEB_SEARCH_METHODS = [TOOL_DEF_WEB_SEARCH]
@@ -301,6 +323,7 @@ export const AI_AGENT_LOCAL_FS_METHODS = [
   TOOL_DEF_LOCAL_FS_WRITE,
   TOOL_DEF_LOCAL_FS_EDIT
 ]
+export const AI_AGENT_KNOWLEDGE_BASE_METHODS = [TOOL_DEF_RAG_SEARCH]
 export const AI_AGENT_DATETIME_METHOD = TOOL_DEF_GET_CURRENT_TIME
 
 /**
@@ -315,6 +338,7 @@ export const AI_AGENT_API_METHODS = [
   ...AI_AGENT_WEB_SEARCH_METHODS,
   ...AI_AGENT_REMOTE_FS_METHODS,
   ...AI_AGENT_LOCAL_FS_METHODS,
+  ...AI_AGENT_KNOWLEDGE_BASE_METHODS,
   AI_AGENT_DATETIME_METHOD
 ]
 
@@ -368,6 +392,17 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
           'Local filesystem',
           AI_AGENT_LOCAL_FS_METHODS,
           { groupDefault: true, description: 'Allow the agent to read/write files on your local computer running WaSSH.' }
+        ),
+        buildApiPermissionGroup(
+          PLUGIN_ID_AI_AGENT,
+          AI_AGENT_GROUP_KNOWLEDGE_BASE,
+          'Knowledge base',
+          AI_AGENT_KNOWLEDGE_BASE_METHODS,
+          {
+            groupDefault: true,
+            description:
+              'Allow the agent to search the local knowledge base folder(s) configured below (app-wide and/or per-host).'
+          }
         ),
         buildPermissionField(PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD)
       ],

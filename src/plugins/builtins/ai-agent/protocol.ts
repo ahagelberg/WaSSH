@@ -6,6 +6,9 @@ export const AI_AGENT_SETTING_HOST_ALLOW_RULES = 'allowRules'
 export const AI_AGENT_SETTING_HOST_DENY_RULES = 'denyRules'
 export const AI_AGENT_SETTING_HOST_PROMPT = 'hostPrompt'
 
+export const AI_AGENT_SETTING_RAG_FOLDER = 'ragFolder'
+export const AI_AGENT_SETTING_HOST_RAG_FOLDER = 'hostRagFolder'
+
 export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
 export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'
 
@@ -24,6 +27,7 @@ export const AI_AGENT_TOOL_LOCAL_FS_WRITE = 'local_fs_write_file'
 export const AI_AGENT_TOOL_LOCAL_FS_LIST = 'local_fs_list_dir'
 export const AI_AGENT_TOOL_LOCAL_FS_EDIT = 'local_fs_edit_file'
 export const AI_AGENT_TOOL_GET_CURRENT_TIME = 'get_current_time'
+export const AI_AGENT_TOOL_RAG_SEARCH = 'rag_search'
 
 export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
 
@@ -37,6 +41,7 @@ export const AI_AGENT_ANTHROPIC_VERSION = '2023-06-01'
 export const AI_AGENT_ANTHROPIC_PATH = '/v1/messages'
 export const AI_AGENT_OPENAI_CHAT_PATH = '/chat/completions'
 export const AI_AGENT_OPENAI_MODELS_PATH = '/models'
+export const AI_AGENT_OPENAI_EMBEDDINGS_PATH = '/embeddings'
 export const AI_AGENT_ANTHROPIC_MODELS_PATH = '/v1/models'
 
 export interface AiAgentProviderConfig {
@@ -45,6 +50,8 @@ export interface AiAgentProviderConfig {
   protocol: AiAgentProviderProtocol
   baseUrl: string
   models: string[]
+  /** Model used for RAG embeddings via this provider's OpenAI-compatible /embeddings endpoint. */
+  embeddingModel?: string
 }
 
 export interface AiAgentDataFile {

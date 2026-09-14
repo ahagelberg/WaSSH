@@ -242,7 +242,8 @@ export default function AiAgentProviderDialog({ tabId, onClose }: Props): ReactE
         ...provider,
         name: provider.name.trim() || 'Provider',
         baseUrl: provider.baseUrl.trim(),
-        models: provider.models.map((model) => model.trim()).filter(Boolean)
+        models: provider.models.map((model) => model.trim()).filter(Boolean),
+        embeddingModel: provider.embeddingModel?.trim() || undefined
       }))
       await window.wassh.setPluginData(AI_AGENT_PLUGIN_ID, { ...current, providers })
       window.dispatchEvent(new CustomEvent('ai-agent-providers-changed', { detail: providers }))
@@ -291,6 +292,16 @@ export default function AiAgentProviderDialog({ tabId, onClose }: Props): ReactE
                       Refresh
                     </button>
                   </div>
+                  {selected.protocol === AI_AGENT_PROTOCOL_OPENAI ? (
+                    <label>
+                      Embedding model (optional)
+                      <input
+                        value={selected.embeddingModel ?? ''}
+                        placeholder="e.g. text-embedding-3-small"
+                        onChange={(event) => updateSelected({ embeddingModel: event.target.value })}
+                      />
+                    </label>
+                  ) : null}
                   <div className="ai-agent-provider-actions">
                     <button type="button" className="primary" disabled={selectedIsChecking || !tabId || !selected.baseUrl.trim()} onClick={() => void checkSelected()}>
                       Check

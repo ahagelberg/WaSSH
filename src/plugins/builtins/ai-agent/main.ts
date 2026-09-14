@@ -6,15 +6,18 @@ import {
   AI_AGENT_DATA_VERSION,
   AI_AGENT_DEFAULT_CHAT_TITLE,
   AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
+  AI_AGENT_RAG_GLOBAL_SCOPE_ID,
   AI_AGENT_TITLE_MAX_CHARS
 } from './defaults'
 import { PLUGIN_ID_AI_AGENT, aiAgentVaultId } from './id'
 import {
+  AI_AGENT_GROUP_KNOWLEDGE_BASE,
   AI_AGENT_GROUP_LOCAL_FS,
   AI_AGENT_GROUP_REMOTE_FS,
   AI_AGENT_GROUP_WEB_ACCESS,
   AI_AGENT_GROUP_WEB_SEARCH,
   AI_AGENT_DATETIME_METHOD,
+  AI_AGENT_KNOWLEDGE_BASE_METHODS,
   AI_AGENT_LOCAL_FS_METHODS,
   AI_AGENT_REMOTE_FS_METHODS,
   AI_AGENT_WEB_ACCESS_METHODS,
@@ -38,7 +41,9 @@ import {
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
+  AI_AGENT_SETTING_HOST_RAG_FOLDER,
   AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
+  AI_AGENT_SETTING_RAG_FOLDER,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
   AI_AGENT_TOOL_GET_CURRENT_TIME,
@@ -46,6 +51,7 @@ import {
   AI_AGENT_TOOL_LOCAL_FS_READ,
   AI_AGENT_TOOL_LOCAL_FS_WRITE,
   AI_AGENT_TOOL_LOCAL_FS_EDIT,
+  AI_AGENT_TOOL_RAG_SEARCH,
   AI_AGENT_TOOL_REMOTE_FS_DELETE,
   AI_AGENT_TOOL_REMOTE_FS_EDIT,
   AI_AGENT_TOOL_REMOTE_FS_LIST,
@@ -74,11 +80,13 @@ import type { PluginApiMethod } from '@plugin-api/shared'
 import { decideCommand } from './permissions'
 import {
   complete,
+  embed,
   listModels,
   RUN_COMMAND_TOOL_NAME,
   type ApiMessage,
   type ApiToolCallMsg
 } from './providers'
+import { searchKnowledgeBase } from './rag'
 import {
   executeDateTime,
   executeLocalFsList,
@@ -220,7 +228,10 @@ function normalizeProviders(raw: unknown): AiAgentProviderConfig[] {
       baseUrl: value.baseUrl.trim(),
       models: value.models
         .filter((model): model is string => typeof model === 'string' && model.trim().length > 0)
-        .map((model) => model.trim())
+        .map((model) => model.trim()),
+      ...(typeof value.embeddingModel === 'string' && value.embeddingModel.trim()
+        ? { embeddingModel: value.embeddingModel.trim() }
+        : {})
     })
   }
   return providers
@@ -1015,6 +1026,9 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
   if (name === AI_AGENT_TOOL_LOCAL_FS_LIST) {
     return `local_ls ${String(args.path || '.')}`
   }
+  if (name === AI_AGENT_TOOL_RAG_SEARCH) {
+    return `rag_search "${String(args.query || '')}"`
+  }
   return `${name} ${JSON.stringify(args)}`
 }
 
@@ -1088,6 +1102,12 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_SEARCH, AI_AGENT_WEB_SEARCH_METHODS, settings),
     ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_REMOTE_FS, AI_AGENT_REMOTE_FS_METHODS, settings),
     ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_LOCAL_FS, AI_AGENT_LOCAL_FS_METHODS, settings),
+    ...allowedGroupMethods(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_KNOWLEDGE_BASE,
+      AI_AGENT_KNOWLEDGE_BASE_METHODS,
+      settings
+    ),
     ...(isMethodAllowed(settings, PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD) ? [AI_AGENT_DATETIME_METHOD] : []),
     ...allExternalApiTools(ctx, settings)
   ]
@@ -2054,6 +2074,44 @@ async function handleApiCall(
   }
   if (method === AI_AGENT_TOOL_LOCAL_FS_LIST) {
     return executeLocalFsList(String(args.path || '.'))
+  }
+  if (method === AI_AGENT_TOOL_RAG_SEARCH) {
+    const host = hostForCtx(ctx)
+    const conv = host?.conversation
+    if (!host || !conv) {
+      throw new Error('No active AI Agent conversation on this tab')
+    }
+    const provider = findProvider(conv.activeProviderId)
+    if (!provider) {
+      return 'No model provider is configured for this conversation.'
+    }
+    if (provider.protocol !== AI_AGENT_PROTOCOL_OPENAI) {
+      return `Provider "${provider.name}" doesn't support embeddings; rag_search requires an OpenAI-compatible provider with an embedding model configured.`
+    }
+    const embeddingModel = provider.embeddingModel?.trim()
+    if (!embeddingModel) {
+      return `No embedding model configured for provider "${provider.name}". Set one in "Configure providers".`
+    }
+    const apiKey = ctx.getSecret(aiAgentVaultId(provider.id)) ?? ''
+    const settings = ctx.getSettings()
+    const embedFn = (texts: string[]): Promise<number[][]> =>
+      embed({ baseUrl: provider.baseUrl, apiKey, model: embeddingModel, input: texts })
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+    return searchKnowledgeBase(ctx, {
+      query: String(args.query || ''),
+      limit,
+      providerId: provider.id,
+      embeddingModel,
+      embed: embedFn,
+      folders: [
+        { scopeId: AI_AGENT_RAG_GLOBAL_SCOPE_ID, folder: stringSetting(settings, AI_AGENT_SETTING_RAG_FOLDER), label: 'Global' },
+        {
+          scopeId: `rag-host:${host.hostKey}`,
+          folder: stringSetting(settings, AI_AGENT_SETTING_HOST_RAG_FOLDER),
+          label: 'Host'
+        }
+      ]
+    })
   }
   throw new Error(`Unknown AI Agent API method: ${method}`)
 }

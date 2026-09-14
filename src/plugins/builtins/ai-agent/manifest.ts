@@ -13,7 +13,9 @@ import {
   AI_AGENT_SETTING_HOST_ALLOW_RULES,
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
+  AI_AGENT_SETTING_HOST_RAG_FOLDER,
   AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
+  AI_AGENT_SETTING_RAG_FOLDER,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER
 } from './protocol'
@@ -73,6 +75,14 @@ export const aiAgentManifest: PluginManifest = {
         description: 'Text included in every AI agent prompt.'
       },
       {
+        key: AI_AGENT_SETTING_RAG_FOLDER,
+        label: 'Knowledge base folder',
+        type: 'directory',
+        default: '',
+        description:
+          'Local folder of documents indexed (via the active provider\u2019s embedding model) for the rag_search tool. Combined with any per-host knowledge base folder.'
+      },
+      {
         key: AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
         label: 'Default allow rules',
         type: 'stringList',
@@ -98,6 +108,14 @@ export const aiAgentManifest: PluginManifest = {
         type: 'textArea',
         default: '',
         description: 'Text included in AI agent prompts for this host or session.'
+      },
+      {
+        key: AI_AGENT_SETTING_HOST_RAG_FOLDER,
+        label: 'Host knowledge base folder',
+        type: 'directory',
+        default: '',
+        description:
+          'Additional local folder of documents indexed just for this host, combined with the app-wide knowledge base folder.'
       },
       {
         key: AI_AGENT_SETTING_HOST_ALLOW_RULES,

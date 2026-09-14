@@ -3,6 +3,7 @@ import {
   AI_AGENT_ANTHROPIC_PATH,
   AI_AGENT_ANTHROPIC_VERSION,
   AI_AGENT_OPENAI_CHAT_PATH,
+  AI_AGENT_OPENAI_EMBEDDINGS_PATH,
   AI_AGENT_OPENAI_MODELS_PATH,
   AI_AGENT_PROTOCOL_ANTHROPIC,
   type AiAgentProviderProtocol
@@ -473,4 +474,32 @@ export async function listModels(opts: ListModelsOptions): Promise<string[]> {
     return listAnthropicModels(opts)
   }
   return listOpenAiModels(opts)
+}
+
+export interface EmbeddingOptions {
+  baseUrl: string
+  apiKey: string
+  model: string
+  input: string[]
+}
+
+/** Compute embeddings via a provider's OpenAI-compatible POST {baseUrl}/embeddings endpoint. */
+export async function embed(opts: EmbeddingOptions): Promise<number[][]> {
+  const res = await fetch(joinUrl(opts.baseUrl, AI_AGENT_OPENAI_EMBEDDINGS_PATH), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {})
+    },
+    body: JSON.stringify({ model: opts.model, input: opts.input })
+  })
+  if (!res.ok) {
+    throw new Error(`Embeddings request failed with ${res.status}: ${await errorText(res)}`)
+  }
+  const json = (await res.json()) as { data?: Array<{ embedding?: number[]; index?: number }> }
+  const items = json.data ?? []
+  return items
+    .slice()
+    .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    .map((item) => (Array.isArray(item.embedding) ? item.embedding : []))
 }

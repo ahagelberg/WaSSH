@@ -305,12 +305,13 @@ onApiCall(ctx, method, params) {
 
 The AI Agent plugin turns every declared method - both other plugins' and its
 own built-ins (`run_command`, `web_fetch`, `web_search`, `remote_fs_*`,
-`local_fs_*`, `get_current_time`) - into an LLM tool, and dispatches **all**
-of them through `ctx.callPluginApi(pluginId, method, args)`, including calls
-to itself (`pluginId === PLUGIN_ID_AI_AGENT`, always active while its own run
-loop executes). This keeps one code path and one declaration shape
-(`PluginApiMethod`) for every tool the model can call, instead of a separate
-ad hoc mechanism for "built-in" vs "other plugin" capabilities.
+`local_fs_*`, `get_current_time`, `rag_search`) - into an LLM tool, and
+dispatches **all** of them through `ctx.callPluginApi(pluginId, method,
+args)`, including calls to itself (`pluginId === PLUGIN_ID_AI_AGENT`, always
+active while its own run loop executes). This keeps one code path and one
+declaration shape (`PluginApiMethod`) for every tool the model can call,
+instead of a separate ad hoc mechanism for "built-in" vs "other plugin"
+capabilities.
 
 - Every method except `run_command` is gated by a `permission` settings field
   (`allow | deny | ask`, §3); `run_command` keeps its own, more granular
