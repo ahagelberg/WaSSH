@@ -790,7 +790,7 @@ export default function SessionsSidebar({
                   onConnect(menuHost)
                 }}
               >
-                Open
+                Connect
               </button>
               <button
                 type="button"
