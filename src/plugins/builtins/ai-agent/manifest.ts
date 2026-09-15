@@ -87,7 +87,8 @@ export const aiAgentManifest: PluginManifest = {
             type: 'select',
             default: '',
             options: [],
-            description: 'OpenAI-compatible provider used to generate embeddings.'
+            description:
+              'Optional. Select an OpenAI-compatible provider to enable semantic knowledge-base search, which can find relevant content even when the wording differs.'
           },
           {
             key: AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
@@ -95,7 +96,8 @@ export const aiAgentManifest: PluginManifest = {
             type: 'select',
             default: '',
             options: [],
-            description: 'Embedding model used for knowledge base vector search.'
+            description:
+              'Optional. Select an embedding model with the provider to enable semantic knowledge-base search; without it, text matching is used instead.'
           }
         ]
       },
@@ -156,4 +158,3 @@ export const aiAgentManifest: PluginManifest = {
     api: { methods: AI_AGENT_API_METHODS }
   }
 }
-
