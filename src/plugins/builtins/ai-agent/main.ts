@@ -442,6 +442,12 @@ function refreshConversationTitle(conversation: AiAgentConversation): void {
   conversation.title = titleFromMessages(conversation.messages)
 }
 
+/** Apply a user-supplied title. Empty input falls back to the derived title. */
+function renameConversation(conversation: AiAgentConversation, rawTitle: string): void {
+  const title = rawTitle.replace(/\s+/g, ' ').trim().slice(0, AI_AGENT_TITLE_MAX_CHARS)
+  conversation.title = title || titleFromMessages(conversation.messages)
+}
+
 function loadData(ctx: PluginMainContext): void {
   if (!dataFile) {
     dataFile = asDataFile(ctx.getData())
@@ -1798,6 +1804,8 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
     case 'openChat':
     case 'deleteChat':
       return typeof message.conversationId === 'string'
+    case 'renameChat':
+      return typeof message.conversationId === 'string' && typeof message.title === 'string'
     case 'rulesChanged':
       return typeof message.rules === 'string'
     case 'select':
@@ -2042,6 +2050,26 @@ async function handleRendererMessage(
       host.conversation = fallback
       dataFile.conversations[fallback.id] = fallback
       dataFile.activeConversationId[host.hostKey] = fallback.id
+    }
+    saveData()
+    pushState(host)
+    return
+  }
+  if (payload.type === 'renameChat') {
+    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
+      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+      return
+    }
+    if (!dataFile) {
+      return
+    }
+    const target = dataFile.conversations[payload.conversationId]
+    if (!target || target.hostKey !== host.hostKey) {
+      return
+    }
+    renameConversation(target, payload.title)
+    if (host.conversation.id === target.id) {
+      host.conversation.title = target.title
     }
     saveData()
     pushState(host)

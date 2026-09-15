@@ -216,3 +216,4 @@ export type AiAgentRendererMessage =
   | { type: 'newChat'; providerId: string; model: string }
   | { type: 'openChat'; conversationId: string }
   | { type: 'deleteChat'; conversationId: string }
+  | { type: 'renameChat'; conversationId: string; title: string }

@@ -47,6 +47,9 @@ const TOOL_OUTPUT_STREAM_LIMIT = 64_000
 /** Max characters shown in the queued-message preview strip */
 const QUEUE_PREVIEW_MAX_CHARS = 120
 
+/** Max characters accepted for a user-supplied chat title */
+const CHAT_TITLE_MAX_CHARS = 80
+
 /** Null bytes in the first N bytes → treat file as binary */
 const BINARY_PROBE_BYTES = 8_000
 
@@ -270,6 +273,8 @@ export default function AiAgentView({
   const [attachments, setAttachments] = useState<AiAgentChatAttachment[]>([])
   const [dropActive, setDropActive] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [titleDraft, setTitleDraft] = useState('')
   const [toast, setToast] = useState<{ kind: 'error' | 'info'; text: string } | null>(null)
   const [queued, setQueued] = useState<QueuedMessage | null>(null)
   const [sudoPassword, setSudoPassword] = useState('')
@@ -277,6 +282,7 @@ export default function AiAgentView({
   const sudoInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const promptInputRef = useRef<HTMLTextAreaElement>(null)
+  const titleInputRef = useRef<HTMLInputElement>(null)
   const dragDepthRef = useRef(0)
   /** Indicates that the queued message should replace the active run. */
   const forceAfterStopRef = useRef(false)
@@ -330,6 +336,8 @@ export default function AiAgentView({
         })
         setStream('')
         setToolOutput({})
+        setEditingId(null)
+        setTitleDraft('')
         if (payload.runPhase !== 'ask_sudo') {
           setSudoPassword('')
         }
@@ -633,6 +641,34 @@ export default function AiAgentView({
     }
   }, [view.runPhase, view.pendingSudo?.requestId])
 
+  useEffect(() => {
+    if (editingId) {
+      titleInputRef.current?.focus()
+      titleInputRef.current?.select()
+    }
+  }, [editingId])
+
+  const startRename = (conversation: AiAgentConversation | AiAgentConversationSummary): void => {
+    setEditingId(conversation.id)
+    setTitleDraft(
+      conversation.title === AI_AGENT_DEFAULT_CHAT_TITLE ? '' : conversation.title
+    )
+  }
+
+  const commitRename = (): void => {
+    if (!editingId) {
+      return
+    }
+    send({ type: 'renameChat', conversationId: editingId, title: titleDraft.trim() })
+    setEditingId(null)
+    setTitleDraft('')
+  }
+
+  const cancelRename = (): void => {
+    setEditingId(null)
+    setTitleDraft('')
+  }
+
   const canResume =
     conv !== null &&
     conv.messages.length > 0 &&
@@ -841,12 +877,41 @@ export default function AiAgentView({
     <div className="plugin-panel ai-agent">
       <>
           <div className="ai-agent-header">
-            <span
-              className="ai-agent-header-title"
-              title={conv?.title || AI_AGENT_DEFAULT_CHAT_TITLE}
-            >
-              {conv?.title || AI_AGENT_DEFAULT_CHAT_TITLE}
-            </span>
+            {editingId === conv?.id ? (
+              <input
+                ref={titleInputRef}
+                className="ai-agent-header-title-input"
+                value={titleDraft}
+                maxLength={CHAT_TITLE_MAX_CHARS}
+                placeholder={AI_AGENT_DEFAULT_CHAT_TITLE}
+                title="Chat title"
+                onChange={(e) => setTitleDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    commitRename()
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault()
+                    cancelRename()
+                  }
+                }}
+                onBlur={commitRename}
+              />
+            ) : (
+              <button
+                type="button"
+                className="ai-agent-header-title"
+                title={conv ? 'Click to rename this chat' : undefined}
+                disabled={!conv}
+                onClick={() => {
+                  if (conv) {
+                    startRename(conv)
+                  }
+                }}
+              >
+                {conv?.title || AI_AGENT_DEFAULT_CHAT_TITLE}
+              </button>
+            )}
             <div className="ai-agent-header-controls">
               <button
                 type="button"
@@ -881,6 +946,31 @@ export default function AiAgentView({
                 <ul className="ai-agent-history-list">
                   {view.conversationSummaries.map((item) => {
                     const active = conv?.id === item.id
+                    if (editingId === item.id) {
+                      return (
+                        <li key={item.id} className="ai-agent-history-item editing">
+                          <input
+                            ref={titleInputRef}
+                            className="ai-agent-history-title-input"
+                            value={titleDraft}
+                            maxLength={CHAT_TITLE_MAX_CHARS}
+                            placeholder={AI_AGENT_DEFAULT_CHAT_TITLE}
+                            title="Chat title"
+                            onChange={(e) => setTitleDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                commitRename()
+                              } else if (e.key === 'Escape') {
+                                e.preventDefault()
+                                cancelRename()
+                              }
+                            }}
+                            onBlur={commitRename}
+                          />
+                        </li>
+                      )
+                    }
                     return (
                       <li key={item.id} className={`ai-agent-history-item${active ? ' active' : ''}`}>
                         <button
@@ -899,6 +989,15 @@ export default function AiAgentView({
                             {item.title || AI_AGENT_DEFAULT_CHAT_TITLE}
                           </span>
                           <span className="ai-agent-history-time">{formatChatTime(item.updatedAt)}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="ai-agent-history-rename"
+                          disabled={busy}
+                          title="Rename conversation"
+                          onClick={() => startRename(item)}
+                        >
+                          ✎
                         </button>
                         <button
                           type="button"

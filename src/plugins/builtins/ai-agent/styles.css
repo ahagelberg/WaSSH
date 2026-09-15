@@ -29,6 +29,31 @@
   white-space: nowrap;
   font-weight: 600;
   color: var(--text);
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  text-align: left;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.ai-agent-header-title:not(:disabled):hover {
+  border-color: var(--border);
+  background: var(--bg-input);
+}
+
+.ai-agent-header-title:disabled {
+  cursor: default;
+}
+
+.ai-agent-header-title-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 4px;
+  font-weight: 600;
+  font-size: 12px;
+  font-family: inherit;
 }
 
 .ai-agent-header-controls {
@@ -234,6 +259,37 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
+}
+
+.ai-agent-history-item.editing {
+  padding: 4px;
+}
+
+.ai-agent-history-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.ai-agent-history-rename {
+  flex-shrink: 0;
+  align-self: stretch;
+  padding: 0 8px;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.ai-agent-history-rename:not(:disabled):hover {
+  color: var(--accent);
+}
+
+.ai-agent-history-rename:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .ai-agent-history-time {
