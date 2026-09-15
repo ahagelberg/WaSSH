@@ -8,6 +8,7 @@ import {
 } from './pluginApiTools'
 import {
   AI_AGENT_TOOL_DEV_CREATE_FILE,
+  AI_AGENT_TOOL_DEV_DIFF_FILE,
   AI_AGENT_TOOL_DEV_EDIT_FILE,
   AI_AGENT_TOOL_DEV_FIND_FILES,
   AI_AGENT_TOOL_DEV_GREP,
@@ -450,6 +451,45 @@ export const TOOL_DEF_DEV_FIND_FILES: PluginApiMethod = {
   }
 }
 
+export const TOOL_DEF_DEV_DIFF_FILE: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_DIFF_FILE,
+  description:
+    'Diff a file on the remote host against expected text, without modifying it. ' +
+    'Pass the exact block of text you expect the file to contain as oldText; the result is a unified diff showing what the file actually contains versus that expectation, ' +
+    'plus a summary of how many lines were added, removed, and kept. ' +
+    'Use this to verify a file\u2019s current state before editing it, or to confirm that an edit you made took effect. ' +
+    'Set apply to true to instead replace the matched oldText with newText (requires newText and user approval).',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'File path on the remote host (relative to working directory or absolute)'
+      },
+      oldText: {
+        type: 'string',
+        description:
+          'The exact block of text expected to be present in the file (including whitespace/indentation). May be empty to diff against an empty file.'
+      },
+      newText: {
+        type: 'string',
+        description: 'Replacement text. Only used when apply is true.'
+      },
+      apply: {
+        type: 'boolean',
+        description:
+          'Whether to write newText in place of oldText instead of only reporting the diff (default: false). Requires newText to be set.'
+      },
+      contextLines: {
+        type: 'number',
+        description: 'Number of unchanged context lines shown around each change (default 3, max 20)'
+      }
+    },
+    required: ['path', 'oldText']
+  }
+}
+
 export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
 export const AI_AGENT_GROUP_LOCAL_FS = 'local-fs'
@@ -461,7 +501,8 @@ export const AI_AGENT_DEV_TOOLS_METHODS = [
   TOOL_DEF_DEV_CREATE_FILE,
   TOOL_DEF_DEV_LIST_DIR,
   TOOL_DEF_DEV_GREP,
-  TOOL_DEF_DEV_FIND_FILES
+  TOOL_DEF_DEV_FIND_FILES,
+  TOOL_DEF_DEV_DIFF_FILE
 ]
 export const AI_AGENT_WEB_ACCESS_METHODS = [TOOL_DEF_WEB_FETCH]
 export const AI_AGENT_WEB_SEARCH_METHODS = [TOOL_DEF_WEB_SEARCH]

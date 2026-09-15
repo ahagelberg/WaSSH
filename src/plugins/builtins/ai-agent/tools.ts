@@ -12,6 +12,11 @@ export const MAX_DEV_VIEW_LINES_DEFAULT = 300
 export const MAX_DEV_GREP_MATCHES = 100
 export const MAX_DEV_FIND_MATCHES = 100
 export const MAX_DEV_TREE_DEPTH = 3
+/** Default/limit unchanged context lines shown around each change in a diff */
+export const DIFF_CONTEXT_LINES_DEFAULT = 3
+export const DIFF_CONTEXT_LINES_MAX = 20
+/** Cap on the LCS table size (lines x lines) for a diff */
+export const MAX_DIFF_TABLE_CELLS = 4_000_000
 /** SFTP operation timeout in milliseconds */
 export const SFTP_TIMEOUT_MS = 30_000
 
@@ -882,6 +887,226 @@ export async function executeDevFindFiles(
   } catch (err) {
     return `Error finding files in "${remotePath}": ${err instanceof Error ? err.message : String(err)}`
   }
+}
+
+type DiffOp = 'keep' | 'add' | 'remove'
+
+interface DiffLine {
+  op: DiffOp
+  text: string
+}
+
+/**
+ * Line diff via longest-common-subsequence. Only used for files small enough
+ * that the O(n*m) table is bounded by `MAX_DIFF_TABLE_CELLS`.
+ */
+function diffLines(before: string[], after: string[]): DiffLine[] {
+  const n = before.length
+  const m = after.length
+  const table = new Uint32Array((n + 1) * (m + 1))
+  const at = (i: number, j: number): number => i * (m + 1) + j
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      table[at(i, j)] =
+        before[i] === after[j]
+          ? table[at(i + 1, j + 1)] + 1
+          : Math.max(table[at(i + 1, j)], table[at(i, j + 1)])
+    }
+  }
+  const out: DiffLine[] = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (before[i] === after[j]) {
+      out.push({ op: 'keep', text: before[i] })
+      i += 1
+      j += 1
+    } else if (table[at(i + 1, j)] >= table[at(i, j + 1)]) {
+      out.push({ op: 'remove', text: before[i] })
+      i += 1
+    } else {
+      out.push({ op: 'add', text: after[j] })
+      j += 1
+    }
+  }
+  while (i < n) {
+    out.push({ op: 'remove', text: before[i] })
+    i += 1
+  }
+  while (j < m) {
+    out.push({ op: 'add', text: after[j] })
+    j += 1
+  }
+  return out
+}
+
+/**
+ * Render a unified-style diff. Line numbers are tracked per side so an
+ * unchanged line keeps its own number on both the "expected" and "actual"
+ * side even when the two sides are misaligned.
+ */
+function formatUnifiedDiff(
+  label: string,
+  before: string[],
+  after: string[],
+  contextLines: number
+): { text: string; added: number; removed: number } {
+  const ops = diffLines(before, after)
+  const added = ops.filter((o) => o.op === 'add').length
+  const removed = ops.filter((o) => o.op === 'remove').length
+  if (added === 0 && removed === 0) {
+    return { text: '', added: 0, removed: 0 }
+  }
+
+  const keepBefore: number[] = []
+  const keepAfter: number[] = []
+  let beforeNo = 1
+  let afterNo = 1
+  for (const op of ops) {
+    keepBefore.push(beforeNo)
+    keepAfter.push(afterNo)
+    if (op.op !== 'add') {
+      beforeNo += 1
+    }
+    if (op.op !== 'remove') {
+      afterNo += 1
+    }
+  }
+
+  const changed = ops.map((o) => o.op !== 'keep')
+  const lines: string[] = []
+  let index = 0
+  while (index < ops.length) {
+    if (!changed[index]) {
+      index += 1
+      continue
+    }
+    let start = index
+    for (let back = 0; back < contextLines && start > 0 && !changed[start - 1]; back += 1) {
+      start -= 1
+    }
+    let end = index
+    while (end < ops.length) {
+      if (changed[end]) {
+        end += 1
+        continue
+      }
+      let gap = 0
+      while (end + gap < ops.length && !changed[end + gap]) {
+        gap += 1
+      }
+      if (gap > contextLines * 2 || end + gap >= ops.length) {
+        break
+      }
+      end += gap
+    }
+    const tail = Math.min(contextLines, ops.length - end)
+    const stop = end + tail
+
+    const beforeStart = keepBefore[start]
+    const afterStart = keepAfter[start]
+    const beforeCount = ops.slice(start, stop).filter((o) => o.op !== 'add').length
+    const afterCount = ops.slice(start, stop).filter((o) => o.op !== 'remove').length
+    lines.push(
+      `@@ -${beforeStart},${beforeCount} +${afterStart},${afterCount} @@`
+    )
+    for (let k = start; k < stop; k += 1) {
+      const op = ops[k]
+      if (op.op === 'keep') {
+        lines.push(`  ${op.text}`)
+      } else if (op.op === 'remove') {
+        lines.push(`- ${op.text}`)
+      } else {
+        lines.push(`+ ${op.text}`)
+      }
+    }
+    index = stop
+  }
+  return { text: `${label}\n${lines.join('\n')}`, added, removed }
+}
+
+function summarizeDiff(added: number, removed: number, kept: number): string {
+  if (added === 0 && removed === 0) {
+    return `Identical: ${kept} line${kept === 1 ? '' : 's'} match, no differences.`
+  }
+  return `Diff summary: +${added} added, -${removed} removed, ${kept} unchanged.`
+}
+
+/**
+ * Execute Developer Tool: diff a remote file against expected text, optionally
+ * applying the replacement. Read-only unless `apply` is true.
+ */
+export async function executeDevDiffFile(
+  ctx: PluginMainContext,
+  cwd: string,
+  filePath: string,
+  oldText: string,
+  newText: string,
+  apply: boolean,
+  contextLines?: number
+): Promise<string> {
+  const remotePath = resolveRemotePath(cwd, filePath)
+  const context = Math.min(Math.max(Number(contextLines) || DIFF_CONTEXT_LINES_DEFAULT, 0), DIFF_CONTEXT_LINES_MAX)
+  const current = await executeRemoteFsRead(ctx, remotePath, MAX_FILE_READ_CHARS)
+  if (
+    current.startsWith('Error') ||
+    current.startsWith('Failed to open SFTP') ||
+    current === 'Remote SFTP is not available on this session.'
+  ) {
+    return current
+  }
+  const truncated = /\n\n\[Remote file truncated at \d+ characters\]$/.test(current)
+  const content = truncated ? current.replace(/\n\n\[Remote file truncated at \d+ characters\]$/, '') : current
+  const actual = content === '(Empty file)' ? '' : content
+
+  if (apply) {
+    if (!newText) {
+      return 'Error: newText is required when apply is true.'
+    }
+    const replaced = applyTextReplacement(actual, oldText, newText)
+    if (typeof replaced !== 'string') {
+      return `Error applying diff to remote file "${remotePath}": ${replaced.error}`
+    }
+    const writeResult = await executeRemoteFsWrite(ctx, remotePath, replaced)
+    if (!writeResult.startsWith('Successfully')) {
+      return writeResult
+    }
+    const applied = formatUnifiedDiff(
+      `Applied to ${remotePath}:`,
+      actual.split('\n'),
+      replaced.split('\n'),
+      context
+    )
+    return `${writeResult}\n${applied.text}\n${summarizeDiff(
+      applied.added,
+      applied.removed,
+      actual.split('\n').length - applied.removed
+    )}`
+  }
+
+  const expectedLines = oldText === '' ? [] : oldText.split('\n')
+  const actualLines = actual === '' ? [] : actual.split('\n')
+  if (expectedLines.length * actualLines.length > MAX_DIFF_TABLE_CELLS) {
+    return (
+      `Error: "${remotePath}" is too large to diff (${actualLines.length} lines vs ${expectedLines.length} expected lines). ` +
+      'Narrow oldText to the region you care about, or use dev_view_file with a line range instead.'
+    )
+  }
+  const diff = formatUnifiedDiff(
+    `Diff of ${remotePath} (expected \u2192 actual):`,
+    expectedLines,
+    actualLines,
+    context
+  )
+  const summary = summarizeDiff(diff.added, diff.removed, expectedLines.length - diff.removed)
+  if (!diff.text) {
+    return `${remotePath}: ${summary}${
+      truncated ? `\n[Note: file was truncated at ${MAX_FILE_READ_CHARS} characters before diffing]` : ''
+    }`
+  }
+  return `${diff.text}\n\n${summary}${
+    truncated ? `\n[Note: file was truncated at ${MAX_FILE_READ_CHARS} characters before diffing]` : ''
+  }`
 }
 
 

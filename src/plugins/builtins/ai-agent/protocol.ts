@@ -35,6 +35,7 @@ export const AI_AGENT_TOOL_DEV_CREATE_FILE = 'dev_create_file'
 export const AI_AGENT_TOOL_DEV_LIST_DIR = 'dev_list_directory'
 export const AI_AGENT_TOOL_DEV_GREP = 'dev_grep_search'
 export const AI_AGENT_TOOL_DEV_FIND_FILES = 'dev_find_files'
+export const AI_AGENT_TOOL_DEV_DIFF_FILE = 'dev_diff_file'
 
 export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
 

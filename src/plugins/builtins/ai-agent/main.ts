@@ -47,6 +47,7 @@ import {
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
   AI_AGENT_TOOL_DEV_CREATE_FILE,
+  AI_AGENT_TOOL_DEV_DIFF_FILE,
   AI_AGENT_TOOL_DEV_EDIT_FILE,
   AI_AGENT_TOOL_DEV_FIND_FILES,
   AI_AGENT_TOOL_DEV_GREP,
@@ -96,6 +97,7 @@ import { searchKnowledgeBase } from './rag'
 import {
   executeDateTime,
   executeDevCreateFile,
+  executeDevDiffFile,
   executeDevEditFile,
   executeDevFindFiles,
   executeDevGrep,
@@ -736,7 +738,8 @@ function systemPrompt(
     ...(hasDevTools
       ? [
           '- When inspecting, searching, creating, or editing code and files, prefer the developer tools (dev_view_file, dev_edit_file, dev_create_file, dev_grep_search, dev_find_files) over raw shell commands.',
-          '- When editing files with dev_edit_file, ensure oldText is exact and unique within the file.'
+          '- When editing files with dev_edit_file, ensure oldText is exact and unique within the file.',
+          '- Use dev_diff_file to verify a file\u2019s actual content against what you expect before editing it, or to confirm an edit took effect.'
         ]
       : []),
     '- After each command or tool call you see its actual result. Never invent output.',
@@ -987,6 +990,10 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
   }
   if (name === AI_AGENT_TOOL_DEV_EDIT_FILE) {
     return `dev_edit ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_DEV_DIFF_FILE) {
+    const suffix = args.apply === true ? ' (apply)' : ''
+    return `dev_diff ${String(args.path || '')}${suffix}`
   }
   if (name === AI_AGENT_TOOL_DEV_CREATE_FILE) {
     return `dev_create ${String(args.path || '')}`
@@ -2208,6 +2215,19 @@ async function handleApiCall(
     const cwd = host?.conversation?.cwd || '/'
     const searchPath = typeof args.path === 'string' ? args.path : undefined
     return executeDevFindFiles(ctx, cwd, String(args.pattern || ''), searchPath)
+  }
+  if (method === AI_AGENT_TOOL_DEV_DIFF_FILE) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    return executeDevDiffFile(
+      ctx,
+      cwd,
+      String(args.path || ''),
+      String(args.oldText ?? ''),
+      String(args.newText ?? ''),
+      args.apply === true,
+      typeof args.contextLines === 'number' ? args.contextLines : undefined
+    )
   }
   if (method === AI_AGENT_TOOL_GET_CURRENT_TIME) {
     return executeDateTime()
