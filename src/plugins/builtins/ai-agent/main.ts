@@ -95,6 +95,7 @@ import {
 } from './providers'
 import { searchKnowledgeBase } from './rag'
 import {
+  closeSftpSession,
   executeDateTime,
   executeDevCreateFile,
   executeDevDiffFile,
@@ -839,7 +840,12 @@ function pauseHost(host: HostState): void {
     resolve(null)
   }
   clearSudoCache(host)
+  const runCtx = host.runCtx
   host.inRun = false
+  host.runCtx = null
+  if (runCtx) {
+    closeSftpSession(runCtx)
+  }
   host.phase = 'paused'
 }
 
@@ -1477,6 +1483,8 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     host.controller = null
     if (host.inRun) {
       host.inRun = false
+      // Release the run's shared SFTP channel; the next run opens a fresh one.
+      closeSftpSession(ctx)
       host.runCtx = null
       host.streamingToolCallId = null
       // A user-initiated stop parks the run in 'paused' so the view can offer

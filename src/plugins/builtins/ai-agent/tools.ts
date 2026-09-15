@@ -321,24 +321,46 @@ export async function executeWebSearch(
   }
 }
 
-/** Helper to open SFTP session with timeout */
-async function openSftpWithTimeout(ctx: PluginMainContext): Promise<SftpSession | null> {
-  let timer: ReturnType<typeof setTimeout> | null = null
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Timed out opening SFTP session after ${SFTP_TIMEOUT_MS / 1000}s`)), SFTP_TIMEOUT_MS)
-  })
-  try {
-    const sftp = await Promise.race([ctx.openSftp(), timeoutPromise])
-    if (timer) {
-      clearTimeout(timer)
-    }
-    return sftp
-  } catch (err) {
-    if (timer) {
-      clearTimeout(timer)
-    }
-    throw err
+/**
+ * SFTP channel for the current AI agent run, keyed by main context.
+ * `ctx.openSftp()` opens a NEW channel on every call, and a single agent run
+ * makes many file calls (view/edit/grep/diff), so channels must be reused and
+ * released - otherwise the SSH server's channel limit is hit and every
+ * subsequent open fails with "Channel open failure: open failed".
+ */
+const sftpByContext = new WeakMap<PluginMainContext, Promise<SftpSession>>()
+
+/**
+ * SFTP session shared by every file tool in one agent run. The promise is
+ * cached (not just the result) so concurrent tool calls await one channel.
+ */
+function getSftpSession(ctx: PluginMainContext): Promise<SftpSession> {
+  let pending = sftpByContext.get(ctx)
+  if (!pending) {
+    pending = ctx.openSftp()
+    sftpByContext.set(ctx, pending)
+    pending.catch(() => {
+      // Don't cache a failed open - the next call should retry.
+      if (sftpByContext.get(ctx) === pending) {
+        sftpByContext.delete(ctx)
+      }
+    })
   }
+  return pending
+}
+
+/** Release the cached SFTP channel for a finished run. */
+export function closeSftpSession(ctx: PluginMainContext): void {
+  const pending = sftpByContext.get(ctx)
+  if (!pending) {
+    return
+  }
+  sftpByContext.delete(ctx)
+  void pending
+    .then((sftp) => sftp.end())
+    .catch(() => {
+      /* channel never opened */
+    })
 }
 
 /** Execute Remote SFTP Read */
@@ -350,7 +372,7 @@ export async function executeRemoteFsRead(
   const limit = Math.min(Math.max(Number(maxChars) || 32_000, 1_000), MAX_FILE_READ_CHARS)
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await openSftpWithTimeout(ctx)
+    sftpSession = await getSftpSession(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -436,7 +458,7 @@ export async function executeRemoteFsWrite(
 ): Promise<string> {
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await openSftpWithTimeout(ctx)
+    sftpSession = await getSftpSession(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -496,7 +518,7 @@ export async function executeRemoteFsList(
   const targetDir = dirPath && dirPath.trim().length > 0 ? dirPath.trim() : '.'
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await openSftpWithTimeout(ctx)
+    sftpSession = await getSftpSession(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -537,7 +559,7 @@ export async function executeRemoteFsDelete(
 ): Promise<string> {
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await openSftpWithTimeout(ctx)
+    sftpSession = await getSftpSession(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -784,7 +806,7 @@ export async function executeDevCreateFile(
   const remotePath = resolveRemotePath(cwd, filePath)
   if (!overwrite) {
     try {
-      const sftpSession = await openSftpWithTimeout(ctx)
+      const sftpSession = await getSftpSession(ctx)
       if (sftpSession) {
         let timer: ReturnType<typeof setTimeout> | null = null
         const statTimeoutPromise = new Promise<null>((resolve) => {
