@@ -129,6 +129,9 @@ function toolBadge(name?: string): { label: string; className: string } {
   if (name === 'rag_search') {
     return { label: 'RAG', className: 'tool-badge-rag' }
   }
+  if (name.startsWith('terminal_')) {
+    return { label: 'Your terminal', className: 'tool-badge-terminal' }
+  }
   return { label: 'Tool', className: 'tool-badge-generic' }
 }
 

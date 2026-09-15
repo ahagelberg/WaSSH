@@ -13,6 +13,8 @@ export const AI_AGENT_SETTING_HOST_RAG_FOLDER = 'hostRagFolder'
 export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
 export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'
 
+export const AI_AGENT_SETTING_HOST_TERMINAL_ACCESS = 'terminalAccess'
+
 export type AiAgentWebSearchProvider = 'bing' | 'brave' | 'google' | 'duckduckgo' | 'custom'
 
 export const AI_AGENT_TOOL_RUN_COMMAND = 'run_command'
@@ -36,6 +38,10 @@ export const AI_AGENT_TOOL_DEV_LIST_DIR = 'dev_list_directory'
 export const AI_AGENT_TOOL_DEV_GREP = 'dev_grep_search'
 export const AI_AGENT_TOOL_DEV_FIND_FILES = 'dev_find_files'
 export const AI_AGENT_TOOL_DEV_DIFF_FILE = 'dev_diff_file'
+export const AI_AGENT_TOOL_TERMINAL_READ = 'terminal_read'
+export const AI_AGENT_TOOL_TERMINAL_WRITE = 'terminal_write'
+export const AI_AGENT_TOOL_TERMINAL_KEYS = 'terminal_send_keys'
+export const AI_AGENT_TOOL_TERMINAL_WAIT = 'terminal_wait'
 
 export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
 

@@ -26,6 +26,10 @@ import {
   AI_AGENT_TOOL_REMOTE_FS_WRITE,
   AI_AGENT_TOOL_RAG_SEARCH,
   AI_AGENT_TOOL_RUN_COMMAND,
+  AI_AGENT_TOOL_TERMINAL_KEYS,
+  AI_AGENT_TOOL_TERMINAL_READ,
+  AI_AGENT_TOOL_TERMINAL_WAIT,
+  AI_AGENT_TOOL_TERMINAL_WRITE,
   AI_AGENT_TOOL_WEB_FETCH,
   AI_AGENT_TOOL_WEB_SEARCH
 } from './protocol'
@@ -498,10 +502,95 @@ export const TOOL_DEF_DEV_DIFF_FILE: PluginApiMethod = {
   }
 }
 
+export const TOOL_DEF_TERMINAL_READ: PluginApiMethod = {
+  name: AI_AGENT_TOOL_TERMINAL_READ,
+  description:
+    'Read what is currently shown in the user\u2019s live terminal, with ANSI colour and cursor codes stripped. ' +
+    'Use this to see the state of the shell the user is working in, or the output of a command they ran themselves. ' +
+    'Only available when terminal access is enabled for this host.',
+  parameters: {
+    type: 'object',
+    properties: {
+      maxChars: {
+        type: 'number',
+        description: 'Optional maximum characters to return, taken from the end of the buffer (default 24000)'
+      }
+    }
+  }
+}
+
+export const TOOL_DEF_TERMINAL_WRITE: PluginApiMethod = {
+  name: AI_AGENT_TOOL_TERMINAL_WRITE,
+  description:
+    'Type text into the user\u2019s live terminal, as if the user typed it. ' +
+    'Set pressEnter to run it as a command (default true); set it to false to fill in a prompt without submitting. ' +
+    'This shares the user\u2019s shell and prompt, so anything typed appears in their session. ' +
+    'Prefer run_command for ordinary non-interactive commands - use this for interactive programs (vim, top, ssh, REPLs) ' +
+    'or when you must act in the user\u2019s own shell. Follow with terminal_wait to observe the result.',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      text: {
+        type: 'string',
+        description: 'The text to type into the terminal'
+      },
+      pressEnter: {
+        type: 'boolean',
+        description: 'Whether to press Enter after typing the text (default: true)'
+      }
+    },
+    required: ['text']
+  }
+}
+
+export const TOOL_DEF_TERMINAL_KEYS: PluginApiMethod = {
+  name: AI_AGENT_TOOL_TERMINAL_KEYS,
+  description:
+    'Send named keys to the user\u2019s live terminal, for navigating interactive programs. ' +
+    'Supports enter, tab, escape, backspace, space, arrow keys, home/end/pageup/pagedown, and ctrl+a through ctrl+z ' +
+    '(e.g. ctrl+c to interrupt, ctrl+d to end input, ctrl+x to exit an editor). ' +
+    'Keys are sent in order in a single write.',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      keys: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Key names to send in order, e.g. ["ctrl+x"] or ["down", "down", "enter"]'
+      }
+    },
+    required: ['keys']
+  }
+}
+
+export const TOOL_DEF_TERMINAL_WAIT: PluginApiMethod = {
+  name: AI_AGENT_TOOL_TERMINAL_WAIT,
+  description:
+    'Wait for the user\u2019s live terminal to stop producing output, then return its contents. ' +
+    'Use this after terminal_write or terminal_send_keys to observe the result of an interactive command. ' +
+    'Returns as soon as output has been quiet briefly, or when the timeout is reached.',
+  parameters: {
+    type: 'object',
+    properties: {
+      timeoutMs: {
+        type: 'number',
+        description: 'Maximum time to wait in milliseconds (default 5000, max 60000)'
+      },
+      maxChars: {
+        type: 'number',
+        description: 'Optional maximum characters of terminal contents to return (default 24000)'
+      }
+    }
+  }
+}
+
 export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
 export const AI_AGENT_GROUP_LOCAL_FS = 'local-fs'
 export const AI_AGENT_GROUP_KNOWLEDGE_BASE = 'knowledge-base'
+export const AI_AGENT_GROUP_TERMINAL = 'terminal'
 
 export const AI_AGENT_DEV_TOOLS_METHODS = [
   TOOL_DEF_DEV_VIEW_FILE,
@@ -536,6 +625,12 @@ export const AI_AGENT_LOCAL_FS_METHODS = [
   TOOL_DEF_LOCAL_FS_EDIT
 ]
 export const AI_AGENT_KNOWLEDGE_BASE_METHODS = [TOOL_DEF_RAG_SEARCH]
+export const AI_AGENT_TERMINAL_METHODS = [
+  TOOL_DEF_TERMINAL_READ,
+  TOOL_DEF_TERMINAL_WAIT,
+  TOOL_DEF_TERMINAL_WRITE,
+  TOOL_DEF_TERMINAL_KEYS
+]
 export const AI_AGENT_DATETIME_METHOD = TOOL_DEF_GET_CURRENT_TIME
 
 /**
@@ -552,6 +647,7 @@ export const AI_AGENT_API_METHODS = [
   ...AI_AGENT_REMOTE_FS_METHODS,
   ...AI_AGENT_LOCAL_FS_METHODS,
   ...AI_AGENT_KNOWLEDGE_BASE_METHODS,
+  ...AI_AGENT_TERMINAL_METHODS,
   AI_AGENT_DATETIME_METHOD
 ]
 
@@ -612,6 +708,17 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
             groupDefault: true,
             description:
               'Allow the agent to search the local knowledge base folder(s) configured below (app-wide and/or per-host).'
+          }
+        ),
+        buildApiPermissionGroup(
+          PLUGIN_ID_AI_AGENT,
+          AI_AGENT_GROUP_TERMINAL,
+          'Live terminal',
+          AI_AGENT_TERMINAL_METHODS,
+          {
+            groupDefault: false,
+            description:
+              'Allow the agent to read and type into your live terminal session. This shares your shell and prompt, so the agent acts as if it were you typing.'
           }
         ),
         buildPermissionField(PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD)

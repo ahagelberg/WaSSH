@@ -15,11 +15,13 @@ import {
   AI_AGENT_GROUP_KNOWLEDGE_BASE,
   AI_AGENT_GROUP_LOCAL_FS,
   AI_AGENT_GROUP_REMOTE_FS,
+  AI_AGENT_GROUP_TERMINAL,
   AI_AGENT_GROUP_WEB_ACCESS,
   AI_AGENT_DATETIME_METHOD,
   AI_AGENT_KNOWLEDGE_BASE_METHODS,
   AI_AGENT_LOCAL_FS_METHODS,
   AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+  AI_AGENT_TERMINAL_METHODS,
   AI_AGENT_WEB_ACCESS_ALL_METHODS,
   TOOL_DEF_RUN_COMMAND
 } from './apiMethods'
@@ -41,6 +43,7 @@ import {
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
   AI_AGENT_SETTING_HOST_RAG_FOLDER,
+  AI_AGENT_SETTING_HOST_TERMINAL_ACCESS,
   AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
   AI_AGENT_SETTING_RAG_FOLDER,
   AI_AGENT_SETTING_RAG_PROVIDER_ID,
@@ -65,6 +68,10 @@ import {
   AI_AGENT_TOOL_REMOTE_FS_READ,
   AI_AGENT_TOOL_REMOTE_FS_WRITE,
   AI_AGENT_TOOL_RUN_COMMAND,
+  AI_AGENT_TOOL_TERMINAL_KEYS,
+  AI_AGENT_TOOL_TERMINAL_READ,
+  AI_AGENT_TOOL_TERMINAL_WAIT,
+  AI_AGENT_TOOL_TERMINAL_WRITE,
   AI_AGENT_TOOL_WEB_FETCH,
   AI_AGENT_TOOL_WEB_SEARCH,
   type AiAgentApprovalKind,
@@ -94,6 +101,13 @@ import {
   type ApiToolCallMsg
 } from './providers'
 import { searchKnowledgeBase } from './rag'
+import {
+  executeTerminalKeys,
+  executeTerminalRead,
+  executeTerminalWait,
+  executeTerminalWrite,
+  terminalBufferFor
+} from './terminal'
 import {
   closeSftpSession,
   executeDateTime,
@@ -723,6 +737,7 @@ function systemPrompt(
   const conv = host.conversation
   const cwd = conv?.cwd || '/'
   const hasDevTools = activeTools.some((t) => t.name.startsWith('dev_'))
+  const hasTerminalTools = activeTools.some((t) => t.name.startsWith('terminal_'))
   const toolDescriptions = activeTools.map((t) => `- ${t.name}: ${t.description}`)
   const base = [
     `You are an AI development agent connected to the remote host "${host.hostLabel}".`,
@@ -735,7 +750,15 @@ function systemPrompt(
     '',
     'Guidelines:',
     '- When asked about the current date or time, call get_current_time to obtain the exact current time.',
-    '- Avoid interactive commands (vim, top, less, tail -f). Prefer small, verifiable steps.',
+    ...(hasTerminalTools
+      ? [
+          '- You share the user\u2019s live terminal. Anything you type appears in their session and they can see it.',
+          '- Prefer run_command for ordinary non-interactive commands; it is isolated and returns output directly.',
+          '- Use terminal_write / terminal_send_keys only for interactive programs (vim, top, ssh, REPLs) or when you must act in the user\u2019s own shell.',
+          '- After typing into the terminal, call terminal_wait to observe the result before deciding the next step.',
+          '- terminal_read shows the current screen contents, including output from commands the user ran themselves.'
+        ]
+      : ['- Avoid interactive commands (vim, top, less, tail -f). Prefer small, verifiable steps.']),
     ...(hasDevTools
       ? [
           '- When inspecting, searching, creating, or editing code and files, prefer the developer tools (dev_view_file, dev_edit_file, dev_create_file, dev_grep_search, dev_find_files) over raw shell commands.',
@@ -1003,6 +1026,21 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
     const suffix = args.apply === true ? ' (apply)' : ''
     return `dev_diff ${mode} ${String(args.path || '')}${suffix}`
   }
+  if (name === AI_AGENT_TOOL_TERMINAL_READ) {
+    return 'terminal read'
+  }
+  if (name === AI_AGENT_TOOL_TERMINAL_WRITE) {
+    const text = String(args.text ?? '')
+    const shown = text.length > 120 ? `${text.slice(0, 120)}…` : text
+    return `terminal type ${JSON.stringify(shown)}${args.pressEnter === false ? '' : ' + Enter'}`
+  }
+  if (name === AI_AGENT_TOOL_TERMINAL_KEYS) {
+    const keys = Array.isArray(args.keys) ? args.keys.join(' ') : ''
+    return `terminal keys ${keys}`
+  }
+  if (name === AI_AGENT_TOOL_TERMINAL_WAIT) {
+    return 'terminal wait'
+  }
   if (name === AI_AGENT_TOOL_DEV_CREATE_FILE) {
     return `dev_create ${String(args.path || '')}`
   }
@@ -1139,6 +1177,16 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
       AI_AGENT_KNOWLEDGE_BASE_METHODS,
       settings
     ),
+    // Live-terminal access needs the explicit per-host opt-in as well as the
+    // permission group, so it is never enabled by a permission toggle alone.
+    ...(settings[AI_AGENT_SETTING_HOST_TERMINAL_ACCESS] === true
+      ? allowedGroupMethods(
+          PLUGIN_ID_AI_AGENT,
+          AI_AGENT_GROUP_TERMINAL,
+          AI_AGENT_TERMINAL_METHODS,
+          settings
+        )
+      : []),
     ...(isMethodAllowed(settings, PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD) ? [AI_AGENT_DATETIME_METHOD] : []),
     ...allExternalApiTools(ctx, settings)
   ]
@@ -1679,8 +1727,10 @@ async function setupForTab(ctx: PluginMainContext, forceProbe: boolean): Promise
   }
   const tab: TabRuntime = { ctx, hostKey, terminalTail: '' }
   tabs.set(ctx.tabId, tab)
+  const buffer = terminalBufferFor(ctx)
   ctx.registerStreamHandler('observe', 'inbound', (data) => {
-    tab.terminalTail = (tab.terminalTail + data).slice(-TERMINAL_TAIL_CHARS)
+    buffer.append(data)
+    tab.terminalTail = buffer.text(TERMINAL_TAIL_CHARS)
     return data
   })
   const host = ensureHost(hostKey, hostLabel, ctx)
@@ -2325,6 +2375,34 @@ async function handleApiCall(
         }
       ]
     })
+  }
+  if (method === AI_AGENT_TOOL_TERMINAL_READ) {
+    const buffer = terminalBufferFor(ctx)
+    return executeTerminalRead(buffer, typeof args.maxChars === 'number' ? args.maxChars : undefined)
+  }
+  if (method === AI_AGENT_TOOL_TERMINAL_WRITE) {
+    const buffer = terminalBufferFor(ctx)
+    return executeTerminalWrite(
+      ctx,
+      buffer,
+      String(args.text ?? ''),
+      args.pressEnter !== false
+    )
+  }
+  if (method === AI_AGENT_TOOL_TERMINAL_KEYS) {
+    const buffer = terminalBufferFor(ctx)
+    const keys = Array.isArray(args.keys)
+      ? args.keys.filter((k): k is string => typeof k === 'string')
+      : []
+    return executeTerminalKeys(ctx, buffer, keys)
+  }
+  if (method === AI_AGENT_TOOL_TERMINAL_WAIT) {
+    const buffer = terminalBufferFor(ctx)
+    return executeTerminalWait(
+      buffer,
+      typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined,
+      typeof args.maxChars === 'number' ? args.maxChars : undefined
+    )
   }
   throw new Error(`Unknown AI Agent API method: ${method}`)
 }

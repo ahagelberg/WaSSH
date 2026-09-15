@@ -14,6 +14,7 @@ import {
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
   AI_AGENT_SETTING_HOST_RAG_FOLDER,
+  AI_AGENT_SETTING_HOST_TERMINAL_ACCESS,
   AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
   AI_AGENT_SETTING_RAG_FOLDER,
   AI_AGENT_SETTING_RAG_PROVIDER_ID,
@@ -121,6 +122,14 @@ export const aiAgentManifest: PluginManifest = {
     ],
     hostSettingsHeading: 'AI agent',
     hostSettingsSchema: [
+      {
+        key: AI_AGENT_SETTING_HOST_TERMINAL_ACCESS,
+        label: 'Allow live terminal access',
+        type: 'boolean',
+        default: false,
+        description:
+          'Let the agent read and type into your live terminal for this host. This shares your shell and prompt, so the agent can run interactive programs and answer prompts as if it were you. Off by default.'
+      },
       {
         key: AI_AGENT_SETTING_HOST_PROMPT,
         label: 'Host prompt text',
