@@ -16,13 +16,11 @@ import {
   AI_AGENT_GROUP_LOCAL_FS,
   AI_AGENT_GROUP_REMOTE_FS,
   AI_AGENT_GROUP_WEB_ACCESS,
-  AI_AGENT_GROUP_WEB_SEARCH,
   AI_AGENT_DATETIME_METHOD,
   AI_AGENT_KNOWLEDGE_BASE_METHODS,
   AI_AGENT_LOCAL_FS_METHODS,
   AI_AGENT_REMOTE_FILESYSTEM_METHODS,
-  AI_AGENT_WEB_ACCESS_METHODS,
-  AI_AGENT_WEB_SEARCH_METHODS,
+  AI_AGENT_WEB_ACCESS_ALL_METHODS,
   TOOL_DEF_RUN_COMMAND
 } from './apiMethods'
 import {
@@ -1101,8 +1099,12 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
 
   const activeTools: PluginApiMethod[] = [
     TOOL_DEF_RUN_COMMAND,
-    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_ACCESS, AI_AGENT_WEB_ACCESS_METHODS, settings),
-    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_SEARCH, AI_AGENT_WEB_SEARCH_METHODS, settings),
+    ...allowedGroupMethods(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_WEB_ACCESS,
+      AI_AGENT_WEB_ACCESS_ALL_METHODS,
+      settings
+    ),
     ...allowedGroupMethods(
       PLUGIN_ID_AI_AGENT,
       AI_AGENT_GROUP_REMOTE_FS,

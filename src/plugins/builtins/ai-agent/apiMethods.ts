@@ -451,7 +451,6 @@ export const TOOL_DEF_DEV_FIND_FILES: PluginApiMethod = {
 }
 
 export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
-export const AI_AGENT_GROUP_WEB_SEARCH = 'web-search'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
 export const AI_AGENT_GROUP_LOCAL_FS = 'local-fs'
 export const AI_AGENT_GROUP_KNOWLEDGE_BASE = 'knowledge-base'
@@ -466,6 +465,10 @@ export const AI_AGENT_DEV_TOOLS_METHODS = [
 ]
 export const AI_AGENT_WEB_ACCESS_METHODS = [TOOL_DEF_WEB_FETCH]
 export const AI_AGENT_WEB_SEARCH_METHODS = [TOOL_DEF_WEB_SEARCH]
+export const AI_AGENT_WEB_ACCESS_ALL_METHODS = [
+  ...AI_AGENT_WEB_ACCESS_METHODS,
+  ...AI_AGENT_WEB_SEARCH_METHODS
+]
 export const AI_AGENT_REMOTE_FS_METHODS = [
   TOOL_DEF_REMOTE_FS_READ,
   TOOL_DEF_REMOTE_FS_LIST,
@@ -526,17 +529,10 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
           PLUGIN_ID_AI_AGENT,
           AI_AGENT_GROUP_WEB_ACCESS,
           'Web access',
-          AI_AGENT_WEB_ACCESS_METHODS,
-          { groupDefault: true, description: 'Allow the agent to fetch web pages and resources.' }
-        ),
-        buildApiPermissionGroup(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_WEB_SEARCH,
-          'Web search',
-          AI_AGENT_WEB_SEARCH_METHODS,
+          AI_AGENT_WEB_ACCESS_ALL_METHODS,
           {
             groupDefault: true,
-            description: 'Allow the agent to search the web.',
+            description: 'Allow the agent to fetch web pages and search the web.',
             extraChildren: webSearchExtraChildren
           }
         ),
