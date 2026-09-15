@@ -13,8 +13,6 @@ export const AI_AGENT_SETTING_HOST_RAG_FOLDER = 'hostRagFolder'
 export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
 export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'
 
-export const AI_AGENT_SETTING_HOST_TERMINAL_ACCESS = 'terminalAccess'
-
 export type AiAgentWebSearchProvider = 'bing' | 'brave' | 'google' | 'duckduckgo' | 'custom'
 
 export const AI_AGENT_TOOL_RUN_COMMAND = 'run_command'

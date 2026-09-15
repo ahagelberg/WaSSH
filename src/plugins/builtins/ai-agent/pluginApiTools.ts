@@ -49,14 +49,6 @@ export function groupKey(pluginId: string, groupId: string): string {
   return `apiGroup:${pluginId}:${groupId}`
 }
 
-/**
- * Root group id every AI Agent tool permission (its own categories, and every
- * other plugin's declared API) is nested under, so one master toggle gates
- * everything beneath it regardless of nesting depth.
- */
-export const AI_AGENT_GROUP_PERMISSIONS_ROOT = 'permissions'
-export const AI_AGENT_PERMISSIONS_ROOT_KEY = groupKey(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_PERMISSIONS_ROOT)
-
 /** Resolved trinary permission for one (pluginId, method), defaulting to 'allow'. */
 export function resolvePermission(
   settings: Record<string, unknown>,
@@ -71,52 +63,42 @@ function isGroupEnabled(settings: Record<string, unknown>, pluginId: string, gro
   return Boolean(settings[groupKey(pluginId, groupId)])
 }
 
-/** Whether the top-level "Permissions" master toggle is on (gates every nested group/method). */
-function isPermissionsRootEnabled(settings: Record<string, unknown>): boolean {
-  return Boolean(settings[AI_AGENT_PERMISSIONS_ROOT_KEY])
-}
-
 /** One settings 'group' field: a master toggle plus one 'permission' child per method. */
 export function buildApiPermissionGroup(
   pluginId: string,
   groupId: string,
   groupLabel: string,
   methods: PluginApiMethod[],
-  opts: { groupDefault?: boolean; description?: string; extraChildren?: PluginSettingsField[] } = {}
+  opts: {
+    groupDefault?: boolean
+    description?: string
+    extraChildren?: PluginSettingsField[]
+    /** Method sets collapsed into one permission field each instead of one per method. */
+    bundles?: PermissionBundle[]
+  } = {}
 ): PluginSettingsField {
+  const bundles = opts.bundles ?? []
+  const bundled = new Set(bundles.flatMap((b) => b.methods.map((m) => m.name)))
+  const children = methods
+    .filter((m) => !bundled.has(m.name))
+    .map((m) => buildPermissionField(pluginId, m))
+  for (const bundle of bundles) {
+    children.push(
+      buildBundledPermissionField(
+        pluginId,
+        bundle.methods,
+        bundle.label,
+        bundle.description
+      )
+    )
+  }
   return {
     key: groupKey(pluginId, groupId),
     label: groupLabel,
     type: 'group',
     default: opts.groupDefault ?? false,
     description: opts.description,
-    children: [
-      ...methods.map((m) => buildPermissionField(pluginId, m)),
-      ...(opts.extraChildren ?? [])
-    ]
-  }
-}
-
-/**
- * A group field whose children are arbitrary already-built fields (including
- * other `group` fields), so a settings tree can nest as many levels as
- * needed - e.g. one root "Permissions" group containing several category
- * subgroups, each containing their own `permission` leaves.
- */
-export function buildContainerGroup(
-  pluginId: string,
-  groupId: string,
-  groupLabel: string,
-  children: PluginSettingsField[],
-  opts: { groupDefault?: boolean; description?: string } = {}
-): PluginSettingsField {
-  return {
-    key: groupKey(pluginId, groupId),
-    label: groupLabel,
-    type: 'group',
-    default: opts.groupDefault ?? true,
-    description: opts.description,
-    children
+    children: [...children, ...(opts.extraChildren ?? [])]
   }
 }
 
@@ -131,6 +113,33 @@ export function buildPermissionField(pluginId: string, method: PluginApiMethod):
   }
 }
 
+/** A set of methods sharing one permission field. */
+export interface PermissionBundle {
+  methods: PluginApiMethod[]
+  label: string
+  description: string
+}
+
+/**
+ * One 'permission' field controlling several methods at once. The key is the
+ * first method's, so every bundled method resolves through the same setting.
+ */
+export function buildBundledPermissionField(
+  pluginId: string,
+  methods: PluginApiMethod[],
+  label: string,
+  description: string,
+  defaultPermission: PluginPermissionDecision = 'ask'
+): PluginSettingsField {
+  return {
+    key: permissionKey(pluginId, methods[0].name),
+    label,
+    type: 'permission',
+    default: defaultPermission,
+    description
+  }
+}
+
 /** Methods within an enabled group whose resolved permission is not 'deny'. */
 export function allowedGroupMethods(
   pluginId: string,
@@ -138,19 +147,69 @@ export function allowedGroupMethods(
   methods: PluginApiMethod[],
   settings: Record<string, unknown>
 ): PluginApiMethod[] {
-  if (!isPermissionsRootEnabled(settings) || !isGroupEnabled(settings, pluginId, groupId)) {
+  if (!isGroupEnabled(settings, pluginId, groupId)) {
     return []
   }
   return methods.filter((m) => resolvePermission(settings, pluginId, m.name) !== 'deny')
 }
 
-/** True unless the root "Permissions" toggle is off, or the method's own permission is 'deny'. */
+/** Map each bundled method name to the permission key its bundle resolves through. */
+function bundleKeyMap(pluginId: string, bundles: PermissionBundle[]): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const bundle of bundles) {
+    for (const method of bundle.methods) {
+      map.set(method.name, permissionKey(pluginId, bundle.methods[0].name))
+    }
+  }
+  return map
+}
+
+/**
+ * Like `allowedGroupMethods`, but methods in any of `bundles` resolve through
+ * their bundle leader's permission setting, so one bundled field gates them
+ * all. Methods outside every bundle keep their own permission.
+ */
+export function allowedGroupMethodsWithBundles(
+  pluginId: string,
+  groupId: string,
+  methods: PluginApiMethod[],
+  bundles: PermissionBundle[],
+  settings: Record<string, unknown>
+): PluginApiMethod[] {
+  if (!isGroupEnabled(settings, pluginId, groupId)) {
+    return []
+  }
+  const keys = bundleKeyMap(pluginId, bundles)
+  return methods.filter((m) => {
+    const key = keys.get(m.name) ?? permissionKey(pluginId, m.name)
+    const value = settings[key]
+    const decision: PluginPermissionDecision =
+      value === 'allow' || value === 'deny' || value === 'ask' ? value : 'allow'
+    return decision !== 'deny'
+  })
+}
+
+/**
+ * Settings key a method's permission is actually stored under. Bundled
+ * methods share their bundle leader's key, so "Always allow" on any of them
+ * persists to the setting the bundle reads.
+ */
+export function permissionSettingKeyFor(
+  pluginId: string,
+  method: string,
+  bundles: PermissionBundle[]
+): string {
+  const keys = bundleKeyMap(pluginId, bundles)
+  return keys.get(method) ?? permissionKey(pluginId, method)
+}
+
+/** True unless the method's own permission is 'deny'. */
 export function isMethodAllowed(
   settings: Record<string, unknown>,
   pluginId: string,
   method: PluginApiMethod
 ): boolean {
-  return isPermissionsRootEnabled(settings) && resolvePermission(settings, pluginId, method.name) !== 'deny'
+  return resolvePermission(settings, pluginId, method.name) !== 'deny'
 }
 
 /** Fixed group id: other plugins contribute exactly one API group each. */

@@ -252,33 +252,6 @@ export function flattenFields(schema: PluginSettingsField[] | undefined): Plugin
   return out
 }
 
-/**
- * Return a new schema with `extraChildren` appended to the `children` of the
- * `group` field whose `key` matches `groupKey`, searched at any depth. Lets a
- * composition root inject fields into a specific nesting level (e.g. one
- * shared "Permissions" group) without knowing or rebuilding the rest of the
- * tree. Returns `schema` unchanged (new array, same fields) if no matching
- * group is found.
- */
-export function appendGroupChildren(
-  schema: PluginSettingsField[],
-  groupKey: string,
-  extraChildren: PluginSettingsField[]
-): PluginSettingsField[] {
-  return schema.map((field) => {
-    if (field.type !== 'group') {
-      return field
-    }
-    if (field.key === groupKey) {
-      return { ...field, children: [...(field.children ?? []), ...extraChildren] }
-    }
-    if (field.children) {
-      return { ...field, children: appendGroupChildren(field.children, groupKey, extraChildren) }
-    }
-    return field
-  })
-}
-
 export function defaultPluginSettingsFromSchema(
   schema: PluginSettingsField[] | undefined
 ): Record<string, unknown> {

@@ -1,11 +1,8 @@
 import type { PluginMainRegistration } from './api'
-import { appendGroupChildren, type PluginManifest } from '../../shared/pluginApi'
+import type { PluginManifest } from '../../shared/pluginApi'
 import { aiAgentMain } from '../../plugins/builtins/ai-agent/main'
 import { aiAgentManifest } from '../../plugins/builtins/ai-agent/manifest'
-import {
-  AI_AGENT_PERMISSIONS_ROOT_KEY,
-  buildExternalApiPermissionField
-} from '../../plugins/builtins/ai-agent/pluginApiTools'
+import { buildExternalApiPermissionField } from '../../plugins/builtins/ai-agent/pluginApiTools'
 import { connectionLoggerMain } from '../../plugins/builtins/connection-logger/main'
 import { connectionLoggerManifest } from '../../plugins/builtins/connection-logger/manifest'
 import { daemonMonitorMain } from '../../plugins/builtins/daemon-monitor/main'
@@ -47,12 +44,14 @@ const externalApiFields = OTHER_MANIFESTS.filter(
 
 const appendExternalApiFields = (
   schema: PluginManifest['contributes']['settingsSchema']
-): NonNullable<PluginManifest['contributes']['settingsSchema']> =>
-  appendGroupChildren(schema ?? [], AI_AGENT_PERMISSIONS_ROOT_KEY, externalApiFields)
+): NonNullable<PluginManifest['contributes']['settingsSchema']> => [
+  ...(schema ?? []),
+  ...externalApiFields
+]
 
-// Nest every other plugin's API group as a child of AI Agent's own root
-// "Permissions" group in both app and host/session settings. This is built
-// from loaded manifests and does not depend on any plugin being active.
+// Append every other plugin's API group alongside AI Agent's own tool
+// categories in both app and host/session settings. This is built from loaded
+// manifests and does not depend on any plugin being active.
 const aiAgentManifestWithExternalApis: PluginManifest = {
   ...aiAgentManifest,
   contributes: {

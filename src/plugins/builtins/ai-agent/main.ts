@@ -19,8 +19,10 @@ import {
   AI_AGENT_GROUP_WEB_ACCESS,
   AI_AGENT_DATETIME_METHOD,
   AI_AGENT_KNOWLEDGE_BASE_METHODS,
+  AI_AGENT_LOCAL_FS_BUNDLES,
   AI_AGENT_LOCAL_FS_METHODS,
   AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+  AI_AGENT_REMOTE_FS_BUNDLES,
   AI_AGENT_TERMINAL_METHODS,
   AI_AGENT_WEB_ACCESS_ALL_METHODS,
   TOOL_DEF_RUN_COMMAND
@@ -28,8 +30,10 @@ import {
 import {
   allExternalApiTools,
   allowedGroupMethods,
+  allowedGroupMethodsWithBundles,
   isMethodAllowed,
   permissionSettingKey,
+  permissionSettingKeyFor,
   resolvePermission,
   resolveToolTarget
 } from './pluginApiTools'
@@ -43,7 +47,6 @@ import {
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
   AI_AGENT_SETTING_HOST_RAG_FOLDER,
-  AI_AGENT_SETTING_HOST_TERMINAL_ACCESS,
   AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
   AI_AGENT_SETTING_RAG_FOLDER,
   AI_AGENT_SETTING_RAG_PROVIDER_ID,
@@ -1164,29 +1167,32 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
       AI_AGENT_WEB_ACCESS_ALL_METHODS,
       settings
     ),
-    ...allowedGroupMethods(
+    ...allowedGroupMethodsWithBundles(
       PLUGIN_ID_AI_AGENT,
       AI_AGENT_GROUP_REMOTE_FS,
       AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+      AI_AGENT_REMOTE_FS_BUNDLES,
       settings
     ),
-    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_LOCAL_FS, AI_AGENT_LOCAL_FS_METHODS, settings),
+    ...allowedGroupMethodsWithBundles(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_LOCAL_FS,
+      AI_AGENT_LOCAL_FS_METHODS,
+      AI_AGENT_LOCAL_FS_BUNDLES,
+      settings
+    ),
     ...allowedGroupMethods(
       PLUGIN_ID_AI_AGENT,
       AI_AGENT_GROUP_KNOWLEDGE_BASE,
       AI_AGENT_KNOWLEDGE_BASE_METHODS,
       settings
     ),
-    // Live-terminal access needs the explicit per-host opt-in as well as the
-    // permission group, so it is never enabled by a permission toggle alone.
-    ...(settings[AI_AGENT_SETTING_HOST_TERMINAL_ACCESS] === true
-      ? allowedGroupMethods(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_TERMINAL,
-          AI_AGENT_TERMINAL_METHODS,
-          settings
-        )
-      : []),
+    ...allowedGroupMethods(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_TERMINAL,
+      AI_AGENT_TERMINAL_METHODS,
+      settings
+    ),
     ...(isMethodAllowed(settings, PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD) ? [AI_AGENT_DATETIME_METHOD] : []),
     ...allExternalApiTools(ctx, settings)
   ]
@@ -1419,7 +1425,13 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             break
           }
           if (decision === 'allowAlways') {
-            ctx.setSettingValue(permissionSettingKey(target.pluginId, target.method), 'allow')
+            ctx.setSettingValue(
+              permissionSettingKeyFor(target.pluginId, target.method, [
+                ...AI_AGENT_REMOTE_FS_BUNDLES,
+                ...AI_AGENT_LOCAL_FS_BUNDLES
+              ]),
+              'allow'
+            )
           }
           if (decision === 'deny' || decision === 'denyAlways') {
             conv.messages.push(

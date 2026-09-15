@@ -1,10 +1,9 @@
 import type { PluginApiMethod, PluginSettingsField } from '@plugin-api/shared'
 import { PLUGIN_ID_AI_AGENT } from './id'
 import {
-  AI_AGENT_GROUP_PERMISSIONS_ROOT,
   buildApiPermissionGroup,
-  buildContainerGroup,
-  buildPermissionField
+  buildPermissionField,
+  type PermissionBundle
 } from './pluginApiTools'
 import {
   AI_AGENT_TOOL_DEV_CREATE_FILE,
@@ -618,11 +617,81 @@ export const AI_AGENT_REMOTE_FILESYSTEM_METHODS = [
   ...AI_AGENT_DEV_TOOLS_METHODS,
   ...AI_AGENT_REMOTE_FS_METHODS
 ]
+/**
+ * Remote-filesystem tools that change files. Bundled under one permission
+ * option so the agent's write access is a single switch rather than one per
+ * tool.
+ */
+export const AI_AGENT_REMOTE_FS_WRITE_METHODS = [
+  TOOL_DEF_DEV_EDIT_FILE,
+  TOOL_DEF_DEV_CREATE_FILE,
+  TOOL_DEF_DEV_DIFF_FILE,
+  TOOL_DEF_REMOTE_FS_WRITE,
+  TOOL_DEF_REMOTE_FS_EDIT,
+  TOOL_DEF_REMOTE_FS_DELETE
+]
+/** Remote-filesystem tools that read file contents. */
+export const AI_AGENT_REMOTE_FS_READ_METHODS = [
+  TOOL_DEF_DEV_VIEW_FILE,
+  TOOL_DEF_REMOTE_FS_READ
+]
+/** Remote-filesystem tools that list, find, and search files. */
+export const AI_AGENT_REMOTE_FS_LIST_METHODS = [
+  TOOL_DEF_DEV_LIST_DIR,
+  TOOL_DEF_DEV_FIND_FILES,
+  TOOL_DEF_DEV_GREP,
+  TOOL_DEF_REMOTE_FS_LIST
+]
 export const AI_AGENT_LOCAL_FS_METHODS = [
   TOOL_DEF_LOCAL_FS_READ,
   TOOL_DEF_LOCAL_FS_LIST,
   TOOL_DEF_LOCAL_FS_WRITE,
   TOOL_DEF_LOCAL_FS_EDIT
+]
+/** Local-filesystem tools that read file contents. */
+export const AI_AGENT_LOCAL_FS_READ_METHODS = [TOOL_DEF_LOCAL_FS_READ]
+/** Local-filesystem tools that list files. */
+export const AI_AGENT_LOCAL_FS_LIST_METHODS = [TOOL_DEF_LOCAL_FS_LIST]
+/** Local-filesystem tools that change files. */
+export const AI_AGENT_LOCAL_FS_WRITE_METHODS = [TOOL_DEF_LOCAL_FS_WRITE, TOOL_DEF_LOCAL_FS_EDIT]
+
+/** Remote-filesystem permission bundles, shared by the settings schema and runtime resolution. */
+export const AI_AGENT_REMOTE_FS_BUNDLES: PermissionBundle[] = [
+  {
+    methods: AI_AGENT_REMOTE_FS_READ_METHODS,
+    label: 'Read files',
+    description: 'Allow the agent to read file contents on the remote SSH server.'
+  },
+  {
+    methods: AI_AGENT_REMOTE_FS_LIST_METHODS,
+    label: 'List and search files',
+    description:
+      'Allow the agent to list directories and search for files or text on the remote SSH server.'
+  },
+  {
+    methods: AI_AGENT_REMOTE_FS_WRITE_METHODS,
+    label: 'Write, edit, and delete files',
+    description: 'Allow the agent to create, edit, and delete files on the remote SSH server.'
+  }
+]
+
+/** Local-filesystem permission bundles, shared by the settings schema and runtime resolution. */
+export const AI_AGENT_LOCAL_FS_BUNDLES: PermissionBundle[] = [
+  {
+    methods: AI_AGENT_LOCAL_FS_READ_METHODS,
+    label: 'Read files',
+    description: 'Allow the agent to read file contents on your local computer.'
+  },
+  {
+    methods: AI_AGENT_LOCAL_FS_LIST_METHODS,
+    label: 'List files',
+    description: 'Allow the agent to list directories on your local computer.'
+  },
+  {
+    methods: AI_AGENT_LOCAL_FS_WRITE_METHODS,
+    label: 'Write and edit files',
+    description: 'Allow the agent to create, edit, and overwrite files on your local computer.'
+  }
 ]
 export const AI_AGENT_KNOWLEDGE_BASE_METHODS = [TOOL_DEF_RAG_SEARCH]
 export const AI_AGENT_TERMINAL_METHODS = [
@@ -657,73 +726,68 @@ export const AI_AGENT_API_METHODS = [
  * override) - identical field/key definitions in both, matching how other
  * per-host plugin settings override same-named app-wide keys.
  *
- * All categories nest under one root "Permissions" group (see
- * `AI_AGENT_PERMISSIONS_ROOT_KEY`), so a single master toggle gates every
- * tool permission beneath it; `main/plugins/builtinRegistry.ts` injects each
- * other plugin's own API group as an additional child of that same root
- * (three levels deep: Permissions > plugin/category group > method).
+ * Each category is a top-level group with its own enable toggle, so it can be
+ * switched on or off independently; `main/plugins/builtinRegistry.ts` appends
+ * each other plugin's own API group alongside them.
  */
 export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSettingsField[]): PluginSettingsField[] {
   return [
-    buildContainerGroup(
+    buildApiPermissionGroup(
       PLUGIN_ID_AI_AGENT,
-      AI_AGENT_GROUP_PERMISSIONS_ROOT,
-      'Permissions',
-      [
-        buildApiPermissionGroup(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_WEB_ACCESS,
-          'Web access',
-          AI_AGENT_WEB_ACCESS_ALL_METHODS,
-          {
-            groupDefault: true,
-            description: 'Allow the agent to fetch web pages and search the web.',
-            extraChildren: webSearchExtraChildren
-          }
-        ),
-        buildApiPermissionGroup(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_REMOTE_FS,
-          'Remote filesystem',
-          AI_AGENT_REMOTE_FILESYSTEM_METHODS,
-          {
-            groupDefault: true,
-            description:
-              'Allow the agent to inspect, search, create, and edit files on the connected remote SSH server.'
-          }
-        ),
-        buildApiPermissionGroup(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_LOCAL_FS,
-          'Local filesystem',
-          AI_AGENT_LOCAL_FS_METHODS,
-          { groupDefault: true, description: 'Allow the agent to read/write files on your local computer running WaSSH.' }
-        ),
-        buildApiPermissionGroup(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_KNOWLEDGE_BASE,
-          'Knowledge base',
-          AI_AGENT_KNOWLEDGE_BASE_METHODS,
-          {
-            groupDefault: true,
-            description:
-              'Allow the agent to search the local knowledge base folder(s) configured below (app-wide and/or per-host).'
-          }
-        ),
-        buildApiPermissionGroup(
-          PLUGIN_ID_AI_AGENT,
-          AI_AGENT_GROUP_TERMINAL,
-          'Live terminal',
-          AI_AGENT_TERMINAL_METHODS,
-          {
-            groupDefault: false,
-            description:
-              'Allow the agent to read and type into your live terminal session. This shares your shell and prompt, so the agent acts as if it were you typing.'
-          }
-        ),
-        buildPermissionField(PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD)
-      ],
-      { description: 'Master switch for every tool the agent can call, including other plugins\u2019 APIs below.' }
-    )
+      AI_AGENT_GROUP_TERMINAL,
+      'Live terminal',
+      AI_AGENT_TERMINAL_METHODS,
+      {
+        groupDefault: false,
+        description:
+          'Allow the agent to read and type into your live terminal session. This shares your shell and prompt, so the agent acts as if it were you typing.'
+      }
+    ),
+    buildApiPermissionGroup(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_REMOTE_FS,
+      'Remote filesystem',
+      AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+      {
+        groupDefault: true,
+        description:
+          'Allow the agent to inspect, search, create, and edit files on the connected remote SSH server.',
+        bundles: AI_AGENT_REMOTE_FS_BUNDLES
+      }
+    ),
+    buildApiPermissionGroup(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_LOCAL_FS,
+      'Local filesystem',
+      AI_AGENT_LOCAL_FS_METHODS,
+      {
+        groupDefault: true,
+        description: 'Allow the agent to read/write files on your local computer running WaSSH.',
+        bundles: AI_AGENT_LOCAL_FS_BUNDLES
+      }
+    ),
+    buildApiPermissionGroup(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_WEB_ACCESS,
+      'Web access',
+      AI_AGENT_WEB_ACCESS_ALL_METHODS,
+      {
+        groupDefault: true,
+        description: 'Allow the agent to fetch web pages and search the web.',
+        extraChildren: webSearchExtraChildren
+      }
+    ),
+    buildApiPermissionGroup(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_KNOWLEDGE_BASE,
+      'Knowledge base',
+      AI_AGENT_KNOWLEDGE_BASE_METHODS,
+      {
+        groupDefault: true,
+        description:
+          'Allow the agent to search the local knowledge base folder(s) configured below (app-wide and/or per-host).'
+      }
+    ),
+    buildPermissionField(PLUGIN_ID_AI_AGENT, AI_AGENT_DATETIME_METHOD)
   ]
 }
