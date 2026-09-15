@@ -1,5 +1,6 @@
 import { readdir, readFile, stat } from 'fs/promises'
 import { extname, join } from 'path'
+import { extractText, getDocumentProxy } from 'unpdf'
 import {
   AI_AGENT_RAG_CHUNK_CHARS,
   AI_AGENT_RAG_CHUNK_OVERLAP_CHARS,
@@ -10,11 +11,16 @@ import {
   AI_AGENT_RAG_MAX_CHUNKS,
   AI_AGENT_RAG_MAX_FILES,
   AI_AGENT_RAG_MAX_FILE_BYTES,
+  AI_AGENT_RAG_MAX_PDF_BYTES,
   AI_AGENT_RAG_MAX_RESULT_LIMIT
 } from './defaults'
 import type { PluginMainContext } from '@plugin-api/main'
 
-const RAG_INDEX_VERSION = 1
+const RAG_INDEX_VERSION = 2
+const TEXT_SEARCH_TOKEN_RE = /[\p{L}\p{N}_-]+/gu
+const MIN_TEXT_SEARCH_TOKEN_CHARS = 2
+
+type RagSearchMode = 'embedding' | 'text'
 
 interface RagFileState {
   mtimeMs: number
@@ -31,6 +37,7 @@ interface RagChunkRecord {
 
 interface RagIndexData {
   version: number
+  searchMode: RagSearchMode
   providerId: string
   embeddingModel: string
   files: Record<string, RagFileState>
@@ -40,14 +47,19 @@ interface RagIndexData {
 interface RagFolderFile {
   relPath: string
   absPath: string
+  extension: string
   mtimeMs: number
   size: number
 }
 
 export type EmbedFn = (texts: string[]) => Promise<number[][]>
 
-function emptyIndex(providerId: string, embeddingModel: string): RagIndexData {
-  return { version: RAG_INDEX_VERSION, providerId, embeddingModel, files: {}, chunks: {} }
+function emptyIndex(
+  searchMode: RagSearchMode,
+  providerId: string,
+  embeddingModel: string
+): RagIndexData {
+  return { version: RAG_INDEX_VERSION, searchMode, providerId, embeddingModel, files: {}, chunks: {} }
 }
 
 function isRagIndexData(value: unknown): value is RagIndexData {
@@ -57,6 +69,7 @@ function isRagIndexData(value: unknown): value is RagIndexData {
   const v = value as Record<string, unknown>
   return (
     v.version === RAG_INDEX_VERSION &&
+    (v.searchMode === 'embedding' || v.searchMode === 'text') &&
     typeof v.providerId === 'string' &&
     typeof v.embeddingModel === 'string' &&
     Boolean(v.files) &&
@@ -94,15 +107,18 @@ async function walkFolder(root: string): Promise<RagFolderFile[]> {
         await walk(absPath, relPath)
         continue
       }
-      if (!entry.isFile() || !AI_AGENT_RAG_FILE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+      const extension = extname(entry.name).toLowerCase()
+      if (!entry.isFile() || !AI_AGENT_RAG_FILE_EXTENSIONS.has(extension)) {
         continue
       }
       try {
         const st = await stat(absPath)
-        if (st.size > AI_AGENT_RAG_MAX_FILE_BYTES) {
+        const maxFileBytes =
+          extension === '.pdf' ? AI_AGENT_RAG_MAX_PDF_BYTES : AI_AGENT_RAG_MAX_FILE_BYTES
+        if (st.size > maxFileBytes) {
           continue
         }
-        out.push({ relPath, absPath, mtimeMs: st.mtimeMs, size: st.size })
+        out.push({ relPath, absPath, extension, mtimeMs: st.mtimeMs, size: st.size })
       } catch {
         continue
       }
@@ -111,6 +127,18 @@ async function walkFolder(root: string): Promise<RagFolderFile[]> {
 
   await walk(root, '')
   return out
+}
+
+async function readIndexableText(file: RagFolderFile): Promise<string> {
+  const data = await readFile(file.absPath)
+  if (file.extension !== '.pdf') {
+    return data.toString('utf8')
+  }
+  const pdf = await getDocumentProxy(
+    new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  )
+  const { text } = await extractText(pdf, { mergePages: true })
+  return text
 }
 
 /** Split text into overlapping character-sized chunks. */
@@ -163,6 +191,30 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB))
 }
 
+function textSearchTokens(text: string): string[] {
+  return (text.toLowerCase().match(TEXT_SEARCH_TOKEN_RE) ?? []).filter(
+    (token) => token.length >= MIN_TEXT_SEARCH_TOKEN_CHARS
+  )
+}
+
+function textSearchScore(queryTokens: Set<string>, text: string): number {
+  const textTokens = textSearchTokens(text)
+  if (queryTokens.size === 0 || textTokens.length === 0) {
+    return 0
+  }
+  const counts = new Map<string, number>()
+  for (const token of textTokens) {
+    if (queryTokens.has(token)) {
+      counts.set(token, (counts.get(token) ?? 0) + 1)
+    }
+  }
+  let score = 0
+  for (const count of counts.values()) {
+    score += 1 + Math.log(count)
+  }
+  return score / Math.sqrt(textTokens.length)
+}
+
 function removeFileFromIndex(index: RagIndexData, relPath: string): void {
   const existing = index.files[relPath]
   if (!existing) {
@@ -183,17 +235,24 @@ async function syncFolderIndex(
   ctx: PluginMainContext,
   scopeId: string,
   folder: string,
+  searchMode: RagSearchMode,
   providerId: string,
   embeddingModel: string,
-  embedFn: EmbedFn
+  embedFn?: EmbedFn
 ): Promise<RagIndexData> {
   const stored = ctx.getData(scopeId)
-  let index = isRagIndexData(stored) ? stored : emptyIndex(providerId, embeddingModel)
-  if (index.providerId !== providerId || index.embeddingModel !== embeddingModel) {
+  let index = isRagIndexData(stored)
+    ? stored
+    : emptyIndex(searchMode, providerId, embeddingModel)
+  if (
+    index.searchMode !== searchMode ||
+    (searchMode === 'embedding' &&
+      (index.providerId !== providerId || index.embeddingModel !== embeddingModel))
+  ) {
     // Embeddings from a different provider/model live in a different vector
     // space and can't be compared, so a provider/model change forces a
     // full rebuild.
-    index = emptyIndex(providerId, embeddingModel)
+    index = emptyIndex(searchMode, providerId, embeddingModel)
   }
 
   const diskFiles = await walkFolder(folder)
@@ -218,7 +277,7 @@ async function syncFolderIndex(
 
     let text: string
     try {
-      text = await readFile(file.absPath, 'utf8')
+      text = await readIndexableText(file)
     } catch {
       continue
     }
@@ -229,7 +288,7 @@ async function syncFolderIndex(
     }
     const budget = AI_AGENT_RAG_MAX_CHUNKS - chunkCount
     const limitedPieces = pieces.slice(0, Math.max(budget, 0))
-    const embeddings = await embedAll(embedFn, limitedPieces)
+    const embeddings = embedFn ? await embedAll(embedFn, limitedPieces) : []
     const chunkIds: string[] = []
     limitedPieces.forEach((piece, i) => {
       const id = `${file.relPath}#${i}`
@@ -254,9 +313,10 @@ export interface RagSearchOptions {
   query: string
   limit?: number
   folders: RagFolderConfig[]
+  searchMode: RagSearchMode
   providerId: string
   embeddingModel: string
-  embed: EmbedFn
+  embed?: EmbedFn
 }
 
 /** Sync every configured knowledge base folder, then return the top matching chunks for `query`. */
@@ -270,7 +330,15 @@ export async function searchKnowledgeBase(ctx: PluginMainContext, opts: RagSearc
   for (const f of folders) {
     let index: RagIndexData
     try {
-      index = await syncFolderIndex(ctx, f.scopeId, f.folder, opts.providerId, opts.embeddingModel, opts.embed)
+      index = await syncFolderIndex(
+        ctx,
+        f.scopeId,
+        f.folder,
+        opts.searchMode,
+        opts.providerId,
+        opts.embeddingModel,
+        opts.embed
+      )
     } catch (err) {
       return `Failed to index knowledge base folder "${f.folder}": ${err instanceof Error ? err.message : String(err)}`
     }
@@ -283,17 +351,34 @@ export async function searchKnowledgeBase(ctx: PluginMainContext, opts: RagSearc
     return 'The configured knowledge base folder(s) contain no indexable text files yet.'
   }
 
-  let queryEmbedding: number[]
-  try {
-    const [embedding] = await opts.embed([opts.query])
-    queryEmbedding = embedding ?? []
-  } catch (err) {
-    return `Failed to compute query embedding: ${err instanceof Error ? err.message : String(err)}`
+  let ranked: Array<{ label: string; chunk: RagChunkRecord; score: number }>
+  if (opts.searchMode === 'text') {
+    const queryTokens = new Set(textSearchTokens(opts.query))
+    ranked = scored
+      .map((item) => ({ ...item, score: textSearchScore(queryTokens, item.chunk.text) }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+  } else {
+    if (!opts.embed) {
+      return 'No embedding function is configured for knowledge base search.'
+    }
+    let queryEmbedding: number[]
+    try {
+      const [embedding] = await opts.embed([opts.query])
+      queryEmbedding = embedding ?? []
+    } catch (err) {
+      return `Failed to compute query embedding: ${err instanceof Error ? err.message : String(err)}`
+    }
+    ranked = scored
+      .map((item) => ({ ...item, score: cosineSimilarity(queryEmbedding, item.chunk.embedding) }))
+      .sort((a, b) => b.score - a.score)
   }
 
-  const ranked = scored
-    .map((item) => ({ ...item, score: cosineSimilarity(queryEmbedding, item.chunk.embedding) }))
-    .sort((a, b) => b.score - a.score)
+  if (ranked.length === 0) {
+    return opts.searchMode === 'text'
+      ? 'No indexed text matches the search terms.'
+      : 'No relevant knowledge base content was found.'
+  }
 
   const count = Math.min(
     Math.max(Number(opts.limit) || AI_AGENT_RAG_DEFAULT_RESULT_LIMIT, 1),

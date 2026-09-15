@@ -37,6 +37,8 @@ const SESSION_CLOSED_MESSAGE = 'Session closed'
 const MS_PER_SECOND = 1000
 /** Exit status when the remote executable is missing */
 const EXEC_NOT_FOUND_STATUS = 127
+/** Timeout for quick command captures (ms) */
+const EXEC_CAPTURE_TIMEOUT_MS = 30000
 
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
@@ -290,11 +292,15 @@ export class SshConnection extends EventEmitter {
         let errOut = ''
         let exitCode: number | null = null
         let settled = false
+        let timer: ReturnType<typeof setTimeout> | null = null
         const finish = (err?: Error): void => {
           if (settled) {
             return
           }
           settled = true
+          if (timer) {
+            clearTimeout(timer)
+          }
           try {
             channel.close()
           } catch {
@@ -310,6 +316,9 @@ export class SshConnection extends EventEmitter {
           }
           resolve(out.trim())
         }
+        timer = setTimeout(() => {
+          finish(new Error(`Command timed out after ${EXEC_CAPTURE_TIMEOUT_MS / 1000}s`))
+        }, EXEC_CAPTURE_TIMEOUT_MS)
         channel.on('data', (buf: Buffer) => {
           out += buf.toString('utf8')
         })
@@ -1068,6 +1077,24 @@ export class SshConnection extends EventEmitter {
         }
         let output = ''
         let exitStatus: number | null = null
+        let settled = false
+        let timer: ReturnType<typeof setTimeout> | null = null
+        const finish = (result: 'none' | 'detached' | 'attached' | 'unknown' | 'unavailable'): void => {
+          if (settled) {
+            return
+          }
+          settled = true
+          if (timer) {
+            clearTimeout(timer)
+          }
+          try {
+            channel.close()
+          } catch {
+            /* ignore */
+          }
+          resolve(result)
+        }
+        timer = setTimeout(() => finish('unavailable'), EXEC_CAPTURE_TIMEOUT_MS)
         channel.on('data', (data: Buffer) => {
           output += data.toString('utf8')
         })
@@ -1077,9 +1104,10 @@ export class SshConnection extends EventEmitter {
         channel.on('exit', (code) => {
           exitStatus = typeof code === 'number' ? code : null
         })
+        channel.on('error', () => finish('unavailable'))
         channel.on('close', () => {
           if (exitStatus === EXEC_NOT_FOUND_STATUS) {
-            resolve('unavailable')
+            finish('unavailable')
             return
           }
           const lower = output.toLowerCase()
@@ -1087,14 +1115,14 @@ export class SshConnection extends EventEmitter {
             lower.includes('command not found') ||
             lower.includes('no such file or directory')
           ) {
-            resolve('unavailable')
+            finish('unavailable')
             return
           }
           if (kind === REMOTE_SESSION_KIND_TMUX) {
-            resolve(parseTmuxListForName(output, sessionName))
+            finish(parseTmuxListForName(output, sessionName))
             return
           }
-          resolve(parseScreenListForName(output, sessionName))
+          finish(parseScreenListForName(output, sessionName))
         })
       })
     })

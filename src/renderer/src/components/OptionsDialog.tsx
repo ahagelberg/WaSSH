@@ -27,6 +27,17 @@ import ColorHexInput from './ColorHexInput'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import PluginSettingsFieldList from '../plugins/PluginSettingsFieldList'
 import AiAgentProviderDialog from './AiAgentProviderDialog'
+import {
+  AI_AGENT_DEFAULT_PROVIDERS,
+  embeddingModelsForProvider,
+  supportsEmbeddings
+} from '../../../plugins/builtins/ai-agent/defaults'
+import {
+  AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
+  AI_AGENT_SETTING_RAG_PROVIDER_ID,
+  type AiAgentProviderConfig
+} from '../../../plugins/builtins/ai-agent/protocol'
+import type { PluginSettingsField } from '@shared/pluginApi'
 
 interface Props {
   activeTabId: string | null
@@ -67,6 +78,49 @@ function themeVarHex(cssVar: string): string {
   return `#${[rgb[1], rgb[2], rgb[3]]
     .map((n) => Number(n).toString(16).padStart(HEX_CHANNEL_DIGITS, '0'))
     .join('')}`
+}
+
+function populateAiAgentSchema(
+  schema: PluginSettingsField[],
+  values: Record<string, unknown>,
+  providers: AiAgentProviderConfig[]
+): PluginSettingsField[] {
+  const embeddingProviders = providers.filter(supportsEmbeddings)
+  const selectedProviderId = String(values[AI_AGENT_SETTING_RAG_PROVIDER_ID] || '')
+  const selectedProvider = embeddingProviders.find((p) => p.id === selectedProviderId)
+
+  const providerOptions = [
+    { value: '', label: 'Select provider...' },
+    ...embeddingProviders.map((p) => ({ value: p.id, label: p.name }))
+  ]
+
+  const modelOptions: Array<{ value: string; label: string }> = []
+  if (selectedProvider) {
+    modelOptions.push({ value: '', label: 'Select embedding model...' })
+    modelOptions.push(
+      ...embeddingModelsForProvider(selectedProvider).map((model) => ({
+        value: model,
+        label: model
+      }))
+    )
+  } else {
+    modelOptions.push({ value: '', label: 'Select a provider first' })
+  }
+
+  const mapField = (field: PluginSettingsField): PluginSettingsField => {
+    if (field.key === AI_AGENT_SETTING_RAG_PROVIDER_ID) {
+      return { ...field, options: providerOptions }
+    }
+    if (field.key === AI_AGENT_SETTING_RAG_EMBEDDING_MODEL) {
+      return { ...field, options: modelOptions }
+    }
+    if (field.children && field.children.length > 0) {
+      return { ...field, children: field.children.map(mapField) }
+    }
+    return field
+  }
+
+  return schema.map(mapField)
 }
 
 function DefaultsColorRow({
@@ -138,6 +192,19 @@ export default function OptionsDialog({
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const [providerDialogOpen, setProviderDialogOpen] = useState(false)
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
+  const [aiAgentProviders, setAiAgentProviders] = useState<AiAgentProviderConfig[]>(AI_AGENT_DEFAULT_PROVIDERS)
+
+  const loadAiAgentProviders = (): void => {
+    void window.wassh.getPluginData('ai-agent').then((raw) => {
+      const data = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+      const stored = Array.isArray(data.providers) ? (data.providers as AiAgentProviderConfig[]) : []
+      setAiAgentProviders(stored.length > 0 ? stored : AI_AGENT_DEFAULT_PROVIDERS)
+    })
+  }
+
+  useEffect(() => {
+    loadAiAgentProviders()
+  }, [])
 
   const patch = (partial: Partial<AppSettings>): void => {
     setDraft((prev) => ({ ...prev, ...partial }))
@@ -426,12 +493,16 @@ export default function OptionsDialog({
         continue
       }
       const values = mergePluginSettings(schema, draft.pluginSettings[plugin.id])
+      const effectiveSchema =
+        plugin.id === 'ai-agent'
+          ? populateAiAgentSchema(schema, values, aiAgentProviders)
+          : schema
       base.push({
         id: `plugin-${plugin.id}`,
         title: plugin.contributes.settingsHeading || plugin.name,
         content: (
           <PluginSettingsFieldList
-            schema={schema}
+            schema={effectiveSchema}
             values={values}
             onChange={(key, value) => patchPluginSetting(plugin.id, key, value)}
             onAction={(field) => {
@@ -445,7 +516,7 @@ export default function OptionsDialog({
     }
 
     return base
-  }, [draft, plugins, fontFamilies])
+  }, [draft, plugins, fontFamilies, aiAgentProviders])
 
   return (
     <>
@@ -462,7 +533,15 @@ export default function OptionsDialog({
           </>
         }
       />
-      {providerDialogOpen ? <AiAgentProviderDialog tabId={activeTabId} onClose={() => setProviderDialogOpen(false)} /> : null}
+      {providerDialogOpen ? (
+        <AiAgentProviderDialog
+          tabId={activeTabId}
+          onClose={() => {
+            setProviderDialogOpen(false)
+            loadAiAgentProviders()
+          }}
+        />
+      ) : null}
     </>
   )
 }

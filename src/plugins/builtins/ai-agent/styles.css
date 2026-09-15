@@ -10,26 +10,31 @@
 }
 
 .ai-agent-header {
-  --ai-header-controls-min: 12rem;
   flex-shrink: 0;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 6px 8px;
+  justify-content: space-between;
+  gap: 8px;
   padding: 6px var(--gap);
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel-2);
   font-size: 12px;
 }
 
+.ai-agent-header-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+
 .ai-agent-header-controls {
+  flex-shrink: 0;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex: 1 1 var(--ai-header-controls-min);
-  min-width: min(100%, var(--ai-header-controls-min));
   gap: 4px;
 }
 
@@ -512,6 +517,11 @@
   color: var(--accent);
 }
 
+.ai-agent-tool-badge.tool-badge-dev {
+  background: color-mix(in srgb, #60a5fa 25%, transparent);
+  color: #60a5fa;
+}
+
 .ai-agent-tool-badge.tool-badge-remote-fs {
   background: color-mix(in srgb, #3dd68c 25%, transparent);
   color: #3dd68c;
@@ -537,6 +547,11 @@
   color: #fb7185;
 }
 
+.ai-agent-tool-badge.tool-badge-rag {
+  background: color-mix(in srgb, #c084fc 25%, transparent);
+  color: #c084fc;
+}
+
 .ai-agent-tool-badge.tool-badge-generic {
   background: color-mix(in srgb, var(--text-muted) 25%, transparent);
   color: var(--text-muted);
@@ -553,6 +568,25 @@
   font-size: 10px;
   color: var(--text-muted);
   padding: 2px 8px;
+}
+
+.ai-agent-tool-status.running {
+  color: var(--warn);
+}
+
+.ai-agent-tool-stop-btn {
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border));
+  color: var(--danger);
+  background: transparent;
+  cursor: pointer;
+  margin-left: auto;
+}
+
+.ai-agent-tool-stop-btn:hover {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
 }
 
 .ai-agent-tool-outcome {

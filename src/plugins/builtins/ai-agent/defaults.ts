@@ -76,6 +76,58 @@ export const AI_AGENT_DEFAULT_PROVIDERS: AiAgentProviderConfig[] = [
   }
 ]
 
+const AI_AGENT_EMBEDDING_MODEL_NAME_RE =
+  /(embed|bge|e5|gte|minilm|nomic|mxbai|snowflake|jina)/i
+
+const AI_AGENT_EMBEDDING_DEFAULT_MODELS: Record<string, string[]> = {
+  [AI_AGENT_OLLAMA_PROVIDER_ID]: [
+    'nomic-embed-text',
+    'all-minilm',
+    'bge-m3',
+    'mxbai-embed-large'
+  ],
+  [AI_AGENT_OPENROUTER_PROVIDER_ID]: [
+    'openai/text-embedding-3-small',
+    'openai/text-embedding-3-large'
+  ]
+}
+
+const AI_AGENT_OPENAI_EMBEDDING_MODELS = [
+  'text-embedding-3-small',
+  'text-embedding-3-large',
+  'text-embedding-ada-002'
+]
+
+/** Whether this endpoint is known to provide the OpenAI /embeddings API. */
+export function supportsEmbeddings(provider: AiAgentProviderConfig): boolean {
+  if (
+    provider.id === AI_AGENT_OLLAMA_PROVIDER_ID ||
+    provider.id === AI_AGENT_OPENROUTER_PROVIDER_ID
+  ) {
+    return true
+  }
+  try {
+    return new URL(provider.baseUrl).hostname === 'api.openai.com'
+  } catch {
+    return false
+  }
+}
+
+/** Known compatible embedding models from the provider's model list plus safe defaults. */
+export function embeddingModelsForProvider(provider: AiAgentProviderConfig): string[] {
+  if (!supportsEmbeddings(provider)) {
+    return []
+  }
+  const defaults =
+    AI_AGENT_EMBEDDING_DEFAULT_MODELS[provider.id] ??
+    AI_AGENT_OPENAI_EMBEDDING_MODELS
+  const models = [
+    ...provider.models.filter((model) => AI_AGENT_EMBEDDING_MODEL_NAME_RE.test(model)),
+    ...defaults
+  ]
+  return Array.from(new Set(models))
+}
+
 export const AI_AGENT_SAFE_RULES: string[] = [
   'pwd',
   'whoami',
@@ -115,7 +167,8 @@ export const AI_AGENT_RAG_FILE_EXTENSIONS = new Set([
   '.yaml',
   '.yml',
   '.json',
-  '.csv'
+  '.csv',
+  '.pdf'
 ])
 
 /** Directory names never descended into while scanning a knowledge base folder. */
@@ -123,6 +176,8 @@ export const AI_AGENT_RAG_IGNORED_DIRS = new Set(['.git', '.svn', '.hg', 'node_m
 
 /** Skip files larger than this (bytes) when indexing - keeps embedding cost bounded. */
 export const AI_AGENT_RAG_MAX_FILE_BYTES = 200_000
+/** PDFs are binary containers and commonly exceed the plain-text file size limit. */
+export const AI_AGENT_RAG_MAX_PDF_BYTES = 20_000_000
 /** Max files indexed per knowledge base folder. */
 export const AI_AGENT_RAG_MAX_FILES = 200
 /** Max chunks kept per knowledge base folder index (stops indexing once reached). */

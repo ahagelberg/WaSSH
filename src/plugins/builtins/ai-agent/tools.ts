@@ -8,6 +8,12 @@ import type { SftpSession } from '@plugin-api/main'
 export const MAX_FETCH_CHARS = 32_000
 export const MAX_FILE_READ_CHARS = 48_000
 export const MAX_DIR_ENTRIES = 200
+export const MAX_DEV_VIEW_LINES_DEFAULT = 300
+export const MAX_DEV_GREP_MATCHES = 100
+export const MAX_DEV_FIND_MATCHES = 100
+export const MAX_DEV_TREE_DEPTH = 3
+/** SFTP operation timeout in milliseconds */
+export const SFTP_TIMEOUT_MS = 30_000
 
 
 /** Execute Date/Time query */
@@ -310,6 +316,26 @@ export async function executeWebSearch(
   }
 }
 
+/** Helper to open SFTP session with timeout */
+async function openSftpWithTimeout(ctx: PluginMainContext): Promise<SftpSession | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out opening SFTP session after ${SFTP_TIMEOUT_MS / 1000}s`)), SFTP_TIMEOUT_MS)
+  })
+  try {
+    const sftp = await Promise.race([ctx.openSftp(), timeoutPromise])
+    if (timer) {
+      clearTimeout(timer)
+    }
+    return sftp
+  } catch (err) {
+    if (timer) {
+      clearTimeout(timer)
+    }
+    throw err
+  }
+}
+
 /** Execute Remote SFTP Read */
 export async function executeRemoteFsRead(
   ctx: PluginMainContext,
@@ -319,7 +345,7 @@ export async function executeRemoteFsRead(
   const limit = Math.min(Math.max(Number(maxChars) || 32_000, 1_000), MAX_FILE_READ_CHARS)
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await ctx.openSftp()
+    sftpSession = await openSftpWithTimeout(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -329,33 +355,70 @@ export async function executeRemoteFsRead(
   }
 
   return new Promise<string>((resolve) => {
+    let settled = false
+    let content = ''
+    let truncated = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const finish = (result: string): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      resolve(result)
+    }
+
+    timer = setTimeout(() => {
+      try {
+        stream?.destroy()
+      } catch {
+        /* ignore */
+      }
+      finish(`Error reading remote file "${filePath}": Operation timed out after ${SFTP_TIMEOUT_MS / 1000}s`)
+    }, SFTP_TIMEOUT_MS)
+
+    let stream: import('ssh2').ReadStream | null = null
     try {
-      const stream = sftpSession.createReadStream(filePath)
-      let content = ''
-      let truncated = false
+      stream = sftpSession.createReadStream(filePath)
 
       stream.on('data', (chunk: Buffer | string) => {
         content += chunk.toString('utf-8')
         if (content.length > limit) {
           truncated = true
           content = content.slice(0, limit)
-          stream.destroy()
+          try {
+            stream?.destroy()
+          } catch {
+            /* ignore */
+          }
+          finish(`${content}\n\n[Remote file truncated at ${limit} characters]`)
         }
       })
 
       stream.on('error', (err: Error) => {
-        resolve(`Error reading remote file "${filePath}": ${err.message}`)
+        finish(`Error reading remote file "${filePath}": ${err.message}`)
+      })
+
+      stream.on('end', () => {
+        if (truncated) {
+          finish(`${content}\n\n[Remote file truncated at ${limit} characters]`)
+        } else {
+          finish(content || '(Empty file)')
+        }
       })
 
       stream.on('close', () => {
         if (truncated) {
-          resolve(`${content}\n\n[Remote file truncated at ${limit} characters]`)
+          finish(`${content}\n\n[Remote file truncated at ${limit} characters]`)
         } else {
-          resolve(content || '(Empty file)')
+          finish(content || '(Empty file)')
         }
       })
     } catch (err) {
-      resolve(`Error reading remote file "${filePath}": ${err instanceof Error ? err.message : String(err)}`)
+      finish(`Error reading remote file "${filePath}": ${err instanceof Error ? err.message : String(err)}`)
     }
   })
 }
@@ -368,7 +431,7 @@ export async function executeRemoteFsWrite(
 ): Promise<string> {
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await ctx.openSftp()
+    sftpSession = await openSftpWithTimeout(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -378,17 +441,44 @@ export async function executeRemoteFsWrite(
   }
 
   return new Promise<string>((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const finish = (result: string): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      resolve(result)
+    }
+
+    timer = setTimeout(() => {
+      try {
+        stream?.destroy()
+      } catch {
+        /* ignore */
+      }
+      finish(`Error writing remote file "${filePath}": Operation timed out after ${SFTP_TIMEOUT_MS / 1000}s`)
+    }, SFTP_TIMEOUT_MS)
+
+    let stream: import('ssh2').WriteStream | null = null
     try {
-      const stream = sftpSession.createWriteStream(filePath)
+      stream = sftpSession.createWriteStream(filePath)
       stream.on('error', (err: Error) => {
-        resolve(`Error writing remote file "${filePath}": ${err.message}`)
+        finish(`Error writing remote file "${filePath}": ${err.message}`)
       })
       stream.on('finish', () => {
-        resolve(`Successfully wrote ${Buffer.byteLength(content, 'utf-8')} bytes to remote file "${filePath}".`)
+        finish(`Successfully wrote ${Buffer.byteLength(content, 'utf-8')} bytes to remote file "${filePath}".`)
+      })
+      stream.on('close', () => {
+        finish(`Successfully wrote ${Buffer.byteLength(content, 'utf-8')} bytes to remote file "${filePath}".`)
       })
       stream.end(content, 'utf-8')
     } catch (err) {
-      resolve(`Error writing remote file "${filePath}": ${err instanceof Error ? err.message : String(err)}`)
+      finish(`Error writing remote file "${filePath}": ${err instanceof Error ? err.message : String(err)}`)
     }
   })
 }
@@ -401,7 +491,7 @@ export async function executeRemoteFsList(
   const targetDir = dirPath && dirPath.trim().length > 0 ? dirPath.trim() : '.'
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await ctx.openSftp()
+    sftpSession = await openSftpWithTimeout(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -411,7 +501,15 @@ export async function executeRemoteFsList(
   }
 
   try {
-    const entries = await sftpSession.list(targetDir)
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out listing remote directory "${targetDir}" after ${SFTP_TIMEOUT_MS / 1000}s`)), SFTP_TIMEOUT_MS)
+    })
+    const entries = await Promise.race([sftpSession.list(targetDir), timeoutPromise]).finally(() => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+    })
     if (entries.length === 0) {
       return `Remote directory "${targetDir}" is empty.`
     }
@@ -434,7 +532,7 @@ export async function executeRemoteFsDelete(
 ): Promise<string> {
   let sftpSession: SftpSession | null = null
   try {
-    sftpSession = await ctx.openSftp()
+    sftpSession = await openSftpWithTimeout(ctx)
   } catch (err) {
     return `Failed to open SFTP session on remote host: ${err instanceof Error ? err.message : String(err)}`
   }
@@ -444,7 +542,15 @@ export async function executeRemoteFsDelete(
   }
 
   try {
-    await sftpSession.delete(targetPath)
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out deleting remote path "${targetPath}" after ${SFTP_TIMEOUT_MS / 1000}s`)), SFTP_TIMEOUT_MS)
+    })
+    await Promise.race([sftpSession.delete(targetPath), timeoutPromise]).finally(() => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+    })
     return `Successfully deleted remote path "${targetPath}".`
   } catch (err) {
     return `Error deleting remote path "${targetPath}": ${err instanceof Error ? err.message : String(err)}`
@@ -572,4 +678,210 @@ export async function executeLocalFsEdit(
     return `Error editing local file "${filePath}": ${err instanceof Error ? err.message : String(err)}`
   }
 }
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+export function resolveRemotePath(cwd: string, targetPath?: string): string {
+  if (!targetPath || targetPath.trim() === '' || targetPath.trim() === '.') {
+    return cwd || '/'
+  }
+  const trimmed = targetPath.trim()
+  if (trimmed.startsWith('/')) {
+    return path.posix.normalize(trimmed)
+  }
+  return path.posix.normalize(path.posix.join(cwd || '/', trimmed))
+}
+
+/** Execute Developer Tool: View file with line numbers and optional range */
+export async function executeDevViewFile(
+  ctx: PluginMainContext,
+  cwd: string,
+  filePath: string,
+  startLine?: number,
+  endLine?: number
+): Promise<string> {
+  const remotePath = resolveRemotePath(cwd, filePath)
+  const raw = await executeRemoteFsRead(ctx, remotePath, MAX_FILE_READ_CHARS)
+  if (
+    raw.startsWith('Error') ||
+    raw.startsWith('Failed to open SFTP') ||
+    raw === 'Remote SFTP is not available on this session.'
+  ) {
+    return raw
+  }
+  if (raw === '(Empty file)') {
+    return `File: ${remotePath} (empty file)`
+  }
+
+  const lines = raw.split(/\r?\n/)
+  const totalLines = lines.length
+
+  let s = 1
+  let e = totalLines
+  if (startLine !== undefined || endLine !== undefined) {
+    s = Math.max(1, Math.min(startLine ?? 1, totalLines))
+    e = Math.max(s, Math.min(endLine ?? totalLines, totalLines))
+  } else if (totalLines > MAX_DEV_VIEW_LINES_DEFAULT) {
+    e = MAX_DEV_VIEW_LINES_DEFAULT
+  }
+
+  const pad = String(e).length
+  const formatted = lines
+    .slice(s - 1, e)
+    .map((line, idx) => `${String(s + idx).padStart(pad, ' ')} | ${line}`)
+    .join('\n')
+
+  const note =
+    totalLines > e - s + 1
+      ? ` (${totalLines} lines total, showing lines ${s}-${e})`
+      : ` (${totalLines} lines)`
+  return `File: ${remotePath}${note}\n\n${formatted}`
+}
+
+/** Execute Developer Tool: Edit file by replacing exact text block */
+export async function executeDevEditFile(
+  ctx: PluginMainContext,
+  cwd: string,
+  filePath: string,
+  oldText: string,
+  newText: string
+): Promise<string> {
+  const remotePath = resolveRemotePath(cwd, filePath)
+  const current = await executeRemoteFsRead(ctx, remotePath, MAX_FILE_READ_CHARS)
+  if (
+    current.startsWith('Error') ||
+    current.startsWith('Failed to open SFTP') ||
+    current === 'Remote SFTP is not available on this session.'
+  ) {
+    return current
+  }
+  const result = applyTextReplacement(current, oldText, newText)
+  if (typeof result !== 'string') {
+    return `Error editing remote file "${remotePath}": ${result.error}`
+  }
+  return executeRemoteFsWrite(ctx, remotePath, result).then((writeResult) =>
+    writeResult.startsWith('Successfully')
+      ? `Successfully edited remote file "${remotePath}".`
+      : writeResult
+  )
+}
+
+/** Execute Developer Tool: Create a new file with text content */
+export async function executeDevCreateFile(
+  ctx: PluginMainContext,
+  cwd: string,
+  filePath: string,
+  content: string,
+  overwrite = false
+): Promise<string> {
+  const remotePath = resolveRemotePath(cwd, filePath)
+  if (!overwrite) {
+    try {
+      const sftpSession = await openSftpWithTimeout(ctx)
+      if (sftpSession) {
+        let timer: ReturnType<typeof setTimeout> | null = null
+        const statTimeoutPromise = new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), 5000)
+        })
+        const stats = await Promise.race([sftpSession.statSafe(remotePath), statTimeoutPromise]).finally(() => {
+          if (timer) {
+            clearTimeout(timer)
+          }
+        })
+        if (stats) {
+          return `Error: File "${remotePath}" already exists. Set overwrite: true if you want to replace it.`
+        }
+      }
+    } catch {
+      // Proceed if stat check cannot be performed
+    }
+  }
+  return executeRemoteFsWrite(ctx, remotePath, content).then((writeResult) =>
+    writeResult.startsWith('Successfully')
+      ? `Successfully created remote file "${remotePath}" (${Buffer.byteLength(content, 'utf-8')} bytes).`
+      : writeResult
+  )
+}
+
+/** Execute Developer Tool: List directory with optional recursive tree */
+export async function executeDevListDir(
+  ctx: PluginMainContext,
+  cwd: string,
+  dirPath?: string,
+  recursive = false
+): Promise<string> {
+  const remotePath = resolveRemotePath(cwd, dirPath)
+  if (recursive && ctx.isSshSession()) {
+    try {
+      const cmd = `find ${shellQuote(remotePath)} -maxdepth ${MAX_DEV_TREE_DEPTH} -not -path '*/.*' -not -path '*/node_modules*' -not -path '*/dist*' -not -path '*/build*' 2>/dev/null | head -n ${MAX_DIR_ENTRIES}`
+      const out = (await ctx.execCapture(cmd)).trim()
+      if (out) {
+        return `Directory tree for "${remotePath}" (depth up to ${MAX_DEV_TREE_DEPTH}):\n${out}`
+      }
+    } catch {
+      // Fallback to non-recursive SFTP listing
+    }
+  }
+  return executeRemoteFsList(ctx, remotePath)
+}
+
+/** Execute Developer Tool: Search file contents using grep */
+export async function executeDevGrep(
+  ctx: PluginMainContext,
+  cwd: string,
+  pattern: string,
+  searchPath?: string,
+  caseSensitive = false,
+  glob?: string
+): Promise<string> {
+  if (!ctx.isSshSession()) {
+    return 'Error: Grep search requires an active SSH session.'
+  }
+  const remotePath = resolveRemotePath(cwd, searchPath)
+  const caseFlag = caseSensitive ? '' : '-i'
+  const globFlag = glob && glob.trim() ? `--include=${shellQuote(glob.trim())}` : ''
+  const cmd = `grep -rnI ${caseFlag} --exclude-dir={.git,node_modules,dist,build,.cache,.next} ${globFlag} -e ${shellQuote(pattern)} ${shellQuote(remotePath)} 2>/dev/null | head -n ${MAX_DEV_GREP_MATCHES}`
+  try {
+    const raw = (await ctx.execCapture(cmd)).trim()
+    if (!raw) {
+      return `No matches found for "${pattern}" in "${remotePath}".`
+    }
+    const lineCount = raw.split('\n').length
+    const truncatedNote =
+      lineCount >= MAX_DEV_GREP_MATCHES ? `\n[Showing first ${MAX_DEV_GREP_MATCHES} matches]` : ''
+    return `Grep matches for "${pattern}" in "${remotePath}":\n\n${raw}${truncatedNote}`
+  } catch (err) {
+    return `Error running grep in "${remotePath}": ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+/** Execute Developer Tool: Find files by name/pattern */
+export async function executeDevFindFiles(
+  ctx: PluginMainContext,
+  cwd: string,
+  pattern: string,
+  searchPath?: string
+): Promise<string> {
+  if (!ctx.isSshSession()) {
+    return 'Error: Finding files requires an active SSH session.'
+  }
+  const remotePath = resolveRemotePath(cwd, searchPath)
+  const maxSearchDepth = 8
+  const cmd = `find ${shellQuote(remotePath)} -maxdepth ${maxSearchDepth} -not -path '*/.*' -not -path '*/node_modules/*' -not -path '*/dist/*' -not -path '*/build/*' -iname ${shellQuote(pattern)} 2>/dev/null | head -n ${MAX_DEV_FIND_MATCHES}`
+  try {
+    const raw = (await ctx.execCapture(cmd)).trim()
+    if (!raw) {
+      return `No files found matching "${pattern}" in "${remotePath}".`
+    }
+    const matchCount = raw.split('\n').length
+    const truncatedNote =
+      matchCount >= MAX_DEV_FIND_MATCHES ? `\n[Showing first ${MAX_DEV_FIND_MATCHES} matches]` : ''
+    return `Files matching "${pattern}" in "${remotePath}":\n\n${raw}${truncatedNote}`
+  } catch (err) {
+    return `Error finding files in "${remotePath}": ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
 

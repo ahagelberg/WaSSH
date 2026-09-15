@@ -1,13 +1,14 @@
 import { randomUUID } from 'crypto'
-import { readdir, readFile } from 'fs/promises'
-import { extname, join } from 'path'
 import {
   AI_AGENT_CONVERSATIONS_PER_HOST_MAX,
   AI_AGENT_DATA_VERSION,
   AI_AGENT_DEFAULT_CHAT_TITLE,
+  AI_AGENT_DEFAULT_PROVIDERS,
   AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
   AI_AGENT_RAG_GLOBAL_SCOPE_ID,
-  AI_AGENT_TITLE_MAX_CHARS
+  AI_AGENT_TITLE_MAX_CHARS,
+  embeddingModelsForProvider,
+  supportsEmbeddings
 } from './defaults'
 import { PLUGIN_ID_AI_AGENT, aiAgentVaultId } from './id'
 import {
@@ -19,7 +20,7 @@ import {
   AI_AGENT_DATETIME_METHOD,
   AI_AGENT_KNOWLEDGE_BASE_METHODS,
   AI_AGENT_LOCAL_FS_METHODS,
-  AI_AGENT_REMOTE_FS_METHODS,
+  AI_AGENT_REMOTE_FILESYSTEM_METHODS,
   AI_AGENT_WEB_ACCESS_METHODS,
   AI_AGENT_WEB_SEARCH_METHODS,
   TOOL_DEF_RUN_COMMAND
@@ -42,10 +43,17 @@ import {
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
   AI_AGENT_SETTING_HOST_RAG_FOLDER,
-  AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
+  AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
   AI_AGENT_SETTING_RAG_FOLDER,
+  AI_AGENT_SETTING_RAG_PROVIDER_ID,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER,
+  AI_AGENT_TOOL_DEV_CREATE_FILE,
+  AI_AGENT_TOOL_DEV_EDIT_FILE,
+  AI_AGENT_TOOL_DEV_FIND_FILES,
+  AI_AGENT_TOOL_DEV_GREP,
+  AI_AGENT_TOOL_DEV_LIST_DIR,
+  AI_AGENT_TOOL_DEV_VIEW_FILE,
   AI_AGENT_TOOL_GET_CURRENT_TIME,
   AI_AGENT_TOOL_LOCAL_FS_LIST,
   AI_AGENT_TOOL_LOCAL_FS_READ,
@@ -89,6 +97,12 @@ import {
 import { searchKnowledgeBase } from './rag'
 import {
   executeDateTime,
+  executeDevCreateFile,
+  executeDevEditFile,
+  executeDevFindFiles,
+  executeDevGrep,
+  executeDevListDir,
+  executeDevViewFile,
   executeLocalFsList,
   executeLocalFsRead,
   executeLocalFsWrite,
@@ -115,6 +129,9 @@ const MAX_TOKENS = 8192
 /** Command timeout before the exec channel is closed (ms) */
 const EXEC_TIMEOUT_MS = 120_000
 
+/** Tool execution timeout for plugin API tools (ms) */
+const TOOL_EXEC_TIMEOUT_MS = 60_000
+
 /** Bytes of command output kept for the model (marker tail is extra) */
 const MAX_OUTPUT_CHARS = 64_000
 
@@ -132,9 +149,6 @@ const HISTORY_MAX = 160
 
 /** Remote project rules file read from the working directory */
 const PROJECT_RULES_FILE = '.wasshrules'
-
-/** Local prompt file extensions loaded from the configured folder. */
-const PROMPT_FILE_EXTENSIONS = new Set(['.txt', '.yaml', '.yml'])
 
 /** How long a successful sudo password / NOPASSWD probe stays cached in memory (ms) */
 const SUDO_PASSWORD_CACHE_MS = 5 * 60 * 1000
@@ -446,7 +460,8 @@ function saveData(): void {
 }
 
 function findProvider(providerId: string): AiAgentProviderConfig | undefined {
-  return dataFile?.providers.find((p) => p.id === providerId)
+  const list = dataFile?.providers && dataFile.providers.length > 0 ? dataFile.providers : AI_AGENT_DEFAULT_PROVIDERS
+  return list.find((p) => p.id === providerId)
 }
 
 function tabCtxForHost(hostKey: string): PluginMainContext | undefined {
@@ -690,7 +705,6 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
 interface PromptAdditions {
   globalText: string
   hostText: string
-  localFiles: string
   projectRules: string
 }
 
@@ -701,6 +715,7 @@ function systemPrompt(
 ): string {
   const conv = host.conversation
   const cwd = conv?.cwd || '/'
+  const hasDevTools = activeTools.some((t) => t.name.startsWith('dev_'))
   const toolDescriptions = activeTools.map((t) => `- ${t.name}: ${t.description}`)
   const base = [
     `You are an AI development agent connected to the remote host "${host.hostLabel}".`,
@@ -714,22 +729,24 @@ function systemPrompt(
     'Guidelines:',
     '- When asked about the current date or time, call get_current_time to obtain the exact current time.',
     '- Avoid interactive commands (vim, top, less, tail -f). Prefer small, verifiable steps.',
+    ...(hasDevTools
+      ? [
+          '- When inspecting, searching, creating, or editing code and files, prefer the developer tools (dev_view_file, dev_edit_file, dev_create_file, dev_grep_search, dev_find_files) over raw shell commands.',
+          '- When editing files with dev_edit_file, ensure oldText is exact and unique within the file.'
+        ]
+      : []),
     '- After each command or tool call you see its actual result. Never invent output.',
     '- When the task is complete, reply with a concise plain-text summary; you do not need to call more tools.'
   ]
   const globalText = additions.globalText.trim()
   const hostText = additions.hostText.trim()
-  const localFiles = additions.localFiles.trim()
-  if (globalText || hostText || localFiles) {
+  if (globalText || hostText) {
     base.push('', 'Additional prompt instructions and context:', '')
     if (globalText) {
       base.push(`[Global prompt]\n${globalText}`, '')
     }
     if (hostText) {
       base.push(`[Host prompt]\n${hostText}`, '')
-    }
-    if (localFiles) {
-      base.push(localFiles)
     }
   }
   const userRules = (dataFile?.rules ?? '').trim()
@@ -748,36 +765,6 @@ function systemPrompt(
 
 function stringSetting(settings: Record<string, unknown>, key: string): string {
   return typeof settings[key] === 'string' ? settings[key].trim() : ''
-}
-
-async function readLocalPromptFiles(folder: string): Promise<string> {
-  if (!folder) {
-    return ''
-  }
-  let names: string[]
-  try {
-    const entries = await readdir(folder, { withFileTypes: true })
-    names = entries
-      .filter(
-        (entry) =>
-          entry.isFile() && PROMPT_FILE_EXTENSIONS.has(extname(entry.name).toLowerCase())
-      )
-      .map((entry) => entry.name)
-      .sort((left, right) => left.localeCompare(right))
-  } catch {
-    return ''
-  }
-  const sections = await Promise.all(
-    names.map(async (name) => {
-      try {
-        const content = (await readFile(join(folder, name), 'utf8')).trim()
-        return content ? `[Prompt file: ${name}]\n${content}` : ''
-      } catch {
-        return ''
-      }
-    })
-  )
-  return sections.filter(Boolean).join('\n\n')
 }
 
 async function readProjectRules(ctx: PluginMainContext): Promise<string> {
@@ -990,6 +977,25 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
   if (name === AI_AGENT_TOOL_RUN_COMMAND) {
     return typeof args.command === 'string' ? args.command : ''
   }
+  if (name === AI_AGENT_TOOL_DEV_VIEW_FILE) {
+    const range = args.startLine ? `:${args.startLine}${args.endLine ? `-${args.endLine}` : ''}` : ''
+    return `dev_view ${String(args.path || '')}${range}`
+  }
+  if (name === AI_AGENT_TOOL_DEV_EDIT_FILE) {
+    return `dev_edit ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_DEV_CREATE_FILE) {
+    return `dev_create ${String(args.path || '')}`
+  }
+  if (name === AI_AGENT_TOOL_DEV_LIST_DIR) {
+    return `dev_ls ${String(args.path || '.')}`
+  }
+  if (name === AI_AGENT_TOOL_DEV_GREP) {
+    return `dev_grep "${String(args.pattern || '')}" ${String(args.path || '.')}`
+  }
+  if (name === AI_AGENT_TOOL_DEV_FIND_FILES) {
+    return `dev_find "${String(args.pattern || '')}" ${String(args.path || '.')}`
+  }
   if (name === AI_AGENT_TOOL_GET_CURRENT_TIME) {
     return 'get_current_time'
   }
@@ -1090,9 +1096,6 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   const promptAdditions: PromptAdditions = {
     globalText: stringSetting(settings, AI_AGENT_SETTING_GLOBAL_PROMPT),
     hostText: stringSetting(settings, AI_AGENT_SETTING_HOST_PROMPT),
-    localFiles: await readLocalPromptFiles(
-      stringSetting(settings, AI_AGENT_SETTING_PROMPT_FILES_FOLDER)
-    ),
     projectRules
   }
 
@@ -1100,7 +1103,12 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     TOOL_DEF_RUN_COMMAND,
     ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_ACCESS, AI_AGENT_WEB_ACCESS_METHODS, settings),
     ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_WEB_SEARCH, AI_AGENT_WEB_SEARCH_METHODS, settings),
-    ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_REMOTE_FS, AI_AGENT_REMOTE_FS_METHODS, settings),
+    ...allowedGroupMethods(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_REMOTE_FS,
+      AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+      settings
+    ),
     ...allowedGroupMethods(PLUGIN_ID_AI_AGENT, AI_AGENT_GROUP_LOCAL_FS, AI_AGENT_LOCAL_FS_METHODS, settings),
     ...allowedGroupMethods(
       PLUGIN_ID_AI_AGENT,
@@ -1263,13 +1271,40 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             sudoStdin = hasCachedSudoPassword(host) ? (host.sudoPassword ?? '') : ''
           }
 
+          const toolController = new AbortController()
+          host.controller = toolController
           host.streamingToolCallId = tc.id
-          const execResult = (await ctx.callPluginApi(PLUGIN_ID_AI_AGENT, AI_AGENT_TOOL_RUN_COMMAND, {
-            command,
-            sudoStdin
-          })) as ExecResult
-          host.streamingToolCallId = null
-          if (!host.inRun) {
+          let execResult: ExecResult
+          try {
+            execResult = (await ctx.callPluginApi(PLUGIN_ID_AI_AGENT, AI_AGENT_TOOL_RUN_COMMAND, {
+              command,
+              sudoStdin
+            })) as ExecResult
+          } catch (err) {
+            execResult = {
+              outcome: host.stopped ? 'cancelled' : 'error',
+              content: err instanceof Error ? err.message : String(err),
+              exitCode: null,
+              truncated: false,
+              pwd: null
+            }
+          } finally {
+            host.controller = null
+            host.streamingToolCallId = null
+          }
+          if (!host.inRun || host.stopped) {
+            conv.messages.push(
+              toolResultMessage(
+                tc.id,
+                toolName,
+                command,
+                'Command stopped by user.',
+                'cancelled',
+                false
+              )
+            )
+            pushState(host)
+            persistConversation(host)
             keepRunning = false
             break
           }
@@ -1325,20 +1360,73 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           }
         }
 
+        const toolController = new AbortController()
+        host.controller = toolController
         let toolOutput = ''
         let toolOutcome: AiAgentToolOutcome = 'ok'
+        let toolTimer: ReturnType<typeof setTimeout> | null = null
         try {
-          const raw = await ctx.callPluginApi(target.pluginId, target.method, toolArgs)
-          toolOutput = typeof raw === 'string' ? raw : JSON.stringify(raw)
-          if (toolOutput.length > MAX_PLUGIN_API_RESULT_CHARS) {
-            toolOutput = `${toolOutput.slice(0, MAX_PLUGIN_API_RESULT_CHARS)}\n\n[Result truncated at ${MAX_PLUGIN_API_RESULT_CHARS} characters]`
+          const timeoutPromise = new Promise<{ raw?: never; error: string; outcome: 'timeout' }>((resolve) => {
+            toolTimer = setTimeout(() => {
+              resolve({
+                outcome: 'timeout',
+                error: `Tool "${toolName}" timed out after ${TOOL_EXEC_TIMEOUT_MS / 1000}s.`
+              })
+            }, TOOL_EXEC_TIMEOUT_MS)
+          })
+          const abortPromise = new Promise<{ raw?: never; error: string; outcome: 'cancelled' }>((resolve) => {
+            toolController.signal.addEventListener('abort', () => {
+              resolve({ outcome: 'cancelled', error: 'Tool execution was cancelled by user.' })
+            })
+          })
+          const executionPromise = ctx.callPluginApi(target.pluginId, target.method, toolArgs).then(
+            (raw) => ({ raw, error: undefined, outcome: 'ok' as const }),
+            (err) => ({
+              raw: undefined,
+              error: err instanceof Error ? err.message : String(err),
+              outcome: 'error' as const
+            })
+          )
+
+          const toolResult = await Promise.race([executionPromise, timeoutPromise, abortPromise])
+          if (toolTimer) {
+            clearTimeout(toolTimer)
+          }
+
+          if (toolResult.outcome === 'ok') {
+            const raw = toolResult.raw
+            toolOutput = typeof raw === 'string' ? raw : JSON.stringify(raw)
+            if (toolOutput.length > MAX_PLUGIN_API_RESULT_CHARS) {
+              toolOutput = `${toolOutput.slice(0, MAX_PLUGIN_API_RESULT_CHARS)}\n\n[Result truncated at ${MAX_PLUGIN_API_RESULT_CHARS} characters]`
+            }
+            toolOutcome = 'ok'
+          } else {
+            toolOutput = toolResult.error
+            toolOutcome = toolResult.outcome
           }
         } catch (err) {
           toolOutput = `Error running tool "${toolName}": ${err instanceof Error ? err.message : String(err)}`
           toolOutcome = 'error'
+        } finally {
+          if (toolTimer) {
+            clearTimeout(toolTimer)
+          }
+          host.controller = null
         }
 
-        if (!host.inRun) {
+        if (!host.inRun || host.stopped) {
+          conv.messages.push(
+            toolResultMessage(
+              tc.id,
+              toolName,
+              displayCommand,
+              toolOutput || 'Tool execution was cancelled by user.',
+              'cancelled',
+              false
+            )
+          )
+          pushState(host)
+          persistConversation(host)
           keepRunning = false
           break
         }
@@ -1440,6 +1528,10 @@ async function execCommand(
     let truncated = false
     let timer: ReturnType<typeof setTimeout> | null = null
 
+    const onAbort = (): void => {
+      finish('cancelled', 'Command stopped by user')
+    }
+
     const finish = (outcome: ExecResult['outcome'], reason?: string): void => {
       if (settled) {
         return
@@ -1448,6 +1540,7 @@ async function execCommand(
       if (timer) {
         clearTimeout(timer)
       }
+      host.controller?.signal.removeEventListener('abort', onAbort)
       if (host.connectionId) {
         host.runCtx?.closeSideConnection(host.connectionId)
         host.connectionId = null
@@ -1466,8 +1559,11 @@ async function execCommand(
       }
       let content = raw.replace(new RegExp(`\\n?${statusTag}:\\d+__`, 'g'), '')
       content = content.replace(new RegExp(`\\n?${pwdTag}:[^\\n]*__`, 'g'), '')
-      if (host.stopped && outcome === 'ok') {
+      if (host.stopped || outcome === 'cancelled') {
         outcome = 'cancelled'
+        if (!reason) {
+          reason = 'Command stopped by user'
+        }
       } else if (outcome === 'ok' && statusMatch === null) {
         outcome = 'error'
         reason = 'Command produced no exit marker'
@@ -1483,6 +1579,12 @@ async function execCommand(
         pwd
       })
     }
+
+    if (host.controller?.signal.aborted || host.stopped) {
+      finish('cancelled', 'Command stopped by user')
+      return
+    }
+    host.controller?.signal.addEventListener('abort', onAbort)
 
     void ctx
       .openSideConnection({ kind: 'ssh-exec', command: wrapped })
@@ -1838,9 +1940,7 @@ async function handleRendererMessage(
   }
   if (payload.type === 'stop') {
     host.stopped = true
-    if (host.controller) {
-      host.controller.abort()
-    }
+    abortCurrent(host)
     if (host.phase === 'ask' && host.approvalResolve) {
       const resolve = host.approvalResolve
       host.approvalResolve = null
@@ -1852,6 +1952,8 @@ async function handleRendererMessage(
       host.pendingSudo = null
       resolve(null)
     }
+    host.phase = 'paused'
+    pushState(host)
     return
   }
   if (payload.type === 'select') {
@@ -2026,6 +2128,57 @@ async function handleApiCall(
     }
     return result
   }
+  if (method === AI_AGENT_TOOL_DEV_VIEW_FILE) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    const startLine = typeof args.startLine === 'number' ? args.startLine : undefined
+    const endLine = typeof args.endLine === 'number' ? args.endLine : undefined
+    return executeDevViewFile(ctx, cwd, String(args.path || ''), startLine, endLine)
+  }
+  if (method === AI_AGENT_TOOL_DEV_EDIT_FILE) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    return executeDevEditFile(
+      ctx,
+      cwd,
+      String(args.path || ''),
+      String(args.oldText || ''),
+      String(args.newText || '')
+    )
+  }
+  if (method === AI_AGENT_TOOL_DEV_CREATE_FILE) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    const overwrite = args.overwrite === true
+    return executeDevCreateFile(
+      ctx,
+      cwd,
+      String(args.path || ''),
+      String(args.content || ''),
+      overwrite
+    )
+  }
+  if (method === AI_AGENT_TOOL_DEV_LIST_DIR) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    const recursive = args.recursive === true
+    const targetPath = typeof args.path === 'string' ? args.path : undefined
+    return executeDevListDir(ctx, cwd, targetPath, recursive)
+  }
+  if (method === AI_AGENT_TOOL_DEV_GREP) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    const caseSensitive = args.caseSensitive === true
+    const searchPath = typeof args.path === 'string' ? args.path : undefined
+    const glob = typeof args.glob === 'string' ? args.glob : undefined
+    return executeDevGrep(ctx, cwd, String(args.pattern || ''), searchPath, caseSensitive, glob)
+  }
+  if (method === AI_AGENT_TOOL_DEV_FIND_FILES) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    const searchPath = typeof args.path === 'string' ? args.path : undefined
+    return executeDevFindFiles(ctx, cwd, String(args.pattern || ''), searchPath)
+  }
   if (method === AI_AGENT_TOOL_GET_CURRENT_TIME) {
     return executeDateTime()
   }
@@ -2081,26 +2234,25 @@ async function handleApiCall(
     if (!host || !conv) {
       throw new Error('No active AI Agent conversation on this tab')
     }
-    const provider = findProvider(conv.activeProviderId)
-    if (!provider) {
-      return 'No model provider is configured for this conversation.'
-    }
-    if (provider.protocol !== AI_AGENT_PROTOCOL_OPENAI) {
-      return `Provider "${provider.name}" doesn't support embeddings; rag_search requires an OpenAI-compatible provider with an embedding model configured.`
-    }
-    const embeddingModel = provider.embeddingModel?.trim()
-    if (!embeddingModel) {
-      return `No embedding model configured for provider "${provider.name}". Set one in "Configure providers".`
-    }
-    const apiKey = ctx.getSecret(aiAgentVaultId(provider.id)) ?? ''
     const settings = ctx.getSettings()
-    const embedFn = (texts: string[]): Promise<number[][]> =>
-      embed({ baseUrl: provider.baseUrl, apiKey, model: embeddingModel, input: texts })
+    const configuredProviderId = stringSetting(settings, AI_AGENT_SETTING_RAG_PROVIDER_ID)
+    const provider = findProvider(configuredProviderId)
+    const embeddingModel = stringSetting(settings, AI_AGENT_SETTING_RAG_EMBEDDING_MODEL)
+    const useEmbeddings =
+      provider !== undefined &&
+      supportsEmbeddings(provider) &&
+      embeddingModelsForProvider(provider).includes(embeddingModel)
+    const apiKey = provider ? ctx.getSecret(aiAgentVaultId(provider.id)) ?? '' : ''
+    const embedFn = useEmbeddings && provider
+      ? (texts: string[]): Promise<number[][]> =>
+          embed({ baseUrl: provider.baseUrl, apiKey, model: embeddingModel, input: texts })
+      : undefined
     const limit = typeof args.limit === 'number' ? args.limit : undefined
     return searchKnowledgeBase(ctx, {
       query: String(args.query || ''),
       limit,
-      providerId: provider.id,
+      searchMode: useEmbeddings ? 'embedding' : 'text',
+      providerId: provider?.id ?? '',
       embeddingModel,
       embed: embedFn,
       folders: [

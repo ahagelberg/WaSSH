@@ -14,8 +14,9 @@ import {
   AI_AGENT_SETTING_HOST_DENY_RULES,
   AI_AGENT_SETTING_HOST_PROMPT,
   AI_AGENT_SETTING_HOST_RAG_FOLDER,
-  AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
+  AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
   AI_AGENT_SETTING_RAG_FOLDER,
+  AI_AGENT_SETTING_RAG_PROVIDER_ID,
   AI_AGENT_SETTING_WEB_SEARCH_API_KEY,
   AI_AGENT_SETTING_WEB_SEARCH_PROVIDER
 } from './protocol'
@@ -60,14 +61,6 @@ export const aiAgentManifest: PluginManifest = {
         description: 'Add, remove, and configure AI model providers.'
       },
       {
-        key: AI_AGENT_SETTING_PROMPT_FILES_FOLDER,
-        label: 'Prompt files folder',
-        type: 'directory',
-        default: '',
-        description:
-          'Local folder whose top-level YAML and text files are included in every AI agent prompt.'
-      },
-      {
         key: AI_AGENT_SETTING_GLOBAL_PROMPT,
         label: 'Global prompt text',
         type: 'textArea',
@@ -75,12 +68,36 @@ export const aiAgentManifest: PluginManifest = {
         description: 'Text included in every AI agent prompt.'
       },
       {
-        key: AI_AGENT_SETTING_RAG_FOLDER,
-        label: 'Knowledge base folder',
-        type: 'directory',
-        default: '',
-        description:
-          'Local folder of documents indexed (via the active provider\u2019s embedding model) for the rag_search tool. Combined with any per-host knowledge base folder.'
+        key: 'globalKnowledgeGroup',
+        label: 'Global knowledge',
+        type: 'group',
+        default: true,
+        description: 'Knowledge base folder and embedding model settings for vector search (rag_search tool).',
+        children: [
+          {
+            key: AI_AGENT_SETTING_RAG_FOLDER,
+            label: 'Folder',
+            type: 'directory',
+            default: '',
+            description: 'Local directory containing documents to index and search.'
+          },
+          {
+            key: AI_AGENT_SETTING_RAG_PROVIDER_ID,
+            label: 'Embedding provider',
+            type: 'select',
+            default: '',
+            options: [],
+            description: 'OpenAI-compatible provider used to generate embeddings.'
+          },
+          {
+            key: AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
+            label: 'Embedding model',
+            type: 'select',
+            default: '',
+            options: [],
+            description: 'Embedding model used for knowledge base vector search.'
+          }
+        ]
       },
       {
         key: AI_AGENT_SETTING_DEFAULT_ALLOW_RULES,
@@ -111,11 +128,11 @@ export const aiAgentManifest: PluginManifest = {
       },
       {
         key: AI_AGENT_SETTING_HOST_RAG_FOLDER,
-        label: 'Host knowledge base folder',
+        label: 'Host knowledge folder',
         type: 'directory',
         default: '',
         description:
-          'Additional local folder of documents indexed just for this host, combined with the app-wide knowledge base folder.'
+          'Additional local folder of documents indexed just for this host, combined with the global knowledge folder.'
       },
       {
         key: AI_AGENT_SETTING_HOST_ALLOW_RULES,

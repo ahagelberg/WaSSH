@@ -105,8 +105,11 @@ function toolBadge(name?: string): { label: string; className: string } {
   if (!name || name === 'run_command') {
     return { label: 'SSH', className: 'tool-badge-ssh' }
   }
+  if (name.startsWith('dev_')) {
+    return { label: 'Remote filesystem', className: 'tool-badge-remote-fs' }
+  }
   if (name.startsWith('remote_fs_')) {
-    return { label: 'Remote SFTP', className: 'tool-badge-remote-fs' }
+    return { label: 'Remote filesystem', className: 'tool-badge-remote-fs' }
   }
   if (name.startsWith('local_fs_')) {
     return { label: 'Local PC', className: 'tool-badge-local-fs' }
@@ -119,6 +122,9 @@ function toolBadge(name?: string): { label: string; className: string } {
   }
   if (name === 'get_current_time') {
     return { label: 'Time', className: 'tool-badge-time' }
+  }
+  if (name === 'rag_search') {
+    return { label: 'RAG', className: 'tool-badge-rag' }
   }
   return { label: 'Tool', className: 'tool-badge-generic' }
 }
@@ -633,6 +639,7 @@ export default function AiAgentView({
     (view.runPhase === 'paused' ||
       (view.runPhase === 'idle' && conv.messages[conv.messages.length - 1].role === 'user'))
 
+  const running = view.runPhase === 'running'
   const messages = conv?.messages ?? []
   const messagesRef = useRef<HTMLDivElement>(null)
 
@@ -675,17 +682,42 @@ export default function AiAgentView({
             outputs.push(later)
           }
         }
+        const isCurrentlyRunning = running && outputs.length === 0
         const body =
           outputs.length === 0 ? (
             toolOutput[tc.id] ? (
               <div className="ai-agent-tool-out">
                 <div className="ai-agent-tool-meta">
-                  <span className="ai-agent-tool-status">running</span>
+                  <span className="ai-agent-tool-status running">running</span>
+                  {isCurrentlyRunning ? (
+                    <button
+                      type="button"
+                      className="ai-agent-tool-stop-btn"
+                      title="Stop command"
+                      onClick={() => send({ type: 'stop' })}
+                    >
+                      Stop
+                    </button>
+                  ) : null}
                 </div>
                 <pre className="ai-agent-out">{toolOutput[tc.id]}</pre>
               </div>
             ) : (
-              <span className="ai-agent-tool-status">ran</span>
+              <div className="ai-agent-tool-meta">
+                <span className={`ai-agent-tool-status${isCurrentlyRunning ? ' running' : ''}`}>
+                  {isCurrentlyRunning ? 'running…' : 'interrupted'}
+                </span>
+                {isCurrentlyRunning ? (
+                  <button
+                    type="button"
+                    className="ai-agent-tool-stop-btn"
+                    title="Stop command"
+                    onClick={() => send({ type: 'stop' })}
+                  >
+                    Stop
+                  </button>
+                ) : null}
+              </div>
             )
           ) : (
             outputs.map((out, k) => (
@@ -736,7 +768,6 @@ export default function AiAgentView({
     )
   }
 
-  const running = view.runPhase === 'running'
   if (running && stream) {
     messageRows.push(
       <div key="stream" className="ai-agent-msg ai-agent-assistant">
@@ -810,6 +841,12 @@ export default function AiAgentView({
     <div className="plugin-panel ai-agent">
       <>
           <div className="ai-agent-header">
+            <span
+              className="ai-agent-header-title"
+              title={conv?.title || AI_AGENT_DEFAULT_CHAT_TITLE}
+            >
+              {conv?.title || AI_AGENT_DEFAULT_CHAT_TITLE}
+            </span>
             <div className="ai-agent-header-controls">
               <button
                 type="button"

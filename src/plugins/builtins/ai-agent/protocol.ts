@@ -1,12 +1,13 @@
 export const AI_AGENT_SETTING_DEFAULT_ALLOW_RULES = 'defaultAllowRules'
 export const AI_AGENT_SETTING_DEFAULT_DENY_RULES = 'defaultDenyRules'
 export const AI_AGENT_SETTING_GLOBAL_PROMPT = 'globalPrompt'
-export const AI_AGENT_SETTING_PROMPT_FILES_FOLDER = 'promptFilesFolder'
 export const AI_AGENT_SETTING_HOST_ALLOW_RULES = 'allowRules'
 export const AI_AGENT_SETTING_HOST_DENY_RULES = 'denyRules'
 export const AI_AGENT_SETTING_HOST_PROMPT = 'hostPrompt'
 
 export const AI_AGENT_SETTING_RAG_FOLDER = 'ragFolder'
+export const AI_AGENT_SETTING_RAG_PROVIDER_ID = 'ragProviderId'
+export const AI_AGENT_SETTING_RAG_EMBEDDING_MODEL = 'ragEmbeddingModel'
 export const AI_AGENT_SETTING_HOST_RAG_FOLDER = 'hostRagFolder'
 
 export const AI_AGENT_SETTING_WEB_SEARCH_PROVIDER = 'webSearchProvider'
@@ -28,6 +29,12 @@ export const AI_AGENT_TOOL_LOCAL_FS_LIST = 'local_fs_list_dir'
 export const AI_AGENT_TOOL_LOCAL_FS_EDIT = 'local_fs_edit_file'
 export const AI_AGENT_TOOL_GET_CURRENT_TIME = 'get_current_time'
 export const AI_AGENT_TOOL_RAG_SEARCH = 'rag_search'
+export const AI_AGENT_TOOL_DEV_VIEW_FILE = 'dev_view_file'
+export const AI_AGENT_TOOL_DEV_EDIT_FILE = 'dev_edit_file'
+export const AI_AGENT_TOOL_DEV_CREATE_FILE = 'dev_create_file'
+export const AI_AGENT_TOOL_DEV_LIST_DIR = 'dev_list_directory'
+export const AI_AGENT_TOOL_DEV_GREP = 'dev_grep_search'
+export const AI_AGENT_TOOL_DEV_FIND_FILES = 'dev_find_files'
 
 export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
 

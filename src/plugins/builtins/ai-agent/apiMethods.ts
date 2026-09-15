@@ -7,6 +7,12 @@ import {
   buildPermissionField
 } from './pluginApiTools'
 import {
+  AI_AGENT_TOOL_DEV_CREATE_FILE,
+  AI_AGENT_TOOL_DEV_EDIT_FILE,
+  AI_AGENT_TOOL_DEV_FIND_FILES,
+  AI_AGENT_TOOL_DEV_GREP,
+  AI_AGENT_TOOL_DEV_LIST_DIR,
+  AI_AGENT_TOOL_DEV_VIEW_FILE,
   AI_AGENT_TOOL_GET_CURRENT_TIME,
   AI_AGENT_TOOL_LOCAL_FS_LIST,
   AI_AGENT_TOOL_LOCAL_FS_READ,
@@ -302,12 +308,162 @@ export const TOOL_DEF_LOCAL_FS_EDIT: PluginApiMethod = {
   }
 }
 
+export const TOOL_DEF_DEV_VIEW_FILE: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_VIEW_FILE,
+  description:
+    'View the contents of a file on the remote host with line numbers. Optionally specify startLine and endLine (1-based) to inspect sections of large files.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'File path on the remote host (relative to working directory or absolute)'
+      },
+      startLine: {
+        type: 'number',
+        description: 'Optional 1-based start line number'
+      },
+      endLine: {
+        type: 'number',
+        description: 'Optional 1-based end line number'
+      }
+    },
+    required: ['path']
+  }
+}
+
+export const TOOL_DEF_DEV_EDIT_FILE: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_EDIT_FILE,
+  description:
+    'Edit a file on the remote host by replacing an exact, unique block of text (oldText) with newText. ' +
+    'The oldText must match exactly once in the file (including indentation and line breaks). Mutating action.',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'File path on the remote host (relative to working directory or absolute)'
+      },
+      oldText: {
+        type: 'string',
+        description: 'The exact, unique block of existing text to find and replace'
+      },
+      newText: {
+        type: 'string',
+        description: 'The text to replace oldText with'
+      }
+    },
+    required: ['path', 'oldText', 'newText']
+  }
+}
+
+export const TOOL_DEF_DEV_CREATE_FILE: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_CREATE_FILE,
+  description:
+    'Create a new file on the remote host with the specified content. Fails if the file already exists unless overwrite is set to true. Mutating action.',
+  defaultPermission: 'ask',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'File path on the remote host (relative to working directory or absolute)'
+      },
+      content: {
+        type: 'string',
+        description: 'The full text content to write to the file'
+      },
+      overwrite: {
+        type: 'boolean',
+        description: 'Whether to overwrite an existing file (default: false)'
+      }
+    },
+    required: ['path', 'content']
+  }
+}
+
+export const TOOL_DEF_DEV_LIST_DIR: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_LIST_DIR,
+  description:
+    'List files and subdirectories in a directory on the remote host with file types, sizes, and permissions.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'Directory path on the remote host (defaults to current working directory)'
+      },
+      recursive: {
+        type: 'boolean',
+        description: 'Whether to recursively list directory tree up to depth 3 (default: false)'
+      }
+    }
+  }
+}
+
+export const TOOL_DEF_DEV_GREP: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_GREP,
+  description:
+    'Search for text or regular expression patterns across files in the remote host workspace. Returns matching lines with line numbers and file paths.',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: {
+        type: 'string',
+        description: 'The regular expression or text pattern to search for'
+      },
+      path: {
+        type: 'string',
+        description: 'Directory or file to search in (defaults to current working directory)'
+      },
+      caseSensitive: {
+        type: 'boolean',
+        description: 'Whether the search is case-sensitive (default: false)'
+      },
+      glob: {
+        type: 'string',
+        description: 'Optional file name pattern filter, e.g. "*.ts" or "*.py"'
+      }
+    },
+    required: ['pattern']
+  }
+}
+
+export const TOOL_DEF_DEV_FIND_FILES: PluginApiMethod = {
+  name: AI_AGENT_TOOL_DEV_FIND_FILES,
+  description:
+    'Find files by name or wildcard pattern on the remote host (e.g. "*.json", "config.*", "test_*.py").',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: {
+        type: 'string',
+        description: 'File name or wildcard pattern to search for (e.g. "*.ts", "package.json")'
+      },
+      path: {
+        type: 'string',
+        description: 'Directory to search in (defaults to current working directory)'
+      }
+    },
+    required: ['pattern']
+  }
+}
+
 export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
 export const AI_AGENT_GROUP_WEB_SEARCH = 'web-search'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
 export const AI_AGENT_GROUP_LOCAL_FS = 'local-fs'
 export const AI_AGENT_GROUP_KNOWLEDGE_BASE = 'knowledge-base'
 
+export const AI_AGENT_DEV_TOOLS_METHODS = [
+  TOOL_DEF_DEV_VIEW_FILE,
+  TOOL_DEF_DEV_EDIT_FILE,
+  TOOL_DEF_DEV_CREATE_FILE,
+  TOOL_DEF_DEV_LIST_DIR,
+  TOOL_DEF_DEV_GREP,
+  TOOL_DEF_DEV_FIND_FILES
+]
 export const AI_AGENT_WEB_ACCESS_METHODS = [TOOL_DEF_WEB_FETCH]
 export const AI_AGENT_WEB_SEARCH_METHODS = [TOOL_DEF_WEB_SEARCH]
 export const AI_AGENT_REMOTE_FS_METHODS = [
@@ -316,6 +472,10 @@ export const AI_AGENT_REMOTE_FS_METHODS = [
   TOOL_DEF_REMOTE_FS_WRITE,
   TOOL_DEF_REMOTE_FS_EDIT,
   TOOL_DEF_REMOTE_FS_DELETE
+]
+export const AI_AGENT_REMOTE_FILESYSTEM_METHODS = [
+  ...AI_AGENT_DEV_TOOLS_METHODS,
+  ...AI_AGENT_REMOTE_FS_METHODS
 ]
 export const AI_AGENT_LOCAL_FS_METHODS = [
   TOOL_DEF_LOCAL_FS_READ,
@@ -334,6 +494,7 @@ export const AI_AGENT_DATETIME_METHOD = TOOL_DEF_GET_CURRENT_TIME
  */
 export const AI_AGENT_API_METHODS = [
   TOOL_DEF_RUN_COMMAND,
+  ...AI_AGENT_DEV_TOOLS_METHODS,
   ...AI_AGENT_WEB_ACCESS_METHODS,
   ...AI_AGENT_WEB_SEARCH_METHODS,
   ...AI_AGENT_REMOTE_FS_METHODS,
@@ -383,8 +544,12 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
           PLUGIN_ID_AI_AGENT,
           AI_AGENT_GROUP_REMOTE_FS,
           'Remote filesystem',
-          AI_AGENT_REMOTE_FS_METHODS,
-          { groupDefault: true, description: 'Allow the agent to read/write files on the connected remote SSH server via SFTP.' }
+          AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+          {
+            groupDefault: true,
+            description:
+              'Allow the agent to inspect, search, create, and edit files on the connected remote SSH server.'
+          }
         ),
         buildApiPermissionGroup(
           PLUGIN_ID_AI_AGENT,

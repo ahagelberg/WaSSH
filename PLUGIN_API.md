@@ -304,7 +304,7 @@ onApiCall(ctx, method, params) {
 ### AI Agent as a consumer (and how its own tools reuse the same shape)
 
 The AI Agent plugin turns every declared method - both other plugins' and its
-own built-ins (`run_command`, `web_fetch`, `web_search`, `remote_fs_*`,
+own built-ins (`run_command`, `dev_*`, `web_fetch`, `web_search`, `remote_fs_*`,
 `local_fs_*`, `get_current_time`, `rag_search`) - into an LLM tool, and
 dispatches **all** of them through `ctx.callPluginApi(pluginId, method,
 args)`, including calls to itself (`pluginId === PLUGIN_ID_AI_AGENT`, always
