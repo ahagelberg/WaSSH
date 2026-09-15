@@ -1054,9 +1054,238 @@ function summarizeDiff(added: number, removed: number, kept: number): string {
   return `Diff summary: +${added} added, -${removed} removed, ${kept} unchanged.`
 }
 
+/** One `@@ -a,b +c,d @@` hunk header from a unified diff. */
+interface PatchHunk {
+  oldStart: number
+  oldCount: number
+  newStart: number
+  newCount: number
+  /** Body lines including their leading ' ', '-' or '+' marker. */
+  body: string[]
+}
+
+interface ParsedPatch {
+  oldPath: string
+  newPath: string
+  hunks: PatchHunk[]
+}
+
+const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
+
+/** Strip a trailing tab-separated timestamp and a leading `a/` or `b/` prefix. */
+function normalizePatchPath(raw: string): string {
+  let value = raw.split('\t')[0].trim()
+  if (value === '/dev/null') {
+    return value
+  }
+  const quoted = /^"(.*)"$/.exec(value)
+  if (quoted) {
+    value = quoted[1]
+  }
+  return value.replace(/^[ab]\//, '')
+}
+
+/**
+ * Parse a unified diff (`git diff` / `diff -u` / `git format-patch` output).
+ * File headers are optional; `---`/`+++` pairs and `@@` hunks are what matter.
+ * Returns an error string when the text is not a unified diff.
+ */
+function parseUnifiedPatch(patch: string): ParsedPatch | { error: string } {
+  const lines = patch.replace(/\r\n/g, '\n').split('\n')
+  const hunks: PatchHunk[] = []
+  let oldPath = ''
+  let newPath = ''
+  let index = 0
+
+  while (index < lines.length) {
+    const line = lines[index]
+    if (line.startsWith('diff --git ') || line.startsWith('index ') || line.startsWith('new file') ||
+        line.startsWith('deleted file') || line.startsWith('similarity index') ||
+        line.startsWith('rename ') || line.startsWith('old mode') || line.startsWith('new mode')) {
+      index += 1
+      continue
+    }
+    if (line.startsWith('--- ')) {
+      oldPath = normalizePatchPath(line.slice(4))
+      index += 1
+      if (index < lines.length && lines[index].startsWith('+++ ')) {
+        newPath = normalizePatchPath(lines[index].slice(4))
+        index += 1
+      }
+      continue
+    }
+    if (line.startsWith('+++ ')) {
+      newPath = normalizePatchPath(line.slice(4))
+      index += 1
+      continue
+    }
+    const header = HUNK_HEADER_RE.exec(line)
+    if (!header) {
+      index += 1
+      continue
+    }
+    const hunk: PatchHunk = {
+      oldStart: Number(header[1]),
+      oldCount: header[2] === undefined ? 1 : Number(header[2]),
+      newStart: Number(header[3]),
+      newCount: header[4] === undefined ? 1 : Number(header[4]),
+      body: []
+    }
+    index += 1
+    // A zero-length side means the hunk starts at the line *before* the change.
+    let oldSeen = 0
+    let newSeen = 0
+    while (index < lines.length && (oldSeen < hunk.oldCount || newSeen < hunk.newCount)) {
+      const bodyLine = lines[index]
+      if (bodyLine.startsWith('\\')) {
+        // "\ No newline at end of file" annotates the previous line.
+        index += 1
+        continue
+      }
+      const marker = bodyLine.charAt(0)
+      if (marker !== ' ' && marker !== '-' && marker !== '+') {
+        break
+      }
+      if (bodyLine.length === 0 && hunk.oldCount === 0 && hunk.newCount === 0) {
+        break
+      }
+      hunk.body.push(bodyLine)
+      if (marker !== '+') {
+        oldSeen += 1
+      }
+      if (marker !== '-') {
+        newSeen += 1
+      }
+      index += 1
+    }
+    if (oldSeen !== hunk.oldCount || newSeen !== hunk.newCount) {
+      return {
+        error:
+          `Hunk @@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@ is truncated: ` +
+          `expected ${hunk.oldCount} old / ${hunk.newCount} new lines, found ${oldSeen} / ${newSeen}.`
+      }
+    }
+    hunks.push(hunk)
+  }
+
+  if (hunks.length === 0) {
+    return { error: 'No unified diff hunks found. Expected at least one "@@ -old,count +new,count @@" header.' }
+  }
+  return { oldPath, newPath, hunks }
+}
+
+/** Lines a hunk removes (old side), used to locate it when the header offset drifted. */
+function hunkOldLines(hunk: PatchHunk): string[] {
+  const out: string[] = []
+  for (const bodyLine of hunk.body) {
+    const marker = bodyLine.charAt(0)
+    if (marker === ' ' || marker === '-') {
+      out.push(bodyLine.slice(1))
+    }
+  }
+  return out
+}
+
+/** Lines a hunk produces (new side). */
+function hunkNewLines(hunk: PatchHunk): string[] {
+  const out: string[] = []
+  for (const bodyLine of hunk.body) {
+    const marker = bodyLine.charAt(0)
+    if (marker === ' ' || marker === '+') {
+      out.push(bodyLine.slice(1))
+    }
+  }
+  return out
+}
+
+/**
+ * Locate a hunk in `fileLines`. Prefers the header's line number and falls
+ * back to a unique content search, so patches still apply when the file has
+ * drifted by unrelated edits outside the hunk.
+ */
+function locateHunk(
+  fileLines: string[],
+  hunk: PatchHunk,
+  claimedStart: number
+): { at: number; fuzz: 'exact' | 'offset' | 'search' } | { error: string } {
+  const oldLines = hunkOldLines(hunk)
+  if (oldLines.length === 0) {
+    // Pure insertion: anchor at the claimed position.
+    return { at: Math.max(0, Math.min(claimedStart, fileLines.length)), fuzz: 'exact' }
+  }
+  const matchesAt = (start: number): boolean => {
+    if (start < 0 || start + oldLines.length > fileLines.length) {
+      return false
+    }
+    for (let k = 0; k < oldLines.length; k += 1) {
+      if (fileLines[start + k] !== oldLines[k]) {
+        return false
+      }
+    }
+    return true
+  }
+  if (matchesAt(claimedStart)) {
+    return { at: claimedStart, fuzz: 'exact' }
+  }
+  const found: number[] = []
+  for (let start = 0; start + oldLines.length <= fileLines.length; start += 1) {
+    if (matchesAt(start)) {
+      found.push(start)
+      if (found.length > 1) {
+        break
+      }
+    }
+  }  if (found.length === 1) {
+    return { at: found[0], fuzz: 'search' }
+  }
+  if (found.length > 1) {
+    return {
+      error:
+        `Hunk @@ -${hunk.oldStart},${hunk.oldCount} @@ no longer matches at line ${claimedStart + 1} and its content ` +
+        'appears in multiple places. Re-read the file and regenerate the patch with more context.'
+    }
+  }
+  return {
+    error:
+      `Hunk @@ -${hunk.oldStart},${hunk.oldCount} @@ does not match the file at line ${claimedStart + 1} ` +
+      'or anywhere else. Re-read the file and regenerate the patch.'
+  }
+}
+
+/**
+ * Apply parsed hunks to file content. Hunks are applied bottom-up so earlier
+ * line numbers stay valid, and each is located independently.
+ */
+function applyPatchHunks(
+  content: string,
+  hunks: PatchHunk[]
+): { text: string; applied: number } | { error: string } {
+  const fileLines = content.split('\n')
+  const ordered = hunks
+    .map((hunk, position) => ({ hunk, position }))
+    .sort((a, b) => b.hunk.oldStart - a.hunk.oldStart)
+
+  let lines = fileLines
+  for (const { hunk, position } of ordered) {
+    // For a zero-count old side the header points at the line before the insert.
+    const claimedStart = hunk.oldCount === 0 ? hunk.oldStart : hunk.oldStart - 1
+    const located = locateHunk(lines, hunk, claimedStart)
+    if ('error' in located) {
+      return { error: `Hunk #${position + 1}: ${located.error}` }
+    }
+    lines = [
+      ...lines.slice(0, located.at),
+      ...hunkNewLines(hunk),
+      ...lines.slice(located.at + hunkOldLines(hunk).length)
+    ]
+  }
+  return { text: lines.join('\n'), applied: hunks.length }
+}
+
 /**
  * Execute Developer Tool: diff a remote file against expected text, optionally
- * applying the replacement. Read-only unless `apply` is true.
+ * applying either a text replacement or a unified patch. Read-only unless
+ * `apply` is true.
  */
 export async function executeDevDiffFile(
   ctx: PluginMainContext,
@@ -1065,7 +1294,8 @@ export async function executeDevDiffFile(
   oldText: string,
   newText: string,
   apply: boolean,
-  contextLines?: number
+  contextLines?: number,
+  patch?: string
 ): Promise<string> {
   const remotePath = resolveRemotePath(cwd, filePath)
   const context = Math.min(Math.max(Number(contextLines) || DIFF_CONTEXT_LINES_DEFAULT, 0), DIFF_CONTEXT_LINES_MAX)
@@ -1080,6 +1310,58 @@ export async function executeDevDiffFile(
   const truncated = /\n\n\[Remote file truncated at \d+ characters\]$/.test(current)
   const content = truncated ? current.replace(/\n\n\[Remote file truncated at \d+ characters\]$/, '') : current
   const actual = content === '(Empty file)' ? '' : content
+
+  if (patch !== undefined && patch.trim() !== '') {
+    const parsed = parseUnifiedPatch(patch)
+    if ('error' in parsed) {
+      return `Error: invalid unified patch for "${remotePath}": ${parsed.error}`
+    }
+    if (truncated) {
+      return (
+        `Error: "${remotePath}" is larger than the ${MAX_FILE_READ_CHARS}-character read limit, so a patch cannot be ` +
+        'applied safely. Use dev_edit_file with a unique oldText block instead.'
+      )
+    }
+    const result = applyPatchHunks(actual, parsed.hunks)
+    if ('error' in result) {
+      return `Error: patch does not apply to "${remotePath}": ${result.error}`
+    }
+    if (!apply) {
+      const preview = formatUnifiedDiff(
+        `Patch preview for ${remotePath}:`,
+        actual.split('\n'),
+        result.text.split('\n'),
+        context
+      )
+      const summary = summarizeDiff(
+        preview.added,
+        preview.removed,
+        actual.split('\n').length - preview.removed
+      )
+      return (
+        `${result.applied} hunk${result.applied === 1 ? '' : 's'} would apply cleanly to ${remotePath}.\n\n` +
+        `${preview.text}\n\n${summary}\n[Preview only - pass apply: true to write the change.]`
+      )
+    }
+    const writeResult = await executeRemoteFsWrite(ctx, remotePath, result.text)
+    if (!writeResult.startsWith('Successfully')) {
+      return writeResult
+    }
+    const applied = formatUnifiedDiff(
+      `Applied to ${remotePath}:`,
+      actual.split('\n'),
+      result.text.split('\n'),
+      context
+    )
+    return (
+      `${writeResult}\nApplied ${result.applied} hunk${result.applied === 1 ? '' : 's'}.\n` +
+      `${applied.text}\n${summarizeDiff(
+        applied.added,
+        applied.removed,
+        actual.split('\n').length - applied.removed
+      )}`
+    )
+  }
 
   if (apply) {
     if (!newText) {

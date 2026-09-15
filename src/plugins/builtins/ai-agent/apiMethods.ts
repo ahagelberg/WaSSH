@@ -454,11 +454,13 @@ export const TOOL_DEF_DEV_FIND_FILES: PluginApiMethod = {
 export const TOOL_DEF_DEV_DIFF_FILE: PluginApiMethod = {
   name: AI_AGENT_TOOL_DEV_DIFF_FILE,
   description:
-    'Diff a file on the remote host against expected text, without modifying it. ' +
-    'Pass the exact block of text you expect the file to contain as oldText; the result is a unified diff showing what the file actually contains versus that expectation, ' +
-    'plus a summary of how many lines were added, removed, and kept. ' +
-    'Use this to verify a file\u2019s current state before editing it, or to confirm that an edit you made took effect. ' +
-    'Set apply to true to instead replace the matched oldText with newText (requires newText and user approval).',
+    'Diff a file on the remote host against expected text, or apply a unified patch, without modifying it unless apply is set. ' +
+    'Two modes: (1) pass the exact block of text you expect the file to contain as oldText to get a unified diff of expectation vs. reality, ' +
+    'plus a summary of lines added, removed, and kept - use this to verify a file\u2019s current state or confirm an edit took effect; ' +
+    '(2) pass a unified diff (git diff / diff -u / git format-patch output, including multi-hunk and partial-hunk patches) as patch ' +
+    'to check whether it applies cleanly, with apply: true to write it. ' +
+    'In oldText mode, apply: true replaces the matched oldText with newText. ' +
+    'Patch mode fails with a diagnostic when a hunk does not match, so you can re-read the file and regenerate.',
   defaultPermission: 'ask',
   parameters: {
     type: 'object',
@@ -470,23 +472,29 @@ export const TOOL_DEF_DEV_DIFF_FILE: PluginApiMethod = {
       oldText: {
         type: 'string',
         description:
-          'The exact block of text expected to be present in the file (including whitespace/indentation). May be empty to diff against an empty file.'
+          'The exact block of text expected to be present in the file (including whitespace/indentation). May be empty to diff against an empty file. Not used in patch mode.'
       },
       newText: {
         type: 'string',
-        description: 'Replacement text. Only used when apply is true.'
+        description: 'Replacement text. Only used in oldText mode when apply is true.'
+      },
+      patch: {
+        type: 'string',
+        description:
+          'A unified diff to apply to the file. Accepts full git diffs with headers and multiple @@ hunks. ' +
+          'Only the hunks for this file are used; file paths in the patch header are ignored in favour of path.'
       },
       apply: {
         type: 'boolean',
         description:
-          'Whether to write newText in place of oldText instead of only reporting the diff (default: false). Requires newText to be set.'
+          'Whether to write the change instead of only reporting the diff (default: false). In patch mode this writes the patched content; in oldText mode it writes newText.'
       },
       contextLines: {
         type: 'number',
         description: 'Number of unchanged context lines shown around each change (default 3, max 20)'
       }
     },
-    required: ['path', 'oldText']
+    required: ['path']
   }
 }
 

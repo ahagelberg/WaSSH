@@ -740,7 +740,8 @@ function systemPrompt(
       ? [
           '- When inspecting, searching, creating, or editing code and files, prefer the developer tools (dev_view_file, dev_edit_file, dev_create_file, dev_grep_search, dev_find_files) over raw shell commands.',
           '- When editing files with dev_edit_file, ensure oldText is exact and unique within the file.',
-          '- Use dev_diff_file to verify a file\u2019s actual content against what you expect before editing it, or to confirm an edit took effect.'
+          '- Use dev_diff_file to verify a file\u2019s actual content against what you expect before editing it, or to confirm an edit took effect.',
+          '- dev_diff_file also accepts a unified diff via its patch parameter to check or apply multi-hunk and partial-hunk patches; prefer it over hand-rolling shell patch commands.'
         ]
       : []),
     '- After each command or tool call you see its actual result. Never invent output.',
@@ -998,8 +999,9 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
     return `dev_edit ${String(args.path || '')}`
   }
   if (name === AI_AGENT_TOOL_DEV_DIFF_FILE) {
+    const mode = typeof args.patch === 'string' && args.patch.trim() !== '' ? 'patch' : 'text'
     const suffix = args.apply === true ? ' (apply)' : ''
-    return `dev_diff ${String(args.path || '')}${suffix}`
+    return `dev_diff ${mode} ${String(args.path || '')}${suffix}`
   }
   if (name === AI_AGENT_TOOL_DEV_CREATE_FILE) {
     return `dev_create ${String(args.path || '')}`
@@ -2234,7 +2236,8 @@ async function handleApiCall(
       String(args.oldText ?? ''),
       String(args.newText ?? ''),
       args.apply === true,
-      typeof args.contextLines === 'number' ? args.contextLines : undefined
+      typeof args.contextLines === 'number' ? args.contextLines : undefined,
+      typeof args.patch === 'string' ? args.patch : undefined
     )
   }
   if (method === AI_AGENT_TOOL_GET_CURRENT_TIME) {
