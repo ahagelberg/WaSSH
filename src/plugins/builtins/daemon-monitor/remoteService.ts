@@ -1,35 +1,17 @@
-import { DAEMON_MONITOR_MAX_PING_TARGETS } from './defaults'
-
-export const REMOTE_SERVICE_VERSION = 1
+export const REMOTE_SERVICE_VERSION = 2
 export const REMOTE_OPERATION_SUCCESS = '__WASSH_SERVICE_OK__'
 export const REMOTE_BASE_PATH = '/usr/local/lib/wassh-service'
 export const REMOTE_EXECUTABLE_PATH = `${REMOTE_BASE_PATH}/wassh-service`
-export const REMOTE_CONFIG_PATH = '/etc/wassh-service.conf'
 export const REMOTE_STATE_PATH = '/var/lib/wassh-service'
 export const REMOTE_RECORDS_PATH = `${REMOTE_STATE_PATH}/records.tsv`
 export const REMOTE_STARTED_AT_PATH = `${REMOTE_STATE_PATH}/started_at`
 export const REMOTE_SYSTEMD_UNIT_NAME = 'wassh-service.service'
 export const REMOTE_SYSTEMD_UNIT_PATH = `/etc/systemd/system/${REMOTE_SYSTEMD_UNIT_NAME}`
 
-const TARGET_PATTERN =
-  /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4})$/
 const MAX_EPOCH_SECONDS = 8_640_000_000_000
 
 function quoteShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
-}
-
-function validatedTargets(targets: string[]): string[] {
-  if (targets.length > DAEMON_MONITOR_MAX_PING_TARGETS) {
-    throw new Error(`At most ${DAEMON_MONITOR_MAX_PING_TARGETS} ping targets are supported`)
-  }
-  return targets.map((target) => {
-    const normalized = target.trim()
-    if (!TARGET_PATTERN.test(normalized) || normalized.includes('..')) {
-      throw new Error(`Invalid ping target: ${target}`)
-    }
-    return normalized
-  })
 }
 
 function sudoScriptCommand(script: string): string {
@@ -78,8 +60,6 @@ state_transition() {
 }
 
 mkdir -p "$STATE_DIR/interfaces"
-rm -rf "$STATE_DIR/pings"
-mkdir "$STATE_DIR/pings"
 touch "$RECORDS"
 # Persist the epoch when monitoring first began, surviving service restarts
 # (a fresh install wipes STATE_DIR, so this resets on reinstall). Clients use
@@ -130,29 +110,6 @@ while :; do
     [ -f "$seen_dir/$interface" ] || state_transition interface "$interface" down "$state_file"
   done
 
-  target_index=0
-  results_dir="$STATE_DIR/ping-results"
-  rm -rf "$results_dir"
-  mkdir "$results_dir"
-  while IFS= read -r target; do
-    [ -n "$target" ] || continue
-    target_index=$((target_index + 1))
-    (if ping -c 1 -W 2 "$target" >/dev/null 2>&1; then printf 'up\\n'; else printf 'down\\n'; fi) > "$results_dir/$target_index" &
-  done < ${REMOTE_CONFIG_PATH}
-  wait
-  target_index=0
-  while IFS= read -r target; do
-    [ -n "$target" ] || continue
-    target_index=$((target_index + 1))
-    state=$(cat "$results_dir/$target_index")
-    target_file="$STATE_DIR/pings/$target_index"
-    previous=$(sed -n '2p' "$target_file" 2>/dev/null || true)
-    if [ -n "$previous" ] && [ "$previous" != "$state" ]; then
-      record event ping "$target" "$state"
-    fi
-    printf '%s\\n%s\\n' "$target" "$state" > "$target_file"
-  done < ${REMOTE_CONFIG_PATH}
-
   sample_count=$((sample_count + 1))
   if [ "$sample_count" -ge "$PRUNE_SAMPLES" ]; then
     prune
@@ -179,8 +136,7 @@ RestartSec=10
 WantedBy=multi-user.target
 `
 
-export function buildInstallCommand(pingTargets: string[]): string {
-  const config = validatedTargets(pingTargets).join('\n')
+export function buildInstallCommand(): string {
   const script = `set -eu
 install -d -m 0755 ${REMOTE_BASE_PATH}
 install -d -m 0755 ${REMOTE_STATE_PATH}
@@ -189,10 +145,9 @@ ${REMOTE_SERVICE_PAYLOAD}WASSH_SERVICE
 chmod 0755 ${REMOTE_EXECUTABLE_PATH}
 cat > ${REMOTE_SYSTEMD_UNIT_PATH} <<'WASSH_UNIT'
 ${REMOTE_SYSTEMD_UNIT_PAYLOAD}WASSH_UNIT
-cat > ${REMOTE_CONFIG_PATH} <<'WASSH_CONFIG'
-${config}
-WASSH_CONFIG
-chmod 0644 ${REMOTE_CONFIG_PATH} ${REMOTE_SYSTEMD_UNIT_PATH}
+rm -rf ${REMOTE_STATE_PATH}/pings
+rm -f /etc/wassh-service.conf
+chmod 0644 ${REMOTE_SYSTEMD_UNIT_PATH}
 systemctl daemon-reload
 systemctl enable ${REMOTE_SYSTEMD_UNIT_NAME}
 systemctl restart ${REMOTE_SYSTEMD_UNIT_NAME}`
@@ -207,7 +162,7 @@ rm -f /etc/systemd/system/multi-user.target.wants/${REMOTE_SYSTEMD_UNIT_NAME}
 systemctl daemon-reload
 systemctl reset-failed ${REMOTE_SYSTEMD_UNIT_NAME} 2>/dev/null || true
 rm -rf ${REMOTE_BASE_PATH} ${REMOTE_STATE_PATH}
-rm -f ${REMOTE_CONFIG_PATH}`
+rm -f /etc/wassh-service.conf`
   return sudoScriptCommand(script)
 }
 
@@ -228,6 +183,6 @@ export function buildStreamCommand(sinceEpochSeconds: number): string {
   // the earliest known time boundary. If no records exist yet, fall back to
   // started_at or current time. This prevents displaying reachability across
   // spans where data was not yet recorded or has been purged.
-  const current = `since=${sinceEpochSeconds}; first_record=$(head -n 1 ${REMOTE_RECORDS_PATH} 2>/dev/null | cut -f 1 || true); [ -n "$first_record" ] && [ "$first_record" -ge 0 ] 2>/dev/null || first_record=$(cat ${REMOTE_STARTED_AT_PATH} 2>/dev/null || date +%s); anchor=$since; [ "$first_record" -gt "$anchor" ] && anchor=$first_record; for file in ${REMOTE_STATE_PATH}/interfaces/*; do [ -f "$file" ] || continue; name=\${file##*/}; state=$(cat "$file"); printf '%s\\tcurrent\\tinterface\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done; for file in ${REMOTE_STATE_PATH}/pings/*; do [ -f "$file" ] || continue; name=$(sed -n '1p' "$file"); state=$(sed -n '2p' "$file"); printf '%s\\tcurrent\\tping\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done`
+  const current = `since=${sinceEpochSeconds}; first_record=$(head -n 1 ${REMOTE_RECORDS_PATH} 2>/dev/null | cut -f 1 || true); [ -n "$first_record" ] && [ "$first_record" -ge 0 ] 2>/dev/null || first_record=$(cat ${REMOTE_STARTED_AT_PATH} 2>/dev/null || date +%s); anchor=$since; [ "$first_record" -gt "$anchor" ] && anchor=$first_record; for file in ${REMOTE_STATE_PATH}/interfaces/*; do [ -f "$file" ] || continue; name=\${file##*/}; state=$(cat "$file"); printf '%s\\tcurrent\\tinterface\\t%s\\t%s\\n' "$anchor" "$name" "$state"; done`
   return `{ ${current}; exec tail -n +1 -F ${REMOTE_RECORDS_PATH}; }`
 }

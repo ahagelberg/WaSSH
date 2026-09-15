@@ -190,14 +190,14 @@ function NetworkChart({
     <section className="daemon-monitor-chart-panel">
       <h3>Network state history</h3>
       {targets.length === 0 ? (
-        <p>No interface or ping data in this range.</p>
+        <p>No interface data in this range.</p>
       ) : (
         <>
           <svg
             className="daemon-monitor-network-chart"
             viewBox={`0 0 ${CHART_WIDTH} ${chartHeight}`}
             role="img"
-            aria-label={`Interface and ping reachability over ${range}`}
+            aria-label={`Interface state over ${range}`}
           >
             {targets.map((key, index) => {
               const y = index * (NETWORK_ROW_HEIGHT + NETWORK_ROW_GAP)

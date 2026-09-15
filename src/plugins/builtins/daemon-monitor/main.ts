@@ -60,11 +60,6 @@ function setStatus(
   sendStatus(ctx, session)
 }
 
-function pingTargets(ctx: PluginMainContext): string[] {
-  const value = ctx.getSettings().pingTargets
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
-}
-
 function parseInteger(value: string): number | null {
   if (!/^\d+$/.test(value)) {
     return null
@@ -86,7 +81,7 @@ function parseRecord(
   if (
     (fields[1] === 'event' || fields[1] === 'current') &&
     fields.length >= RECORD_FIELD_COUNT_EVENT &&
-    (fields[2] === 'interface' || fields[2] === 'ping') &&
+    fields[2] === 'interface' &&
     (fields[4] === 'up' || fields[4] === 'down')
   ) {
     if (fields[1] === 'event' && timestamp < cutoffMs) {
@@ -320,7 +315,7 @@ async function runSudoOperation(
   let command: string
   try {
     command =
-      action === 'install' ? buildInstallCommand(pingTargets(ctx)) : buildUninstallCommand()
+      action === 'install' ? buildInstallCommand() : buildUninstallCommand()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     setStatus(ctx, session, { state: 'error', streamConnected: false, message })

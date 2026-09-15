@@ -25,7 +25,7 @@ export interface DaemonMonitorSample {
   diskTotalBytes: number
 }
 
-export type DaemonMonitorTargetKind = 'interface' | 'ping'
+export type DaemonMonitorTargetKind = 'interface'
 export type DaemonMonitorTargetState = 'up' | 'down'
 
 export interface DaemonMonitorStateEvent {

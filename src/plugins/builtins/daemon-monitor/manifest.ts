@@ -13,15 +13,6 @@ export const daemonMonitorManifest: PluginManifest = {
   contributes: {
     toolbar: { label: 'Daemon monitor' },
     hostSettingsHeading: 'Daemon monitor',
-    hostSettingsSchema: [
-      {
-        key: 'pingTargets',
-        label: 'Ping targets',
-        type: 'stringList',
-        default: [],
-        description: 'Hostnames or IP addresses checked by the remote service.'
-      }
-    ],
     views: [{ id: 'panel', placement: 'split-right', title: 'Daemon monitor' }],
     api: {
       methods: [
