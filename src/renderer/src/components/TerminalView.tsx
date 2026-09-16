@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type DragEvent as ReactDragEvent } from 'react'
+import { useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { SearchAddon } from '@xterm/addon-search'
@@ -63,11 +63,6 @@ interface Props {
   unregisterWriter: (tabId: string) => void
   registerSearch: (tabId: string, controller: TerminalSearchController) => void
   unregisterSearch: (tabId: string) => void
-  /** When true, dropping files onto the terminal uploads them via the SFTP plugin. */
-  dropEnabled: boolean
-  onDropFiles: (tabId: string, files: File[]) => void
-  /** Live progress of a file dropped onto this terminal for SFTP upload (null when idle). */
-  dropUpload: { name: string; meta: string; pct: number } | null
 }
 
 function xtermThemeFromHost(el: HTMLElement) {
@@ -146,10 +141,7 @@ export default function TerminalView({
   registerWriter,
   unregisterWriter,
   registerSearch,
-  unregisterSearch,
-  dropEnabled,
-  onDropFiles,
-  dropUpload
+  unregisterSearch
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const bellLineRef = useRef<HTMLDivElement>(null)
@@ -457,51 +449,6 @@ export default function TerminalView({
     return () => cancelAnimationFrame(frame)
   }, [focusNonce, active])
 
-  const [dragActive, setDragActive] = useState(false)
-  const dragDepthRef = useRef(0)
-
-  const handleDragEnter = (e: ReactDragEvent<HTMLDivElement>): void => {
-    if (!dropEnabled) {
-      return
-    }
-    e.preventDefault()
-    dragDepthRef.current += 1
-    setDragActive(true)
-  }
-
-  const handleDragOver = (e: ReactDragEvent<HTMLDivElement>): void => {
-    if (!dropEnabled) {
-      return
-    }
-    e.preventDefault()
-    e.dataTransfer.dropEffect = 'copy'
-  }
-
-  const handleDragLeave = (e: ReactDragEvent<HTMLDivElement>): void => {
-    if (!dropEnabled) {
-      return
-    }
-    e.preventDefault()
-    dragDepthRef.current -= 1
-    if (dragDepthRef.current <= 0) {
-      dragDepthRef.current = 0
-      setDragActive(false)
-    }
-  }
-
-  const handleDrop = (e: ReactDragEvent<HTMLDivElement>): void => {
-    e.preventDefault()
-    dragDepthRef.current = 0
-    setDragActive(false)
-    if (!dropEnabled) {
-      return
-    }
-    const files = e.dataTransfer.files
-    if (files && files.length > 0) {
-      onDropFiles(tabId, Array.from(files))
-    }
-  }
-
   return (
     <div
       className="terminal-host"
@@ -509,10 +456,6 @@ export default function TerminalView({
       data-term-bg={termBackground || undefined}
       data-term-fg={termForeground || undefined}
       style={sessionTerminalStyle(termBackground, termForeground)}
-      onDragEnter={handleDragEnter}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
     >
       <div className="terminal-bell-line" ref={bellLineRef} />
       {findOpen && active ? (
@@ -527,26 +470,6 @@ export default function TerminalView({
           onFindNext={onFindNext}
           onClose={onFindClose}
         />
-      ) : null}
-      {dragActive && dropEnabled ? (
-        <div className="terminal-drop-overlay">
-          <div className="terminal-drop-box">
-            <div className="terminal-drop-icon">⬆</div>
-            <div className="terminal-drop-title">Drop to upload over SFTP</div>
-            <div className="terminal-drop-hint">Files are uploaded to the remote user's home folder</div>
-          </div>
-        </div>
-      ) : null}
-      {dropUpload ? (
-        <div className="drop-upload-banner">
-          <div className="drop-upload-row">
-            <span className="drop-upload-name">⬆ {dropUpload.name}</span>
-            <span className="drop-upload-meta">{dropUpload.meta}</span>
-          </div>
-          <div className="drop-upload-track">
-            <div className="drop-upload-fill" style={{ width: `${dropUpload.pct}%` }} />
-          </div>
-        </div>
       ) : null}
     </div>
   )

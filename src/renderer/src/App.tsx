@@ -40,13 +40,6 @@ import HostSessionSettingsDialog, {
   type HostSessionMode
 } from './components/HostSessionSettingsDialog'
 import {
-  PLUGIN_ID_SFTP
-} from '../../plugins/builtins/sftp/id'
-import type {
-  SftpRendererMessage,
-  SftpStatusPayload
-} from '../../plugins/builtins/sftp/protocol'
-import {
   mergePluginSettings,
   pluginHostSettingsSectionId,
   pluginSettingsSectionId,
@@ -134,23 +127,6 @@ function commandPluginSetting(commandId: string, prefix: string): PluginSettingT
 
 /** Max closed sessions kept for reopen */
 const CLOSED_SESSION_STACK_MAX = 20
-
-/** Live progress of a file dropped onto the terminal for SFTP upload */
-interface DropUploadState {
-  name: string
-  transferredBytes: number
-  totalBytes: number
-}
-
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    return '0 B'
-  }
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const value = bytes / 1024 ** i
-  return `${value >= 10 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`
-}
 
 interface TabState {
   id: string
@@ -245,9 +221,6 @@ export default function App() {
   const writers = useRef<Map<string, (data: string) => void>>(new Map())
   const searchControllers = useRef<Map<string, TerminalSearchController>>(new Map())
   const closedSessionsRef = useRef<ClosedSession[]>([])
-  const sftpReadyRef = useRef<Set<string>>(new Set())
-  const [, setSftpReadyTick] = useState(0)
-  const [dropUploads, setDropUploads] = useState<Record<string, DropUploadState>>({})
   const findQueryRef = useRef(findQuery)
   const findCaseRef = useRef(findCaseSensitive)
   const lastFindQueryRef = useRef('')
@@ -523,13 +496,6 @@ export default function App() {
     const offStatus = window.wassh.onSessionStatus((ev) => {
       if (ev.status === 'closed') {
         closeTab(ev.tabId)
-        sftpReadyRef.current.delete(ev.tabId)
-        setDropUploads((prev) => {
-          if (!(ev.tabId in prev)) return prev
-          const next = { ...prev }
-          delete next[ev.tabId]
-          return next
-        })
         return
       }
       setTabs((prev) =>
@@ -597,18 +563,6 @@ export default function App() {
           return { ...t, activePluginIds: Array.from(set) }
         })
       )
-      if (ev.pluginId === PLUGIN_ID_SFTP && !ev.active) {
-        sftpReadyRef.current.delete(ev.tabId)
-        setSftpReadyTick((n) => n + 1)
-      }
-    })
-    const offPluginMessage = window.wassh.onPluginMessage((ev) => {
-      if (ev.pluginId !== PLUGIN_ID_SFTP) return
-      const payload = ev.payload as SftpStatusPayload
-      if (payload.type !== 'status') return
-      if (payload.state === 'connected') sftpReadyRef.current.add(ev.tabId)
-      else sftpReadyRef.current.delete(ev.tabId)
-      setSftpReadyTick((n) => n + 1)
     })
     const offSettingsChanged = window.wassh.onSettingsChanged((next) => {
       setSettings(next)
@@ -629,7 +583,6 @@ export default function App() {
       offReconnectAll()
       offSessionSettings()
       offPluginActive()
-      offPluginMessage()
       offSettingsChanged()
     }
   }, [
@@ -756,44 +709,6 @@ export default function App() {
       })
     )
     await window.wassh.deactivatePlugin(tabId, pluginId)
-  }, [])
-
-  const uploadDroppedFiles = useCallback(async (tabId: string, files: File[]) => {
-    for (const file of files) {
-      if (!sftpReadyRef.current.has(tabId) || file.size === 0) continue
-      setDropUploads((prev) => ({
-        ...prev,
-        [tabId]: { name: file.name, transferredBytes: 0, totalBytes: file.size }
-      }))
-      const send = (payload: SftpRendererMessage): Promise<unknown> =>
-        window.wassh.sendPluginMessage(tabId, PLUGIN_ID_SFTP, payload)
-      try {
-        await send({ type: 'uploadStart', name: file.name, size: file.size })
-        const chunkSize = 256 * 1024
-        let offset = 0
-        while (offset < file.size) {
-          const end = Math.min(offset + chunkSize, file.size)
-          const buffer = await file.slice(offset, end).arrayBuffer()
-          await send({ type: 'uploadChunk', name: file.name, data: new Uint8Array(buffer) })
-          offset = end
-          setDropUploads((prev) => {
-            const cur = prev[tabId]
-            if (!cur) return prev
-            return { ...prev, [tabId]: { ...cur, transferredBytes: offset } }
-          })
-        }
-        await send({ type: 'uploadEnd', name: file.name })
-      } catch {
-        void send({ type: 'cancel' })
-      } finally {
-        setDropUploads((prev) => {
-          if (!(tabId in prev)) return prev
-          const next = { ...prev }
-          delete next[tabId]
-          return next
-        })
-      }
-    }
   }, [])
 
   const styleDefaults = sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
@@ -1451,19 +1366,6 @@ export default function App() {
             <div className="terminal-stack">
               {tabsByStablePaneOrder(tabs).map((t) => {
                 const style = resolveSessionStyle(t.connection, styleDefaults)
-                const dropUpload = dropUploads[t.id]
-                const dropUploadView = dropUpload
-                  ? {
-                      name: dropUpload.name,
-                      meta: `${formatBytes(dropUpload.transferredBytes)} / ${formatBytes(
-                        dropUpload.totalBytes
-                      )}`,
-                      pct:
-                        dropUpload.totalBytes > 0
-                          ? Math.min(100, (dropUpload.transferredBytes / dropUpload.totalBytes) * 100)
-                          : 0
-                    }
-                  : null
                 return (
                   <div
                     key={t.id}
@@ -1522,11 +1424,6 @@ export default function App() {
                         unregisterWriter={unregisterWriter}
                         registerSearch={registerSearch}
                         unregisterSearch={unregisterSearch}
-                        dropEnabled={sftpReadyRef.current.has(t.id)}
-                        dropUpload={dropUploadView}
-                        onDropFiles={(tabId, files) => {
-                          void uploadDroppedFiles(tabId, files)
-                        }}
                       />
                     </PluginSessionFrame>
                   </div>

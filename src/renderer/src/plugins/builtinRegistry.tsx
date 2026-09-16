@@ -8,7 +8,6 @@ import SftpView from '../../../plugins/builtins/sftp/View'
 import AiAgentView from '../../../plugins/builtins/ai-agent/View'
 import ConnectionLoggerView from '../../../plugins/builtins/connection-logger/View'
 import DaemonMonitorView from '../../../plugins/builtins/daemon-monitor/View'
-import { sftpFileDropHandler } from '../../../plugins/builtins/sftp/fileDrop'
 import { PLUGIN_ID_SERVER_MONITOR } from '../../../plugins/builtins/server-monitor/id'
 import { PLUGIN_ID_DAEMON_MONITOR } from '../../../plugins/builtins/daemon-monitor/id'
 import { PLUGIN_ID_SCRATCHPAD } from '../../../plugins/builtins/scratchpad/id'
@@ -24,7 +23,7 @@ const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
   { id: PLUGIN_ID_SCRATCHPAD, view: ScratchpadView },
   { id: PLUGIN_ID_MACRO_PAD, view: MacroPadView },
   { id: PLUGIN_ID_MQTT_ANALYSER, view: MqttAnalyserView },
-  { id: PLUGIN_ID_SFTP, view: SftpView, fileDrop: sftpFileDropHandler },
+  { id: PLUGIN_ID_SFTP, view: SftpView },
   { id: PLUGIN_ID_AI_AGENT, view: AiAgentView },
   { id: PLUGIN_ID_CONNECTION_LOGGER, view: ConnectionLoggerView }
 ]

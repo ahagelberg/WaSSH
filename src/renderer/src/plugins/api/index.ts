@@ -11,25 +11,9 @@ export interface PluginViewProps {
   onSettingsPatch: (partial: Record<string, unknown>) => void
 }
 
-export interface PluginFileDropProgress {
-  name: string
-  transferredBytes: number
-  totalBytes: number
-}
-
-export interface PluginFileDropHandler {
-  isReady: (tabId: string) => boolean
-  onFilesDropped: (
-    tabId: string,
-    files: File[],
-    onProgress: (progress: PluginFileDropProgress | null) => void
-  ) => Promise<void>
-}
-
 export interface PluginRendererRegistration {
   id: string
   view?: ComponentType<PluginViewProps>
-  fileDrop?: PluginFileDropHandler
 }
 
 export { default as PluginColorInput } from './PluginColorInput'

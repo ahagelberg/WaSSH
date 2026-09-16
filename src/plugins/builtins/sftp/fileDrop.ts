@@ -1,24 +1,15 @@
-import type { PluginActiveStateEvent, PluginMessageEvent } from '@plugin-api/shared'
-import type { PluginFileDropHandler, PluginFileDropProgress } from '@plugin-api/renderer'
 import { PLUGIN_ID_SFTP } from './id'
-import type { SftpRendererMessage, SftpStatusPayload } from './protocol'
+import type { SftpRendererMessage } from './protocol'
 
 interface UploadFilesOptions {
   tabId: string
   files: File[]
   path?: string
   pluginId?: string
-  onProgress?: (progress: PluginFileDropProgress | null) => void
 }
 
-interface ActiveUploadState {
-  cancelled: boolean
-}
-
+/** Chunk size for streamed uploads; keeps each IPC payload small. */
 const SFTP_UPLOAD_CHUNK_SIZE = 256 * 1024
-const readyTabs = new Set<string>()
-const activeUploads = new Map<string, ActiveUploadState>()
-let trackingStarted = false
 
 function sendSftpMessage(
   tabId: string,
@@ -28,132 +19,34 @@ function sendSftpMessage(
   return window.wassh.sendPluginMessage(tabId, pluginId, payload)
 }
 
-function handlePluginActive(ev: PluginActiveStateEvent): void {
-  if (ev.pluginId !== PLUGIN_ID_SFTP) {
-    return
-  }
-  if (ev.active) {
-    return
-  }
-  readyTabs.delete(ev.tabId)
-  activeUploads.delete(ev.tabId)
-}
-
-function handlePluginMessage(ev: PluginMessageEvent): void {
-  if (ev.pluginId !== PLUGIN_ID_SFTP) {
-    return
-  }
-  const payload = ev.payload as SftpStatusPayload | null
-  if (!payload || payload.type !== 'status') {
-    return
-  }
-  if (payload.state === 'connected') {
-    readyTabs.add(ev.tabId)
-  } else {
-    readyTabs.delete(ev.tabId)
-  }
-}
-
-function startTracking(): void {
-  if (trackingStarted) {
-    return
-  }
-  trackingStarted = true
-  window.wassh.onPluginActive((ev) => handlePluginActive(ev))
-  window.wassh.onPluginMessage((ev) => handlePluginMessage(ev))
-  window.wassh.onSessionStatus((ev) => {
-    if (ev.status !== 'closed') {
-      return
-    }
-    readyTabs.delete(ev.tabId)
-    activeUploads.delete(ev.tabId)
-  })
-}
-
-function cancelSftpFileDrop(tabId: string, pluginId = PLUGIN_ID_SFTP): void {
-  const active = activeUploads.get(tabId)
-  if (active) {
-    active.cancelled = true
-    activeUploads.delete(tabId)
-  }
-  void sendSftpMessage(tabId, { type: 'cancel' }, pluginId)
-}
-
+/** Stream `files` to the plugin's main module, which writes them under `path`. */
 export async function uploadFilesOverSftp({
   tabId,
   files,
   path,
-  pluginId = PLUGIN_ID_SFTP,
-  onProgress
+  pluginId = PLUGIN_ID_SFTP
 }: UploadFilesOptions): Promise<void> {
-  startTracking()
-  if (activeUploads.has(tabId)) {
-    cancelSftpFileDrop(tabId, pluginId)
-  }
-  const active: ActiveUploadState = { cancelled: false }
-  activeUploads.set(tabId, active)
-  try {
-    for (const file of files) {
-      if (active.cancelled) {
-        break
+  for (const file of files) {
+    try {
+      await sendSftpMessage(
+        tabId,
+        { type: 'uploadStart', name: file.name, size: file.size, path },
+        pluginId
+      )
+      let offset = 0
+      while (offset < file.size) {
+        const end = Math.min(offset + SFTP_UPLOAD_CHUNK_SIZE, file.size)
+        const buffer = await file.slice(offset, end).arrayBuffer()
+        await sendSftpMessage(
+          tabId,
+          { type: 'uploadChunk', name: file.name, data: new Uint8Array(buffer) },
+          pluginId
+        )
+        offset = end
       }
-      onProgress?.({
-        name: file.name,
-        transferredBytes: 0,
-        totalBytes: file.size
-      })
-      try {
-        await sendSftpMessage(tabId, { type: 'uploadStart', name: file.name, size: file.size, path }, pluginId)
-        let offset = 0
-        while (offset < file.size) {
-          if (active.cancelled) {
-            throw new Error('cancelled')
-          }
-          const end = Math.min(offset + SFTP_UPLOAD_CHUNK_SIZE, file.size)
-          const buffer = await file.slice(offset, end).arrayBuffer()
-          if (active.cancelled) {
-            throw new Error('cancelled')
-          }
-          await sendSftpMessage(
-            tabId,
-            { type: 'uploadChunk', name: file.name, data: new Uint8Array(buffer) },
-            pluginId
-          )
-          offset = end
-          onProgress?.({
-            name: file.name,
-            transferredBytes: offset,
-            totalBytes: file.size
-          })
-        }
-        await sendSftpMessage(tabId, { type: 'uploadEnd', name: file.name }, pluginId)
-      } catch {
-        if (active.cancelled) {
-          break
-        }
-        void sendSftpMessage(tabId, { type: 'cancel' }, pluginId)
-      } finally {
-        onProgress?.(null)
-      }
+      await sendSftpMessage(tabId, { type: 'uploadEnd', name: file.name }, pluginId)
+    } catch {
+      void sendSftpMessage(tabId, { type: 'cancel' }, pluginId)
     }
-  } finally {
-    if (activeUploads.get(tabId) === active) {
-      activeUploads.delete(tabId)
-    }
-    onProgress?.(null)
-  }
-}
-
-export const sftpFileDropHandler: PluginFileDropHandler = {
-  isReady(tabId) {
-    startTracking()
-    return readyTabs.has(tabId)
-  },
-  onFilesDropped(tabId, files, onProgress) {
-    return uploadFilesOverSftp({
-      tabId,
-      files,
-      onProgress
-    })
   }
 }
