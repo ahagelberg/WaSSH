@@ -51,15 +51,8 @@ export const aiAgentManifest: PluginManifest = {
   contributes: {
     toolbar: { label: 'AI' },
     settingsHeading: 'AI agent',
+    settingsPresentation: 'view',
     settingsSchema: [
-      {
-        key: 'configureProviders',
-        label: 'Configure providers',
-        type: 'action',
-        default: null,
-        action: 'configureProviders',
-        description: 'Add, remove, and configure AI model providers.'
-      },
       {
         key: AI_AGENT_SETTING_GLOBAL_PROMPT,
         label: 'Global prompt text',

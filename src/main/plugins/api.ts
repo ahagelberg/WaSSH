@@ -1,11 +1,13 @@
 import type { Duplex } from 'stream'
 import type {
   PluginApiListing,
+  PluginListItem,
+  PluginManifest,
   SideConnectionOpenRequest,
   StreamDirection,
   StreamMode
 } from '../../shared/pluginApi'
-export type { PluginApiListing } from '../../shared/pluginApi'
+export type { PluginApiListing, PluginListItem } from '../../shared/pluginApi'
 import type { SessionStatus } from '../../shared/types'
 export type { SessionStatus } from '../../shared/types'
 import type { SftpSession } from './SftpSession'
@@ -104,6 +106,28 @@ export interface PluginMainContext {
   showOpenDialog: (options: PluginOpenDialogOptions) => Promise<PluginOpenDialogResult>
   /** Native save-file dialog; returns the picked path (`undefined` when cancelled). */
   showSaveDialog: (options: PluginSaveDialogOptions) => Promise<PluginSaveDialogResult>
+  /**
+   * Every loaded plugin (built-in + external) with its manifest and enabled
+   * flag. Use this to discover and aggregate other plugins' contributions
+   * without importing them.
+   */
+  listPlugins: () => PluginListItem[]
+}
+
+/**
+ * Manifest-time context for `PluginMainModule.getSettingsSchema`. Only the
+ * members that make sense before any tab instance exists are exposed.
+ */
+export interface PluginSettingsSchemaContext {
+  readonly pluginId: string
+  /** Every loaded plugin except this one. */
+  listOtherPlugins: () => PluginListItem[]
+}
+
+/** Settings schemas a plugin contributes, possibly computed at manifest time. */
+export interface PluginSettingsSchemaContribution {
+  settingsSchema?: PluginManifest['contributes']['settingsSchema']
+  hostSettingsSchema?: PluginManifest['contributes']['hostSettingsSchema']
 }
 
 export interface PluginMainModule {
@@ -116,6 +140,15 @@ export interface PluginMainModule {
   ) => void | Promise<void>
   /** Handle a `ctx.callPluginApi` invocation from another plugin (or self). */
   onApiCall?: (ctx: PluginMainContext, method: string, params: unknown) => unknown | Promise<unknown>
+  /**
+   * Optional computed settings schemas. The host calls this when serving the
+   * plugin's manifest, so a plugin can build schema fields from other plugins'
+   * contributions (`listOtherPlugins`) without importing them. Must be pure
+   * and cheap - it runs on every manifest read.
+   */
+  getSettingsSchema?: (
+    ctx: PluginSettingsSchemaContext
+  ) => PluginSettingsSchemaContribution
 }
 
 export interface PluginMainRegistration {

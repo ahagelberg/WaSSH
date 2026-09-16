@@ -26,18 +26,8 @@ import SettingsColorRow from './SettingsColorRow'
 import { TAB_COLOR_THEME_VAR, TERM_BG_THEME_VAR, TERM_FG_THEME_VAR } from './settingsColor'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import PluginSettingsFieldList from '../plugins/api/PluginSettingsFieldList'
-import AiAgentProviderDialog from './AiAgentProviderDialog'
-import {
-  AI_AGENT_DEFAULT_PROVIDERS,
-  embeddingModelsForProvider,
-  supportsEmbeddings
-} from '../../../plugins/builtins/ai-agent/defaults'
-import {
-  AI_AGENT_SETTING_RAG_EMBEDDING_MODEL,
-  AI_AGENT_SETTING_RAG_PROVIDER_ID,
-  type AiAgentProviderConfig
-} from '../../../plugins/builtins/ai-agent/protocol'
-import type { PluginSettingsField } from '@shared/pluginApi'
+import { getPluginSettingsView } from '../plugins/registry'
+import DialogShell from './DialogShell'
 
 interface Props {
   activeTabId: string | null
@@ -59,49 +49,6 @@ function optionsPayload(draft: AppSettings): Partial<AppSettings> {
   }
 }
 
-function populateAiAgentSchema(
-  schema: PluginSettingsField[],
-  values: Record<string, unknown>,
-  providers: AiAgentProviderConfig[]
-): PluginSettingsField[] {
-  const embeddingProviders = providers.filter(supportsEmbeddings)
-  const selectedProviderId = String(values[AI_AGENT_SETTING_RAG_PROVIDER_ID] || '')
-  const selectedProvider = embeddingProviders.find((p) => p.id === selectedProviderId)
-
-  const providerOptions = [
-    { value: '', label: 'Select provider...' },
-    ...embeddingProviders.map((p) => ({ value: p.id, label: p.name }))
-  ]
-
-  const modelOptions: Array<{ value: string; label: string }> = []
-  if (selectedProvider) {
-    modelOptions.push({ value: '', label: 'Select embedding model...' })
-    modelOptions.push(
-      ...embeddingModelsForProvider(selectedProvider).map((model) => ({
-        value: model,
-        label: model
-      }))
-    )
-  } else {
-    modelOptions.push({ value: '', label: 'Select a provider first' })
-  }
-
-  const mapField = (field: PluginSettingsField): PluginSettingsField => {
-    if (field.key === AI_AGENT_SETTING_RAG_PROVIDER_ID) {
-      return { ...field, options: providerOptions }
-    }
-    if (field.key === AI_AGENT_SETTING_RAG_EMBEDDING_MODEL) {
-      return { ...field, options: modelOptions }
-    }
-    if (field.children && field.children.length > 0) {
-      return { ...field, children: field.children.map(mapField) }
-    }
-    return field
-  }
-
-  return schema.map(mapField)
-}
-
 export default function OptionsDialog({
   activeTabId,
   settings,
@@ -115,21 +62,9 @@ export default function OptionsDialog({
     sessionStyleDefaults: sessionStyleDefaultsFrom(settings.sessionStyleDefaults)
   }))
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
-  const [providerDialogOpen, setProviderDialogOpen] = useState(false)
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
-  const [aiAgentProviders, setAiAgentProviders] = useState<AiAgentProviderConfig[]>(AI_AGENT_DEFAULT_PROVIDERS)
-
-  const loadAiAgentProviders = (): void => {
-    void window.wassh.getPluginData('ai-agent').then((raw) => {
-      const data = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
-      const stored = Array.isArray(data.providers) ? (data.providers as AiAgentProviderConfig[]) : []
-      setAiAgentProviders(stored.length > 0 ? stored : AI_AGENT_DEFAULT_PROVIDERS)
-    })
-  }
-
-  useEffect(() => {
-    loadAiAgentProviders()
-  }, [])
+  /** Plugin id whose custom settings editor is open, if any. */
+  const [settingsViewPluginId, setSettingsViewPluginId] = useState<string | null>(null)
 
   const patch = (partial: Partial<AppSettings>): void => {
     setDraft((prev) => ({ ...prev, ...partial }))
@@ -417,34 +352,40 @@ export default function OptionsDialog({
       if (!schema || schema.length === 0) {
         continue
       }
-      if (plugin.contributes.settingsPresentation === 'view') {
-        continue
-      }
       const values = mergePluginSettings(schema, draft.pluginSettings[plugin.id])
-      const effectiveSchema =
-        plugin.id === 'ai-agent'
-          ? populateAiAgentSchema(schema, values, aiAgentProviders)
-          : schema
+      // A plugin that owns a custom settings editor gets a button instead of a
+      // schema-driven field list; the host renders its view in a modal.
+      const hasSettingsView = Boolean(getPluginSettingsView(plugin.id))
       base.push({
         id: pluginSettingsSectionId(plugin.id),
         title: plugin.contributes.settingsHeading || plugin.name,
-        content: (
+        content: hasSettingsView ? (
+          <div className="settings-row">
+            <div className="settings-row-label">
+              <strong>{plugin.name} settings</strong>
+              <span>Configured in a dedicated editor.</span>
+            </div>
+            <button type="button" onClick={() => setSettingsViewPluginId(plugin.id)}>
+              Configure…
+            </button>
+          </div>
+        ) : (
           <PluginSettingsFieldList
-            schema={effectiveSchema}
+            schema={schema}
             values={values}
             onChange={(key, value) => patchPluginSetting(plugin.id, key, value)}
-            onAction={(field) => {
-              if (plugin.id === 'ai-agent' && field.action === 'configureProviders') {
-                setProviderDialogOpen(true)
-              }
-            }}
           />
         )
       })
     }
 
     return base
-  }, [draft, plugins, fontFamilies, aiAgentProviders])
+  }, [draft, plugins, fontFamilies])
+
+  const settingsViewPlugin = settingsViewPluginId
+    ? plugins.find((p) => p.id === settingsViewPluginId) ?? null
+    : null
+  const SettingsView = settingsViewPlugin ? getPluginSettingsView(settingsViewPlugin.id) : null
 
   return (
     <>
@@ -461,14 +402,27 @@ export default function OptionsDialog({
           </>
         }
       />
-      {providerDialogOpen ? (
-        <AiAgentProviderDialog
-          tabId={activeTabId}
-          onClose={() => {
-            setProviderDialogOpen(false)
-            loadAiAgentProviders()
-          }}
-        />
+      {settingsViewPlugin && SettingsView ? (
+        <DialogShell
+          titleId="plugin-settings-view-title"
+          title={`${settingsViewPlugin.name} settings`}
+          onClose={() => setSettingsViewPluginId(null)}
+          className="plugin-settings-view-dialog"
+        >
+          <SettingsView
+            tabId={activeTabId}
+            settings={mergePluginSettings(
+              settingsViewPlugin.contributes.settingsSchema,
+              draft.pluginSettings[settingsViewPlugin.id]
+            )}
+            onSettingsPatch={(partial) => {
+              for (const [key, value] of Object.entries(partial)) {
+                patchPluginSetting(settingsViewPlugin.id, key, value)
+              }
+            }}
+            onClose={() => setSettingsViewPluginId(null)}
+          />
+        </DialogShell>
       ) : null}
     </>
   )

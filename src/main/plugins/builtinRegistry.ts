@@ -2,7 +2,6 @@ import type { PluginMainRegistration } from './api'
 import type { PluginManifest } from '../../shared/pluginApi'
 import { aiAgentMain } from '../../plugins/builtins/ai-agent/main'
 import { aiAgentManifest } from '../../plugins/builtins/ai-agent/manifest'
-import { buildExternalApiPermissionField } from '../../plugins/builtins/ai-agent/pluginApiTools'
 import { connectionLoggerMain } from '../../plugins/builtins/connection-logger/main'
 import { connectionLoggerManifest } from '../../plugins/builtins/connection-logger/manifest'
 import { daemonMonitorMain } from '../../plugins/builtins/daemon-monitor/main'
@@ -23,44 +22,6 @@ export interface BuiltinPluginDefinition {
   registration: PluginMainRegistration
 }
 
-/**
- * Manifests other than AI Agent's own. This is the one place allowed to
- * aggregate every plugin's `contributes.api` into AI Agent's settings, so
- * individual plugins stay decoupled from each other (see PLUGIN_API.md).
- */
-const OTHER_MANIFESTS: PluginManifest[] = [
-  serverMonitorManifest,
-  daemonMonitorManifest,
-  scratchpadManifest,
-  macroPadManifest,
-  mqttAnalyserManifest,
-  sftpManifest,
-  connectionLoggerManifest
-]
-
-const externalApiFields = OTHER_MANIFESTS.filter(
-  (m) => (m.contributes.api?.methods.length ?? 0) > 0
-).map((m) => buildExternalApiPermissionField(m.id, m.name, m.contributes.api!.methods))
-
-const appendExternalApiFields = (
-  schema: PluginManifest['contributes']['settingsSchema']
-): NonNullable<PluginManifest['contributes']['settingsSchema']> => [
-  ...(schema ?? []),
-  ...externalApiFields
-]
-
-// Append every other plugin's API group alongside AI Agent's own tool
-// categories in both app and host/session settings. This is built from loaded
-// manifests and does not depend on any plugin being active.
-const aiAgentManifestWithExternalApis: PluginManifest = {
-  ...aiAgentManifest,
-  contributes: {
-    ...aiAgentManifest.contributes,
-    settingsSchema: appendExternalApiFields(aiAgentManifest.contributes.settingsSchema),
-    hostSettingsSchema: appendExternalApiFields(aiAgentManifest.contributes.hostSettingsSchema)
-  }
-}
-
 export const BUILTIN_PLUGIN_DEFINITIONS: BuiltinPluginDefinition[] = [
   { manifest: serverMonitorManifest, registration: { id: serverMonitorManifest.id, module: serverMonitorMain } },
   { manifest: daemonMonitorManifest, registration: { id: daemonMonitorManifest.id, module: daemonMonitorMain } },
@@ -77,7 +38,7 @@ export const BUILTIN_PLUGIN_DEFINITIONS: BuiltinPluginDefinition[] = [
     }
   },
   {
-    manifest: aiAgentManifestWithExternalApis,
+    manifest: aiAgentManifest,
     registration: { id: aiAgentManifest.id, module: aiAgentMain }
   },
   {

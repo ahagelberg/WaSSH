@@ -219,6 +219,31 @@ interface PluginMainModule {
 | `setSettingValue(key, value)` | Persist one key of this plugin's own app-wide stored settings (§4) |
 | `showOpenDialog(options): Promise<{canceled, filePaths}>` | Native open-file/directory dialog. `options`: `{title?, buttonLabel?, defaultPath?, properties?('openFile'\|'openDirectory'\|'multiSelections'), filters?({name, extensions[]})}`. No Electron types are exposed |
 | `showSaveDialog(options): Promise<{canceled, filePath?}>` | Native save-file dialog. `options`: `{title?, buttonLabel?, defaultPath?, filters?}`. `filePath` is `undefined` when cancelled |
+| `listPlugins(): PluginListItem[]` | Every loaded plugin (built-in + external) with its manifest and `enabled` flag. Use it to discover other plugins' contributions without importing them |
+
+### `PluginMainModule.getSettingsSchema` (optional)
+
+Manifests are static data, so a plugin that needs schema fields computed from
+*other* plugins' contributions implements this hook. The host calls it whenever
+it serves that plugin's manifest:
+
+```ts
+getSettingsSchema?: (ctx: PluginSettingsSchemaContext) => PluginSettingsSchemaContribution
+
+interface PluginSettingsSchemaContext {
+  pluginId: string
+  listOtherPlugins: () => PluginListItem[]   // every plugin except this one
+}
+
+interface PluginSettingsSchemaContribution {
+  settingsSchema?: PluginSettingsField[]
+  hostSettingsSchema?: PluginSettingsField[]
+}
+```
+
+Returned schemas replace the manifest's own for that read. Keep the hook pure
+and cheap — it runs on every manifest access. AI Agent uses it to append one
+permission group per other plugin that declares API methods.
 
 ## 6. Side connections, streams, transforms
 
@@ -453,6 +478,34 @@ interface PluginViewProps {
 - Plugins that register global shortcuts or timers must use `active` to suppress
   work while their tab is not visible.
 
+### Custom settings editor (`PluginSettingsViewProps`)
+
+A plugin that sets `settingsPresentation: 'view'` in its manifest owns its
+settings UI. The host renders a **Configure…** button in the plugin's Options
+section; clicking it opens the plugin's registered editor in a modal:
+
+```ts
+interface PluginSettingsViewProps {
+  tabId: string | null                // tab the dialog was opened from
+  settings: Record<string, unknown>   // merged app+host (§4)
+  onSettingsPatch: (partial: Record<string, unknown>) => void
+  onClose: () => void
+}
+```
+
+Register the editor alongside the view:
+
+```ts
+// renderer/src/plugins/builtinRegistry.tsx
+{ id: PLUGIN_ID_X, view: XView, settingsView: XSettings }
+```
+
+The editor renders only its **body and footer** — the host supplies the modal
+chrome (overlay, title, close button). Look it up with
+`getPluginSettingsView(pluginId)` from `renderer/src/plugins/registry.ts`.
+A plugin with `settingsPresentation: 'view'` gets no schema-driven field list
+and no command-palette entries for its settings fields.
+
 ## 12. Renderer UI kit
 
 Import renderer components from `@plugin-api/renderer` and load no application
@@ -529,16 +582,20 @@ and AI Agent's own built-in tools are called via `ctx.callPluginApi`, not
    composition registry.
 4. Add the main module and any generic background activation metadata to
    `main/plugins/builtinRegistry.ts`.
-5. Add the view and optional terminal file-drop handler to
+5. Add the view and, if it owns a custom settings editor, the `settingsView` to
    `renderer/src/plugins/builtinRegistry.ts`; import the plugin's private CSS
    from its renderer entry.
 6. Use manifest settings schemas for automatically rendered settings.
-   Set `settingsPresentation: 'view'` when the plugin owns a custom editor.
+   Set `settingsPresentation: 'view'` when the plugin owns a custom editor, and
+   register that editor as `settingsView` (§11).
 7. To expose methods to other plugins, declare `contributes.api.methods` and
    implement `onApiCall` (§7). Keep the method's own `parameters`/description
    self-sufficient - never import a consuming plugin (e.g. AI Agent) to learn
    its shape.
-8. Document any new generic capability before adding it to a stable API entry
+8. To build settings from other plugins' contributions, implement
+   `getSettingsSchema(ctx)` and use `ctx.listOtherPlugins()` (§5) - never import
+   another plugin's manifest.
+9. Document any new generic capability before adding it to a stable API entry
    point. Keep plugin protocols, defaults, and unique styles local.
 
 External plugins will follow the same manifest/main/ui split once the loader

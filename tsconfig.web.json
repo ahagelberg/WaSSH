@@ -31,6 +31,7 @@
     "src/plugins/builtins/**/manifest.ts",
     "src/plugins/builtins/ai-agent/apiMethods.ts",
     "src/plugins/builtins/ai-agent/pluginApiTools.ts",
+    "src/plugins/builtins/ai-agent/ProviderSettings.tsx",
     "src/shared/**/*"
   ]
 }

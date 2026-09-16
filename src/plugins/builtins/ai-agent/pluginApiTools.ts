@@ -225,6 +225,15 @@ export function buildExternalApiPermissionField(
   })
 }
 
+/** One permission group per other plugin that declares API methods. */
+export function buildExternalApiPermissionFields(
+  plugins: Array<{ id: string; name: string; methods: PluginApiMethod[] }>
+): PluginSettingsField[] {
+  return plugins
+    .filter((p) => p.methods.length > 0)
+    .map((p) => buildExternalApiPermissionField(p.id, p.name, p.methods))
+}
+
 /** Wire-ready tools for one other plugin's currently-allowed methods. */
 export function externalApiTools(
   listing: PluginApiListing,

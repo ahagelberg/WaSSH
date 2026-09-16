@@ -69,11 +69,45 @@ export class PluginHost {
 
   listPlugins(): PluginListItem[] {
     const enabled = new Set(this.settingsStore.get().enabledPlugins)
-    const external = loadExternalPlugins()
-    return [...BUILTIN_MANIFESTS, ...external].map((m) => ({
-      ...m,
+    return this.allManifests().map((m) => ({
+      ...this.withComputedSchemas(m),
       enabled: enabled.has(m.id)
     }))
+  }
+
+  /** Every loaded manifest, without any computed-schema augmentation. */
+  private allManifests(): PluginManifest[] {
+    return [...BUILTIN_MANIFESTS, ...loadExternalPlugins()]
+  }
+
+  /**
+   * Apply a plugin's optional `getSettingsSchema` hook so it can compute schema
+   * fields from other plugins' contributions without importing them.
+   */
+  private withComputedSchemas(manifest: PluginManifest): PluginManifest {
+    const module = this.registrations.get(manifest.id)?.module
+    if (!module?.getSettingsSchema) {
+      return manifest
+    }
+    const enabled = new Set(this.settingsStore.get().enabledPlugins)
+    const contribution = module.getSettingsSchema({
+      pluginId: manifest.id,
+      // Raw manifests only: computing schemas for the others here would recurse.
+      listOtherPlugins: () =>
+        this.allManifests()
+          .filter((m) => m.id !== manifest.id)
+          .map((m) => ({ ...m, enabled: enabled.has(m.id) }))
+    })
+    return {
+      ...manifest,
+      contributes: {
+        ...manifest.contributes,
+        settingsSchema:
+          contribution.settingsSchema ?? manifest.contributes.settingsSchema,
+        hostSettingsSchema:
+          contribution.hostSettingsSchema ?? manifest.contributes.hostSettingsSchema
+      }
+    }
   }
 
   getManifest(pluginId: string): PluginManifest | undefined {
@@ -292,7 +326,8 @@ export class PluginHost {
         this.setSettingValue(pluginId, key, value)
       },
       showOpenDialog: (options) => this.showOpenDialog(options),
-      showSaveDialog: (options) => this.showSaveDialog(options)
+      showSaveDialog: (options) => this.showSaveDialog(options),
+      listPlugins: () => this.listPlugins()
     }
 
     const instance: ActiveInstance = {

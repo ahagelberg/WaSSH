@@ -27,6 +27,7 @@
   ],
   "exclude": [
     "src/plugins/**/View.tsx",
+    "src/plugins/**/ProviderSettings.tsx",
     "src/plugins/**/fileDrop.ts",
     "src/plugins/**/viewUtils.ts",
     "src/plugins/**/styles.css"

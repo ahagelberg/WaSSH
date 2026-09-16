@@ -27,10 +27,12 @@ import {
   AI_AGENT_WEB_ACCESS_ALL_METHODS,
   TOOL_DEF_RUN_COMMAND
 } from './apiMethods'
+import { aiAgentManifest } from './manifest'
 import {
   allExternalApiTools,
   allowedGroupMethods,
   allowedGroupMethodsWithBundles,
+  buildExternalApiPermissionFields,
   isMethodAllowed,
   permissionSettingKey,
   permissionSettingKeyFor,
@@ -2422,6 +2424,26 @@ async function handleApiCall(
 export const aiAgentMain: PluginMainModule = {
   async onActivate(ctx) {
     await setupForTab(ctx, true)
+  },
+  /**
+   * Append one permission group per other plugin that declares API methods.
+   * Built from loaded manifests at manifest-read time, so ai-agent needs no
+   * import of any other plugin.
+   */
+  getSettingsSchema(ctx) {
+    const otherPlugins = ctx.listOtherPlugins().map((p) => ({
+      id: p.id,
+      name: p.name,
+      methods: p.contributes.api?.methods ?? []
+    }))
+    const externalFields = buildExternalApiPermissionFields(otherPlugins)
+    return {
+      settingsSchema: [...(aiAgentManifest.contributes.settingsSchema ?? []), ...externalFields],
+      hostSettingsSchema: [
+        ...(aiAgentManifest.contributes.hostSettingsSchema ?? []),
+        ...externalFields
+      ]
+    }
   },
   onDeactivate(ctx) {
     const tab = tabs.get(ctx.tabId)
