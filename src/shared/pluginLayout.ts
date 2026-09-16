@@ -1,5 +1,16 @@
 import type { PluginListItem, PluginViewPlacement } from './pluginApi'
 
+/** Plugin ids that were merged into another plugin, mapped to the survivor. */
+export const PLUGIN_ID_ALIASES: Record<string, string> = {
+  // The daemon monitor was merged into the server monitor.
+  'daemon-monitor': 'server-monitor'
+}
+
+/** Resolve a possibly-renamed plugin id to its current id. */
+export function resolvePluginId(pluginId: string): string {
+  return PLUGIN_ID_ALIASES[pluginId] ?? pluginId
+}
+
 /** Side-by-side (horizontal flex) */
 export const SPLIT_ROW = 'row'
 /** Stacked (vertical flex) */
@@ -381,7 +392,7 @@ function parseNode(raw: unknown): LayoutNode | null {
   }
   const obj = raw as Record<string, unknown>
   if (obj.kind === 'leaf' && typeof obj.pluginId === 'string') {
-    return { kind: 'leaf', pluginId: obj.pluginId }
+    return { kind: 'leaf', pluginId: resolvePluginId(obj.pluginId) }
   }
   if (obj.kind === 'split') {
     const a = parseNode(obj.a)

@@ -1,6 +1,5 @@
 import type { PluginManifest } from '@plugin-api/shared'
 import {
-  SERVER_MONITOR_DEFAULT_INTERVAL_MS,
   SERVER_MONITOR_SHOW_GAUGES_DEFAULT,
   SERVER_MONITOR_SHOW_NETWORK_DEFAULT,
   SERVER_MONITOR_SHOW_PROCESSES_DEFAULT,
@@ -12,22 +11,15 @@ import { PLUGIN_ID_SERVER_MONITOR } from './id'
 export const serverMonitorManifest: PluginManifest = {
   id: PLUGIN_ID_SERVER_MONITOR,
   name: 'Server monitor',
-  version: '1.1.0',
+  version: '2.0.0',
   description:
-    'htop/btop-style remote stats: per-core CPU, memory breakdown, disk I/O, processes, network, and temps via SSH exec.',
+    'htop/btop-style remote stats with multi-resolution history: per-core CPU, memory breakdown, disk I/O, processes, network, and temps via SSH, backed by the WaSSH Service daemon when installed.',
   activation: 'manual',
   source: 'builtin',
   contributes: {
     toolbar: { label: 'Monitor' },
     hostSettingsHeading: 'Server monitor',
     hostSettingsSchema: [
-      {
-        key: 'intervalMs',
-        label: 'Poll interval (ms)',
-        type: 'number',
-        default: SERVER_MONITOR_DEFAULT_INTERVAL_MS,
-        description: 'How often to refresh remote stats for this session.'
-      },
       {
         key: 'showGauges',
         label: 'Show gauges',

@@ -65,36 +65,75 @@
 .monitor-header {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   flex-shrink: 0;
-}
-
-.monitor-header-top {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.monitor-title {
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.monitor-host {
-  font-weight: 600;
-  font-size: 14px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .monitor-section-toggles {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+.monitor-range {
+  flex: 0 0 auto;
+  width: auto;
+  height: calc(var(--monitor-toggle-height) - 2px);
+  padding: 0 2px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.monitor-service-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--monitor-card-radius);
+}
+
+.monitor-service-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.monitor-service-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.monitor-service-sudo {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.monitor-service-sudo label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+}
+
+.monitor-service-sudo input {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input, transparent);
+  color: var(--text);
+}
+
+.monitor-service-sudo small {
+  font-size: 10px;
+  color: var(--text-muted);
 }
 
 .monitor-section-toggle {
@@ -836,20 +875,9 @@
     gap: 8px;
   }
 
-  .monitor-header-top {
-    flex-direction: row;
-    align-items: baseline;
-    gap: 8px;
-    min-width: 0;
-  }
-
-  .monitor-title {
-    flex-shrink: 0;
-  }
-
   .monitor-section-toggles {
+    flex-wrap: nowrap;
     flex-shrink: 0;
-    margin-left: auto;
   }
 
   .monitor-body {
@@ -988,7 +1016,8 @@
   }
 
   .monitor-cpu-block,
-  .monitor-processes {
+  .monitor-processes,
+  .monitor-service-panel {
     grid-column: 1 / -1;
   }
 
@@ -1004,6 +1033,10 @@
   }
 
   .monitor-cpu-block {
+    grid-column: 1 / -1;
+  }
+
+  .monitor-service-panel {
     grid-column: 1 / -1;
   }
 

@@ -1,8 +1,5 @@
-/** Default poll interval for server monitor (ms) */
+/** Fixed sampling cadence for the monitor and the remote daemon (ms) */
 export const SERVER_MONITOR_DEFAULT_INTERVAL_MS = 1000
-
-/** Minimum poll interval for server monitor (ms) */
-export const SERVER_MONITOR_MIN_INTERVAL_MS = 500
 
 /** How many top processes to return per sample */
 export const SERVER_MONITOR_TOP_PROCESS_COUNT = 24

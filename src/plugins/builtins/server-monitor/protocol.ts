@@ -135,7 +135,11 @@ export function isServerMonitorStatsEvent(value: unknown): value is ServerMonito
 }
 
 /** Discriminant of requests the server-monitor view sends to its main module */
-export type ServerMonitorRendererMessageType = 'refresh' | 'setProcessSort' | 'signalProcess'
+export type ServerMonitorRendererMessageType =
+  | 'refresh'
+  | 'setProcessSort'
+  | 'signalProcess'
+  | 'requestHistory'
 
 /**
  * Requests the server-monitor view sends via `sendPluginMessage`. Field types
@@ -146,6 +150,10 @@ export type ServerMonitorRendererMessage =
   | { type: 'refresh' }
   | { type: 'setProcessSort'; sort: ServerMonitorProcessSort; descending?: boolean }
   | { type: 'signalProcess'; pid: number; signal: ServerMonitorProcessSignal }
+  | { type: 'probeService' }
+  | { type: 'installService'; password: string }
+  | { type: 'uninstallService'; password: string }
+  | { type: 'requestHistory'; bucketSeconds: number; fromMs: number; toMs: number }
 
 /** Narrows to a message with a recognized `type`; per-field values are still `unknown`. */
 export function isServerMonitorRendererMessageEnvelope(
@@ -155,7 +163,12 @@ export function isServerMonitorRendererMessageEnvelope(
     return false
   }
   const type = (value as Record<string, unknown>).type
-  return type === 'refresh' || type === 'setProcessSort' || type === 'signalProcess'
+  return (
+    type === 'refresh' ||
+    type === 'setProcessSort' ||
+    type === 'signalProcess' ||
+    type === 'requestHistory'
+  )
 }
 
 /** Result of a `setProcessSort` / `signalProcess` / `refresh` request */

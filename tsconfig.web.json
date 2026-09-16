@@ -26,6 +26,7 @@
     "src/plugins/builtins/**/fileDrop.ts",
     "src/plugins/builtins/**/viewUtils.ts",
     "src/plugins/builtins/**/protocol.ts",
+    "src/plugins/builtins/**/serviceProtocol.ts",
     "src/plugins/builtins/**/id.ts",
     "src/plugins/builtins/**/defaults.ts",
     "src/plugins/builtins/**/manifest.ts",

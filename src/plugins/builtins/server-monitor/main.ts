@@ -1,11 +1,23 @@
 import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
+import type { MonitorSample, MonitorStreamHeader } from '@shared/monitorFrames'
+import { MonitorLadder } from '@shared/monitorLadder'
 import {
   BYTES_PER_KIB,
+  SERIES_DISK_READ,
+  SERIES_DISK_TOTAL,
+  SERIES_DISK_USED,
+  SERIES_DISK_WRITE,
+  SERIES_MEM_TOTAL,
+  SERIES_MEM_USED,
+  SERIES_CPU,
+  tempSeriesId,
+  type MonitorSeries
+} from '@shared/monitorSeries'
+import {
   SERVER_MONITOR_DEFAULT_INTERVAL_MS,
   SERVER_MONITOR_DISK_SECTOR_BYTES,
   SERVER_MONITOR_LOOPBACK_IFACE,
   SERVER_MONITOR_MEGABIT_BITS,
-  SERVER_MONITOR_MIN_INTERVAL_MS,
   SERVER_MONITOR_TEMP_MILLI_PER_C,
   SERVER_MONITOR_TOP_PROCESS_COUNT
 } from './defaults'
@@ -26,6 +38,15 @@ import {
   SERVER_MONITOR_PROCESS_SORT_DEFAULT,
   SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT
 } from './protocol'
+import {
+  closeStream,
+  createServiceSession,
+  probeService,
+  runServiceAction,
+  type MonitorServiceHooks,
+  type MonitorServiceSession
+} from './service'
+import { isMonitorRendererMessage, type MonitorMainMessage } from './serviceProtocol'
 
 /** `ps --sort=` field for each UI column */
 const PS_SORT_FIELD: Record<ServerMonitorProcessSort, string> = {
@@ -57,6 +78,9 @@ const WHOLE_DISK_RE = /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk
 /** Marker prefix for kill exit status in execCapture output */
 const KILL_EXIT_MARKER = '__EC:'
 
+/** Fixed sampling cadence shared by the poller and the daemon (ms) */
+const SAMPLE_INTERVAL_MS = SERVER_MONITOR_DEFAULT_INTERVAL_MS
+
 interface CpuJiffies {
   idle: number
   total: number
@@ -86,7 +110,6 @@ interface MonitorSessionState {
   prevNet: NetCounters | null
   prevDiskIo: DiskIoCounters | null
   timer: ReturnType<typeof setInterval> | null
-  intervalMs: number
   poll: () => Promise<void>
   /** OS family detected from `uname`; selects the sample command + parser */
   family: MonitorFamily
@@ -96,20 +119,78 @@ interface MonitorSessionState {
   shortSamples: number
   /** Most recent snapshot pushed to the renderer, for `get_snapshot` API calls */
   lastSnapshot: ServerMonitorSnapshot | null
+  /** Remote daemon ("WaSSH Service") probe + stream state */
+  service: MonitorServiceSession
+  /** Ladder built from poller samples when no daemon is streaming */
+  localLadder: MonitorLadder | null
+  /** Series set the renderer should draw for the active history source */
+  activeSeries: MonitorSeries[]
 }
 
 const sessionStates = new Map<string, MonitorSessionState>()
 
-function instanceKey(ctx: PluginMainContext): string {
-  return `${ctx.tabId}:${ctx.pluginId}`
+/** Series the app-side ladder records when the daemon is absent. */
+function localLadderSeries(): MonitorSeries[] {
+  return [
+    { id: SERIES_CPU, label: 'CPU', unit: '%', kind: 'gauge', max: 100 },
+    { id: SERIES_MEM_USED, label: 'Memory used', unit: 'B', kind: 'gauge', max: null },
+    { id: SERIES_MEM_TOTAL, label: 'Memory total', unit: 'B', kind: 'gauge', max: null },
+    { id: SERIES_DISK_USED, label: 'Disk used', unit: 'B', kind: 'gauge', max: null },
+    { id: SERIES_DISK_TOTAL, label: 'Disk total', unit: 'B', kind: 'gauge', max: null },
+    { id: SERIES_DISK_READ, label: 'Disk read', unit: 'B/s', kind: 'rate', max: null },
+    { id: SERIES_DISK_WRITE, label: 'Disk write', unit: 'B/s', kind: 'rate', max: null }
+  ]
 }
 
-function parseInterval(settings: Record<string, unknown>): number {
-  const n = Number(settings.intervalMs)
-  if (!Number.isFinite(n)) {
-    return SERVER_MONITOR_DEFAULT_INTERVAL_MS
+/** Series the app-side ladder records for a snapshot's temperatures. */
+function localTempSeries(snapshot: ServerMonitorSnapshot): MonitorSeries[] {
+  return snapshot.temperatures.map((temp) => ({
+    id: tempSeriesId(temp.name),
+    label: `Temp (${temp.name})`,
+    unit: '°C' as const,
+    kind: 'gauge' as const,
+    max: null
+  }))
+}
+
+/** Fold one poller snapshot into the app-side ladder. */
+function pushLocalHistory(
+  ctx: PluginMainContext,
+  state: MonitorSessionState,
+  snapshot: ServerMonitorSnapshot
+): void {
+  if (snapshot.error) {
+    return
   }
-  return Math.max(SERVER_MONITOR_MIN_INTERVAL_MS, Math.floor(n))
+  const series = [...localLadderSeries(), ...localTempSeries(snapshot)]
+  if (!state.localLadder) {
+    state.localLadder = new MonitorLadder(series)
+    state.activeSeries = series
+    const ready: MonitorMainMessage = {
+      type: 'historyReady',
+      series,
+      temperatureZones: snapshot.temperatures.map((temp) => temp.name),
+      interfaces: []
+    }
+    ctx.sendToRenderer(ready)
+  }
+  const values: Record<string, number> = {
+    [SERIES_CPU]: snapshot.cpuPercent ?? 0,
+    [SERIES_MEM_USED]: snapshot.memUsedBytes,
+    [SERIES_MEM_TOTAL]: snapshot.memTotalBytes,
+    [SERIES_DISK_USED]: snapshot.diskUsedBytes,
+    [SERIES_DISK_TOTAL]: snapshot.diskTotalBytes,
+    [SERIES_DISK_READ]: snapshot.diskReadRate ?? 0,
+    [SERIES_DISK_WRITE]: snapshot.diskWriteRate ?? 0
+  }
+  for (const temp of snapshot.temperatures) {
+    values[tempSeriesId(temp.name)] = temp.celsius
+  }
+  state.localLadder.push(snapshot.updatedAt, values)
+}
+
+function instanceKey(ctx: PluginMainContext): string {
+  return `${ctx.tabId}:${ctx.pluginId}`
 }
 
 /** Map UI sort to `ps --sort=` key (leading - = descending). */
@@ -1044,6 +1125,7 @@ async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): 
     parsed.snapshot.processes = stabilizeProcessList(state, parsed.snapshot.processes)
 
     pushStats(ctx, state, parsed.snapshot)
+    pushLocalHistory(ctx, state, parsed.snapshot)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     pushStats(ctx, state, emptySnapshot({ error: message }))
@@ -1058,14 +1140,67 @@ function armTimer(ctx: PluginMainContext, state: MonitorSessionState): void {
     state.timer = null
   }
   state.timer = setInterval(() => {
-    const nextInterval = parseInterval(ctx.getSettings())
-    if (nextInterval !== state.intervalMs) {
-      state.intervalMs = nextInterval
-      armTimer(ctx, state)
-      return
-    }
     void state.poll()
-  }, state.intervalMs)
+  }, SAMPLE_INTERVAL_MS)
+}
+
+function stopTimer(state: MonitorSessionState): void {
+  if (state.timer) {
+    clearInterval(state.timer)
+    state.timer = null
+  }
+}
+
+/**
+ * Daemon stream hooks. The daemon's series set becomes the active history
+ * source; poller samples keep feeding the app-side ladder so switching back
+ * when the stream drops does not leave a gap.
+ */
+function serviceHooks(state: MonitorSessionState): MonitorServiceHooks {
+  return {
+    onHeader: (header) => {
+      state.activeSeries = header.series
+    },
+    onSample: () => undefined,
+    onStreamClosed: () => undefined
+  }
+}
+
+/** History source in use: the daemon's ladder when streaming, else the app's. */
+function activeLadder(state: MonitorSessionState): MonitorLadder | null {
+  return state.service.ladder ?? state.localLadder
+}
+
+/** Push one tier of buckets for the requested range to the view. */
+function sendHistory(
+  ctx: PluginMainContext,
+  state: MonitorSessionState,
+  bucketSeconds: number,
+  fromMs: number,
+  toMs: number
+): void {
+  const ladder = activeLadder(state)
+  if (!ladder) {
+    return
+  }
+  const tier = ladder.buckets(bucketSeconds, fromMs, toMs)
+  if (!tier) {
+    return
+  }
+  for (const series of tier.series) {
+    for (const bucket of series.buckets) {
+      const message: MonitorMainMessage = {
+        type: 'history',
+        bucketSeconds,
+        seriesId: series.seriesId,
+        timestamp: bucket.timestamp,
+        min: bucket.min,
+        max: bucket.max,
+        avg: bucket.avg
+      }
+      ctx.sendToRenderer(message)
+    }
+  }
 }
 
 export const serverMonitorMain: PluginMainModule = {
@@ -1084,31 +1219,51 @@ export const serverMonitorMain: PluginMainModule = {
       shortSamples: 0,
       lastSnapshot: null,
       timer: null,
-      intervalMs: parseInterval(ctx.getSettings()),
-      poll: async () => undefined
+      poll: async () => undefined,
+      service: createServiceSession(),
+      localLadder: null,
+      activeSeries: []
     }
     state.poll = () => pollSession(ctx, state)
 
     sessionStates.set(instanceKey(ctx), state)
     ctx.onDeactivateCleanup(() => {
       state.stopped = true
-      if (state.timer) {
-        clearInterval(state.timer)
-        state.timer = null
-      }
+      stopTimer(state)
+      closeStream(ctx, state.service)
       sessionStates.delete(instanceKey(ctx))
     })
 
+    await probeService(ctx, state.service, serviceHooks(state))
     void state.poll()
     armTimer(ctx, state)
   },
 
   async onMessage(ctx, payload): Promise<ServerMonitorActionResult | undefined> {
-    if (!isServerMonitorRendererMessageEnvelope(payload)) {
-      return undefined
-    }
     const state = sessionStates.get(instanceKey(ctx))
     if (!state || state.stopped) {
+      return undefined
+    }
+
+    if (isMonitorRendererMessage(payload)) {
+      if (payload.type === 'probeService') {
+        await probeService(ctx, state.service, serviceHooks(state))
+        return { ok: true }
+      }
+      if (payload.type === 'requestHistory') {
+        sendHistory(ctx, state, payload.bucketSeconds, payload.fromMs, payload.toMs)
+        return { ok: true }
+      }
+      return runServiceAction(
+        ctx,
+        state.service,
+        serviceHooks(state),
+        payload.type === 'installService' ? 'install' : 'uninstall',
+        payload.password
+      )
+    }
+
+    if (!isServerMonitorRendererMessageEnvelope(payload)) {
       return undefined
     }
 

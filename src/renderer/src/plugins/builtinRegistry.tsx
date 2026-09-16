@@ -8,9 +8,7 @@ import SftpView from '../../../plugins/builtins/sftp/View'
 import AiAgentView from '../../../plugins/builtins/ai-agent/View'
 import AiAgentProviderSettings from '../../../plugins/builtins/ai-agent/ProviderSettings'
 import ConnectionLoggerView from '../../../plugins/builtins/connection-logger/View'
-import DaemonMonitorView from '../../../plugins/builtins/daemon-monitor/View'
 import { PLUGIN_ID_SERVER_MONITOR } from '../../../plugins/builtins/server-monitor/id'
-import { PLUGIN_ID_DAEMON_MONITOR } from '../../../plugins/builtins/daemon-monitor/id'
 import { PLUGIN_ID_SCRATCHPAD } from '../../../plugins/builtins/scratchpad/id'
 import { PLUGIN_ID_MACRO_PAD } from '../../../plugins/builtins/macro-pad/id'
 import { PLUGIN_ID_MQTT_ANALYSER } from '../../../plugins/builtins/mqtt-analyser/id'
@@ -20,7 +18,6 @@ import { PLUGIN_ID_CONNECTION_LOGGER } from '../../../plugins/builtins/connectio
 
 const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
   { id: PLUGIN_ID_SERVER_MONITOR, view: ServerMonitorView },
-  { id: PLUGIN_ID_DAEMON_MONITOR, view: DaemonMonitorView },
   { id: PLUGIN_ID_SCRATCHPAD, view: ScratchpadView },
   { id: PLUGIN_ID_MACRO_PAD, view: MacroPadView },
   { id: PLUGIN_ID_MQTT_ANALYSER, view: MqttAnalyserView },

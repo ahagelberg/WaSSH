@@ -51,6 +51,7 @@ import {
   normalizeTabPluginLayout,
   pruneLayoutToKeep,
   removePluginFromLayout,
+  resolvePluginId,
   type TabPluginLayout
 } from '@shared/pluginLayout'
 import {
@@ -387,7 +388,9 @@ export default function App() {
       const restored: TabState[] = snapshot.map((t) => {
         const activePluginIds = (
           Array.isArray(t.activePluginIds) ? t.activePluginIds : []
-        ).filter((id) => available.has(id))
+        )
+          .map(resolvePluginId)
+          .filter((id) => available.has(id))
         return {
           id: t.id,
           connection: normalizeConnectionParams(t.connection),

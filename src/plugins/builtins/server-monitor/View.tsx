@@ -1,5 +1,22 @@
-import { useEffect, useLayoutEffect, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import type { PluginViewProps } from '@plugin-api/renderer'
+import { PluginButton } from '@plugin-api/renderer'
+import {
+  LADDER_TIER_ARCHIVE,
+  LADDER_TIER_FAST,
+  LADDER_TIER_MEDIUM,
+  LADDER_TIER_SLOW
+} from '@shared/monitorLadder'
+import {
+  SERIES_CPU,
+  SERIES_DISK_READ,
+  SERIES_DISK_TOTAL,
+  SERIES_DISK_USED,
+  SERIES_DISK_WRITE,
+  SERIES_MEM_TOTAL,
+  SERIES_MEM_USED,
+  type MonitorSeries
+} from '@shared/monitorSeries'
 import {
   BITS_PER_BYTE,
   BYTES_PER_KIB,
@@ -25,10 +42,29 @@ import {
   SERVER_MONITOR_PROCESS_SORT_DEFAULT,
   SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT
 } from './protocol'
+import {
+  isMonitorActionResult,
+  isMonitorMainMessage,
+  MONITOR_SERVICE_INITIAL_STATUS,
+  type MonitorServiceStatus
+} from './serviceProtocol'
 import './styles.css'
 
-/** Samples kept for sparkline history */
-const HISTORY_POINTS = 60
+/** History ranges the view can request, keyed by the label shown in the picker */
+const HISTORY_RANGES = {
+  '5m': { seconds: 5 * 60, tier: LADDER_TIER_FAST },
+  '1h': { seconds: 60 * 60, tier: LADDER_TIER_MEDIUM },
+  '24h': { seconds: 24 * 60 * 60, tier: LADDER_TIER_SLOW },
+  '7d': { seconds: 7 * 24 * 60 * 60, tier: LADDER_TIER_ARCHIVE }
+} as const
+
+type HistoryRange = keyof typeof HISTORY_RANGES
+
+/** Range selected when the panel opens */
+const HISTORY_RANGE_DEFAULT: HistoryRange = '5m'
+
+/** Milliseconds per second (history range math) */
+const MS_PER_SEC = 1000
 
 /** SVG viewBox width for sparklines */
 const SPARK_WIDTH = 120
@@ -185,57 +221,66 @@ function formatTemp(celsius: number): string {
   return Number.isFinite(celsius) ? `${celsius.toFixed(0)}°C` : MISSING
 }
 
-function pushHistory(prev: number[], value: number): number[] {
-  const next =
-    prev.length >= HISTORY_POINTS ? prev.slice(prev.length - HISTORY_POINTS + 1) : prev.slice()
-  next.push(value)
-  return next
+/** One aggregated history point for a series. */
+interface HistoryPoint {
+  timestamp: number
+  min: number
+  max: number
+  avg: number
 }
 
-/** Appends a sample to a history state array, skipping samples not yet available */
-function appendIfPresent(
-  setHistory: Dispatch<SetStateAction<number[]>>,
-  value: number | null | undefined
-): void {
-  if (value == null) {
-    return
-  }
-  setHistory((h) => pushHistory(h, value))
-}
+/** Buckets received from the main process, keyed by series id. */
+type HistoryStore = Record<string, HistoryPoint[]>
 
-function sparkCoords(values: number[], maxValue: number): Array<{ x: number; y: number }> {
+function sparkCoords(
+  points: HistoryPoint[],
+  maxValue: number,
+  fromMs: number,
+  toMs: number
+): Array<{ x: number; y: number }> {
   const max = maxValue > 0 ? maxValue : 1
-  const step = values.length > 1 ? SPARK_WIDTH / (values.length - 1) : SPARK_WIDTH
-  return values.map((v, i) => ({
-    x: i * step,
-    y: SPARK_HEIGHT - (Math.max(0, Math.min(v, max)) / max) * (SPARK_HEIGHT - 2) - 1
+  const span = Math.max(1, toMs - fromMs)
+  return points.map((point) => ({
+    x: ((point.timestamp - fromMs) / span) * SPARK_WIDTH,
+    y: SPARK_HEIGHT - (Math.max(0, Math.min(point.avg, max)) / max) * (SPARK_HEIGHT - 2) - 1
   }))
 }
 
-function sparkPath(values: number[], maxValue: number): string {
-  if (values.length === 0) {
+function sparkPath(
+  points: HistoryPoint[],
+  maxValue: number,
+  fromMs: number,
+  toMs: number
+): string {
+  if (points.length === 0) {
     return ''
   }
-  return sparkCoords(values, maxValue)
+  return sparkCoords(points, maxValue, fromMs, toMs)
     .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
     .join(' ')
 }
 
-function sparkArea(values: number[], maxValue: number): string {
-  const line = sparkPath(values, maxValue)
-  if (!line || values.length === 0) {
+function sparkArea(
+  points: HistoryPoint[],
+  maxValue: number,
+  fromMs: number,
+  toMs: number
+): string {
+  const line = sparkPath(points, maxValue, fromMs, toMs)
+  if (!line || points.length === 0) {
     return ''
   }
-  const coords = sparkCoords(values, maxValue)
+  const coords = sparkCoords(points, maxValue, fromMs, toMs)
   const lastX = coords[coords.length - 1].x
-  return `${line} L${lastX.toFixed(1)} ${SPARK_HEIGHT} L0 ${SPARK_HEIGHT} Z`
+  const firstX = coords[0].x
+  return `${line} L${lastX.toFixed(1)} ${SPARK_HEIGHT} L${firstX.toFixed(1)} ${SPARK_HEIGHT} Z`
 }
 
-function historyMax(values: number[]): number {
+function historyMax(points: HistoryPoint[]): number {
   let max = 0
-  for (const v of values) {
-    if (v > max) {
-      max = v
+  for (const point of points) {
+    if (point.max > max) {
+      max = point.max
     }
   }
   return max
@@ -417,21 +462,27 @@ function Gauge({
 
 function SparkCard({
   title,
-  values,
+  points,
   tone,
   current,
+  fromMs,
+  toMs,
   scaleMax
 }: {
   title: string
-  values: number[]
+  points: HistoryPoint[]
   tone: SparkTone
   current: string
+  /** Left edge of the drawn window (ms) */
+  fromMs: number
+  /** Right edge of the drawn window (ms) */
+  toMs: number
   /** When set, sparklines scale to this max (rate history); else 0–100 */
   scaleMax?: number
 }): ReactElement {
-  const max = scaleMax != null ? Math.max(scaleMax, historyMax(values), 1) : 100
-  const line = sparkPath(values, max)
-  const area = sparkArea(values, max)
+  const max = scaleMax != null ? Math.max(scaleMax, historyMax(points), 1) : 100
+  const line = sparkPath(points, max, fromMs, toMs)
+  const area = sparkArea(points, max, fromMs, toMs)
   return (
     <div className={`monitor-spark monitor-spark-${tone}`}>
       <div className="monitor-spark-head">
@@ -773,19 +824,23 @@ function NetworkPanel({
   ifaces,
   showGauges,
   showSparks,
-  rxHistory,
-  txHistory
+  rxPoints,
+  txPoints,
+  fromMs,
+  toMs
 }: {
   ifaces: ServerMonitorNetIface[]
   showGauges: boolean
   showSparks: boolean
-  rxHistory: number[]
-  txHistory: number[]
+  rxPoints: HistoryPoint[]
+  txPoints: HistoryPoint[]
+  fromMs: number
+  toMs: number
 }): ReactElement {
   const totals = netTotals(ifaces)
   const peakRate = Math.max(
-    historyMax(rxHistory),
-    historyMax(txHistory),
+    historyMax(rxPoints),
+    historyMax(txPoints),
     totals.rxRate ?? 0,
     totals.txRate ?? 0
   )
@@ -803,16 +858,20 @@ function NetworkPanel({
         <div className="monitor-panel-sparks monitor-panel-sparks-2">
           <SparkCard
             title="Net ↓"
-            values={rxHistory}
+            points={rxPoints}
             tone="net"
             scaleMax={capacity}
+            fromMs={fromMs}
+            toMs={toMs}
             current={formatRate(totals.rxRate)}
           />
           <SparkCard
             title="Net ↑"
-            values={txHistory}
+            points={txPoints}
             tone="net"
             scaleMax={capacity}
+            fromMs={fromMs}
+            toMs={toMs}
             current={formatRate(totals.txRate)}
           />
         </div>
@@ -878,16 +937,20 @@ function DiskPanel({
   snapshot,
   showGauge,
   showSparks,
-  diskHistory,
-  readHistory,
-  writeHistory
+  usedPoints,
+  readPoints,
+  writePoints,
+  fromMs,
+  toMs
 }: {
   snapshot: ServerMonitorSnapshot | null
   showGauge: boolean
   showSparks: boolean
-  diskHistory: number[]
-  readHistory: number[]
-  writeHistory: number[]
+  usedPoints: HistoryPoint[]
+  readPoints: HistoryPoint[]
+  writePoints: HistoryPoint[]
+  fromMs: number
+  toMs: number
 }): ReactElement {
   const diskPct = snapshot ? ratioPercent(snapshot.diskUsedBytes, snapshot.diskTotalBytes) : null
   const diskFree =
@@ -916,22 +979,28 @@ function DiskPanel({
         <div className="monitor-panel-sparks monitor-panel-sparks-3">
           <SparkCard
             title="Used"
-            values={diskHistory}
+            points={usedPoints}
             tone="disk"
+            fromMs={fromMs}
+            toMs={toMs}
             current={diskPct == null ? MISSING : `${Math.round(diskPct)}%`}
           />
           <SparkCard
             title="Read"
-            values={readHistory}
+            points={readPoints}
             tone="disk"
-            scaleMax={historyMax(readHistory)}
+            fromMs={fromMs}
+            toMs={toMs}
+            scaleMax={historyMax(readPoints)}
             current={formatRate(snapshot?.diskReadRate)}
           />
           <SparkCard
             title="Write"
-            values={writeHistory}
+            points={writePoints}
             tone="disk"
-            scaleMax={historyMax(writeHistory)}
+            fromMs={fromMs}
+            toMs={toMs}
+            scaleMax={historyMax(writePoints)}
             current={formatRate(snapshot?.diskWriteRate)}
           />
         </div>
@@ -964,8 +1033,7 @@ function DiskPanel({
   )
 }
 
-function TempFacts({ temps }: { temps: ServerMonitorTemp[] }): ReactElement | null {
-  if (temps.length === 0) {
+function TempFacts({ temps }: { temps: ServerMonitorTemp[] }): ReactElement | null {  if (temps.length === 0) {
     return null
   }
   return (
@@ -987,13 +1055,13 @@ export default function ServerMonitorView({
   onSettingsPatch
 }: PluginViewProps) {
   const [snapshot, setSnapshot] = useState<ServerMonitorSnapshot | null>(null)
-  const [cpuHistory, setCpuHistory] = useState<number[]>([])
-  const [memHistory, setMemHistory] = useState<number[]>([])
-  const [diskHistory, setDiskHistory] = useState<number[]>([])
-  const [diskReadHistory, setDiskReadHistory] = useState<number[]>([])
-  const [diskWriteHistory, setDiskWriteHistory] = useState<number[]>([])
-  const [netRxHistory, setNetRxHistory] = useState<number[]>([])
-  const [netTxHistory, setNetTxHistory] = useState<number[]>([])
+  const [history, setHistory] = useState<HistoryStore>({})
+  const [series, setSeries] = useState<MonitorSeries[]>([])
+  const [range, setRange] = useState<HistoryRange>(HISTORY_RANGE_DEFAULT)
+  const [service, setService] = useState<MonitorServiceStatus>(MONITOR_SERVICE_INITIAL_STATUS)
+  const [sudoAction, setSudoAction] = useState<'install' | 'uninstall' | null>(null)
+  const [password, setPassword] = useState('')
+  const [actionError, setActionError] = useState('')
   const [procSort, setProcSort] = useState<ServerMonitorProcessSort>(
     SERVER_MONITOR_PROCESS_SORT_DEFAULT
   )
@@ -1001,6 +1069,7 @@ export default function ServerMonitorView({
   const [procStatus, setProcStatus] = useState<string | null>(null)
   const [procStatusError, setProcStatusError] = useState(false)
   const lastAt = useRef(0)
+  const rangeRef = useRef<HistoryRange>(HISTORY_RANGE_DEFAULT)
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const showGauges = settingBool(settings, 'showGauges', SERVER_MONITOR_SHOW_GAUGES_DEFAULT)
@@ -1013,6 +1082,9 @@ export default function ServerMonitorView({
   )
   const showNetwork = settingBool(settings, 'showNetwork', SERVER_MONITOR_SHOW_NETWORK_DEFAULT)
   const showDiskPanel = showGauges || showSparks || showStatus
+  const operationRunning = service.state === 'installing' || service.state === 'uninstalling'
+  const serviceNeedsAttention =
+    service.state === 'missing' || service.state === 'outdated' || service.state === 'error'
 
   const showProcStatus = (message: string, isError: boolean): void => {
     setProcStatus(message)
@@ -1035,9 +1107,57 @@ export default function ServerMonitorView({
     }
   }, [])
 
+  /** Ask the main process for the buckets covering the selected range. */
+  const requestHistory = (nextRange: HistoryRange): void => {
+    const toMs = Date.now()
+    const fromMs = toMs - HISTORY_RANGES[nextRange].seconds * MS_PER_SEC
+    setHistory({})
+    void window.wassh.sendPluginMessage(tabId, pluginId, {
+      type: 'requestHistory',
+      bucketSeconds: HISTORY_RANGES[nextRange].tier.bucketSeconds,
+      fromMs,
+      toMs
+    } satisfies ServerMonitorRendererMessage)
+  }
+
+  useEffect(() => {
+    requestHistory(rangeRef.current)
+    void window.wassh.sendPluginMessage(tabId, pluginId, { type: 'probeService' })
+  }, [tabId, pluginId])
+
   useEffect(() => {
     return window.wassh.onPluginMessage((ev) => {
       if (ev.tabId !== tabId || ev.pluginId !== pluginId) {
+        return
+      }
+      if (isMonitorMainMessage(ev.payload)) {
+        if (ev.payload.type === 'service') {
+          setService(ev.payload.status)
+          return
+        }
+        if (ev.payload.type === 'historyReady') {
+          setSeries(ev.payload.series)
+          return
+        }
+        const bucket = ev.payload
+        setHistory((current) => {
+          const points = current[bucket.seriesId] ?? []
+          if (points.some((point) => point.timestamp === bucket.timestamp)) {
+            return current
+          }
+          return {
+            ...current,
+            [bucket.seriesId]: [
+              ...points,
+              {
+                timestamp: bucket.timestamp,
+                min: bucket.min,
+                max: bucket.max,
+                avg: bucket.avg
+              }
+            ]
+          }
+        })
         return
       }
       if (!isServerMonitorStatsEvent(ev.payload)) {
@@ -1049,14 +1169,7 @@ export default function ServerMonitorView({
         return
       }
       lastAt.current = next.updatedAt
-      appendIfPresent(setCpuHistory, next.cpuPercent)
-      appendIfPresent(setMemHistory, ratioPercent(next.memUsedBytes, next.memTotalBytes))
-      appendIfPresent(setDiskHistory, ratioPercent(next.diskUsedBytes, next.diskTotalBytes))
-      appendIfPresent(setDiskReadHistory, next.diskReadRate)
-      appendIfPresent(setDiskWriteHistory, next.diskWriteRate)
-      const totals = netTotals(next.network ?? [])
-      appendIfPresent(setNetRxHistory, totals.rxRate)
-      appendIfPresent(setNetTxHistory, totals.txRate)
+      requestHistory(rangeRef.current)
     })
   }, [tabId, pluginId])
 
@@ -1106,17 +1219,82 @@ export default function ServerMonitorView({
   const showSwapGauge = Boolean(snapshot && snapshot.swapTotalBytes > 0)
   const showCpuBlock = showGauges || showSparks
 
+  const selectRange = (nextRange: HistoryRange): void => {
+    rangeRef.current = nextRange
+    setRange(nextRange)
+    requestHistory(nextRange)
+  }
+
+  const runSudoAction = async (): Promise<void> => {
+    if (!sudoAction) {
+      return
+    }
+    setActionError('')
+    const result = await window.wassh.sendPluginMessage(tabId, pluginId, {
+      type: sudoAction === 'install' ? 'installService' : 'uninstallService',
+      password
+    } satisfies ServerMonitorRendererMessage)
+    setPassword('')
+    if (!isMonitorActionResult(result) || !result.ok) {
+      setActionError(isMonitorActionResult(result) ? result.error || 'Operation failed' : 'Operation failed')
+      return
+    }
+    setSudoAction(null)
+  }
+
+  const toMs = Date.now()
+  const fromMs = toMs - HISTORY_RANGES[range].seconds * MS_PER_SEC
+  const pointsFor = (seriesId: string): HistoryPoint[] => history[seriesId] ?? []
+  const netRxPoints = useMemo(() => {
+    const totals: Record<number, HistoryPoint> = {}
+    for (const item of series) {
+      if (item.kind !== 'rate' || !item.id.startsWith('net:') || !item.id.endsWith(':rx')) {
+        continue
+      }
+      for (const point of pointsFor(item.id)) {
+        const existing = totals[point.timestamp]
+        totals[point.timestamp] = existing
+          ? { ...existing, avg: existing.avg + point.avg, max: existing.max + point.max }
+          : point
+      }
+    }
+    return Object.values(totals).sort((a, b) => a.timestamp - b.timestamp)
+  }, [series, history])
+  const netTxPoints = useMemo(() => {
+    const totals: Record<number, HistoryPoint> = {}
+    for (const item of series) {
+      if (item.kind !== 'rate' || !item.id.startsWith('net:') || !item.id.endsWith(':tx')) {
+        continue
+      }
+      for (const point of pointsFor(item.id)) {
+        const existing = totals[point.timestamp]
+        totals[point.timestamp] = existing
+          ? { ...existing, avg: existing.avg + point.avg, max: existing.max + point.max }
+          : point
+      }
+    }
+    return Object.values(totals).sort((a, b) => a.timestamp - b.timestamp)
+  }, [series, history])
+
   return (
     <div className="plugin-panel plugin-server-monitor">
       <div className="monitor-scroll">
         <div className="monitor-header">
-          <div className="monitor-header-top">
-            <div className="monitor-title">Server</div>
-            <div className="monitor-host" title={snapshot?.hostname || ''}>
-              {snapshot?.hostname || 'Connecting…'}
-            </div>
-          </div>
           <div className="monitor-section-toggles" role="group" aria-label="Visible sections">
+            {showSparks ? (
+              <select
+                className="monitor-range"
+                value={range}
+                aria-label="History range"
+                onChange={(e) => selectRange(e.target.value as HistoryRange)}
+              >
+                {(Object.keys(HISTORY_RANGES) as HistoryRange[]).map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            ) : null}
             {SECTION_TOGGLES.map((tog) => {
               const on = settingBool(settings, tog.key, tog.fallback)
               return (
@@ -1138,6 +1316,73 @@ export default function ServerMonitorView({
         {snapshot?.error ? <div className="plugin-monitor-error">{snapshot.error}</div> : null}
 
         <div className="monitor-body">
+          {serviceNeedsAttention ? (
+            <div className="monitor-service-panel">
+              <div className="monitor-section-title">WaSSH Service</div>
+              <p className="monitor-service-note">
+                {service.message ||
+                  'Install WaSSH Service for retained, multi-resolution history that survives restarts.'}
+              </p>
+              {actionError ? <div className="plugin-monitor-error">{actionError}</div> : null}
+              {sudoAction ? (
+                <form
+                  className="monitor-service-sudo"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    void runSudoAction()
+                  }}
+                >
+                  <label>
+                    Sudo password
+                    <input
+                      autoFocus
+                      type="password"
+                      autoComplete="current-password"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                    />
+                  </label>
+                  <small>
+                    Kept in memory only for this operation. Leave blank for passwordless sudo.
+                  </small>
+                  <div className="monitor-service-actions">
+                    <PluginButton
+                      type="submit"
+                      disabled={operationRunning}
+                      variant={sudoAction === 'uninstall' ? 'danger' : 'primary'}
+                    >
+                      {operationRunning
+                        ? 'Working…'
+                        : sudoAction === 'install'
+                          ? service.state === 'outdated'
+                            ? 'Upgrade service'
+                            : 'Install service'
+                          : 'Uninstall completely'}
+                    </PluginButton>
+                    <PluginButton disabled={operationRunning} onClick={() => setSudoAction(null)}>
+                      Cancel
+                    </PluginButton>
+                  </div>
+                </form>
+              ) : (
+                <div className="monitor-service-actions">
+                  <PluginButton
+                    variant="primary"
+                    disabled={operationRunning}
+                    onClick={() => setSudoAction('install')}
+                  >
+                    {service.state === 'outdated' ? 'Upgrade service' : 'Install service'}
+                  </PluginButton>
+                  {service.version ? (
+                    <PluginButton variant="danger" onClick={() => setSudoAction('uninstall')}>
+                      Uninstall service
+                    </PluginButton>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          ) : null}
+
           {showCpuBlock ? (
             <div className="monitor-overview monitor-cpu-block">
               {showGauges ? (
@@ -1183,8 +1428,10 @@ export default function ServerMonitorView({
                 <div className="monitor-sparks monitor-panel-sparks-2">
                   <SparkCard
                     title="CPU"
-                    values={cpuHistory}
+                    points={pointsFor(SERIES_CPU)}
                     tone="cpu"
+                    fromMs={fromMs}
+                    toMs={toMs}
                     current={
                       snapshot?.cpuPercent == null
                         ? MISSING
@@ -1193,8 +1440,10 @@ export default function ServerMonitorView({
                   />
                   <SparkCard
                     title="Memory"
-                    values={memHistory}
+                    points={pointsFor(SERIES_MEM_USED)}
                     tone="mem"
+                    fromMs={fromMs}
+                    toMs={toMs}
                     current={memPct == null ? MISSING : `${Math.round(memPct)}%`}
                   />
                 </div>
@@ -1207,8 +1456,10 @@ export default function ServerMonitorView({
               ifaces={snapshot?.network ?? []}
               showGauges={showGauges}
               showSparks={showSparks}
-              rxHistory={netRxHistory}
-              txHistory={netTxHistory}
+              rxPoints={netRxPoints}
+              txPoints={netTxPoints}
+              fromMs={fromMs}
+              toMs={toMs}
             />
           ) : null}
 
@@ -1217,9 +1468,11 @@ export default function ServerMonitorView({
               snapshot={snapshot}
               showGauge={showGauges}
               showSparks={showSparks}
-              diskHistory={diskHistory}
-              readHistory={diskReadHistory}
-              writeHistory={diskWriteHistory}
+              usedPoints={pointsFor(SERIES_DISK_USED)}
+              readPoints={pointsFor(SERIES_DISK_READ)}
+              writePoints={pointsFor(SERIES_DISK_WRITE)}
+              fromMs={fromMs}
+              toMs={toMs}
             />
           ) : null}
 
