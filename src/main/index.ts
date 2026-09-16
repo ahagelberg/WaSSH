@@ -1,5 +1,5 @@
 import { app, BrowserWindow, Menu, powerMonitor, shell } from 'electron'
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import {
   DEFAULT_THEME,
@@ -9,8 +9,7 @@ import {
   TAB_CYCLE_KEY,
   TAB_CYCLE_NEXT,
   TAB_CYCLE_PREV,
-  THEME_WINDOW_BACKGROUND,
-  WAKE_RECONNECT_DELAY_MS
+  THEME_WINDOW_BACKGROUND
 } from '../shared/types'
 import { APP_ID, APP_NAME } from '../shared/version'
 import { applyChromeTheme, isSafeExternalUrl, registerIpc } from './ipc/handlers'
@@ -23,6 +22,7 @@ import {
   TabStore
 } from './store/sessionStore'
 import { attachWindowBoundsPersistence, restoreWindowBounds } from './windowBounds'
+import { sendToWindow } from './windowSend'
 import { createPluginSystem } from './plugins/createPluginSystem'
 import { PluginDataStore } from './store/pluginDataStore'
 import { checkForUpdatesManually, setupAutoUpdater } from './updater'
@@ -61,8 +61,6 @@ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
 /** Cooldown before another auto-reload after a renderer module-link error. */
 const DEV_MODULE_RELOAD_COOLDOWN_MS = 10_000
 
-let wakeReconnectTimer: ReturnType<typeof setTimeout> | null = null
-
 /** Whether the machine has suspended since startup (module-graph corruptions only follow sleep). */
 let rendererSuspended = false
 
@@ -82,18 +80,21 @@ function installProcessErrorGuards(): void {
     if (isTransientNetworkError(err)) {
       return
     }
-    console.error(err)
+    console.error('[main] uncaught exception:', err)
   })
   process.on('unhandledRejection', (reason) => {
     if (isTransientNetworkError(reason)) {
       return
     }
-    console.error(reason)
+    console.error('[main] unhandled rejection:', reason)
   })
 }
 
 /** userData dir used by pre-pinning runs (Electron dev fell back to the package name). */
 const LEGACY_USER_DATA_DIR_NAME = 'wassh'
+
+/** Marks a completed legacy copy so the migration runs at most once. */
+const LEGACY_MIGRATION_MARKER = '.legacy-data-migrated'
 
 /** Pin config to a stable per-user dir regardless of the app name Electron resolves to. */
 function pinUserDataPath(): void {
@@ -107,6 +108,10 @@ function migrateLegacyUserData(): void {
   if (legacy === target || !existsSync(legacy)) {
     return
   }
+  const marker = join(target, LEGACY_MIGRATION_MARKER)
+  if (existsSync(marker)) {
+    return
+  }
   mkdirSync(target, { recursive: true })
   for (const entry of readdirSync(legacy, { withFileTypes: true })) {
     if (!entry.isFile()) {
@@ -118,25 +123,18 @@ function migrateLegacyUserData(): void {
       copyFileSync(from, to)
     }
   }
+  writeFileSync(marker, '')
 }
 
 function attachPowerMonitor(): void {
   powerMonitor.on('suspend', () => {
     rendererSuspended = true
-    if (wakeReconnectTimer) {
-      clearTimeout(wakeReconnectTimer)
-      wakeReconnectTimer = null
-    }
     sessions?.prepareForSleep()
   })
+  // Waking is like regaining focus: attempt immediately — a failed attempt is
+  // retried by the reconnect policy instead of waiting on a fixed timer.
   powerMonitor.on('resume', () => {
-    if (wakeReconnectTimer) {
-      clearTimeout(wakeReconnectTimer)
-    }
-    wakeReconnectTimer = setTimeout(() => {
-      wakeReconnectTimer = null
-      sessions?.reconnectOnWake()
-    }, WAKE_RECONNECT_DELAY_MS)
+    sessions?.reconnectOnFocus()
   })
 }
 
@@ -171,7 +169,7 @@ function createWindow(): void {
     minHeight: DEFAULT_WINDOW_MIN_HEIGHT,
     backgroundColor: THEME_WINDOW_BACKGROUND[theme],
     show: false,
-    title: 'WaSSH',
+    title: APP_NAME,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -264,11 +262,11 @@ function createWindow(): void {
 }
 
 function openAboutDialog(): void {
-  getWindow()?.webContents.send('app:openAbout')
+  sendToRenderer('app:openAbout')
 }
 
 function sendToRenderer(channel: string): void {
-  getWindow()?.webContents.send(channel)
+  sendToWindow(getWindow, channel)
 }
 
 function installAppMenu(): void {
@@ -416,7 +414,9 @@ if (!app.requestSingleInstanceLock()) {
     const sessionStore = new SessionStore()
     const tabStore = new TabStore()
     settingsStore = new SettingsStore()
-    sessionStore.migrateReconnectModes()
+    // Persist migrated reconnect/style defaults onto hosts and tabs once.
+    sessionStore.listHosts()
+    tabStore.getTabs()
     const knownHosts = new KnownHostsStore()
     const pluginData = new PluginDataStore()
     sessions = new SessionManager(
@@ -456,8 +456,8 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.on('window-all-closed', () => {
-    pluginSystem?.dispose()
-    sessions?.disposeAll()
+    // On macOS the app (and its live sessions) survives the last window closing;
+    // everything is disposed once, in before-quit.
     if (process.platform !== 'darwin') {
       app.quit()
     }
