@@ -125,9 +125,6 @@ export abstract class ByteSession extends EventEmitter {
     if (this.disposed || this.intentionalDisconnect) {
       return
     }
-    if (!this.everConnected) {
-      return
-    }
     if (this.isTransportOpen() || this.opening) {
       return
     }

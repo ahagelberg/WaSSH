@@ -78,6 +78,13 @@ const PLUGIN_TOGGLE_COMMAND_PREFIX = 'plugin-toggle:'
 const PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX = 'plugin-global-option:'
 const PLUGIN_HOST_OPTION_COMMAND_PREFIX = 'plugin-host-option:'
 
+const CONNECTION_BANNER_STATUSES = new Set<SessionStatus>([
+  'connected',
+  'disconnected',
+  'failed',
+  'reconnecting'
+])
+
 interface PaletteCommand {
   id: string
   title: string
@@ -829,6 +836,12 @@ export default function App() {
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
   const activeStyle = activeTab ? resolveSessionStyle(activeTab.connection, styleDefaults) : null
+  const activeTabHasConnectionBanner =
+    !!activeTab?.statusMessage && CONNECTION_BANNER_STATUSES.has(activeTab.status)
+  const activeTabCanReconnect =
+    activeTab?.status === 'disconnected' ||
+    activeTab?.status === 'failed' ||
+    activeTab?.status === 'reconnecting'
 
   const registerWriter = useCallback((tabId: string, write: (data: string) => void) => {
     writers.current.set(tabId, write)
@@ -1422,10 +1435,7 @@ export default function App() {
             </div>
           ) : null}
 
-          {activeTab?.statusMessage &&
-          (activeTab.status === 'reconnecting' ||
-            activeTab.status === 'failed' ||
-            activeTab.status === 'connected') ? (
+          {activeTab && activeTabHasConnectionBanner ? (
             <div
               className={`inline-banner ${activeTab.status === 'connected' ? 'warn' : 'info'}`}
             >
@@ -1434,6 +1444,16 @@ export default function App() {
                   ? activeTab.statusMessage
                   : `${activeTab.status}: ${activeTab.statusMessage}`}
               </div>
+              {activeTabCanReconnect ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void reconnectTab(activeTab.id)
+                  }}
+                >
+                  Reconnect
+                </button>
+              ) : null}
             </div>
           ) : null}
 

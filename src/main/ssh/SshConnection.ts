@@ -230,9 +230,6 @@ export class SshConnection extends EventEmitter {
     if (this.disposed || this.intentionalDisconnect) {
       return
     }
-    if (!this.everConnected) {
-      return
-    }
     if (this.stream || this.opening) {
       return
     }
