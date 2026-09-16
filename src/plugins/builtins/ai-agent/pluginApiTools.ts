@@ -70,7 +70,6 @@ export function buildApiPermissionGroup(
   groupLabel: string,
   methods: PluginApiMethod[],
   opts: {
-    groupDefault?: boolean
     description?: string
     extraChildren?: PluginSettingsField[]
     /** Method sets collapsed into one permission field each instead of one per method. */
@@ -96,7 +95,7 @@ export function buildApiPermissionGroup(
     key: groupKey(pluginId, groupId),
     label: groupLabel,
     type: 'group',
-    default: opts.groupDefault ?? false,
+    default: false,
     description: opts.description,
     children: [...children, ...(opts.extraChildren ?? [])]
   }

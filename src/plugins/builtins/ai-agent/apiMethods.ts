@@ -728,7 +728,8 @@ export const AI_AGENT_API_METHODS = [
  *
  * Each category is a top-level group with its own enable toggle, so it can be
  * switched on or off independently; `main/plugins/builtinRegistry.ts` appends
- * each other plugin's own API group alongside them.
+ * each other plugin's own API group alongside them. Every group starts off,
+ * so a new host has no capabilities until the user enables them.
  */
 export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSettingsField[]): PluginSettingsField[] {
   return [
@@ -738,7 +739,6 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
       'Live terminal',
       AI_AGENT_TERMINAL_METHODS,
       {
-        groupDefault: false,
         description:
           'Allow the agent to read and type into your live terminal session. This shares your shell and prompt, so the agent acts as if it were you typing.'
       }
@@ -749,7 +749,6 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
       'Remote filesystem',
       AI_AGENT_REMOTE_FILESYSTEM_METHODS,
       {
-        groupDefault: true,
         description:
           'Allow the agent to inspect, search, create, and edit files on the connected remote SSH server.',
         bundles: AI_AGENT_REMOTE_FS_BUNDLES
@@ -761,7 +760,6 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
       'Local filesystem',
       AI_AGENT_LOCAL_FS_METHODS,
       {
-        groupDefault: true,
         description: 'Allow the agent to read/write files on your local computer running WaSSH.',
         bundles: AI_AGENT_LOCAL_FS_BUNDLES
       }
@@ -772,7 +770,6 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
       'Web access',
       AI_AGENT_WEB_ACCESS_ALL_METHODS,
       {
-        groupDefault: true,
         description: 'Allow the agent to fetch web pages and search the web.',
         extraChildren: webSearchExtraChildren
       }
@@ -783,7 +780,6 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
       'Knowledge base',
       AI_AGENT_KNOWLEDGE_BASE_METHODS,
       {
-        groupDefault: true,
         description:
           'Allow the agent to search the local knowledge base folder(s) configured below (app-wide and/or per-host).'
       }
