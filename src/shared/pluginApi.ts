@@ -163,11 +163,6 @@ export interface PluginViewContribution {
   title?: string
 }
 
-export interface PluginTerminalFileDropContribution {
-  /** Accessible description shown by the host while a file is dragged over the terminal. */
-  label?: string
-}
-
 export interface PluginManifest {
   id: string
   name: string
@@ -188,7 +183,6 @@ export interface PluginManifest {
     /** Per-host settings. */
     hostSettingsSchema?: PluginSettingsField[]
     views?: PluginViewContribution[]
-    terminalFileDrop?: PluginTerminalFileDropContribution
     /** Methods this plugin exposes to other plugins via `ctx.callPluginApi`. */
     api?: PluginApiContribution
   }
@@ -196,6 +190,16 @@ export interface PluginManifest {
 
 export interface PluginListItem extends PluginManifest {
   enabled: boolean
+}
+
+/** Settings-dialog section id for a plugin's app-level settings. */
+export function pluginSettingsSectionId(pluginId: string): string {
+  return `plugin-${pluginId}`
+}
+
+/** Settings-dialog section id for a plugin's per-host settings. */
+export function pluginHostSettingsSectionId(pluginId: string): string {
+  return `plugin-host-${pluginId}`
 }
 
 export interface PluginActiveStateEvent {

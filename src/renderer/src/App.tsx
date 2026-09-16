@@ -7,6 +7,8 @@ import {
   DEFAULT_TERM_COLS,
   DEFAULT_TERM_ROWS,
   DEFAULT_THEME,
+  FONT_SIZE_MAX_PX,
+  FONT_SIZE_MIN_PX,
   HostKeyPrompt,
   HostProfile,
   HostsOrganization,
@@ -16,17 +18,14 @@ import {
   TabSnapshot
 } from '@shared/types'
 import {
-  defaultPortForType,
   hostDisplayName,
   hostToConnection,
   hostProfileFromConnection,
-  protocolConfigFrom,
-  reconnectModeFrom,
+  emptyHostProfile,
+  normalizeConnectionParams,
   resolveSessionStyle,
-  screenConfigFrom,
   sessionStyleDefaultsFrom,
   sessionStyleOverridesFrom,
-  emptySessionStyleOverrides,
   sessionTitle,
   tunnelConfigFrom
 } from '@shared/connection'
@@ -49,6 +48,8 @@ import type {
 } from '../../plugins/builtins/sftp/protocol'
 import {
   mergePluginSettings,
+  pluginHostSettingsSectionId,
+  pluginSettingsSectionId,
   type PluginListItem,
   type PluginSettingsField
 } from '@shared/pluginApi'
@@ -65,7 +66,7 @@ import {
   normalizeHostsOrganization,
   UNGROUPED_SECTION_ID
 } from '@shared/hostOrganization'
-import { sessionAccentStyle, sessionTerminalStyle } from './sessionStyleCss'
+import { sessionTerminalStyle } from './sessionStyleCss'
 import PluginToolbar from './plugins/host/PluginToolbar'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
@@ -77,6 +78,9 @@ const PLUGIN_DEACTIVATE_COMMAND_PREFIX = 'plugin-deactivate:'
 const PLUGIN_TOGGLE_COMMAND_PREFIX = 'plugin-toggle:'
 const PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX = 'plugin-global-option:'
 const PLUGIN_HOST_OPTION_COMMAND_PREFIX = 'plugin-host-option:'
+
+/** Six-digit hex color accepted from command-palette args */
+const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/
 
 const CONNECTION_BANNER_STATUSES = new Set<SessionStatus>([
   'connected',
@@ -191,26 +195,7 @@ function tabsByStablePaneOrder(tabs: TabState[]): TabState[] {
 }
 
 function emptyHost(): HostProfile {
-  const proto = protocolConfigFrom(null)
-  return {
-    id: crypto.randomUUID(),
-    name: '',
-    host: '',
-    port: defaultPortForType(proto.connectionType),
-    username: '',
-    passwordVaultId: '',
-    privateKeyPath: '',
-    passphraseVaultId: '',
-    authMethod: 'none',
-    proxyHostId: '',
-    ...proto,
-    ...emptySessionStyleOverrides(),
-    ...tunnelConfigFrom(null),
-    pluginSettings: {},
-    reconnectMode: reconnectModeFrom(null),
-    ...screenConfigFrom(null),
-    tags: []
-  }
+  return emptyHostProfile(crypto.randomUUID())
 }
 
 export default function App() {
@@ -312,13 +297,8 @@ export default function App() {
     ])
     setHosts(
       list.map((h) => ({
-        ...h,
-        ...protocolConfigFrom(h),
-        ...sessionStyleOverridesFrom(h),
-        ...tunnelConfigFrom(h),
-        pluginSettings: h.pluginSettings ?? {},
-        reconnectMode: reconnectModeFrom(h),
-        ...screenConfigFrom(h)
+        ...normalizeConnectionParams(h),
+        pluginSettings: h.pluginSettings ?? {}
       }))
     )
     setHostsOrganization(normalizeHostsOrganization(org))
@@ -340,17 +320,7 @@ export default function App() {
   const persistTabs = useCallback(() => {
     const snapshot: TabSnapshot[] = tabsRef.current.map((t) => ({
       id: t.id,
-      connection: {
-        ...t.connection,
-        ...protocolConfigFrom(t.connection),
-        ...sessionStyleOverridesFrom(t.connection),
-        ...tunnelConfigFrom(t.connection),
-        ephemeralPassword: '',
-        ephemeralPassphrase: '',
-        pluginSettings: t.connection.pluginSettings ?? {},
-        reconnectMode: reconnectModeFrom(t.connection),
-        ...screenConfigFrom(t.connection)
-      },
+      connection: normalizeConnectionParams(t.connection, true),
       active: t.id === activeRef.current,
       activePluginIds: t.activePluginIds,
       pluginLayout: t.pluginLayout
@@ -447,14 +417,7 @@ export default function App() {
         ).filter((id) => available.has(id))
         return {
           id: t.id,
-          connection: {
-            ...t.connection,
-            ...protocolConfigFrom(t.connection),
-            ...sessionStyleOverridesFrom(t.connection),
-            ...tunnelConfigFrom(t.connection),
-            reconnectMode: reconnectModeFrom(t.connection),
-            ...screenConfigFrom(t.connection)
-          },
+          connection: normalizeConnectionParams(t.connection),
           status: 'connecting',
           activePluginIds,
           pluginLayout: pruneLayoutToKeep(
@@ -486,13 +449,11 @@ export default function App() {
       closedSessionsRef.current = nextClosed
     }
     void window.wassh.disconnect(id)
-    setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== id)
-      if (activeRef.current === id) {
-        setActiveTabId(next[next.length - 1]?.id ?? null)
-      }
-      return next
-    })
+    const next = list.filter((t) => t.id !== id)
+    setTabs(next)
+    if (activeRef.current === id) {
+      setActiveTabId(next[next.length - 1]?.id ?? null)
+    }
   }, [])
 
   const reopenLastClosedSession = useCallback((): void => {
@@ -682,8 +643,9 @@ export default function App() {
   ])
 
   const updateSettings = (partial: Partial<AppSettings>): void => {
-    void window.wassh.setSettings(partial).then((next) => {
-      setSettings(next)
+    // The main process broadcasts `settings:changed` with the authoritative value;
+    // refresh the plugin list here since that broadcast does not.
+    void window.wassh.setSettings(partial).then(() => {
       void refreshPlugins()
     })
   }
@@ -713,8 +675,10 @@ export default function App() {
           ...settingsRef.current.pluginSettings,
           [pluginId]: { ...current, ...appPartial }
         }
+        // Optimistic local merge; the main process broadcasts the authoritative
+        // `settings:changed` value, so no echo is applied here.
         setSettings((prev) => ({ ...prev, pluginSettings: nextSettings }))
-        void window.wassh.setSettings({ pluginSettings: nextSettings }).then(setSettings)
+        void window.wassh.setSettings({ pluginSettings: nextSettings })
       }
 
       if (Object.keys(hostPartial).length === 0) return
@@ -1130,7 +1094,7 @@ export default function App() {
       }
       if (commandId.startsWith(PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX)) {
         const target = commandPluginSetting(commandId, PLUGIN_GLOBAL_OPTION_COMMAND_PREFIX)
-        setOptionsSectionId(`plugin-${target.pluginId}`)
+        setOptionsSectionId(pluginSettingsSectionId(target.pluginId))
         setOptionsFieldKey(target.fieldKey)
         setShowOptions(true)
         setPaletteOpen(false)
@@ -1139,7 +1103,7 @@ export default function App() {
       if (commandId.startsWith(PLUGIN_HOST_OPTION_COMMAND_PREFIX)) {
         if (activeTabId) {
           const target = commandPluginSetting(commandId, PLUGIN_HOST_OPTION_COMMAND_PREFIX)
-          openSessionSettings(activeTabId, `plugin-host-${target.pluginId}`, target.fieldKey)
+          openSessionSettings(activeTabId, pluginHostSettingsSectionId(target.pluginId), target.fieldKey)
         }
         setPaletteOpen(false)
         return
@@ -1206,7 +1170,7 @@ export default function App() {
           break
         case 'set-font-size': {
           const size = Number.parseInt(args, 10)
-          if (!Number.isNaN(size) && size >= 8 && size <= 48) {
+          if (!Number.isNaN(size) && size >= FONT_SIZE_MIN_PX && size <= FONT_SIZE_MAX_PX) {
             updateSettings({
               sessionStyleDefaults: { ...settings.sessionStyleDefaults, fontSizePx: size }
             })
@@ -1221,21 +1185,21 @@ export default function App() {
           }
           break
         case 'set-term-background':
-          if (/^#[0-9A-Fa-f]{6}$/.test(args)) {
+          if (HEX_COLOR_RE.test(args)) {
             updateSettings({
               sessionStyleDefaults: { ...settings.sessionStyleDefaults, termBackground: args }
             })
           }
           break
         case 'set-term-foreground':
-          if (/^#[0-9A-Fa-f]{6}$/.test(args)) {
+          if (HEX_COLOR_RE.test(args)) {
             updateSettings({
               sessionStyleDefaults: { ...settings.sessionStyleDefaults, termForeground: args }
             })
           }
           break
         case 'set-tab-accent':
-          if (/^#[0-9A-Fa-f]{6}$/.test(args)) {
+          if (HEX_COLOR_RE.test(args)) {
             updateSettings({
               sessionStyleDefaults: { ...settings.sessionStyleDefaults, tabColor: args }
             })

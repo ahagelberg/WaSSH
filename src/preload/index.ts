@@ -15,9 +15,7 @@ import type {
 } from '../shared/types'
 import type {
   PluginActiveStateEvent,
-  PluginMessageEvent,
-  SideConnectionClosedEvent,
-  SideConnectionDataEvent
+  PluginMessageEvent
 } from '../shared/pluginApi'
 
 function on(
@@ -82,8 +80,6 @@ const api: WasshApi = {
     ipcRenderer.invoke('plugins:getData', pluginId, scopeId),
   setPluginData: (pluginId, data, scopeId) =>
     ipcRenderer.invoke('plugins:setData', pluginId, data, scopeId),
-  getCommandPaletteData: () => ipcRenderer.invoke('commandPalette:get'),
-  setCommandPaletteData: (data) => ipcRenderer.invoke('commandPalette:set', data),
   onSessionData: (cb) =>
     on('session:data', (tabId, data) => cb(tabId as string, data as string)),
   onSessionStatus: (cb) =>
@@ -106,10 +102,6 @@ const api: WasshApi = {
     on('plugin:active', (ev) => cb(ev as PluginActiveStateEvent)),
   onPluginMessage: (cb) =>
     on('plugin:message', (ev) => cb(ev as PluginMessageEvent)),
-  onSideConnectionData: (cb) =>
-    on('plugin:sideData', (ev) => cb(ev as SideConnectionDataEvent)),
-  onSideConnectionClosed: (cb) =>
-    on('plugin:sideClosed', (ev) => cb(ev as SideConnectionClosedEvent)),
   onSettingsChanged: (cb) => on('settings:changed', (settings) => cb(settings as AppSettings)),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url)
 }

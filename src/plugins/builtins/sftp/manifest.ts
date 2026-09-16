@@ -1,4 +1,4 @@
-import type { PluginManifest } from '../../../shared/pluginApi'
+import type { PluginManifest } from '@plugin-api/shared'
 import { PLUGIN_ID_SFTP, SFTP_PANEL_VIEW_ID } from './id'
 
 export const sftpManifest: PluginManifest = {
@@ -10,9 +10,6 @@ export const sftpManifest: PluginManifest = {
   source: 'builtin',
   contributes: {
     toolbar: { label: 'Files' },
-    views: [{ id: SFTP_PANEL_VIEW_ID, placement: 'split-right', title: 'Files' }],
-    terminalFileDrop: {
-      label: 'Upload dropped files over SFTP'
-    }
+    views: [{ id: SFTP_PANEL_VIEW_ID, placement: 'split-right', title: 'Files' }]
   }
 }

@@ -143,7 +143,7 @@ export function appendHostToUngrouped(
   }
 }
 
-function hostIdsForSection(org: HostsOrganization, sectionId: string): string[] {
+export function hostIdsForSection(org: HostsOrganization, sectionId: string): string[] {
   if (sectionId === UNGROUPED_SECTION_ID) {
     return org.ungroupedHostIds
   }

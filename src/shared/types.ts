@@ -2,9 +2,7 @@ import type {
   PluginActiveStateEvent,
   PluginListItem,
   PluginMessageEvent,
-  PluginViewPlacement,
-  SideConnectionClosedEvent,
-  SideConnectionDataEvent
+  PluginViewPlacement
 } from './pluginApi'
 import type { TabPluginLayout } from './pluginLayout'
 import type { HostGroup, HostsOrganization } from './hostOrganization'
@@ -680,10 +678,6 @@ export interface WasshApi {
   getPluginData: (pluginId: string, scopeId?: string) => Promise<unknown>
   /** Write plugin-owned JSON to userData/plugin-<id>.json (or plugin-<id>.<scope>.json) */
   setPluginData: (pluginId: string, data: unknown, scopeId?: string) => Promise<void>
-  /** Read command palette history from userData/command-palette.json */
-  getCommandPaletteData: () => Promise<{ recentCommandIds: string[]; lastArgByCommand: Record<string, string> }>
-  /** Write command palette history to userData/command-palette.json */
-  setCommandPaletteData: (data: { recentCommandIds: string[]; lastArgByCommand: Record<string, string> }) => Promise<{ recentCommandIds: string[]; lastArgByCommand: Record<string, string> }>
   onSessionData: (cb: (tabId: string, data: string) => void) => () => void
   onSessionStatus: (cb: (ev: SessionStatusEvent) => void) => () => void
   onCycleTab: (cb: (delta: number) => void) => () => void
@@ -700,8 +694,6 @@ export interface WasshApi {
   onSavePasswordPrompt: (cb: (prompt: SavePasswordPrompt) => void) => () => void
   onPluginActive: (cb: (ev: PluginActiveStateEvent) => void) => () => void
   onPluginMessage: (cb: (ev: PluginMessageEvent) => void) => () => void
-  onSideConnectionData: (cb: (ev: SideConnectionDataEvent) => void) => () => void
-  onSideConnectionClosed: (cb: (ev: SideConnectionClosedEvent) => void) => () => void
   /** Fired whenever app settings are persisted from any source (renderer or main-process plugin code). */
   onSettingsChanged: (cb: (settings: AppSettings) => void) => () => void
   /** Open a URL in the OS default browser */

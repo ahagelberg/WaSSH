@@ -1,5 +1,5 @@
-import type { PluginMainContext, SftpSession } from '../../../main/plugins/api'
-import { classifySftpError } from '../../../main/plugins/api'
+import type { PluginMainContext, SftpSession } from '@plugin-api/main'
+import { classifySftpError } from '@plugin-api/main'
 import type { SftpViewFilePayload } from './protocol'
 
 const SFTP_VIEW_MAX_BYTES = 1024 * 1024

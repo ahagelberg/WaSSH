@@ -10,6 +10,9 @@ import type { SessionStatus } from '../../shared/types'
 export type { SessionStatus } from '../../shared/types'
 import type { SftpSession } from './SftpSession'
 import type { StreamTransform } from './types'
+// Re-exported deliberately: plugins get the SFTP session type and the two
+// shared error/path helpers through the API entry (`@plugin-api/main`) instead
+// of importing `./SftpSession` internals directly.
 export { classifySftpError, joinRemotePath } from './SftpSession'
 export type { SftpError, SftpSession } from './SftpSession'
 
@@ -19,6 +22,42 @@ export interface PluginSessionStatusEvent {
   message?: string
   timestamp: number
   previousDurationMs?: number
+}
+
+/** File-type filter for native open/save dialogs. */
+export interface PluginFileDialogFilter {
+  name: string
+  extensions: string[]
+}
+
+/** Options for `ctx.showOpenDialog` (narrow subset of the Electron dialog options). */
+export interface PluginOpenDialogOptions {
+  title?: string
+  buttonLabel?: string
+  defaultPath?: string
+  /** `openFile`/`openDirectory` select one; add `multiSelections` for many. */
+  properties?: Array<'openFile' | 'openDirectory' | 'multiSelections'>
+  filters?: PluginFileDialogFilter[]
+}
+
+/** Result of `ctx.showOpenDialog`; `filePaths` is empty when cancelled. */
+export interface PluginOpenDialogResult {
+  canceled: boolean
+  filePaths: string[]
+}
+
+/** Options for `ctx.showSaveDialog` (narrow subset of the Electron dialog options). */
+export interface PluginSaveDialogOptions {
+  title?: string
+  buttonLabel?: string
+  defaultPath?: string
+  filters?: PluginFileDialogFilter[]
+}
+
+/** Result of `ctx.showSaveDialog`; `filePath` is undefined when cancelled. */
+export interface PluginSaveDialogResult {
+  canceled: boolean
+  filePath?: string
 }
 
 export interface PluginMainContext {
@@ -61,6 +100,10 @@ export interface PluginMainContext {
   callPluginApi: (pluginId: string, method: string, params: unknown) => Promise<unknown>
   /** Persist one key of this plugin's own app-wide stored settings. */
   setSettingValue: (key: string, value: unknown) => void
+  /** Native open-file/directory dialog; returns the picked paths (empty when cancelled). */
+  showOpenDialog: (options: PluginOpenDialogOptions) => Promise<PluginOpenDialogResult>
+  /** Native save-file dialog; returns the picked path (`undefined` when cancelled). */
+  showSaveDialog: (options: PluginSaveDialogOptions) => Promise<PluginSaveDialogResult>
 }
 
 export interface PluginMainModule {

@@ -94,14 +94,21 @@ interface PluginManifest {
 |---|---|
 | `key` | Unique within its schema; stored object key |
 | `label`, `description?` | UI text |
-| `type` | `boolean` \| `number` \| `string` \| `select` \| `stringList` \| `commandList` \| `group` \| `permission` |
+| `type` | `boolean` \| `number` \| `string` \| `textArea` \| `directory` \| `select` \| `stringList` \| `commandList` \| `itemList` \| `group` \| `action` \| `permission` |
 | `default` | Used when no stored value exists |
 | `secret?` | `string` fields render as a password input (value is **not** vault-encrypted; only input masking) |
+| `options?` | Only for `type: 'select'` - the dropdown options (`{ value, label }`) |
 | `children?` | Only for `type: 'group'` - nested fields shown under the master boolean toggle |
+| `itemSchema?` | Only for `type: 'itemList'` - the fields shown for each list item |
+| `itemLabel?` | Only for `type: 'itemList'` - label used for each item |
+| `action?` | Only for `type: 'action'` - host-defined action identifier for button fields |
 
 `commandList` values are `PluginCommand[]` = `{ id, label, text, hotkey }`
 (hotkey e.g. `"Ctrl+Shift+1"`, empty = none). `stringList` UI is one-per-line
-text; stored as `string[]`.
+text; stored as `string[]`. `itemList` is a repeatable list of records edited
+from `itemSchema`, each shown as an expandable row labelled by `itemLabel`.
+`action` renders a button that invokes the host-defined `action` identifier.
+`textArea` is a multi-line string; `directory` is a string path with a picker.
 
 `group` is a boolean master toggle (its own `default` is `boolean`) whose
 `children` are rendered indented underneath, visible but disabled while the
@@ -109,7 +116,7 @@ master is off. `permission` is a trinary control with a fixed value space
 `PluginPermissionDecision = 'allow' | 'deny' | 'ask'` (its `default` is one of
 those three strings) - used for AI Agent's own and other plugins' API-method
 permissions (§7). Both are generic, reusable field types, not private to any
-one plugin. `renderer/src/plugins/PluginSettingsFieldList.tsx` (exported as
+one plugin. `renderer/src/plugins/api/PluginSettingsFieldList.tsx` (exported as
 `PluginSettingsFieldList` from `@plugin-api/renderer`) renders a whole schema
 recursively, including `group` nesting; `PluginFieldEditor` renders one field's
 control (used internally by `PluginSettingsFieldList`, and directly by plugins
@@ -210,6 +217,8 @@ interface PluginMainModule {
 | `listPluginApis(): PluginApiListing[]` | Declared API methods of every *other* plugin currently active on this tab (§7) |
 | `callPluginApi(pluginId, method, params): Promise<unknown>` | Call another plugin's (or, for uniformity, this plugin's own) declared API method on this tab (§7) |
 | `setSettingValue(key, value)` | Persist one key of this plugin's own app-wide stored settings (§4) |
+| `showOpenDialog(options): Promise<{canceled, filePaths}>` | Native open-file/directory dialog. `options`: `{title?, buttonLabel?, defaultPath?, properties?('openFile'\|'openDirectory'\|'multiSelections'), filters?({name, extensions[]})}`. No Electron types are exposed |
+| `showSaveDialog(options): Promise<{canceled, filePath?}>` | Native save-file dialog. `options`: `{title?, buttonLabel?, defaultPath?, filters?}`. `filePath` is `undefined` when cancelled |
 
 ## 6. Side connections, streams, transforms
 
@@ -271,8 +280,10 @@ contributes: {
     methods: [
       {
         name: 'get_snapshot',
+        label: 'Get snapshot',                            // optional UI label
         description: 'Return the latest sampled stats snapshot.',
-        parameters: { type: 'object', properties: {} }   // optional, JSON-schema-ish
+        parameters: { type: 'object', properties: {} },   // optional, JSON-schema-ish
+        defaultPermission: 'allow'                        // optional; 'allow' | 'ask' | 'deny'
       }
     ]
   }
@@ -285,6 +296,8 @@ onApiCall(ctx, method, params) {
 }
 ```
 
+- `label` is an optional display name; `defaultPermission` is the permission
+  applied once the method's group is enabled and defaults to `'allow'`.
 - `ctx.listPluginApis()` returns the declared methods of every *other* plugin
   **currently active on the same tab** (the caller's own plugin id is
   excluded, and inactive plugins are not listed - the list changes live as
@@ -391,8 +404,11 @@ modeSymbolic, mtime (epoch ms), uid?, gid? }`. Helper:
 | `getActivePlugins(tabId)` | `plugins:getActive` | `string[]` (instantiated ids, incl. headless SFTP) |
 | `sendPluginMessage(tabId, pluginId, payload)` | `plugins:message` | resolves to the main module's `onMessage` return |
 | `queuePluginRestore(tabId, ids)` | `plugins:queueRestore` | applied on next `connected` status |
-| `getPluginData(pluginId)` | `plugins:getData` | stored JSON value |
-| `setPluginData(pluginId, data)` | `plugins:setData` | — |
+| `getPluginData(pluginId, scopeId?)` | `plugins:getData` | stored JSON value |
+| `setPluginData(pluginId, data, scopeId?)` | `plugins:setData` | — |
+
+`scopeId` (optional) selects a scoped store (`plugin-<id>.<scope>.json`); omit
+it for the plugin's app-wide data. It mirrors `ctx.getData`/`ctx.setData` (§5).
 
 ### Events (main→renderer)
 
@@ -449,6 +465,7 @@ stable, neutral styling contract below.
 | `PluginField` | Label, control, and optional hint layout |
 | `PluginColorInput` | Validated six-digit hex color input |
 | `PluginSettingsFieldList` | Recursively renders a `PluginSettingsField[]` schema (including `group`/`permission` nesting, §3); used by the Options and Host dialogs, and available to a plugin's own custom settings view |
+| `isFileDrag(e)`, `collectDroppedFiles(dt)` | Shared OS file-drag detection and dropped-file collection (skips directories); `FileDragEventLike` types the minimal event shape |
 | `.plugin-ui-panel` | Full-height plugin view root |
 | `.plugin-ui-toolbar`, `.plugin-ui-actions`, `.plugin-ui-spacer` | Flexible action rows |
 | `.plugin-ui-button` with `--primary`, `--danger`, `--compact` | Button classes for non-component use |

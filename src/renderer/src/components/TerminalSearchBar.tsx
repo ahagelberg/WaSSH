@@ -3,11 +3,11 @@ import { useEffect, useRef } from 'react'
 /** Keyboard key that dismisses the find bar */
 const DISMISS_KEY = 'Escape'
 
-/** Find previous (backwards) */
-const FIND_PREV_KEY = 'Enter'
+/** Find submit key; Shift inverts direction */
+const FIND_SUBMIT_KEY = 'Enter'
 
-/** Find previous accelerator key (also F3) */
-const FIND_PREV_FKEY = 'F3'
+/** Find submit accelerator key (also F3); Shift inverts direction */
+const FIND_SUBMIT_FKEY = 'F3'
 
 interface Props {
   query: string
@@ -59,7 +59,7 @@ export default function TerminalSearchBar({
           onClose()
           return
         }
-        if (e.key === FIND_PREV_FKEY) {
+        if (e.key === FIND_SUBMIT_FKEY) {
           e.preventDefault()
           e.stopPropagation()
           if (e.shiftKey) {
@@ -69,7 +69,7 @@ export default function TerminalSearchBar({
           }
           return
         }
-        if (e.key === FIND_PREV_KEY) {
+        if (e.key === FIND_SUBMIT_KEY) {
           e.preventDefault()
           e.stopPropagation()
           if (e.shiftKey) {

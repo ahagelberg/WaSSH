@@ -6,6 +6,7 @@ import {
   useState,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
+  type ReactElement,
   type ReactNode
 } from 'react'
 import type { AppSettings } from '@shared/types'
@@ -53,6 +54,26 @@ interface Props {
 type DropTarget =
   | { kind: 'edge'; edge: DockEdge; insert: 'inner' | 'outer' }
   | { kind: 'leaf'; pluginId: string; zone: LeafSplitZone }
+
+/** True when `target` selects the given edge + insert side. */
+function isDropZone(
+  target: DropTarget | null,
+  edge: DockEdge,
+  insert: 'inner' | 'outer'
+): boolean {
+  return target?.kind === 'edge' && target.edge === edge && target.insert === insert
+}
+
+/** Drop-zone overlay div; `active` when the current drop target matches. */
+function DropZone({
+  className,
+  active
+}: {
+  className: string
+  active: boolean
+}): ReactElement {
+  return <div className={`${className}${active ? ' active' : ''}`} />
+}
 
 /** Splitter bar thickness between panes (must match --plugin-splitter-size). */
 const PLUGIN_SPLITTER_SIZE_PX = 4
@@ -561,18 +582,8 @@ export default function PluginSessionFrame({
     return (
       <div
         className={`plugin-dock plugin-dock-${edge}${
-          dropTarget?.kind === 'edge' &&
-          dropTarget.edge === edge &&
-          dropTarget.insert === 'outer'
-            ? ' drop-active'
-            : ''
-        }${
-          dropTarget?.kind === 'edge' &&
-          dropTarget.edge === edge &&
-          dropTarget.insert === 'inner'
-            ? ' drop-insert-inner'
-            : ''
-        }`}
+          isDropZone(dropTarget, edge, 'outer') ? ' drop-active' : ''
+        }${isDropZone(dropTarget, edge, 'inner') ? ' drop-insert-inner' : ''}`}
         style={sizeStyle}
       >
         <LayoutTreeView
@@ -603,51 +614,26 @@ export default function PluginSessionFrame({
     >
       {draggingId ? (
         <>
-          <div
-            className={`plugin-outer-drop plugin-outer-drop-left${
-              dropTarget?.kind === 'edge' &&
-              dropTarget.edge === 'left' &&
-              dropTarget.insert === 'outer'
-                ? ' active'
-                : ''
-            }`}
+          <DropZone
+            className="plugin-outer-drop plugin-outer-drop-left"
+            active={isDropZone(dropTarget, 'left', 'outer')}
           />
-          <div
-            className={`plugin-outer-drop plugin-outer-drop-right${
-              dropTarget?.kind === 'edge' &&
-              dropTarget.edge === 'right' &&
-              dropTarget.insert === 'outer'
-                ? ' active'
-                : ''
-            }`}
+          <DropZone
+            className="plugin-outer-drop plugin-outer-drop-right"
+            active={isDropZone(dropTarget, 'right', 'outer')}
           />
-          <div
-            className={`plugin-outer-drop plugin-outer-drop-top${
-              dropTarget?.kind === 'edge' &&
-              dropTarget.edge === 'top' &&
-              dropTarget.insert === 'outer'
-                ? ' active'
-                : ''
-            }`}
+          <DropZone
+            className="plugin-outer-drop plugin-outer-drop-top"
+            active={isDropZone(dropTarget, 'top', 'outer')}
           />
-          <div
-            className={`plugin-outer-drop plugin-outer-drop-bottom${
-              dropTarget?.kind === 'edge' &&
-              dropTarget.edge === 'bottom' &&
-              dropTarget.insert === 'outer'
-                ? ' active'
-                : ''
-            }`}
+          <DropZone
+            className="plugin-outer-drop plugin-outer-drop-bottom"
+            active={isDropZone(dropTarget, 'bottom', 'outer')}
           />
           {displayLayout.bottom ? (
-            <div
-              className={`plugin-inner-drop plugin-inner-drop-bottom${
-                dropTarget?.kind === 'edge' &&
-                dropTarget.edge === 'bottom' &&
-                dropTarget.insert === 'inner'
-                  ? ' active'
-                  : ''
-              }`}
+            <DropZone
+              className="plugin-inner-drop plugin-inner-drop-bottom"
+              active={isDropZone(dropTarget, 'bottom', 'inner')}
             />
           ) : null}
         </>
@@ -670,47 +656,27 @@ export default function PluginSessionFrame({
 
         <div ref={terminalRef} className="plugin-session-terminal">
           {draggingId && displayLayout.left ? (
-            <div
-              className={`plugin-inner-drop plugin-inner-drop-left${
-                dropTarget?.kind === 'edge' &&
-                dropTarget.edge === 'left' &&
-                dropTarget.insert === 'inner'
-                  ? ' active'
-                  : ''
-              }`}
+            <DropZone
+              className="plugin-inner-drop plugin-inner-drop-left"
+              active={isDropZone(dropTarget, 'left', 'inner')}
             />
           ) : null}
           {draggingId && displayLayout.right ? (
-            <div
-              className={`plugin-inner-drop plugin-inner-drop-right${
-                dropTarget?.kind === 'edge' &&
-                dropTarget.edge === 'right' &&
-                dropTarget.insert === 'inner'
-                  ? ' active'
-                  : ''
-              }`}
+            <DropZone
+              className="plugin-inner-drop plugin-inner-drop-right"
+              active={isDropZone(dropTarget, 'right', 'inner')}
             />
           ) : null}
           {draggingId && displayLayout.top ? (
-            <div
-              className={`plugin-inner-drop plugin-inner-drop-top${
-                dropTarget?.kind === 'edge' &&
-                dropTarget.edge === 'top' &&
-                dropTarget.insert === 'inner'
-                  ? ' active'
-                  : ''
-              }`}
+            <DropZone
+              className="plugin-inner-drop plugin-inner-drop-top"
+              active={isDropZone(dropTarget, 'top', 'inner')}
             />
           ) : null}
           {draggingId && displayLayout.bottom ? (
-            <div
-              className={`plugin-inner-drop plugin-inner-drop-bottom${
-                dropTarget?.kind === 'edge' &&
-                dropTarget.edge === 'bottom' &&
-                dropTarget.insert === 'inner'
-                  ? ' active'
-                  : ''
-              }`}
+            <DropZone
+              className="plugin-inner-drop plugin-inner-drop-bottom"
+              active={isDropZone(dropTarget, 'bottom', 'inner')}
             />
           ) : null}
           {children}

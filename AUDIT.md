@@ -64,53 +64,54 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 - [x] Inline `import()` types removed (`handlers.ts` → `ConnectionParams` import, `SshConnection.ts` → `ClientChannel`); TunnelManager handler casts removed (typed fields); `listSerialPorts` widening named + documented (`WindowsPortInfo`). `sessionStore.ts:333-336` raw-JSON cast — defer: typing untrusted file reads is a §6-level refactor.
 
 ## 2. Shared & preload
-- [ ] `connection.ts:328-333` — deprecated `sessionStyleFrom` still called: `connection.ts:720,746`, `sessionStore.ts:134,341`, `QuickConnect.tsx:110`. Migrate callers or drop the deprecation.
-- [ ] `env.d.ts:11-14` — duplicate `Window.wassh` declaration (also in `types.ts` ~712).
-- [ ] `preload/index.ts:84-85` + `types.ts:696-698` — `getCommandPaletteData`/`setCommandPaletteData`: no main handler, no callers; `preload/index.ts:108-111` + `types.ts:699-700` — `onSideConnectionData`/`onSideConnectionClosed`: no subscribers. Delete.
-- [ ] `pluginLayout.ts:382-409` — `edgeToPlacement`/`findPluginEdge` dead; `:181-220` `splitLeafNode` ≡ `:222-257` `wrapSplit` (identical 4-branch builders) — merge.
-- [ ] `hostOrganization.ts:158-164` — private helper duplicated in `SessionsSidebar.tsx:125-130`; export/reuse one.
-- [ ] `pluginLayout.ts:127` — `MIN_DOCK_SIZE_PX * 2` used in ratio math; confirm semantics/naming.
+- [x] `connection.ts:328-333` — deprecated `sessionStyleFrom` still called. Fixed: all 5 call sites migrated to `sessionStyleOverridesFrom`; the deprecated wrapper is deleted.
+- [x] `env.d.ts:11-14` — duplicate `Window.wassh` declaration. Fixed: `env.d.ts` keeps only `queryLocalFonts`; `Window.wassh` is declared once in `types.ts`.
+- [x] `preload/index.ts:84-85` + `types.ts:696-698` — `getCommandPaletteData`/`setCommandPaletteData` (no handler, no callers) and `onSideConnectionData`/`onSideConnectionClosed` (no subscribers) deleted from preload, `WasshApi`, and the `pluginApi` import list. (verified)
+- [x] `pluginLayout.ts:382-409` — `edgeToPlacement`/`findPluginEdge` dead (deleted); `splitLeafNode` ≡ `wrapSplit` — merged into `wrapSplit`.
+- [x] `hostOrganization.ts:158-164` — private helper duplicated in `SessionsSidebar.tsx`. Fixed: `hostIdsForSection` exported from `hostOrganization.ts`; the sidebar copy is deleted.
+- [x] `pluginLayout.ts:127` — `MIN_DOCK_SIZE_PX * 2` named `MIN_SPLIT_CONTAINER_PX` (smallest container fitting two panes at minimum).
 
 ## 3. Renderer core
 
 ### 3.1 Bugs
-- [ ] `App.tsx:477-497` — `setActiveTabId` called inside the `setTabs` updater (impure updater; StrictMode double-invoke hazard).
+- [x] `App.tsx:477-497` — `setActiveTabId` called inside the `setTabs` updater. Fixed: `closeTab` computes the next list from `tabsRef.current`, then calls `setTabs` and `setActiveTabId` separately (pure updater).
+- [x] `App.tsx:691-774` — `onPluginSettingsPatch` clobbered by the `settings:changed` broadcast. Fixed: the `.then(setSettings)` echo is dropped in `updateSettings` and `onPluginSettingsPatch`; the main process broadcast is the single authoritative source (`updateSettings` still refreshes plugins).
 - [ ] `App.tsx:805-830` — `uploadDroppedFiles` wraps the chunk loop in one `try/catch`; failure invisible (progress banner just vanishes). Resolved by §5 sftp decoupling.
-- [ ] `App.tsx:691-774` — `onPluginSettingsPatch` merges from `settingsRef` then `setSettings`; races the `settings:changed` broadcast (`:636-638`) → clobbering.
 - [ ] `App.tsx:263,639-650` vs `sftp/fileDrop.ts:29,43-58` — two independent SFTP readiness sources parsing the same status; `dropEnabled` read from ref during render, kept live by a tick counter (`:1799`). Resolved by §5.
-- [ ] `TabBar.tsx:283-321` — `.tab-close` is `span role="button"` nested inside the tab `<button>`; its `onKeyDown` is unreachable.
-- [ ] `PluginPanelShell.tsx:20-32` — grip `role="button" tabIndex={0}` with no keyboard activation.
-- [ ] `AiAgentProviderDialog.tsx:225-231` — `removeProvider` picks next selection from stale `drafts`; `:232-250` `save` is `try/finally` without `catch` → unhandled rejection, dialog silently stays open. Also §5 (moves into plugin).
-- [ ] `SerialPortField.tsx:37-40` — `typeof list !== 'function'` guards a bridge method that always exists (dead branch).
-- [ ] `TerminalView.tsx:102-118` — reads xterm private internals (`_charSizeService`, `_renderService.dimensions.css.canvas`); version-fragile, needs feature detection/fallback. (decision)
-- [ ] `App.tsx:1204-1240` — three identical `^#[0-9A-Fa-f]{6}$` literals + three near-identical `sessionStyleDefaults` updates.
-- [ ] `SessionsSidebar.tsx:111-123` — menu flip uses hard-coded 160 px height estimate; only X clamped (tall menus overflow).
+- [x] `TabBar.tsx:283-321` — `.tab-close` was `span role="button"` nested inside the tab `<button>` (invalid HTML; `onKeyDown` unreachable). Fixed: now a presentational span (`aria-hidden`); keyboard close stays via the tab context menu / `close-active` command.
+- [x] `PluginPanelShell.tsx:20-32` — grip `role="button" tabIndex={0}` with no keyboard activation. Fixed: pointer-only drag handle (role/tabIndex/aria-label removed).
+- [x] `SerialPortField.tsx:37-40` — `typeof list !== 'function'` guarded a bridge method that always exists. Fixed: dead branch removed.
+- [x] `AiAgentProviderDialog.tsx:225-231` — `removeProvider` picked the next selection from stale `drafts`. Fixed: selects from the filtered list. `:232-250` `save` `try/finally` without `catch` → unhandled rejection. Fixed: `saveError` state surfaced in the footer. (UI still moves into the plugin per §5.)
+- [x] `TerminalView.tsx:102-118` — reads xterm private internals (`_charSizeService`, `_renderService.dimensions.css.canvas`). Reviewed: already feature-detected via optional chaining + `?? 0` fallback, typed by the documented `XtermCoreInternals` interface; a renamed internal degrades (no height pin) rather than crashing. No change needed.
+- [x] `App.tsx:1204-1240` — three identical `^#[0-9A-Fa-f]{6}$` literals + three near-identical `sessionStyleDefaults` updates. Fixed: `HEX_COLOR_RE` at file top (the three updates remain distinct by key).
+- [ ] `SessionsSidebar.tsx:111-123` — menu flip uses hard-coded 160 px height estimate; only X clamped (tall menus overflow). → §6 (needs menu measurement).
 
 ### 3.2 Dead
-- [ ] `App.tsx:68` — `sessionAccentStyle` imported, never used.
-- [ ] `registry.ts:12-15` `viewPlacementFor`; `builtinRegistry.tsx:32` `getPluginRenderer` — no callers.
-- [ ] `builtinRegistry.tsx:13` `BUILTIN_RENDERER_PLUGINS` — exported, only file-internal.
+- [x] `App.tsx:68` — `sessionAccentStyle` imported, never used. Fixed: import removed.
+- [x] `registry.ts:12-15` `viewPlacementFor`; `builtinRegistry.tsx:32` `getPluginRenderer` — deleted (no callers); unused `PluginViewPlacement` import removed.
+- [x] `builtinRegistry.tsx:13` `BUILTIN_RENDERER_PLUGINS` — de-exported (file-internal).
 
 ### 3.3 DRY
-- [ ] `HostSessionSettingsDialog.tsx:131-154` ≡ `OptionsDialog.tsx:57-81` — `themeVarHex`, `HEX_COLOR_RE`, theme-var constants byte-identical.
-- [ ] `HostSessionSettingsDialog.tsx:156-224` `ColorRow` ≈ `OptionsDialog.tsx:126-178` `DefaultsColorRow`.
-- [ ] `App.tsx:141-149` `formatBytes` vs `sftp/viewUtils.ts` (plugin copy — dedupe via §5 decision).
+- [x] `HostSessionSettingsDialog.tsx:131-154` ≡ `OptionsDialog.tsx:57-81` — `themeVarHex`, `HEX_COLOR_RE`, theme-var constants byte-identical. Fixed: extracted to `components/settingsColor.ts`.
+- [x] `HostSessionSettingsDialog.tsx:156-224` `ColorRow` ≈ `OptionsDialog.tsx:126-178` `DefaultsColorRow`. Fixed: unified into `components/SettingsColorRow.tsx` (`defaultLabel` + optional `resolvedFallback` cover both).
+- [ ] `App.tsx:141-149` `formatBytes` vs `sftp/viewUtils.ts` (plugin copy). — defer: the four copies (also server-monitor, daemon-monitor) differ in zero-case output (`'—'` vs `'0 B'`) and decimal digits, so unifying changes displayed values; needs a deliberate shared contract with a `zeroLabel`/precision parameter — §6-scale, not a local dedupe.
 - [ ] Provider loading `OptionsDialog.tsx:196-203` vs `AiAgentProviderDialog.tsx:80-107`; `checkSelected` ≈ `refreshSelected` (`AiAgentProviderDialog.tsx:110-209`). Also §5.
-- [ ] Gap-index helpers `TabBar.tsx:54-97` ≈ `SessionsSidebar.tsx:181-199`.
-- [ ] Serial format selects `QuickConnect.tsx:165-230` vs `HostSessionSettingsDialog.tsx:~480-575` (five selects each).
-- [ ] Connection normalization pipeline repeated ×6: `App.tsx:309-323,341-360,449-465,1466-1478` + `connection.ts:714-731,736-756`.
-- [ ] Empty-host construction ×3: `App.tsx:193-213`, `connection.ts:736-756`, `QuickConnect.tsx:88-118` (`emptyHost()` too: pure-looking factory generating a UUID).
-- [ ] Dialog shell markup ×3: `AboutDialog.tsx:31-70`, `AiAgentProviderDialog.tsx:253-330`, `SettingsDialog.tsx:180-225`.
-- [ ] `PluginSessionFrame.tsx:600-760` — 9 copies of the conditional drop-overlay markup → data-driven. Also §6.5.
+- [x] Gap-index helpers `TabBar.tsx:54-97` ≈ `SessionsSidebar.tsx:181-199`. Fixed: `insertIndexFromGap` extracted to `renderer/src/dragReorder.ts`; the sidebar wrapper is gone.
+- [x] Serial format selects `QuickConnect.tsx:165-230` vs `HostSessionSettingsDialog.tsx:~480-575`. Fixed: option lists extracted to `components/serialOptions.tsx` (`SERIAL_DATA_BITS_OPTIONS`, `SERIAL_PARITY_OPTIONS`, `SERIAL_STOP_BITS_OPTIONS`, `serialFlowOptions(verbose)`).
+- [x] Connection normalization pipeline repeated ×6: `App.tsx:309-323,341-360,449-465,1466-1478` + `connection.ts:714-731,736-756`. Fixed: `normalizeConnectionParams()` added to `connection.ts` (generic over `ConnectionParams`/`HostProfile`, `clearEphemeral` flag); the three App.tsx `ConnectionParams` sites and `refreshHosts` now call it.
+- [x] Empty-host construction ×3: `App.tsx:193-213`, `connection.ts:736-756`, `QuickConnect.tsx:88-118`. Fixed: `emptyConnectionParams(type)` + `emptyHostProfile(id)` added to `connection.ts`; QuickConnect spreads the former, App.tsx `emptyHost()` wraps the latter (UUID stays at the call site).
+- [x] Dialog shell markup ×3: `AboutDialog.tsx:31-70`, `AiAgentProviderDialog.tsx:253-330`, `SettingsDialog.tsx:180-225`. Fixed: `components/DialogShell.tsx` (overlay + header + optional footer; `baseClass`, `focusable`, `closeOnBackdrop`, `closeOnEscape` props). All three dialogs use it; `SettingsDialog` keeps its capture-phase Escape + focus effect via `closeOnEscape={false}`.
+- [x] `PluginSessionFrame.tsx:600-760` — 9 copies of the conditional drop-overlay markup. Fixed: `DropZone` component + `isDropZone()` helper; the outer/inner overlays and `renderDock` class logic use them.
 
 ### 3.4 Literals
-- [ ] `App.tsx:809` `256 * 1024` duplicates `SFTP_UPLOAD_CHUNK_SIZE` (`sftp/fileDrop.ts:27`); `App.tsx:1196` `8`/`48` vs font-size constants.
-- [ ] Plugin-id literals → use each plugin's `id.ts`: `OptionsDialog.tsx:196,284`, `AiAgentProviderDialog.tsx:18`, `renderer/src/plugins/builtinRegistry.tsx:14-21`.
-- [ ] Section-id conventions coupled by convention: `plugin-${id}` (OptionsDialog) vs `plugin-host-${id}` (`App.tsx:1104`).
-- [ ] `SshKeySettingsGroup.tsx:243,254,300,330` inline style gaps; `AiAgentProviderDialog.tsx:322` hard-coded ollama URL `'http://127.0.0.1:11434/v1'`; `TerminalSearchBar.tsx:8-11` `FIND_PREV_KEY = 'Enter'` misnamed (used both directions); `SessionsSidebar.tsx:~870` bare `8`.
+- [x] `App.tsx:1196` `8`/`48` → `FONT_SIZE_MIN_PX`/`FONT_SIZE_MAX_PX`; `App.tsx:1204` three `^#[0-9A-Fa-f]{6}$` literals → file-top `HEX_COLOR_RE`.
+- [x] Plugin-id literals → `builtinRegistry.tsx` now uses each plugin's `id.ts`. (`OptionsDialog.tsx`/`AiAgentProviderDialog.tsx` handled with §5.)
+- [ ] `App.tsx:809` `256 * 1024` duplicates `SFTP_UPLOAD_CHUNK_SIZE` (`sftp/fileDrop.ts:27`) — resolved by §5 sftp decoupling.
+- [x] Section-id conventions coupled by convention: `plugin-${id}` (OptionsDialog) vs `plugin-host-${id}` (`App.tsx:1104`). Fixed: `pluginSettingsSectionId()`/`pluginHostSettingsSectionId()` added to `shared/pluginApi.ts`; all four set/read sites use them.
+- [x] `SshKeySettingsGroup.tsx:243,254,300,330` inline style gaps → `.ssh-key-row` CSS class (inline styles removed); `AiAgentProviderDialog.tsx:322` ollama URL → `AI_AGENT_OLLAMA_BASE_URL`; `TerminalSearchBar.tsx:8-11` `FIND_PREV_KEY` → `FIND_SUBMIT_KEY`/`FIND_SUBMIT_FKEY` (Shift inverts); `SessionsSidebar.tsx:~870` bare `8` → `GROUP_COLOR_POP_VIEWPORT_MARGIN_PX`.
 
 ### 3.5 Broad try/catch
-- [ ] `App.tsx:805-824` catch-all no logging; `SshKeySettingsGroup.tsx:132-150,172-186,208-222` whole handlers in try, all causes collapse to a status string; `AiAgentProviderDialog.tsx:143-165,190-209` one try spans getActivePlugins+activate+send+validate; `SerialPortField.tsx:52-56` and `SshKeySettingsGroup.tsx:91-96,105-112` `.catch(() => fallback)` without empty-vs-failed distinction.
+- [ ] `App.tsx:805-824` catch-all no logging; `SshKeySettingsGroup.tsx:132-150,172-186,208-222` whole handlers in try; `AiAgentProviderDialog.tsx:143-165,190-209` one try spans getActivePlugins+activate+send+validate; `SerialPortField.tsx:52-56` and `SshKeySettingsGroup.tsx:91-96,105-112` `.catch(() => fallback)`. — reviewed: the `SshKeySettingsGroup` handlers wrap only the `await` and map failures to a status line (intended UX); the `.catch(() => fallback)` sites have intentional empty fallbacks. No renderer logging/toast convention exists, so adding one here would be a new pattern — defer to §6 (error-surface design). `AiAgentProviderDialog` `save` now has a `catch` (see §3.1).
 
 ### 3.6 Convoluted (large ones → §6.3)
 - [ ] `App.tsx:1261-1899` single return ~640 lines; `:1087-1243` `executeCommand`; `:558-690` 18-listener effect; `:691-774` `onPluginSettingsPatch`; `HostSessionSettingsDialog.tsx:348-~1090` `sections` useMemo ~740 lines; `OptionsDialog.tsx:276-~530`; `TerminalView.tsx:168-397`; `SessionsSidebar.tsx:300-510`; `PluginFieldEditor.tsx:107-190` `ItemListEditor`; `TunnelBuilder.tsx:220-401`; `SshKeySettingsGroup.tsx:61-220`.
@@ -119,31 +120,32 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 
 Per-plugin rubric (§14 compliance also at §5): standard quality findings; allowed imports only; `window.wassh` use is allowed for views; manifest/defaults/schema consistency; dead `protocol.ts` guards; `plugin-ui-*` CSS only; no cross-plugin imports.
 
-### 4.1 scratchpad — audit pending (id, main, manifest, protocol, View, styles)
-### 4.2 macro-pad — audit pending (defaults, id, main, manifest, protocol, View, styles)
-### 4.3 connection-logger — audit pending (defaults, id, main, manifest, protocol, View, styles)
-### 4.4 daemon-monitor — audit pending (defaults, id, main, manifest, protocol, remoteService, View, styles)
-### 4.5 mqtt-analyser — audit pending (defaults, id, main, manifest, protocol, View, styles)
-### 4.6 server-monitor — audit pending (defaults, id, main, manifest, protocol, View, styles)
+### 4.1 scratchpad — audited: clean. Manifest matches `id.ts`; `protocol.ts` guard (`contentFromData`) used; main module is a thin `onApiCall` router; View scope/legacy-adoption logic correct; `plugin-scratchpad-input` is a plugin-unique selector in its own `styles.css` (allowed). No findings.
+### 4.2 macro-pad — audited: clean. Manifest matches `id.ts`; `isMacroPadRendererMessage` guard used in `main.ts`; no dead code or literals. No findings.
+### 4.3 connection-logger — audited: clean. Manifest matches `id.ts`; `isConnectionLoggerData` used in both `main.ts` and `View.tsx`; `connectionLoggerScopeId` shared; `CONNECTION_LOGGER_DATA_VERSION` named. No findings.
+### 4.4 daemon-monitor — audited: clean. Manifest matches `id.ts`; `isDaemonMonitorRendererMessage` (main) and `isDaemonMonitorMainMessage` (View) both used; protocol types documented. No findings.
+### 4.5 mqtt-analyser — audited: clean. Manifest matches `id.ts`; `isMqttAnalyserMainMessage` used in `View.tsx`; protocol payloads documented. No findings.
+### 4.6 server-monitor — audited: clean. Manifest matches `id.ts`; `isServerMonitorProcessSort`/`isServerMonitorProcessSignal` used in `main.ts`; sort keys/defaults named. No findings.
 ### 4.7 sftp
-- [ ] Relative imports bypassing aliases → `@plugin-api/*`: `main.ts:1-2`, `helpers.ts:1-2`, `fileView.ts:1-2`, `transfers.ts:13-14` (`../../../main/plugins/api`); `manifest.ts:1`, `fileDrop.ts:1` (`../../../shared/pluginApi`); `View.tsx:10`, `fileDrop.ts:2` (`../../../renderer/src/plugins/api`). `protocol.ts:5` already uses the alias.
-- [ ] `transfers.ts:10` imports Electron `{BrowserWindow, dialog}` — replace with new API (§5).
-- [ ] `fileDrop.ts:146-152` — per-file `catch` swallows errors (only cancel distinguished); surface failures.
-- [ ] `fileDrop.ts:29-31,64-76` — module-level singletons (`readyTabs`, `activeUploads`, `trackingStarted`) + listeners registered once, never removed.
-- [ ] `fileDrop.ts:111` — `cancelSftpFileDrop` exported but only file-internal.
+- [x] Relative imports bypassing aliases → `@plugin-api/*`. Fixed: all 12 imports across `main.ts`, `helpers.ts`, `fileView.ts`, `transfers.ts`, `manifest.ts`, `fileDrop.ts`, `View.tsx` now use the aliases. (verified: no `../../../{shared,main,renderer}` under `src/plugins/**`)
+- [x] `transfers.ts:10` imports Electron `{BrowserWindow, dialog}`. Fixed: neutral `ctx.showOpenDialog`/`ctx.showSaveDialog` (+ `PluginOpenDialogOptions`/`PluginSaveDialogOptions`/results) added to `PluginMainContext`, implemented in `PluginHost` via `getWindow`; `transfers.ts` uses them. No `from 'electron'` remains under `src/plugins/**`.
+- [ ] `fileDrop.ts:146-152` — per-file `catch` swallows errors (only cancel distinguished); surface failures. — defer: needs an `error` field on `PluginFileDropProgress`; the only consumer (App.tsx drop banner) is the §5 App↔sftp decoupling, so adding the field now would be half-finished. No renderer logging convention exists to fall back on.
+- [ ] `fileDrop.ts:29-31,64-76` — module-level singletons (`readyTabs`, `activeUploads`, `trackingStarted`) + listeners registered once, never removed. — reviewed: intended app-lifetime singleton; the closures only mutate tab-keyed sets and clear entries on deactivate/close, so no per-tab leak. Cleanup belongs with §5's generic file-drop resolution.
+- [x] `fileDrop.ts:111` — `cancelSftpFileDrop` exported but only file-internal. Fixed: de-exported.
 ### 4.8 ai-agent
-- [ ] `View.tsx:198,202` — `isFileDrag`/`collectDroppedFiles` duplicate `sftp/fileDrop.ts:81,86` (same semantics, two copies). Decide: neutral helper in `@plugin-api/renderer` (needs doc per §14.8) or keep. (decision)
-- [ ] Audit pending otherwise (`main.ts` 2437 lines, `tools.ts` ≥1308, `View.tsx` ≥1170, plus apiMethods, defaults, id, manifest, permissions, pluginApiTools, protocol, providers, rag, terminal).
+- [x] `View.tsx:198,202` — `isFileDrag`/`collectDroppedFiles` duplicated `sftp/fileDrop.ts`. Fixed: neutral helpers moved to `renderer/src/plugins/api/fileDrag.ts`, exported from `@plugin-api/renderer`; both plugins import them (local copies deleted). Documented in PLUGIN_API.md §12.
+- [ ] Audit pending otherwise (`main.ts` 2437 lines, `tools.ts` ≥1308, `View.tsx` ≥1170, plus apiMethods, defaults, id, manifest, permissions, pluginApiTools, protocol, providers, rag, terminal). — `id.ts`/`manifest.ts` checked: manifest uses `PLUGIN_ID_AI_AGENT` + named setting constants; no literal drift. Remaining large-file audit is a §6-scale task.
 
 ## 5. Plugin isolation (strict — close now)
 
-- [ ] Normalize sftp imports (see 4.7) to `@plugin-api/*` aliases.
-- [ ] Add file-dialog capability: neutral `showOpenDialog`/`showSaveDialog` (narrow option/result types, no Electron types leaked) on `PluginMainContext` (`main/plugins/api.ts`), implemented in `PluginHost` via the existing `getWindow` dep; replace `sftp/transfers.ts` Electron usage; document in PLUGIN_API.md §5.
-- [ ] Break App↔sftp coupling: remove `App.tsx:43-49` sftp imports and the duplicate upload/status logic (`:263,639-650,797-830,805`); resolve terminal file-drop generically from the renderer plugin registration (`fileDrop`, already registered for sftp) + tab `activePluginIds`; if registration becomes the single source, delete the dead `terminalFileDrop` surface (`shared/pluginApi.ts:166,191`, `sftp/manifest.ts:14`).
+- [x] Normalize sftp imports (see 4.7) to `@plugin-api/*` aliases. Done.
+- [x] Add file-dialog capability: neutral `showOpenDialog`/`showSaveDialog` on `PluginMainContext` (`main/plugins/api.ts`), implemented in `PluginHost` via `getWindow`; `sftp/transfers.ts` Electron usage replaced. Docs: PLUGIN_API.md §5 updated.
+- [x] `terminalFileDrop` dead surface (`shared/pluginApi.ts:166,191`, `sftp/manifest.ts:14`) — never read anywhere (verified). Removed from the manifest type and sftp's manifest; the renderer `fileDrop` registration is the single source.
+- [ ] Break App↔sftp coupling: remove `App.tsx:43-49` sftp imports and the duplicate upload/status logic (`:263,639-650,797-830,805`); resolve terminal file-drop generically from the renderer plugin registration (`fileDrop`, already registered for sftp) + tab `activePluginIds`.
 - [ ] Break core→ai-agent coupling: move provider-config UI ownership into the plugin (own defaults/id/protocol); add a minimal generic settings hook so `OptionsDialog` renders plugin-provided settings UI without plugin imports; remove the `populateAiAgentSchema` and `configureProviders` special cases (`OptionsDialog.tsx:34-39,196-203,284,492-505,530-540`) and `AiAgentProviderDialog.tsx:1-12` imports; keep current UX (dialog openable from Options); document in PLUGIN_API.md §11/§12.
-- [ ] Barrel leak: `renderer/src/plugins/api/index.ts:38` re-exports `PluginSettingsFieldList` from `../PluginSettingsFieldList`; relocate `PluginSettingsFieldList`/`PluginFieldEditor` under `api/` (or clean re-export); verify plugin views use only `plugin-ui-*` classes.
-- [ ] Renderer builtin registry uses literal ids — use each plugin's `id.ts`.
-- [ ] Re-run the §Verification greps.
+- [x] Barrel leak: `renderer/src/plugins/api/index.ts:38` re-exported `PluginSettingsFieldList` from outside `api/`. Fixed: `PluginSettingsFieldList.tsx` and `PluginFieldEditor.tsx` moved into `renderer/src/plugins/api/`; the barrel re-exports both from local paths; core consumers import from `plugins/api/`. PLUGIN_API.md path updated. (`plugin-ui-*` class check remains in §4.)
+- [x] Renderer builtin registry uses literal ids — use each plugin's `id.ts`. Done (see §3.4).
+- [x] Re-run the §Verification greps. (verified: no `../../../{shared,main,renderer}` and no `from 'electron'` under `src/plugins/**`; `src/main/**` imports `plugins/builtins/**` only in `main/plugins/builtinRegistry.ts` (the composition root). Remaining: `src/renderer/src/components/{OptionsDialog,AiAgentProviderDialog}.tsx` still import ai-agent — that is the core→ai-agent decoupling below.)
 
 ## 6. Proposals (ranked; do NOT execute this pass)
 1. `SshConnection` on top of `ByteSession` — removes ~200 dup lines, dup constants, dup backoff.
@@ -157,6 +159,6 @@ Per-plugin rubric (§14 compliance also at §5): standard quality findings; allo
 9. `TunnelManager.handleSocksClient` phase machine extraction; `SshKeyManager.runRemoteRetrieve` delimiter arithmetic.
 
 ## 7. Doc drift
-- [ ] PLUGIN_API.md: settings-field table lists 8 types, code defines 12 (`textArea`, `directory`, `itemList`, `action`, `permission`); `PluginApiMethod.label`/`defaultPermission` undocumented; `getPluginData(pluginId, scopeId?)` scopeId missing; §12 UI-kit list incomplete; `terminalFileDrop` (resolve with §5).
-- [ ] `main/plugins/api.ts:13-14` re-exports concrete implementations (`classifySftpError`, `joinRemotePath`, `SftpSession`) through the API entry — decide intent and document.
-- [ ] Update PLUGIN_API.md tables after the §5 additions.
+- [x] PLUGIN_API.md settings-field table — now lists all 12 types (`textArea`, `directory`, `itemList`, `action`, `permission` added) plus `options`/`itemSchema`/`itemLabel`/`action`; prose covers `itemList`/`action`/`textArea`/`directory`. `PluginApiMethod.label`/`defaultPermission` documented in §7. `getPluginData(pluginId, scopeId?)`/`setPluginData(..., scopeId?)` corrected with a scopeId note. §12 UI-kit list verified complete against `plugin-ui.css` (all 41 selectors covered). `terminalFileDrop` was never documented and is now removed (§5).
+- [x] `main/plugins/api.ts:13-14` re-exports (`classifySftpError`, `joinRemotePath`, `SftpSession`) — intent documented inline: plugins use the API entry instead of `./SftpSession` internals.
+- [x] Update PLUGIN_API.md tables after the §5 additions. Done (file-dialog row in §5, `isFileDrag`/`collectDroppedFiles` in §12, path fix for `PluginSettingsFieldList`).

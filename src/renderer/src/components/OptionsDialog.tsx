@@ -1,4 +1,3 @@
-import type { ReactElement } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import {
   BELL_MODE_INVERT_LINE,
@@ -19,13 +18,14 @@ import {
   type SessionStyleDefaults
 } from '@shared/types'
 import type { PluginListItem } from '@shared/pluginApi'
-import { mergePluginSettings } from '@shared/pluginApi'
+import { mergePluginSettings, pluginSettingsSectionId } from '@shared/pluginApi'
 import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
-import ColorHexInput from './ColorHexInput'
+import SettingsColorRow from './SettingsColorRow'
+import { TAB_COLOR_THEME_VAR, TERM_BG_THEME_VAR, TERM_FG_THEME_VAR } from './settingsColor'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
-import PluginSettingsFieldList from '../plugins/PluginSettingsFieldList'
+import PluginSettingsFieldList from '../plugins/api/PluginSettingsFieldList'
 import AiAgentProviderDialog from './AiAgentProviderDialog'
 import {
   AI_AGENT_DEFAULT_PROVIDERS,
@@ -57,27 +57,6 @@ function optionsPayload(draft: AppSettings): Partial<AppSettings> {
     pluginSettings: draft.pluginSettings,
     sessionStyleDefaults: sessionStyleDefaultsFrom(draft.sessionStyleDefaults)
   }
-}
-
-/** CSS vars for color sampling; terminal text default is theme-independent */
-const TAB_COLOR_THEME_VAR = '--accent'
-const TERM_BG_THEME_VAR = '--bg-term'
-const TERM_FG_THEME_VAR = '--term-fg-default'
-const HEX_CHANNEL_DIGITS = 2
-const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
-
-function themeVarHex(cssVar: string): string {
-  const raw = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim()
-  if (HEX_COLOR_RE.test(raw)) {
-    return raw
-  }
-  const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(raw)
-  if (!rgb) {
-    return raw
-  }
-  return `#${[rgb[1], rgb[2], rgb[3]]
-    .map((n) => Number(n).toString(16).padStart(HEX_CHANNEL_DIGITS, '0'))
-    .join('')}`
 }
 
 function populateAiAgentSchema(
@@ -121,60 +100,6 @@ function populateAiAgentSchema(
   }
 
   return schema.map(mapField)
-}
-
-function DefaultsColorRow({
-  label,
-  hint,
-  value,
-  themeVar,
-  onChange
-}: {
-  label: string
-  hint: string
-  value: string
-  themeVar: string
-  onChange: (value: string) => void
-}): ReactElement {
-  const useTheme = !value
-  const pickerValue = useTheme ? themeVarHex(themeVar) : value
-  return (
-    <div className="settings-row">
-      <div className="settings-row-label">
-        <strong>{label}</strong>
-        <span>{hint}</span>
-      </div>
-      <div className="settings-color-field">
-        <label className="settings-theme-default">
-          <input
-            type="checkbox"
-            checked={useTheme}
-            onChange={(e) =>
-              onChange(e.target.checked ? '' : themeVarHex(themeVar))
-            }
-          />
-          Theme default
-        </label>
-        {HEX_COLOR_RE.test(pickerValue) ? (
-          <>
-            <input
-              type="color"
-              value={pickerValue}
-              onClick={() => {
-                // Clicking the swatch starts a custom color: clear “Theme default”
-                // even if the picker is cancelled.
-                if (useTheme) {
-                  onChange(themeVarHex(themeVar))
-                }
-              }}
-              onChange={(e) => onChange(e.target.value)}
-            />
-            <ColorHexInput value={pickerValue} onChange={onChange} />
-          </>
-        ) : null}
-      </div>
-    </div>
-  )
 }
 
 export default function OptionsDialog({
@@ -339,25 +264,28 @@ export default function OptionsDialog({
               Applied to new hosts and quick connect, and to any host/session field set to “Use
               default”. Changing a value here updates those fields immediately.
             </p>
-            <DefaultsColorRow
+            <SettingsColorRow
               label="Tab color"
               hint="Theme default follows the app accent."
               value={draft.sessionStyleDefaults.tabColor}
               themeVar={TAB_COLOR_THEME_VAR}
+              defaultLabel="Theme default"
               onChange={(tabColor) => patchDefaults({ tabColor })}
             />
-            <DefaultsColorRow
+            <SettingsColorRow
               label="Terminal background"
               hint="Theme default follows the app terminal background."
               value={draft.sessionStyleDefaults.termBackground}
               themeVar={TERM_BG_THEME_VAR}
+              defaultLabel="Theme default"
               onChange={(termBackground) => patchDefaults({ termBackground })}
             />
-            <DefaultsColorRow
+            <SettingsColorRow
               label="Terminal text"
               hint="The built-in default is fixed light gray; it does not follow the app theme."
               value={draft.sessionStyleDefaults.termForeground}
               themeVar={TERM_FG_THEME_VAR}
+              defaultLabel="Theme default"
               onChange={(termForeground) => patchDefaults({ termForeground })}
             />
             <div className="settings-row">
@@ -498,7 +426,7 @@ export default function OptionsDialog({
           ? populateAiAgentSchema(schema, values, aiAgentProviders)
           : schema
       base.push({
-        id: `plugin-${plugin.id}`,
+        id: pluginSettingsSectionId(plugin.id),
         title: plugin.contributes.settingsHeading || plugin.name,
         content: (
           <PluginSettingsFieldList

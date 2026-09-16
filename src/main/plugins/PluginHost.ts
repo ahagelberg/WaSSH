@@ -1,4 +1,4 @@
-import { BrowserWindow } from 'electron'
+import { BrowserWindow, dialog } from 'electron'
 import type {
   PluginActiveStateEvent,
   PluginListItem,
@@ -20,6 +20,10 @@ import type {
   PluginMainContext,
   PluginMainModule,
   PluginMainRegistration,
+  PluginOpenDialogOptions,
+  PluginOpenDialogResult,
+  PluginSaveDialogOptions,
+  PluginSaveDialogResult,
   PluginSessionStatusEvent
 } from './api'
 export type { PluginMainContext, PluginMainModule } from './api'
@@ -162,6 +166,24 @@ export class PluginHost {
     this.send('settings:changed', this.settingsStore.get())
   }
 
+  /** Native open-file/directory dialog; returns the picked paths (empty when cancelled). */
+  async showOpenDialog(options: PluginOpenDialogOptions): Promise<PluginOpenDialogResult> {
+    const win = this.getWindow()
+    const result = win
+      ? await dialog.showOpenDialog(win, options)
+      : await dialog.showOpenDialog(options)
+    return { canceled: result.canceled, filePaths: result.filePaths }
+  }
+
+  /** Native save-file dialog; returns the picked path (`undefined` when cancelled). */
+  async showSaveDialog(options: PluginSaveDialogOptions): Promise<PluginSaveDialogResult> {
+    const win = this.getWindow()
+    const result = win
+      ? await dialog.showSaveDialog(win, options)
+      : await dialog.showSaveDialog(options)
+    return { canceled: result.canceled, filePath: result.filePath }
+  }
+
   async activate(tabId: string, pluginId: string, announce = true): Promise<void> {
     if (!this.isEnabled(pluginId)) {
       throw new Error(`Plugin "${pluginId}" is not enabled`)
@@ -268,7 +290,9 @@ export class PluginHost {
         this.callPluginApi(tabId, targetPluginId, method, params),
       setSettingValue: (key, value) => {
         this.setSettingValue(pluginId, key, value)
-      }
+      },
+      showOpenDialog: (options) => this.showOpenDialog(options),
+      showSaveDialog: (options) => this.showSaveDialog(options)
     }
 
     const instance: ActiveInstance = {

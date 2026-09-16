@@ -247,10 +247,9 @@ export default function SshKeySettingsGroup({
               ))}
             </select>
           ) : null}
-          <div style={{ display: 'flex', gap: 6 }}>
+          <div className="ssh-key-row">
             <input
               type="text"
-              style={{ flex: 1 }}
               value={privateKeyPath}
               placeholder="e.g. ~/.ssh/id_ed25519"
               onChange={(e) => onSelectKey(e.target.value)}
@@ -324,17 +323,16 @@ export default function SshKeySettingsGroup({
         </div>
         <div className="ssh-key-action-card">
           {!password && !passwordVaultId ? (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+            <div className="ssh-key-row">
               <input
                 type="password"
                 placeholder="Enter host password for setup"
                 value={deployPassword}
                 onChange={(e) => setDeployPassword(e.target.value)}
-                style={{ flex: 1 }}
               />
             </div>
           ) : null}
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div className="ssh-key-row">
             <button
               type="button"
               disabled={deployStatus === 'running' || !privateKeyPath || !host}
@@ -386,7 +384,7 @@ export default function SshKeySettingsGroup({
               />
             </label>
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+          <div className="ssh-key-row">
             <button
               type="button"
               disabled={genStatus === 'running' || !genFilename.trim()}
@@ -412,17 +410,16 @@ export default function SshKeySettingsGroup({
         </div>
         <div className="ssh-key-action-card">
           {!password && !passwordVaultId ? (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+            <div className="ssh-key-row">
               <input
                 type="password"
                 placeholder="Enter host password to authenticate"
                 value={retrievePassword}
                 onChange={(e) => setRetrievePassword(e.target.value)}
-                style={{ flex: 1 }}
               />
             </div>
           ) : null}
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div className="ssh-key-row">
             <button
               type="button"
               disabled={retrieveStatus === 'running' || !host}

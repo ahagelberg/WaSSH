@@ -34,11 +34,8 @@ export default function SerialPortField({
   const rootRef = useRef<HTMLDivElement>(null)
 
   const refresh = useCallback(() => {
-    const list = window.wassh.listSerialPorts
-    if (typeof list !== 'function') {
-      return
-    }
-    void list()
+    void window.wassh
+      .listSerialPorts()
       .then((next) => {
         setPorts(next)
         setActiveIndex((i) => {

@@ -11,21 +11,6 @@ import {
   SERIAL_BAUD_MAX,
   SERIAL_BAUD_MIN,
   SERIAL_BAUD_RATES,
-  SERIAL_DATA_BITS_5,
-  SERIAL_DATA_BITS_6,
-  SERIAL_DATA_BITS_7,
-  SERIAL_DATA_BITS_8,
-  SERIAL_FLOW_NONE,
-  SERIAL_FLOW_RTSCTS,
-  SERIAL_FLOW_XONXOFF,
-  SERIAL_PARITY_EVEN,
-  SERIAL_PARITY_MARK,
-  SERIAL_PARITY_NONE,
-  SERIAL_PARITY_ODD,
-  SERIAL_PARITY_SPACE,
-  SERIAL_STOP_BITS_1,
-  SERIAL_STOP_BITS_1_5,
-  SERIAL_STOP_BITS_2,
   type ConnectionParams,
   type ConnectionType,
   type SerialDataBits,
@@ -35,13 +20,16 @@ import {
 } from '@shared/types'
 import {
   defaultPortForType,
-  protocolConfigFrom,
-  reconnectModeFrom,
-  screenConfigFrom,
-  sessionStyleFrom,
-  tunnelConfigFrom
+  emptyConnectionParams,
+  protocolConfigFrom
 } from '@shared/connection'
 import SerialPortField from './SerialPortField'
+import {
+  SERIAL_DATA_BITS_OPTIONS,
+  SERIAL_PARITY_OPTIONS,
+  SERIAL_STOP_BITS_OPTIONS,
+  serialFlowOptions
+} from './serialOptions'
 
 interface Props {
   onConnect: (connection: ConnectionParams) => void
@@ -96,24 +84,14 @@ export default function QuickConnect({ onConnect }: Props) {
       serialFlowControl: flow
     })
     onConnect({
-      hostId: null,
+      ...emptyConnectionParams(type),
       name: quickName(type, trimmed, username.trim()),
       host: trimmed,
       port: type === CONNECTION_TYPE_SERIAL ? 0 : Number(port) || defaultPortForType(type),
       username: type === CONNECTION_TYPE_SSH ? username.trim() : '',
-      passwordVaultId: '',
-      privateKeyPath: '',
-      passphraseVaultId: '',
       authMethod: type === CONNECTION_TYPE_SSH && password ? 'password' : 'none',
-      proxyHostId: '',
       ...serial,
-      ...sessionStyleFrom(null),
-      ...tunnelConfigFrom(null),
-      ephemeralPassword: type === CONNECTION_TYPE_SSH ? password : '',
-      ephemeralPassphrase: '',
-      pluginSettings: {},
-      reconnectMode: reconnectModeFrom(null),
-      ...screenConfigFrom(null)
+      ephemeralPassword: type === CONNECTION_TYPE_SSH ? password : ''
     })
   }
 
@@ -170,10 +148,7 @@ export default function QuickConnect({ onConnect }: Props) {
                 value={dataBits}
                 onChange={(e) => setDataBits(Number(e.target.value) as SerialDataBits)}
               >
-                <option value={SERIAL_DATA_BITS_5}>5</option>
-                <option value={SERIAL_DATA_BITS_6}>6</option>
-                <option value={SERIAL_DATA_BITS_7}>7</option>
-                <option value={SERIAL_DATA_BITS_8}>8</option>
+                {SERIAL_DATA_BITS_OPTIONS}
               </select>
             </div>
             <div className="field-row">
@@ -183,11 +158,7 @@ export default function QuickConnect({ onConnect }: Props) {
                 value={parity}
                 onChange={(e) => setParity(e.target.value as SerialParity)}
               >
-                <option value={SERIAL_PARITY_NONE}>None</option>
-                <option value={SERIAL_PARITY_EVEN}>Even</option>
-                <option value={SERIAL_PARITY_ODD}>Odd</option>
-                <option value={SERIAL_PARITY_MARK}>Mark</option>
-                <option value={SERIAL_PARITY_SPACE}>Space</option>
+                {SERIAL_PARITY_OPTIONS}
               </select>
             </div>
             <div className="field-row">
@@ -197,9 +168,7 @@ export default function QuickConnect({ onConnect }: Props) {
                 value={stopBits}
                 onChange={(e) => setStopBits(Number(e.target.value) as SerialStopBits)}
               >
-                <option value={SERIAL_STOP_BITS_1}>1</option>
-                <option value={SERIAL_STOP_BITS_1_5}>1.5</option>
-                <option value={SERIAL_STOP_BITS_2}>2</option>
+                {SERIAL_STOP_BITS_OPTIONS}
               </select>
             </div>
             <div className="field-row">
@@ -209,9 +178,7 @@ export default function QuickConnect({ onConnect }: Props) {
                 value={flow}
                 onChange={(e) => setFlow(e.target.value as SerialFlowControl)}
               >
-                <option value={SERIAL_FLOW_NONE}>None</option>
-                <option value={SERIAL_FLOW_RTSCTS}>RTS/CTS</option>
-                <option value={SERIAL_FLOW_XONXOFF}>XON/XOFF</option>
+                {serialFlowOptions(false)}
               </select>
             </div>
           </div>

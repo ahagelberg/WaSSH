@@ -2,10 +2,12 @@ import { useEffect, useRef, useState, type ReactElement } from 'react'
 import type { HostProfile, HostsOrganization } from '@shared/types'
 import { hostDisplayName, hostSubtitle, resolveSessionStyle, type SessionStyle } from '@shared/connection'
 import { sessionAccentStyle } from '../sessionStyleCss'
+import { insertIndexFromGap } from '../dragReorder'
 import ColorHexInput from './ColorHexInput'
 import {
   UNGROUPED_SECTION_ID,
   deleteNamedGroup,
+  hostIdsForSection,
   moveHostInOrganization,
   reorderNamedGroups,
   uniqueGroupName,
@@ -69,6 +71,9 @@ const GROUP_COLOR_FALLBACK = '#3d8bfd'
 const GROUP_COLOR_POP_WIDTH_PX = 224
 const GROUP_COLOR_POP_ESTIMATED_HEIGHT_PX = 176
 
+/** Keep popovers this far from the viewport edge */
+const GROUP_COLOR_POP_VIEWPORT_MARGIN_PX = 8
+
 interface HostMenuState {
   hostId: string
   left: number
@@ -120,13 +125,6 @@ function menuPositionAtPoint(x: number, y: number): { left: number; top: number 
   const top = fitsBelow ? openBelow : Math.max(0, openAbove)
 
   return { left, top }
-}
-
-function hostIdsForSection(org: HostsOrganization, sectionId: string): string[] {
-  if (sectionId === UNGROUPED_SECTION_ID) {
-    return org.ungroupedHostIds
-  }
-  return org.groups.find((g) => g.id === sectionId)?.hostIds ?? []
 }
 
 function targetInsertIndex(
@@ -189,13 +187,6 @@ function gapIndexAtY(listEl: HTMLElement, clientY: number, groupCount: number): 
     }
   }
   return groupCount
-}
-
-function groupInsertIndexFromGap(from: number, gap: number): number | null {
-  if (gap === from || gap === from + 1) {
-    return null
-  }
-  return gap > from ? gap - 1 : gap
 }
 
 function hostDropClass(hint: HostDropHint | null, sectionId: string, hostId: string): string {
@@ -396,7 +387,7 @@ export default function SessionsSidebar({
           }, 0)
           if (groupDrag.dropGap !== null) {
             const from = orgRef.current.groups.findIndex((g) => g.id === groupDrag.groupId)
-            const insert = groupInsertIndexFromGap(from, groupDrag.dropGap)
+            const insert = insertIndexFromGap(from, groupDrag.dropGap)
             if (from >= 0 && insert !== null) {
               onSaveOrgRef.current(reorderNamedGroups(orgRef.current, from, insert))
             }
@@ -880,7 +871,7 @@ export default function SessionsSidebar({
               style={{
                 left: Math.min(
                   groupColorMenu.left,
-                  Math.max(0, window.innerWidth - GROUP_COLOR_POP_WIDTH_PX - 8)
+                  Math.max(0, window.innerWidth - GROUP_COLOR_POP_WIDTH_PX - GROUP_COLOR_POP_VIEWPORT_MARGIN_PX)
                 ),
                 top: Math.min(
                   groupColorMenu.top,

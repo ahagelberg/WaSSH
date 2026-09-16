@@ -46,6 +46,9 @@ export const DEFAULT_DOCK_HEIGHT_PX = 160
 /** Sole minimum for dock edges and split panes (px) */
 export const MIN_DOCK_SIZE_PX = 200
 
+/** Smallest container that fits two panes at MIN_DOCK_SIZE_PX each (px) */
+const MIN_SPLIT_CONTAINER_PX = MIN_DOCK_SIZE_PX * 2
+
 /** Default split ratio when creating a split */
 export const DEFAULT_SPLIT_RATIO = 0.5
 
@@ -99,7 +102,7 @@ export function clampSplitRatio(ratio: number, totalPx = 0): number {
   if (!Number.isFinite(ratio)) {
     return DEFAULT_SPLIT_RATIO
   }
-  if (totalPx > MIN_DOCK_SIZE_PX * 2) {
+  if (totalPx > MIN_SPLIT_CONTAINER_PX) {
     const minRatio = MIN_DOCK_SIZE_PX / totalPx
     return Math.min(1 - minRatio, Math.max(minRatio, ratio))
   }
@@ -171,52 +174,8 @@ function insertIntoNode(
   if (!node) {
     return leaf
   }
-  if (node.kind === 'leaf') {
-    return splitLeafNode(node, leaf, zone)
-  }
   // Prefer splitting toward the outer/new side of the whole dock by wrapping root
   return wrapSplit(node, leaf, zone)
-}
-
-function splitLeafNode(
-  existing: Extract<LayoutNode, { kind: 'leaf' }>,
-  incoming: LayoutNode,
-  zone: LeafSplitZone
-): LayoutNode {
-  if (zone === 'left') {
-    return {
-      kind: 'split',
-      direction: SPLIT_ROW,
-      ratio: DEFAULT_SPLIT_RATIO,
-      a: incoming,
-      b: existing
-    }
-  }
-  if (zone === 'right') {
-    return {
-      kind: 'split',
-      direction: SPLIT_ROW,
-      ratio: DEFAULT_SPLIT_RATIO,
-      a: existing,
-      b: incoming
-    }
-  }
-  if (zone === 'top') {
-    return {
-      kind: 'split',
-      direction: SPLIT_COLUMN,
-      ratio: DEFAULT_SPLIT_RATIO,
-      a: incoming,
-      b: existing
-    }
-  }
-  return {
-    kind: 'split',
-    direction: SPLIT_COLUMN,
-    ratio: DEFAULT_SPLIT_RATIO,
-    a: existing,
-    b: incoming
-  }
 }
 
 function wrapSplit(existing: LayoutNode, incoming: LayoutNode, zone: LeafSplitZone): LayoutNode {
@@ -348,7 +307,7 @@ export function splitPluginLeaf(
       continue
     }
     const next = mapNode(root, targetPluginId, (leaf) =>
-      splitLeafNode(leaf, { kind: 'leaf', pluginId }, zone)
+      wrapSplit(leaf, { kind: 'leaf', pluginId }, zone)
     )
     return { ...cleaned, [key]: next }
   }
@@ -377,36 +336,6 @@ export function placementToEdge(placement: PluginViewPlacement): DockEdge | 'ove
     return 'top'
   }
   return 'bottom'
-}
-
-export function edgeToPlacement(edge: DockEdge | 'overlay'): PluginViewPlacement {
-  if (edge === 'overlay') {
-    return 'overlay'
-  }
-  if (edge === 'left') {
-    return 'split-left'
-  }
-  if (edge === 'right') {
-    return 'split-right'
-  }
-  if (edge === 'top') {
-    return 'split-top'
-  }
-  return 'split-bottom'
-}
-
-export function findPluginEdge(
-  layout: TabPluginLayout,
-  pluginId: string
-): DockEdge | 'overlay' | null {
-  const edges: Array<DockEdge | 'overlay'> = ['left', 'right', 'top', 'bottom', 'overlay']
-  for (const edge of edges) {
-    const root = edge === 'overlay' ? layout.overlay : layout[edge]
-    if (collectPluginIds(root).includes(pluginId)) {
-      return edge
-    }
-  }
-  return null
 }
 
 export function ensurePluginInLayout(

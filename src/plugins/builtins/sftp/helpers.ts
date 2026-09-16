@@ -1,5 +1,5 @@
-import type { PluginMainContext } from '../../../main/plugins/api'
-import { joinRemotePath, type SftpSession } from '../../../main/plugins/api'
+import type { PluginMainContext } from '@plugin-api/main'
+import { joinRemotePath, type SftpSession } from '@plugin-api/main'
 import type {
   SftpErrorKind,
   SftpOpResultPayload,

@@ -7,7 +7,7 @@ import {
   type DragEvent as ReactDragEvent,
   type ReactElement
 } from 'react'
-import type { PluginViewProps } from '../../../renderer/src/plugins/api'
+import type { PluginViewProps } from '@plugin-api/renderer'
 import type {
   SftpEntry,
   SftpMainPayload,
@@ -25,7 +25,8 @@ import {
   parentPath,
   typeIcon
 } from './viewUtils'
-import { collectDroppedFiles, isFileDrag, uploadFilesOverSftp } from './fileDrop'
+import { uploadFilesOverSftp } from './fileDrop'
+import { collectDroppedFiles, isFileDrag } from '@plugin-api/renderer'
 import './styles.css'
 
 interface TransferProgress {

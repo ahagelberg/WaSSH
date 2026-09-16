@@ -1,7 +1,5 @@
 /// <reference types="vite/client" />
 
-import type { WasshApi } from '../../shared/types'
-
 interface FontData {
   family: string
   fullName: string
@@ -11,7 +9,6 @@ interface FontData {
 
 declare global {
   interface Window {
-    wassh: WasshApi
     queryLocalFonts?: () => Promise<FontData[]>
   }
 }

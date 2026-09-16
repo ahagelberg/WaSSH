@@ -23,9 +23,6 @@ export default function PluginPanelShell({
         <span
           className="plugin-panel-drag"
           title="Drag to dock or split"
-          aria-label={`Move ${title}`}
-          role="button"
-          tabIndex={0}
           onPointerDown={(e) => {
             if (e.button !== 0) {
               return

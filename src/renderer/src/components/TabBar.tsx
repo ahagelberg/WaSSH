@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { SessionStatus } from '@shared/types'
 import { sessionAccentStyle } from '../sessionStyleCss'
+import { insertIndexFromGap } from '../dragReorder'
 
 /** Drop before the tab if the pointer is left of this fraction of its width */
 const TAB_DROP_BEFORE_RATIO = 0.5
@@ -75,18 +76,6 @@ function indicatorLeftForGap(bar: HTMLElement, gap: number): number {
     return last.getBoundingClientRect().right - barRect.left
   }
   return nodes[gap].getBoundingClientRect().left - barRect.left
-}
-
-/**
- * Convert a visual gap index to the insert index expected by onReorder
- * (index in the array after the dragged tab is removed).
- * Returns null when the drop would not change order.
- */
-function insertIndexFromGap(from: number, gap: number): number | null {
-  if (gap === from || gap === from + 1) {
-    return null
-  }
-  return gap > from ? gap - 1 : gap
 }
 
 export default function TabBar({
@@ -280,8 +269,7 @@ export default function TabBar({
           <span className="tab-title">{tab.title}</span>
           <span
             className="tab-close"
-            role="button"
-            tabIndex={-1}
+            aria-hidden="true"
             onClick={(e) => {
               e.stopPropagation()
               onClose(tab.id)
@@ -292,12 +280,6 @@ export default function TabBar({
             }}
             onPointerDown={(e) => {
               e.stopPropagation()
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.stopPropagation()
-                onClose(tab.id)
-              }
             }}
           >
             ×

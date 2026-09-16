@@ -2,7 +2,6 @@ import {
   useEffect,
   useRef,
   useState,
-  type DragEvent as ReactDragEvent,
   type ReactElement
 } from 'react'
 import Markdown, { type Components } from 'react-markdown'
@@ -37,6 +36,7 @@ import {
   type AiAgentToolOutputPayload
 } from './protocol'
 import type { PluginViewProps } from '@plugin-api/renderer'
+import { collectDroppedFiles, isFileDrag } from '@plugin-api/renderer'
 
 /** Streaming rows rendered between two state snapshots may not exceed this */
 const STREAM_PLACEHOLDER_LIMIT = 1_000_000
@@ -193,35 +193,6 @@ function formatChatTime(ts: number): string {
   } catch {
     return ''
   }
-}
-
-function isFileDrag(e: ReactDragEvent<HTMLElement>): boolean {
-  return Array.from(e.dataTransfer.types).includes('Files')
-}
-
-function collectDroppedFiles(dt: DataTransfer | null): File[] {
-  if (!dt) {
-    return []
-  }
-  const items = dt.items
-  if (items && items.length > 0) {
-    const files: File[] = []
-    for (const item of Array.from(items)) {
-      if (item.kind !== 'file') {
-        continue
-      }
-      const entry = item.webkitGetAsEntry?.()
-      if (entry?.isDirectory) {
-        continue
-      }
-      const file = item.getAsFile()
-      if (file) {
-        files.push(file)
-      }
-    }
-    return files
-  }
-  return Array.from(dt.files)
 }
 
 function looksBinary(bytes: Uint8Array): boolean {

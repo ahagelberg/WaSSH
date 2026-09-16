@@ -321,16 +321,6 @@ export function sessionStyleDefaultsFrom(
   }
 }
 
-/**
- * @deprecated Prefer sessionStyleOverridesFrom + resolveSessionStyle.
- * Kept as resolve against built-in defaults for call sites without AppSettings.
- */
-export function sessionStyleFrom(
-  src: Partial<SessionStyleOverrides> | null | undefined
-): SessionStyleOverrides {
-  return sessionStyleOverridesFrom(src)
-}
-
 function tunnelTypeOrDefault(value: string | undefined): TunnelType {
   if (
     value === TUNNEL_TYPE_LOCAL ||
@@ -717,13 +707,76 @@ export function hostToConnection(host: HostProfile): ConnectionParams {
     authMethod: host.authMethod,
     proxyHostId: host.proxyHostId || '',
     ...protocolConfigFrom(host),
-    ...sessionStyleFrom(host),
+    ...sessionStyleOverridesFrom(host),
     ...tunnelConfigFrom(host),
     ephemeralPassword: '',
     ephemeralPassphrase: '',
     pluginSettings: normalizeHostPluginSettings(host.pluginSettings),
     reconnectMode: reconnectModeFrom(host),
     ...screenConfigFrom(host)
+  }
+}
+
+/** All-default connection params for a new quick-connect session. */
+export function emptyConnectionParams(connectionType: ConnectionType): ConnectionParams {
+  return {
+    hostId: null,
+    name: '',
+    host: '',
+    port: defaultPortForType(connectionType),
+    username: '',
+    passwordVaultId: '',
+    privateKeyPath: '',
+    passphraseVaultId: '',
+    authMethod: 'none',
+    proxyHostId: '',
+    ...protocolConfigFrom({ connectionType }),
+    ...emptySessionStyleOverrides(),
+    ...tunnelConfigFrom(null),
+    ephemeralPassword: '',
+    ephemeralPassphrase: '',
+    pluginSettings: {},
+    reconnectMode: reconnectModeFrom(null),
+    ...screenConfigFrom(null)
+  }
+}
+
+/** All-default host profile for a new saved host. */
+export function emptyHostProfile(id: string): HostProfile {
+  const {
+    hostId: _hostId,
+    ephemeralPassword: _ephemeralPassword,
+    ephemeralPassphrase: _ephemeralPassphrase,
+    ...host
+  } = emptyConnectionParams(DEFAULT_CONNECTION_TYPE)
+  return { id, ...host, tags: [] }
+}
+
+/**
+ * Fields shared by `ConnectionParams` and `HostProfile` that the normalizers read.
+ */
+type ConnectionLike = Partial<ConnectionParams & HostProfile> & {
+  pluginSettings?: unknown
+}
+
+/**
+ * Normalize a connection (stored, restored, or edited) to concrete protocol,
+ * style, tunnel, screen, reconnect, and plugin-settings fields.
+ * Pass `clearEphemeral` when persisting so one-time secrets are not written.
+ */
+export function normalizeConnectionParams<T extends ConnectionLike>(
+  src: T,
+  clearEphemeral = false
+): T {
+  return {
+    ...src,
+    ...protocolConfigFrom(src),
+    ...sessionStyleOverridesFrom(src),
+    ...tunnelConfigFrom(src),
+    ...(clearEphemeral ? { ephemeralPassword: '', ephemeralPassphrase: '' } : {}),
+    pluginSettings: normalizeHostPluginSettings(src.pluginSettings),
+    reconnectMode: reconnectModeFrom(src),
+    ...screenConfigFrom(src)
   }
 }
 
@@ -743,7 +796,7 @@ export function hostProfileFromConnection(
     authMethod: src.authMethod,
     proxyHostId: src.proxyHostId || '',
     ...protocolConfigFrom(src),
-    ...sessionStyleFrom(src),
+    ...sessionStyleOverridesFrom(src),
     ...tunnelConfigFrom(src),
     pluginSettings: normalizeHostPluginSettings(src.pluginSettings),
     reconnectMode: reconnectModeFrom(src),

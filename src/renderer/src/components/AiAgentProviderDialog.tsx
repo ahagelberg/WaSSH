@@ -1,7 +1,8 @@
 import { useEffect, useState, type ReactElement } from 'react'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
-  AI_AGENT_DEFAULT_PROVIDERS
+  AI_AGENT_DEFAULT_PROVIDERS,
+  AI_AGENT_OLLAMA_BASE_URL
 } from '../../../plugins/builtins/ai-agent/defaults'
 import { aiAgentVaultId } from '../../../plugins/builtins/ai-agent/id'
 import {
@@ -10,6 +11,7 @@ import {
   type AiAgentProviderConfig,
   type AiAgentProviderProtocol
 } from '../../../plugins/builtins/ai-agent/protocol'
+import DialogShell from './DialogShell'
 
 const AI_AGENT_PLUGIN_ID = 'ai-agent'
 
@@ -74,6 +76,7 @@ export default function AiAgentProviderDialog({ tabId, onClose }: Props): ReactE
   const [templateId, setTemplateId] = useState(PROVIDER_TEMPLATES[0].id)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
   const [checkingProviderIds, setCheckingProviderIds] = useState<Set<string>>(() => new Set())
   const [checkMessages, setCheckMessages] = useState<Record<string, ProviderCheckMessage>>({})
 
@@ -225,12 +228,14 @@ export default function AiAgentProviderDialog({ tabId, onClose }: Props): ReactE
   const removeProvider = async (): Promise<void> => {
     if (!selected) return
     if (selected.hasKey) await window.wassh.deleteSecret(aiAgentVaultId(selected.id))
-    setDrafts((current) => current.filter((provider) => provider.id !== selected.id))
-    setSelectedId(drafts.find((provider) => provider.id !== selected.id)?.id ?? null)
+    const remaining = drafts.filter((provider) => provider.id !== selected.id)
+    setDrafts(remaining)
+    setSelectedId(remaining[0]?.id ?? null)
   }
 
   const save = async (): Promise<void> => {
     setSaving(true)
+    setSaveError('')
     try {
       const hasNewKey = drafts.some((provider) => provider.draftKey.trim())
       if (hasNewKey && !(await window.wassh.isVaultEncryptionAvailable())) {
@@ -256,76 +261,79 @@ export default function AiAgentProviderDialog({ tabId, onClose }: Props): ReactE
       await window.wassh.setPluginData(AI_AGENT_PLUGIN_ID, { ...current, providers })
       window.dispatchEvent(new CustomEvent('ai-agent-providers-changed', { detail: providers }))
       onClose()
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : String(err))
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="settings-dialog ai-agent-provider-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-agent-provider-title">
-        <div className="settings-dialog-header">
-          <h2 id="ai-agent-provider-title">AI model providers</h2>
-          <button type="button" onClick={onClose} aria-label="Close">✕</button>
-        </div>
-        {loading ? <div className="settings-dialog-body"><p>Loading providers…</p></div> : (
-          <div className="settings-dialog-body ai-agent-provider-dialog-body">
-            <div className="ai-agent-provider-dialog-list">
-              {drafts.map((provider) => (
-                <button
-                  type="button"
-                  key={provider.id}
-                  className={provider.id === selectedId ? 'active' : ''}
-                  onClick={() => setSelectedId(provider.id)}
-                >
-                  <strong>{provider.name || 'Unnamed provider'}</strong>
-                  <span>{protocolLabel(provider.protocol)}</span>
-                </button>
-              ))}
-              {drafts.length === 0 ? <p>No providers configured.</p> : null}
-            </div>
-            <div className="ai-agent-provider-dialog-editor">
-              {selected ? (
-                <>
-                  <label>Name<input value={selected.name} onChange={(event) => updateSelected({ name: event.target.value })} /></label>
-                  <label>Protocol<select value={selected.protocol} onChange={(event) => updateSelected({ protocol: event.target.value as AiAgentProviderProtocol })}>
-                    <option value={AI_AGENT_PROTOCOL_OPENAI}>OpenAI compatible</option>
-                    <option value={AI_AGENT_PROTOCOL_ANTHROPIC}>Anthropic</option>
-                  </select></label>
-                  <label>Base URL<input value={selected.baseUrl} placeholder={selected.protocol === AI_AGENT_PROTOCOL_ANTHROPIC ? AI_AGENT_ANTHROPIC_BASE_URL : 'http://127.0.0.1:11434/v1'} onChange={(event) => updateSelected({ baseUrl: event.target.value })} /></label>
-                  <label>API key<input type="password" value={selected.draftKey} placeholder={selected.hasKey ? 'Key stored — type to replace' : 'API key'} autoComplete="off" onChange={(event) => updateSelected({ draftKey: event.target.value })} /></label>
-                  <div className="ai-agent-provider-model-row">
-                    <label>Available models<output className="ai-agent-provider-models">{selected.models.length > 0 ? selected.models.join(', ') : 'Models load automatically when available.'}</output></label>
-                    <button type="button" className="primary" disabled={selectedIsChecking || !tabId || !selected.baseUrl.trim()} onClick={() => void refreshSelected()}>
-                      Refresh
-                    </button>
-                  </div>
-                  <div className="ai-agent-provider-actions">
-                    <button type="button" className="primary" disabled={selectedIsChecking || !tabId || !selected.baseUrl.trim()} onClick={() => void checkSelected()}>
-                      Check
-                    </button>
-                    <button type="button" className="ai-agent-danger" onClick={() => void removeProvider()}>Remove provider</button>
-                  </div>
-                  {selectedCheckMessage ? (
-                    <output className={`ai-agent-provider-check-message is-${selectedCheckMessage.kind}`}>
-                      {selectedCheckMessage.text}
-                    </output>
-                  ) : null}
-                </>
-              ) : <p>Select a provider to configure it.</p>}
-            </div>
-          </div>
-        )}
-        <div className="settings-footer">
+    <DialogShell
+      titleId="ai-agent-provider-title"
+      title="AI model providers"
+      onClose={onClose}
+      className="ai-agent-provider-dialog"
+      footer={
+        <>
           <select aria-label="Provider template" value={templateId} onChange={(event) => setTemplateId(event.target.value)}>
             {PROVIDER_TEMPLATES.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}
           </select>
           <button type="button" onClick={addProvider}>Add provider</button>
-          <span />
+          {saveError ? <output className="ai-agent-provider-check-message is-error">{saveError}</output> : <span />}
           <button type="button" onClick={onClose}>Cancel</button>
           <button type="button" className="primary" disabled={loading || saving} onClick={() => void save()}>Save</button>
+        </>
+      }
+    >
+      {loading ? <div className="settings-dialog-body"><p>Loading providers…</p></div> : (
+        <div className="settings-dialog-body ai-agent-provider-dialog-body">
+          <div className="ai-agent-provider-dialog-list">
+            {drafts.map((provider) => (
+              <button
+                type="button"
+                key={provider.id}
+                className={provider.id === selectedId ? 'active' : ''}
+                onClick={() => setSelectedId(provider.id)}
+              >
+                <strong>{provider.name || 'Unnamed provider'}</strong>
+                <span>{protocolLabel(provider.protocol)}</span>
+              </button>
+            ))}
+            {drafts.length === 0 ? <p>No providers configured.</p> : null}
+          </div>
+          <div className="ai-agent-provider-dialog-editor">
+            {selected ? (
+              <>
+                <label>Name<input value={selected.name} onChange={(event) => updateSelected({ name: event.target.value })} /></label>
+                <label>Protocol<select value={selected.protocol} onChange={(event) => updateSelected({ protocol: event.target.value as AiAgentProviderProtocol })}>
+                  <option value={AI_AGENT_PROTOCOL_OPENAI}>OpenAI compatible</option>
+                  <option value={AI_AGENT_PROTOCOL_ANTHROPIC}>Anthropic</option>
+                </select></label>
+                <label>Base URL<input value={selected.baseUrl} placeholder={selected.protocol === AI_AGENT_PROTOCOL_ANTHROPIC ? AI_AGENT_ANTHROPIC_BASE_URL : AI_AGENT_OLLAMA_BASE_URL} onChange={(event) => updateSelected({ baseUrl: event.target.value })} /></label>
+                <label>API key<input type="password" value={selected.draftKey} placeholder={selected.hasKey ? 'Key stored — type to replace' : 'API key'} autoComplete="off" onChange={(event) => updateSelected({ draftKey: event.target.value })} /></label>
+                <div className="ai-agent-provider-model-row">
+                  <label>Available models<output className="ai-agent-provider-models">{selected.models.length > 0 ? selected.models.join(', ') : 'Models load automatically when available.'}</output></label>
+                  <button type="button" className="primary" disabled={selectedIsChecking || !tabId || !selected.baseUrl.trim()} onClick={() => void refreshSelected()}>
+                    Refresh
+                  </button>
+                </div>
+                <div className="ai-agent-provider-actions">
+                  <button type="button" className="primary" disabled={selectedIsChecking || !tabId || !selected.baseUrl.trim()} onClick={() => void checkSelected()}>
+                    Check
+                  </button>
+                  <button type="button" className="ai-agent-danger" onClick={() => void removeProvider()}>Remove provider</button>
+                </div>
+                {selectedCheckMessage ? (
+                  <output className={`ai-agent-provider-check-message is-${selectedCheckMessage.kind}`}>
+                    {selectedCheckMessage.text}
+                  </output>
+                ) : null}
+              </>
+            ) : <p>Select a provider to configure it.</p>}
+          </div>
         </div>
-      </div>
-    </div>
+      )}
+    </DialogShell>
   )
 }

@@ -1,5 +1,5 @@
-import type { PluginActiveStateEvent, PluginMessageEvent } from '../../../shared/pluginApi'
-import type { PluginFileDropHandler, PluginFileDropProgress } from '../../../renderer/src/plugins/api'
+import type { PluginActiveStateEvent, PluginMessageEvent } from '@plugin-api/shared'
+import type { PluginFileDropHandler, PluginFileDropProgress } from '@plugin-api/renderer'
 import { PLUGIN_ID_SFTP } from './id'
 import type { SftpRendererMessage, SftpStatusPayload } from './protocol'
 
@@ -13,14 +13,6 @@ interface UploadFilesOptions {
 
 interface ActiveUploadState {
   cancelled: boolean
-}
-
-type FileDragEventLike = {
-  dataTransfer: DataTransfer
-}
-
-type WebKitItem = DataTransferItem & {
-  webkitGetAsEntry?: () => { isDirectory?: boolean } | null
 }
 
 const SFTP_UPLOAD_CHUNK_SIZE = 256 * 1024
@@ -78,37 +70,7 @@ function startTracking(): void {
   })
 }
 
-export function isFileDrag(e: FileDragEventLike): boolean {
-  return Array.from(e.dataTransfer.types).includes('Files')
-}
-
-/** Files dropped from the OS; directories are skipped (cannot be chunk-uploaded). */
-export function collectDroppedFiles(dt: DataTransfer | null): File[] {
-  if (!dt) {
-    return []
-  }
-  const items = dt.items
-  if (items && items.length > 0) {
-    const files: File[] = []
-    for (const item of Array.from(items)) {
-      if (item.kind !== 'file') {
-        continue
-      }
-      const entry = (item as WebKitItem).webkitGetAsEntry?.()
-      if (entry?.isDirectory) {
-        continue
-      }
-      const file = item.getAsFile()
-      if (file) {
-        files.push(file)
-      }
-    }
-    return files
-  }
-  return Array.from(dt.files)
-}
-
-export function cancelSftpFileDrop(tabId: string, pluginId = PLUGIN_ID_SFTP): void {
+function cancelSftpFileDrop(tabId: string, pluginId = PLUGIN_ID_SFTP): void {
   const active = activeUploads.get(tabId)
   if (active) {
     active.cancelled = true

@@ -1036,6 +1036,16 @@
   width: 100%;
 }
 
+.ssh-key-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ssh-key-row > input {
+  flex: 1;
+}
+
 .ssh-key-gen-field {
   display: flex;
   flex-direction: column;

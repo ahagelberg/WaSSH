@@ -30,21 +30,6 @@ import {
   SERIAL_BAUD_MAX,
   SERIAL_BAUD_MIN,
   SERIAL_BAUD_RATES,
-  SERIAL_DATA_BITS_5,
-  SERIAL_DATA_BITS_6,
-  SERIAL_DATA_BITS_7,
-  SERIAL_DATA_BITS_8,
-  SERIAL_FLOW_NONE,
-  SERIAL_FLOW_RTSCTS,
-  SERIAL_FLOW_XONXOFF,
-  SERIAL_PARITY_EVEN,
-  SERIAL_PARITY_MARK,
-  SERIAL_PARITY_NONE,
-  SERIAL_PARITY_ODD,
-  SERIAL_PARITY_SPACE,
-  SERIAL_STOP_BITS_1,
-  SERIAL_STOP_BITS_1_5,
-  SERIAL_STOP_BITS_2,
   TUNNEL_PORT_MAX,
   TUNNEL_PORT_MIN,
   TUNNEL_TYPE_DYNAMIC,
@@ -82,14 +67,22 @@ import {
 import {
   mergePluginSettings,
   normalizeHostPluginSettings,
+  pluginHostSettingsSectionId,
   type PluginListItem
 } from '@shared/pluginApi'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
-import ColorHexInput from './ColorHexInput'
+import SettingsColorRow from './SettingsColorRow'
+import { HEX_COLOR_RE, TAB_COLOR_THEME_VAR, TERM_BG_THEME_VAR, TERM_FG_THEME_VAR, themeVarHex } from './settingsColor'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import SerialPortField from './SerialPortField'
-import PluginSettingsFieldList from '../plugins/PluginSettingsFieldList'
+import {
+  SERIAL_DATA_BITS_OPTIONS,
+  SERIAL_PARITY_OPTIONS,
+  SERIAL_STOP_BITS_OPTIONS,
+  serialFlowOptions
+} from './serialOptions'
+import PluginSettingsFieldList from '../plugins/api/PluginSettingsFieldList'
 import TagInput from './TagInput'
 import TunnelBuilder from './TunnelBuilder'
 import SshKeySettingsGroup from './SshKeySettingsGroup'
@@ -127,100 +120,6 @@ function toConnection(initial: ConnectionParams | HostProfile): ConnectionParams
     }
   }
   return hostToConnection(initial)
-}
-
-/** CSS variable used as the tab custom-color starting sample */
-const TAB_COLOR_THEME_VAR = '--accent'
-/** CSS variable for themed terminal background */
-const TERM_BG_THEME_VAR = '--bg-term'
-/** Default terminal text color: fixed, not theme-dependent */
-const TERM_FG_THEME_VAR = '--term-fg-default'
-/** Hex digits per RGB channel */
-const HEX_CHANNEL_DIGITS = 2
-const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
-
-function themeVarHex(cssVar: string): string {
-  const raw = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim()
-  if (HEX_COLOR_RE.test(raw)) {
-    return raw
-  }
-  const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(raw)
-  if (!rgb) {
-    return raw
-  }
-  return `#${[rgb[1], rgb[2], rgb[3]]
-    .map((n) => Number(n).toString(16).padStart(HEX_CHANNEL_DIGITS, '0'))
-    .join('')}`
-}
-
-function ColorRow({
-  label,
-  hint,
-  value,
-  themeVar,
-  defaultLabel,
-  resolvedFallback,
-  onChange
-}: {
-  label: string
-  hint: string
-  value: string
-  themeVar: string
-  defaultLabel: string
-  /** Hex used when turning off “use default” if theme var is not a hex */
-  resolvedFallback: string
-  onChange: (value: string) => void
-}) {
-  const useDefault = !value
-  const themeHex = themeVarHex(themeVar)
-  const pickerValue = useDefault
-    ? HEX_COLOR_RE.test(resolvedFallback)
-      ? resolvedFallback
-      : themeHex
-    : value
-  return (
-    <div className="settings-row">
-      <div className="settings-row-label">
-        <strong>{label}</strong>
-        <span>{hint}</span>
-      </div>
-      <div className="settings-color-field">
-        <label className="settings-theme-default">
-          <input
-            type="checkbox"
-            checked={useDefault}
-            onChange={(e) =>
-              onChange(
-                e.target.checked
-                  ? ''
-                  : HEX_COLOR_RE.test(resolvedFallback)
-                    ? resolvedFallback
-                    : themeHex
-              )
-            }
-          />
-          {defaultLabel}
-        </label>
-        {HEX_COLOR_RE.test(pickerValue) ? (
-          <>
-            <input
-              type="color"
-              value={pickerValue}
-              onClick={() => {
-                // Clicking the swatch starts a custom color: clear “use default”
-                // even if the picker is cancelled.
-                if (useDefault) {
-                  onChange(HEX_COLOR_RE.test(resolvedFallback) ? resolvedFallback : themeHex)
-                }
-              }}
-              onChange={(e) => onChange(e.target.value)}
-            />
-            <ColorHexInput value={pickerValue} onChange={onChange} />
-          </>
-        ) : null}
-      </div>
-    </div>
-  )
 }
 
 function DefaultableControl({
@@ -435,10 +334,7 @@ export default function HostSessionSettingsDialog({
                   patch({ serialDataBits: Number(e.target.value) as SerialDataBits })
                 }
               >
-                <option value={SERIAL_DATA_BITS_5}>5</option>
-                <option value={SERIAL_DATA_BITS_6}>6</option>
-                <option value={SERIAL_DATA_BITS_7}>7</option>
-                <option value={SERIAL_DATA_BITS_8}>8</option>
+                {SERIAL_DATA_BITS_OPTIONS}
               </select>
             </div>
             <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
@@ -450,11 +346,7 @@ export default function HostSessionSettingsDialog({
                 disabled={identityLocked}
                 onChange={(e) => patch({ serialParity: e.target.value as SerialParity })}
               >
-                <option value={SERIAL_PARITY_NONE}>None</option>
-                <option value={SERIAL_PARITY_EVEN}>Even</option>
-                <option value={SERIAL_PARITY_ODD}>Odd</option>
-                <option value={SERIAL_PARITY_MARK}>Mark</option>
-                <option value={SERIAL_PARITY_SPACE}>Space</option>
+                {SERIAL_PARITY_OPTIONS}
               </select>
             </div>
             <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
@@ -468,9 +360,7 @@ export default function HostSessionSettingsDialog({
                   patch({ serialStopBits: Number(e.target.value) as SerialStopBits })
                 }
               >
-                <option value={SERIAL_STOP_BITS_1}>1</option>
-                <option value={SERIAL_STOP_BITS_1_5}>1.5</option>
-                <option value={SERIAL_STOP_BITS_2}>2</option>
+                {SERIAL_STOP_BITS_OPTIONS}
               </select>
             </div>
             <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
@@ -484,9 +374,7 @@ export default function HostSessionSettingsDialog({
                   patch({ serialFlowControl: e.target.value as SerialFlowControl })
                 }
               >
-                <option value={SERIAL_FLOW_NONE}>None</option>
-                <option value={SERIAL_FLOW_RTSCTS}>Hardware (RTS/CTS)</option>
-                <option value={SERIAL_FLOW_XONXOFF}>Software (XON/XOFF)</option>
+                {serialFlowOptions(true)}
               </select>
             </div>
           </>
@@ -731,7 +619,7 @@ export default function HostSessionSettingsDialog({
 
     const appearanceRows = (
       <>
-        <ColorRow
+        <SettingsColorRow
           label="Tab color"
           hint={fontHint}
           value={form.tabColor}
@@ -740,7 +628,7 @@ export default function HostSessionSettingsDialog({
           resolvedFallback={colorFallback('tabColor', TAB_COLOR_THEME_VAR)}
           onChange={(tabColor) => patch({ tabColor })}
         />
-        <ColorRow
+        <SettingsColorRow
           label="Terminal background"
           hint={fontHint}
           value={form.termBackground}
@@ -749,7 +637,7 @@ export default function HostSessionSettingsDialog({
           resolvedFallback={colorFallback('termBackground', TERM_BG_THEME_VAR)}
           onChange={(termBackground) => patch({ termBackground })}
         />
-        <ColorRow
+        <SettingsColorRow
           label="Terminal text"
           hint={fontHint}
           value={form.termForeground}
@@ -1072,7 +960,7 @@ export default function HostSessionSettingsDialog({
       }
       const values = mergePluginSettings(schema, form.pluginSettings[plugin.id])
       list.push({
-        id: `plugin-host-${plugin.id}`,
+        id: pluginHostSettingsSectionId(plugin.id),
         title: plugin.contributes.hostSettingsHeading || plugin.name,
         content: (
           <PluginSettingsFieldList

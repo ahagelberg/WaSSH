@@ -16,7 +16,7 @@ import {
   type ConnectionParams,
   type ReconnectMode
 } from '../../shared/types'
-import { sessionStyleFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
+import { sessionStyleOverridesFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 import { normalizeHostPluginSettings } from '../../shared/pluginApi'
 import { DEFAULT_ENABLED_PLUGIN_IDS } from '../plugins/builtinRegistry'
@@ -133,7 +133,7 @@ function normalizeHost(
     authMethod: raw.authMethod ?? 'none',
     proxyHostId: raw.proxyHostId ?? '',
     ...protocolConfigFrom(raw),
-    ...sessionStyleFrom({ ...styleFallbackFrom(stored), ...raw }),
+    ...sessionStyleOverridesFrom({ ...styleFallbackFrom(stored), ...raw }),
     ...tunnelConfigFrom(raw),
     pluginSettings: normalizeHostPluginSettings(raw.pluginSettings),
     reconnectMode: reconnectModeFrom(raw, reconnectFallbackFrom(stored)),
@@ -334,7 +334,7 @@ export class TabStore {
       connection: {
         ...t.connection,
         ...protocolConfigFrom(t.connection),
-        ...sessionStyleFrom({ ...fallback, ...t.connection }),
+        ...sessionStyleOverridesFrom({ ...fallback, ...t.connection }),
         ...tunnelConfigFrom(t.connection),
         pluginSettings: normalizeHostPluginSettings(
           (t.connection as ConnectionParams & { pluginSettings?: unknown }).pluginSettings

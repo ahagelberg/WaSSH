@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import DialogShell from './DialogShell'
 
 export interface SettingsSection {
   id: string
@@ -141,51 +142,44 @@ export default function SettingsDialog({
   }
 
   return (
-    <div className="settings-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div
-        ref={dialogRef}
-        className="settings-dialog"
-        role="dialog"
-        aria-modal="true"
-        tabIndex={-1}
-      >
-        <div className="settings-dialog-header">
-          <h2>{title}</h2>
-          <button type="button" onClick={onClose} aria-label="Close">
-            ✕
-          </button>
+    <DialogShell
+      titleId="settings-dialog-title"
+      title={title}
+      onClose={onClose}
+      dialogRef={dialogRef}
+      focusable
+      closeOnEscape={false}
+      footer={footer}
+    >
+      <div className="settings-dialog-body">
+        <nav className="settings-nav">
+          {sections.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              className={activeId === s.id ? 'active' : ''}
+              onClick={() => scrollTo(s.id)}
+            >
+              {s.title}
+            </button>
+          ))}
+        </nav>
+        <div className="settings-content" ref={contentRef}>
+          {sections.map((s) => (
+            <section
+              key={s.id}
+              id={s.id}
+              className="settings-section"
+              ref={(el) => {
+                sectionRefs.current[s.id] = el
+              }}
+            >
+              <h3>{s.title}</h3>
+              {s.content}
+            </section>
+          ))}
         </div>
-        <div className="settings-dialog-body">
-          <nav className="settings-nav">
-            {sections.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                className={activeId === s.id ? 'active' : ''}
-                onClick={() => scrollTo(s.id)}
-              >
-                {s.title}
-              </button>
-            ))}
-          </nav>
-          <div className="settings-content" ref={contentRef}>
-            {sections.map((s) => (
-              <section
-                key={s.id}
-                id={s.id}
-                className="settings-section"
-                ref={(el) => {
-                  sectionRefs.current[s.id] = el
-                }}
-              >
-                <h3>{s.title}</h3>
-                {s.content}
-              </section>
-            ))}
-          </div>
-        </div>
-        {footer ? <div className="settings-footer">{footer}</div> : null}
       </div>
-    </div>
+    </DialogShell>
   )
 }

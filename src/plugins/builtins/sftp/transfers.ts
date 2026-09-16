@@ -7,11 +7,10 @@ import {
 } from 'fs'
 import type { ReadStream as FsReadStream, WriteStream as FsWriteStream } from 'fs'
 import { basename } from 'path'
-import { BrowserWindow, dialog, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
 import type { ReadStream as SftpReadStream, WriteStream as SftpWriteStream } from 'ssh2'
 import { ZipFile } from 'yazl'
-import type { PluginMainContext, SftpError, SftpSession } from '../../../main/plugins/api'
-import { classifySftpError, joinRemotePath } from '../../../main/plugins/api'
+import type { PluginMainContext, SftpError, SftpSession } from '@plugin-api/main'
+import { classifySftpError, joinRemotePath } from '@plugin-api/main'
 import type { SftpTransferDonePayload, SftpTransferProgressPayload } from './protocol'
 
 interface FileTransferState {
@@ -64,30 +63,6 @@ interface ArchiveEntry {
   mtime: number
   mode: number
   directory: boolean
-}
-
-function focusedWindow(): BrowserWindow | null {
-  const win = BrowserWindow.getFocusedWindow()
-  if (win && !win.isDestroyed()) {
-    return win
-  }
-  const all = BrowserWindow.getAllWindows()
-  for (const w of all) {
-    if (!w.isDestroyed()) {
-      return w
-    }
-  }
-  return null
-}
-
-function showSaveDialog(opts: SaveDialogOptions): Promise<Electron.SaveDialogReturnValue> {
-  const win = focusedWindow()
-  return win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts)
-}
-
-function showOpenDialog(opts: OpenDialogOptions): Promise<Electron.OpenDialogReturnValue> {
-  const win = focusedWindow()
-  return win ? dialog.showOpenDialog(win, opts) : dialog.showOpenDialog(opts)
 }
 
 function sendTransferDone(
@@ -172,7 +147,7 @@ export async function handleDownload(
     return
   }
 
-  const result = await showSaveDialog({
+  const result = await ctx.showSaveDialog({
     title: 'Save downloaded file',
     defaultPath: basename(path),
     buttonLabel: 'Download'
@@ -299,7 +274,7 @@ export async function handleDownloadZip(
   }
 
   const rootName = archiveRootName(path)
-  const result = await showSaveDialog({
+  const result = await ctx.showSaveDialog({
     title: 'Save folder as ZIP',
     defaultPath: `${rootName}.zip`,
     buttonLabel: 'Download',
@@ -514,7 +489,7 @@ export async function handleUploadDialog(
   if (!state.sftp) {
     return 0
   }
-  const result = await showOpenDialog({
+  const result = await ctx.showOpenDialog({
     title: 'Upload files',
     properties: ['openFile', 'multiSelections'],
     buttonLabel: 'Upload'

@@ -1,5 +1,5 @@
-import type { PluginMainContext, PluginMainModule } from '../../../main/plugins/api'
-import { classifySftpError } from '../../../main/plugins/api'
+import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
+import { classifySftpError } from '@plugin-api/main'
 import { handleViewFile } from './fileView'
 import {
   instanceKey,
