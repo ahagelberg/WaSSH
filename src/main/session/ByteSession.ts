@@ -153,7 +153,7 @@ export abstract class ByteSession extends EventEmitter {
       this.emitStatus('closed', SESSION_CLOSED_MESSAGE)
       return
     }
-    this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
+    this.emitStatus('disconnected')
     this.scheduleReconnect()
   }
 
