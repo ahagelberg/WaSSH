@@ -8,7 +8,7 @@ import {
   SessionStatus,
   type ConnectionParams
 } from '../../shared/types'
-import { connectionTypeOf, reconnectModeFrom } from '../../shared/connection'
+import { connectionTypeOf } from '../../shared/connection'
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore } from '../store/sessionStore'
 import { SerialConnection } from '../serial/SerialConnection'
@@ -57,8 +57,6 @@ export class SessionManager {
   private isAppFocused = (): boolean => this.getWindow()?.isFocused() === true
 
   private wire(conn: LiveSession): void {
-    conn.setReconnectPolicy(reconnectModeFrom(conn.getConnection()))
-
     conn.on('data', (data: string) => {
       const pipeline = this.pipeline
       const out = pipeline ? pipeline.processInbound(conn.tabId, data) : data
@@ -145,18 +143,8 @@ export class SessionManager {
     this.sessions.get(tabId)?.respondSavePassword(decision, hostName)
   }
 
-  getConnection(tabId: string) {
-    return this.sessions.get(tabId)?.getConnection()
-  }
-
   updateConnection(tabId: string, partial: Partial<ConnectionParams>): void {
-    const conn = this.sessions.get(tabId)
-    if (!conn) {
-      return
-    }
-    if ('updateConnection' in conn && typeof conn.updateConnection === 'function') {
-      conn.updateConnection(partial)
-    }
+    this.sessions.get(tabId)?.updateConnection(partial)
   }
 
   getPluginSessionHandle(tabId: string): PluginSessionHandle | null {
@@ -226,9 +214,5 @@ export class SessionManager {
         conn.reconnectNow()
       }
     }
-  }
-
-  reconnectOnWake(): void {
-    this.reconnectOnFocus()
   }
 }
