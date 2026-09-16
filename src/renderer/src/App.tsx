@@ -891,11 +891,25 @@ export default function App() {
     void window.wassh.resize(tabId, cols, rows)
   }, [])
 
+  const [vaultEncryption, setVaultEncryption] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    void window.wassh.isVaultEncryptionAvailable().then(setVaultEncryption)
+  }, [])
+
   const saveHost = async (
     host: HostProfile,
     password: string,
     passphrase: string
   ): Promise<void> => {
+    if ((password || passphrase) && vaultEncryption === false) {
+      const proceed = window.confirm(
+        'OS encryption is unavailable on this system, so the password would be stored unencrypted. Save anyway?'
+      )
+      if (!proceed) {
+        return
+      }
+    }
     if (password) {
       const vid = host.passwordVaultId || `pwd-${host.id}`
       await window.wassh.setSecret(vid, password)
@@ -1391,6 +1405,11 @@ export default function App() {
           {activeTab?.savePasswordPrompt ? (
             <div className="inline-banner info">
               <div className="msg">Save password to this host?</div>
+              {vaultEncryption === false ? (
+                <div className="msg">
+                  Warning: OS encryption is unavailable — the password would be stored unencrypted.
+                </div>
+              ) : null}
               {!activeTab.savePasswordPrompt.hasHostProfile ? (
                 <input
                   value={saveAsHostName}

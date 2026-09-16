@@ -47,6 +47,7 @@ const api: WasshApi = {
   setSecret: (vaultId: string, value: string) => ipcRenderer.invoke('vault:set', vaultId, value),
   getSecret: (vaultId: string) => ipcRenderer.invoke('vault:get', vaultId),
   deleteSecret: (vaultId: string) => ipcRenderer.invoke('vault:delete', vaultId),
+  isVaultEncryptionAvailable: () => ipcRenderer.invoke('vault:encryptionAvailable'),
   connect: (req: ConnectRequest) => ipcRenderer.invoke('session:connect', req),
   disconnect: (tabId: string) => ipcRenderer.invoke('session:disconnect', tabId),
   write: (tabId: string, data: string) => ipcRenderer.invoke('session:write', tabId, data),

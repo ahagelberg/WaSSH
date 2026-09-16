@@ -11,6 +11,7 @@ import {
   SshKeyRetrieveOptions,
   TabSnapshot,
   THEME_WINDOW_BACKGROUND,
+  type ConnectionParams,
   type HostsOrganization
 } from '../../shared/types'
 import { CredentialVault } from '../store/credentialVault'
@@ -31,6 +32,10 @@ import { sendToWindow } from '../windowSend'
 /** Protocols the shell may open in the default browser */
 const EXTERNAL_URL_PROTOCOLS = new Set(['http:', 'https:'])
 
+/** OS dialog titles for file pickers */
+const PICK_PRIVATE_KEY_TITLE = 'Select private key'
+const PICK_DIRECTORY_TITLE = 'Select folder'
+
 /** True when a string is an http(s) URL safe to hand to the OS. */
 export function isSafeExternalUrl(url: string): boolean {
   let parsed: URL
@@ -47,6 +52,18 @@ export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): vo
   if (win && !win.isDestroyed()) {
     win.setBackgroundColor(THEME_WINDOW_BACKGROUND[theme])
   }
+}
+
+async function showOpenDialog(
+  getWindow: () => BrowserWindow | null,
+  options: Electron.OpenDialogOptions
+): Promise<Electron.OpenDialogReturnValue> {
+  const win = getWindow()
+  return win ? dialog.showOpenDialog(win, options) : dialog.showOpenDialog(options)
+}
+
+function firstPickedPath(result: Electron.OpenDialogReturnValue): string | null {
+  return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
 }
 
 export function registerIpc(
@@ -110,6 +127,7 @@ export function registerIpc(
   ipcMain.handle('vault:delete', (_e, vaultId: string) => {
     vault.delete(vaultId)
   })
+  ipcMain.handle('vault:encryptionAvailable', () => vault.isEncryptionAvailable())
 
   ipcMain.handle('session:connect', async (_e, req: ConnectRequest) => {
     await sessions.connect(req)
@@ -125,7 +143,7 @@ export function registerIpc(
   })
   ipcMain.handle(
     'session:updateConnection',
-    (_e, tabId: string, partial: Partial<import('../../shared/types').ConnectionParams>) => {
+    (_e, tabId: string, partial: Partial<ConnectionParams>) => {
       sessions.updateConnection(tabId, partial)
     }
   )
@@ -146,34 +164,18 @@ export function registerIpc(
     shell.beep()
   })
 
-  ipcMain.handle('dialog:pickPrivateKey', async () => {
-    const win = getWindow()
-    const result = win
-      ? await dialog.showOpenDialog(win, {
-          title: 'Select private key',
-          properties: ['openFile']
-        })
-      : await dialog.showOpenDialog({
-          title: 'Select private key',
-          properties: ['openFile']
-        })
-    if (result.canceled || result.filePaths.length === 0) {
-      return null
-    }
-    return result.filePaths[0]
-  })
+  ipcMain.handle('dialog:pickPrivateKey', () =>
+    showOpenDialog(getWindow, { title: PICK_PRIVATE_KEY_TITLE, properties: ['openFile'] }).then(
+      firstPickedPath
+    )
+  )
 
-  ipcMain.handle('dialog:pickDirectory', async () => {
-    const win = getWindow()
-    const options: Electron.OpenDialogOptions = {
-      title: 'Select folder',
+  ipcMain.handle('dialog:pickDirectory', () =>
+    showOpenDialog(getWindow, {
+      title: PICK_DIRECTORY_TITLE,
       properties: ['openDirectory']
-    }
-    const result = win
-      ? await dialog.showOpenDialog(win, options)
-      : await dialog.showOpenDialog(options)
-    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0]
-  })
+    }).then(firstPickedPath)
+  )
 
   ipcMain.handle('serial:listPorts', () => listSerialPorts())
 
@@ -183,7 +185,6 @@ export function registerIpc(
     }
     await shell.openExternal(url)
   })
-
 
   ipcMain.handle('plugins:list', () => pluginHost.listPlugins())
   ipcMain.handle('plugins:activate', async (_e, tabId: string, pluginId: string) => {

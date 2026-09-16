@@ -232,6 +232,15 @@ export default function AiAgentProviderDialog({ tabId, onClose }: Props): ReactE
   const save = async (): Promise<void> => {
     setSaving(true)
     try {
+      const hasNewKey = drafts.some((provider) => provider.draftKey.trim())
+      if (hasNewKey && !(await window.wassh.isVaultEncryptionAvailable())) {
+        const proceed = window.confirm(
+          'OS encryption is unavailable on this system, so the API key would be stored unencrypted. Save anyway?'
+        )
+        if (!proceed) {
+          return
+        }
+      }
       for (const provider of drafts) {
         const key = provider.draftKey.trim()
         if (key) await window.wassh.setSecret(aiAgentVaultId(provider.id), key)

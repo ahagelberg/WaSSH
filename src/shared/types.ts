@@ -283,8 +283,10 @@ export type ScreenBusyHandling =
 /** Default when enabling open-in-screen */
 export const DEFAULT_SCREEN_BUSY_HANDLING: ScreenBusyHandling = SCREEN_BUSY_DO_NOT_ATTACH
 
-/** Wait after OS resume so the network stack is up before reconnecting */
-export const WAKE_RECONNECT_DELAY_MS = 2000
+/** Source address reported to the SSH server for forwarded connections */
+export const SSH_FORWARD_SOURCE_IP = '127.0.0.1'
+/** Ephemeral source port for forwarded connections */
+export const SSH_FORWARD_SOURCE_PORT = 0
 
 /** Tab snapshot write debounce ms */
 export const TAB_SNAPSHOT_DEBOUNCE_MS = 500
@@ -645,6 +647,8 @@ export interface WasshApi {
   setSecret: (vaultId: string, value: string) => Promise<void>
   getSecret: (vaultId: string) => Promise<string | null>
   deleteSecret: (vaultId: string) => Promise<void>
+  /** False when the OS provides no encryption for stored secrets */
+  isVaultEncryptionAvailable: () => Promise<boolean>
   connect: (req: ConnectRequest) => Promise<void>
   disconnect: (tabId: string) => Promise<void>
   write: (tabId: string, data: string) => Promise<void>

@@ -36,8 +36,14 @@ export class CredentialVault {
     writeFileSync(this.path, JSON.stringify(this.cache, null, JSON_INDENT), 'utf8')
   }
 
+  /** True when the OS can encrypt stored secrets. */
+  isEncryptionAvailable(): boolean {
+    return safeStorage.isEncryptionAvailable()
+  }
+
   set(vaultId: string, plaintext: string): void {
     if (!safeStorage.isEncryptionAvailable()) {
+      console.warn('OS encryption unavailable — storing secret without encryption:', vaultId)
       this.cache[vaultId] = Buffer.from(plaintext, 'utf8').toString('base64')
       this.persist()
       return
