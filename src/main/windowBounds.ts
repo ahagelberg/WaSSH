@@ -44,7 +44,7 @@ export function restoreWindowBounds(saved: WindowBounds | null): {
   return { x: saved.x, y: saved.y, width, height, maximized: saved.maximized }
 }
 
-export function readWindowBounds(win: BrowserWindow): WindowBounds {
+function readWindowBounds(win: BrowserWindow): WindowBounds {
   const maximized = win.isMaximized()
   const bounds = maximized ? win.getNormalBounds() : win.getBounds()
   return {
