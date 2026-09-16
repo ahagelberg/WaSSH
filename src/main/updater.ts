@@ -17,6 +17,9 @@ const DOWNLOAD_AND_INSTALL_BUTTON_INDEX = 0
 /** Index of the "Not now" (dismiss) button in the update-available prompt. */
 const NOT_NOW_BUTTON_INDEX = 1
 
+/** electron-builder unpacked build directory — such builds cannot update themselves. */
+const UNPACKED_BUILD_DIR_NAME = 'win-unpacked'
+
 let downloadedVersion: string | null = null
 let declinedVersion: string | null = null
 let checkInProgress = false
@@ -32,7 +35,7 @@ function canAutoUpdate(): boolean {
     return false
   }
   // Portable and win-unpacked builds run from an unpacked dir; only an install can update itself.
-  if (process.env.PORTABLE_EXECUTABLE_DIR || app.getPath('exe').includes('win-unpacked')) {
+  if (process.env.PORTABLE_EXECUTABLE_DIR || app.getPath('exe').includes(UNPACKED_BUILD_DIR_NAME)) {
     return false
   }
   return true
