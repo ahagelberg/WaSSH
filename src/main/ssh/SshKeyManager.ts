@@ -11,16 +11,18 @@ import {
   DEFAULT_SERIAL_FLOW_CONTROL,
   DEFAULT_SERIAL_PARITY,
   DEFAULT_SERIAL_STOP_BITS,
-  type ConnectionParams,
-  type HostProfile,
-  type SshKeyDeployOptions,
-  type SshKeyDeployResult,
-  type SshKeyGenerateOptions,
-  type SshKeyGenerateResult,
-  type SshKeyInfo,
-  type SshKeyLocalItem,
-  type SshKeyRetrieveOptions,
-  type SshKeyRetrieveResult
+  ConnectionParams,
+  SSH_FORWARD_SOURCE_IP,
+  SSH_FORWARD_SOURCE_PORT,
+  SshKeyDeployOptions,
+  SshKeyDeployResult,
+  SshKeyGenerateOptions,
+  SshKeyGenerateResult,
+  SshKeyInfo,
+  SshKeyLocalItem,
+  SshKeyRetrieveOptions,
+  SshKeyRetrieveResult,
+  type HostProfile
 } from '../../shared/types'
 import type { CredentialVault } from '../store/credentialVault'
 import type { SessionStore } from '../store/sessionStore'
@@ -41,10 +43,6 @@ const DEFAULT_KEY_COMMENT = 'wassh'
 
 /** SSH connection timeout in ms */
 const SSH_CONNECT_TIMEOUT_MS = 15000
-/** Target loopback address for tunnel forwarding */
-const FORWARD_BIND_HOST = '127.0.0.1'
-/** Ephemeral port for tunnel forwarding */
-const FORWARD_BIND_PORT = 0
 
 /** Suffix for public key files */
 const PUB_EXT = '.pub'
@@ -73,11 +71,11 @@ export class SshKeyManager {
     private sessionStore: SessionStore
   ) {}
 
-  getDefaultSshDir(): string {
+  private getDefaultSshDir(): string {
     return join(homedir(), '.ssh')
   }
 
-  ensureSshDir(): string {
+  private ensureSshDir(): string {
     const dir = this.getDefaultSshDir()
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: SSH_DIR_FILE_MODE })
@@ -430,7 +428,7 @@ export class SshKeyManager {
 
   private forwardThrough(client: Client, host: string, port: number): Promise<Readable> {
     return new Promise((resolve, reject) => {
-      client.forwardOut(FORWARD_BIND_HOST, FORWARD_BIND_PORT, host, port, (err, stream) => {
+      client.forwardOut(SSH_FORWARD_SOURCE_IP, SSH_FORWARD_SOURCE_PORT, host, port, (err, stream) => {
         if (err) {
           reject(err)
           return
