@@ -69,23 +69,25 @@ type StoredSettings = Partial<AppSettings> & {
   reconnectMaxAttempts?: number
 }
 
-function storedStyleFallback(): {
+function readStoredSettings(): StoredSettings {
+  return readJson<StoredSettings>(SETTINGS_FILE, {})
+}
+
+function styleFallbackFrom(stored: StoredSettings): {
   fontSizePx?: number
   fontFamily?: string
   scrollbackLines?: number
 } {
-  const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
   return {
-    fontSizePx: raw.fontSizePx,
-    fontFamily: raw.fontFamily,
-    scrollbackLines: raw.scrollbackLines
+    fontSizePx: stored.fontSizePx,
+    fontFamily: stored.fontFamily,
+    scrollbackLines: stored.scrollbackLines
   }
 }
 
 /** Map removed global auto-reconnect toggle onto per-host default once */
-function legacyReconnectModeDefault(): ReconnectMode {
-  const raw = readJson<StoredSettings>(SETTINGS_FILE, {})
-  if (raw.autoReconnectOnDrop === false) {
+function reconnectFallbackFrom(stored: StoredSettings): ReconnectMode {
+  if (stored.autoReconnectOnDrop === false) {
     return RECONNECT_MODE_NONE
   }
   return DEFAULT_RECONNECT_MODE
@@ -117,7 +119,7 @@ function normalizeTags(value: unknown): string[] {
 
 function normalizeHost(
   raw: Partial<HostProfile> & { id: string },
-  fallbackMode: ReconnectMode = DEFAULT_RECONNECT_MODE
+  stored: StoredSettings
 ): HostProfile {
   return {
     id: raw.id,
@@ -131,10 +133,10 @@ function normalizeHost(
     authMethod: raw.authMethod ?? 'none',
     proxyHostId: raw.proxyHostId ?? '',
     ...protocolConfigFrom(raw),
-    ...sessionStyleFrom({ ...storedStyleFallback(), ...raw }),
+    ...sessionStyleFrom({ ...styleFallbackFrom(stored), ...raw }),
     ...tunnelConfigFrom(raw),
     pluginSettings: normalizeHostPluginSettings(raw.pluginSettings),
-    reconnectMode: reconnectModeFrom(raw, fallbackMode),
+    reconnectMode: reconnectModeFrom(raw, reconnectFallbackFrom(stored)),
     ...screenConfigFrom(raw),
     tags: normalizeTags(raw.tags)
   }
@@ -172,7 +174,6 @@ function readRawHostsFile(): unknown {
 
 function loadHostsDocument(): { doc: HostsDocument; needsWrite: boolean } {
   const raw = readRawHostsFile()
-  const fallbackMode = legacyReconnectModeDefault()
 
   if (isHostsArray(raw)) {
     const hosts = raw.map((h) => ({ ...h, id: h.id ?? randomUUID() }))
@@ -224,10 +225,10 @@ function writeHostsDocument(doc: HostsDocument): void {
 }
 
 function normalizedDocument(): { doc: HostsDocument; hosts: HostProfile[] } {
-  const fallbackMode = legacyReconnectModeDefault()
+  const stored = readStoredSettings()
   const { doc: rawDoc, needsWrite } = loadHostsDocument()
   const hosts = rawDoc.hosts.map((h) =>
-    normalizeHost({ ...h, id: h.id ?? randomUUID() }, fallbackMode)
+    normalizeHost({ ...h, id: h.id ?? randomUUID() }, stored)
   )
   const hostIds = hosts.map((h) => h.id)
   const org = reconcileOrganization(
@@ -253,12 +254,6 @@ function normalizedDocument(): { doc: HostsDocument; hosts: HostProfile[] } {
 }
 
 export class SessionStore {
-  /** Persist reconnectMode onto hosts/tabs that predate the per-host setting */
-  migrateReconnectModes(): void {
-    this.listHosts()
-    new TabStore().getTabs()
-  }
-
   listHosts(): HostProfile[] {
     return normalizedDocument().hosts
   }
@@ -284,7 +279,7 @@ export class SessionStore {
 
   saveHost(host: HostProfile): HostProfile {
     const { doc, hosts } = normalizedDocument()
-    const next = normalizeHost({ ...host, id: host.id })
+    const next = normalizeHost({ ...host, id: host.id }, readStoredSettings())
     const idx = hosts.findIndex((h) => h.id === next.id)
     let org: HostsOrganization = {
       groups: doc.groups,
@@ -326,8 +321,9 @@ export class SessionStore {
 
 export class TabStore {
   getTabs(): TabSnapshot[] {
-    const fallback = storedStyleFallback()
-    const fallbackMode = legacyReconnectModeDefault()
+    const stored = readStoredSettings()
+    const fallback = styleFallbackFrom(stored)
+    const fallbackMode = reconnectFallbackFrom(stored)
     const rawTabs = readJson<TabSnapshot[]>(TABS_FILE, [])
     const tabs = rawTabs.map((t) => ({
       ...t,
