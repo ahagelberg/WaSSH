@@ -75,13 +75,13 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 
 ### 3.1 Bugs
 - [x] `App.tsx:477-497` — `setActiveTabId` called inside the `setTabs` updater. Fixed: `closeTab` computes the next list from `tabsRef.current`, then calls `setTabs` and `setActiveTabId` separately (pure updater).
-- [x] `App.tsx:691-774` — `onPluginSettingsPatch` clobbered by the `settings:changed` broadcast. Fixed: the `.then(setSettings)` echo is dropped in `updateSettings` and `onPluginSettingsPatch`; the main process broadcast is the single authoritative source (`updateSettings` still refreshes plugins).
 - [x] `App.tsx:805-830` — `uploadDroppedFiles` wraps the chunk loop in one `try/catch`; failure invisible (progress banner just vanishes). Resolved by §5 sftp decoupling (routed).
+- [x] `App.tsx:691-774` — `onPluginSettingsPatch` clobbered by the `settings:changed` broadcast. Fixed: the `.then(setSettings)` echo is dropped in `updateSettings` and `onPluginSettingsPatch`; the main process broadcast is the single authoritative source (`updateSettings` still refreshes plugins).
 - [x] `App.tsx:263,639-650` vs `sftp/fileDrop.ts:29,43-58` — two independent SFTP readiness sources parsing the same status; `dropEnabled` read from ref during render, kept live by a tick counter (`:1799`). Resolved by §5 (routed).
 - [x] `TabBar.tsx:283-321` — `.tab-close` was `span role="button"` nested inside the tab `<button>` (invalid HTML; `onKeyDown` unreachable). Fixed: now a presentational span (`aria-hidden`); keyboard close stays via the tab context menu / `close-active` command.
 - [x] `PluginPanelShell.tsx:20-32` — grip `role="button" tabIndex={0}` with no keyboard activation. Fixed: pointer-only drag handle (role/tabIndex/aria-label removed).
-- [x] `SerialPortField.tsx:37-40` — `typeof list !== 'function'` guarded a bridge method that always exists. Fixed: dead branch removed.
 - [x] `AiAgentProviderDialog.tsx:225-231` — `removeProvider` picked the next selection from stale `drafts`. Fixed: selects from the filtered list. `:232-250` `save` `try/finally` without `catch` → unhandled rejection. Fixed: `saveError` state surfaced in the footer. (UI still moves into the plugin per §5.)
+- [x] `SerialPortField.tsx:37-40` — `typeof list !== 'function'` guarded a bridge method that always exists. Fixed: dead branch removed.
 - [x] `TerminalView.tsx:102-118` — reads xterm private internals (`_charSizeService`, `_renderService.dimensions.css.canvas`). Reviewed: already feature-detected via optional chaining + `?? 0` fallback, typed by the documented `XtermCoreInternals` interface; a renamed internal degrades (no height pin) rather than crashing. No change needed.
 - [x] `App.tsx:1204-1240` — three identical `^#[0-9A-Fa-f]{6}$` literals + three near-identical `sessionStyleDefaults` updates. Fixed: `HEX_COLOR_RE` at file top (the three updates remain distinct by key).
 - [x] `SessionsSidebar.tsx:111-123` — menu flip uses hard-coded 160 px height estimate; only X clamped (tall menus overflow). → §6 (needs menu measurement) (routed).
