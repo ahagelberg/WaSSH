@@ -2,6 +2,8 @@ import { connect, createServer, type Server, type Socket } from 'net'
 import type { Client, ClientChannel } from 'ssh2'
 import {
   DEFAULT_X11_HOST,
+  SSH_FORWARD_SOURCE_IP,
+  SSH_FORWARD_SOURCE_PORT,
   TUNNEL_TYPE_DYNAMIC,
   TUNNEL_TYPE_LOCAL,
   TUNNEL_TYPE_REMOTE,
@@ -25,10 +27,10 @@ const SOCKS5_REP_SUCCESS = 0x00
 const SOCKS5_REP_FAILURE = 0x01
 /** Bytes to wait for before treating SOCKS greeting as incomplete */
 const SOCKS_GREETING_MIN_BYTES = 2
-/** Source IP reported to the SSH server for local→remote forwards */
-const FORWARD_SRC_IP = '127.0.0.1'
-/** Source port reported to the SSH server for local→remote forwards */
-const FORWARD_SRC_PORT = 0
+/** SOCKS5 CONNECT request header: ver, cmd, rsv, atyp */
+const SOCKS_CONNECT_HEADER_LEN = 4
+/** Bind-host spellings a remote forward may be reported under by the server */
+const REMOTE_BIND_HOST_ALIASES = ['127.0.0.1', 'localhost', '0.0.0.0', '::']
 
 function remoteBindKey(host: string, port: number): string {
   return `${host}:${port}`
@@ -88,15 +90,14 @@ function readSocksGreeting(buf: Buffer): { ok: true; consumed: number } | { ok: 
 function parseSocksConnect(
   buf: Buffer
 ): { host: string; port: number; consumed: number } | { error: true } | null {
-  const headerLen = 4
-  if (buf.length < headerLen) {
+  if (buf.length < SOCKS_CONNECT_HEADER_LEN) {
     return null
   }
   if (buf[0] !== SOCKS5_VERSION || buf[1] !== SOCKS5_CMD_CONNECT) {
     return { error: true }
   }
   const atyp = buf[3]
-  let offset = headerLen
+  let offset = SOCKS_CONNECT_HEADER_LEN
   let host = ''
   if (atyp === SOCKS5_ATYP_IPV4) {
     if (buf.length < offset + 4 + 2) {
@@ -153,8 +154,16 @@ export class TunnelManager {
   private localServers: Server[] = []
   private remoteBinds: Array<{ host: string; port: number }> = []
   private remoteRoutes = new Map<string, { destHost: string; destPort: number }>()
-  private tcpHandler: ((...args: unknown[]) => void) | null = null
-  private x11Handler: ((...args: unknown[]) => void) | null = null
+  private tcpHandler:
+    | ((
+        details: { destIP: string; destPort: number },
+        accept: () => ClientChannel,
+        reject: () => void
+      ) => void)
+    | null = null
+  private x11Handler:
+    | ((details: unknown, accept: () => ClientChannel, reject: () => void) => void)
+    | null = null
 
   constructor(private readonly onNotice: (message: string) => void) {}
 
@@ -240,7 +249,7 @@ export class TunnelManager {
         )
       })
     }
-    this.x11Handler = handler as (...args: unknown[]) => void
+    this.x11Handler = handler
     client.on('x11', handler)
   }
 
@@ -255,10 +264,9 @@ export class TunnelManager {
     ): void => {
       const route =
         this.remoteRoutes.get(remoteBindKey(details.destIP, details.destPort)) ||
-        this.remoteRoutes.get(remoteBindKey('127.0.0.1', details.destPort)) ||
-        this.remoteRoutes.get(remoteBindKey('localhost', details.destPort)) ||
-        this.remoteRoutes.get(remoteBindKey('0.0.0.0', details.destPort)) ||
-        this.remoteRoutes.get(remoteBindKey('::', details.destPort))
+        REMOTE_BIND_HOST_ALIASES.map((host) =>
+          this.remoteRoutes.get(remoteBindKey(host, details.destPort))
+        ).find((entry) => entry !== undefined)
       if (!route) {
         reject()
         return
@@ -272,7 +280,7 @@ export class TunnelManager {
         reject()
       })
     }
-    this.tcpHandler = handler as (...args: unknown[]) => void
+    this.tcpHandler = handler
     client.on('tcp connection', handler)
   }
 
@@ -297,8 +305,8 @@ export class TunnelManager {
           socket.destroy()
         })
         client.forwardOut(
-          FORWARD_SRC_IP,
-          FORWARD_SRC_PORT,
+          SSH_FORWARD_SOURCE_IP,
+          SSH_FORWARD_SOURCE_PORT,
           tunnel.destHost,
           tunnel.destPort,
           (err, stream) => {
@@ -393,7 +401,7 @@ export class TunnelManager {
         buf = buf.subarray(req.consumed)
         socket.removeListener('data', onData)
         phase = 'proxy'
-        client.forwardOut(FORWARD_SRC_IP, FORWARD_SRC_PORT, req.host, req.port, (err, stream) => {
+        client.forwardOut(SSH_FORWARD_SOURCE_IP, SSH_FORWARD_SOURCE_PORT, req.host, req.port, (err, stream) => {
           if (err || !stream) {
             socket.write(socksReply(SOCKS5_REP_FAILURE))
             socket.destroy()
