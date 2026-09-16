@@ -230,7 +230,10 @@ export const RECONNECT_MAX_BACKOFF_MS = 10 * 60 * 1000
 /** No automatic reconnect after a drop */
 export const RECONNECT_MODE_NONE = 'none'
 
-/** Reconnect when the app window gains focus (or after wake) */
+/**
+ * Reconnect when the app window gains focus (or after wake); a failed attempt
+ * keeps retrying with backoff while that focus is kept
+ */
 export const RECONNECT_MODE_ON_FOCUS = 'onFocus'
 
 /** Keep retrying with backoff; also reconnect on focus / wake */

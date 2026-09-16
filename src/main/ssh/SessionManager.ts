@@ -53,6 +53,9 @@ export class SessionManager {
     sendToWindow(this.getWindow, channel, ...args)
   }
 
+  /** True while the app window has focus, used by the reconnect retry policy. */
+  private isAppFocused = (): boolean => this.getWindow()?.isFocused() === true
+
   private wire(conn: LiveSession): void {
     conn.setReconnectPolicy(reconnectModeFrom(conn.getConnection()))
 
@@ -84,16 +87,17 @@ export class SessionManager {
     const type = connectionTypeOf(req.connection)
     let conn: LiveSession
     if (type === CONNECTION_TYPE_TELNET) {
-      conn = new TelnetConnection(req.tabId, req.connection)
+      conn = new TelnetConnection(req.tabId, req.connection, this.isAppFocused)
     } else if (type === CONNECTION_TYPE_SERIAL) {
-      conn = new SerialConnection(req.tabId, req.connection)
+      conn = new SerialConnection(req.tabId, req.connection, this.isAppFocused)
     } else {
       conn = new SshConnection(
         req.tabId,
         req.connection,
         this.vault,
         this.knownHosts,
-        this.sessionStore
+        this.sessionStore,
+        this.isAppFocused
       )
     }
     this.sessions.set(req.tabId, conn)

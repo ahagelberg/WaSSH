@@ -519,9 +519,20 @@ export function reconnectModeFrom(
   return fallback
 }
 
-/** True when a drop should schedule backoff retries */
-export function reconnectModeSchedulesBackoff(mode: ReconnectMode): boolean {
-  return mode === RECONNECT_MODE_ALWAYS
+/**
+ * True when a reconnect should be scheduled now. 'Always' keeps retrying a
+ * session that has been up; 'On focus' retries a failed connect attempt for as
+ * long as the app window keeps focus, and otherwise only reconnects on the next
+ * focus change (or wake), which is what triggers the immediate attempt.
+ */
+export function reconnectModeSchedulesRetry(
+  mode: ReconnectMode,
+  opts: { everConnected: boolean; failedAttempt: boolean; appFocused: boolean }
+): boolean {
+  if (mode === RECONNECT_MODE_ALWAYS) {
+    return opts.everConnected
+  }
+  return mode === RECONNECT_MODE_ON_FOCUS && opts.failedAttempt && opts.appFocused
 }
 
 /** True when window focus / wake should trigger an immediate reconnect */

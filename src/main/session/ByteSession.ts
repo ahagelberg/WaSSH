@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events'
 import {
   reconnectModeFrom,
-  reconnectModeSchedulesBackoff,
+  reconnectModeSchedulesRetry,
   reconnectModeWantsFocus
 } from '../../shared/connection'
 import {
@@ -40,7 +40,8 @@ export abstract class ByteSession extends EventEmitter {
 
   constructor(
     readonly tabId: string,
-    protected connection: ConnectionParams
+    protected connection: ConnectionParams,
+    protected isAppFocused: () => boolean
   ) {
     super()
     this.reconnectMode = reconnectModeFrom(connection)
@@ -156,12 +157,16 @@ export abstract class ByteSession extends EventEmitter {
     this.scheduleReconnect()
   }
 
-  protected scheduleReconnect(): void {
+  /** Backoff retry; `failedAttempt` marks a connect attempt that ended in 'failed'. */
+  protected scheduleReconnect(failedAttempt = false): void {
     if (
-      !reconnectModeSchedulesBackoff(this.reconnectMode) ||
       this.intentionalDisconnect ||
       this.disposed ||
-      !this.everConnected
+      !reconnectModeSchedulesRetry(this.reconnectMode, {
+        everConnected: this.everConnected,
+        failedAttempt,
+        appFocused: this.isAppFocused()
+      })
     ) {
       return
     }

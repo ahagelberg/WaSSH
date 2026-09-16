@@ -1,5 +1,5 @@
 import { Socket } from 'net'
-import { DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS } from '../../shared/types'
+import { DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS, type ConnectionParams } from '../../shared/types'
 import { ByteSession } from '../session/ByteSession'
 
 /** Telnet IAC (Interpret As Command) */
@@ -222,6 +222,10 @@ export class TelnetConnection extends ByteSession {
   private socket: Socket | null = null
   private filter: TelnetFilter | null = null
 
+  constructor(tabId: string, connection: ConnectionParams, isAppFocused: () => boolean) {
+    super(tabId, connection, isAppFocused)
+  }
+
   protected isTransportOpen(): boolean {
     return Boolean(this.socket && !this.socket.destroyed)
   }
@@ -315,7 +319,7 @@ export class TelnetConnection extends ByteSession {
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
-      this.scheduleReconnect()
+      this.scheduleReconnect(true)
       return
     }
 

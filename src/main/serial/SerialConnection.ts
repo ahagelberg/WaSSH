@@ -2,6 +2,7 @@ import type { SerialPort } from 'serialport'
 import {
   SERIAL_FLOW_RTSCTS,
   SERIAL_FLOW_XONXOFF,
+  type ConnectionParams,
   type SerialFlowControl
 } from '../../shared/types'
 import { serialConfigFrom } from '../../shared/connection'
@@ -19,6 +20,10 @@ function flowFlags(flow: SerialFlowControl): { rtscts: boolean; xon: boolean; xo
 
 export class SerialConnection extends ByteSession {
   private port: SerialPort | null = null
+
+  constructor(tabId: string, connection: ConnectionParams, isAppFocused: () => boolean) {
+    super(tabId, connection, isAppFocused)
+  }
 
   protected isTransportOpen(): boolean {
     return Boolean(this.port?.isOpen)
@@ -104,7 +109,7 @@ export class SerialConnection extends ByteSession {
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
-      this.scheduleReconnect()
+      this.scheduleReconnect(true)
       return
     }
 

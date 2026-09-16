@@ -4,7 +4,7 @@ import { readFileSync } from 'fs'
 import { Client, ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2'
 import type { SFTPWrapper } from 'ssh2'
 import { Readable } from 'stream'
-import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesBackoff, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, parseTmuxListForName, remoteSessionBusyFallbackMessage, remoteSessionUnavailableMessage, type ScreenSessionConfig, type ScreenSessionPresence } from '../../shared/connection'
+import { proxyLabel, resolveProxyChain, tunnelConfigFrom, hostProfileFromConnection, reconnectModeFrom, reconnectModeSchedulesRetry, reconnectModeWantsFocus, screenConfigFrom, parseScreenListForName, parseTmuxListForName, remoteSessionBusyFallbackMessage, remoteSessionUnavailableMessage, type ScreenSessionConfig, type ScreenSessionPresence } from '../../shared/connection'
 import {
   ConnectionParams,
   DEFAULT_RECONNECT_MODE,
@@ -100,7 +100,8 @@ export class SshConnection extends EventEmitter {
     private connection: ConnectionParams,
     private vault: CredentialVault,
     private knownHosts: KnownHostsStore,
-    private sessionStore: SessionStore
+    private sessionStore: SessionStore,
+    private isAppFocused: () => boolean
   ) {
     super()
     this.reconnectMode = reconnectModeFrom(connection)
@@ -835,7 +836,7 @@ export class SshConnection extends EventEmitter {
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeClientOnly()
-      this.scheduleReconnect()
+      this.scheduleReconnect(true)
       return
     }
 
@@ -881,7 +882,7 @@ export class SshConnection extends EventEmitter {
           this.opening = false
           const msg = err instanceof Error ? err.message : String(err)
           this.emitStatus('failed', msg)
-          this.scheduleReconnect()
+          this.scheduleReconnect(true)
           resolve()
         })
 
@@ -988,7 +989,7 @@ export class SshConnection extends EventEmitter {
           this.opening = false
           this.tunnels.stop()
           this.emitStatus('failed', err.message)
-          this.scheduleReconnect()
+          this.scheduleReconnect(true)
           resolve()
           return
         }
@@ -1169,12 +1170,16 @@ export class SshConnection extends EventEmitter {
     this.endAfterRemoteLogout()
   }
 
-  private scheduleReconnect(): void {
+  /** Backoff retry; `failedAttempt` marks a connect attempt that ended in 'failed'. */
+  private scheduleReconnect(failedAttempt = false): void {
     if (
-      !reconnectModeSchedulesBackoff(this.reconnectMode) ||
       this.intentionalDisconnect ||
       this.disposed ||
-      !this.everConnected
+      !reconnectModeSchedulesRetry(this.reconnectMode, {
+        everConnected: this.everConnected,
+        failedAttempt,
+        appFocused: this.isAppFocused()
+      })
     ) {
       return
     }

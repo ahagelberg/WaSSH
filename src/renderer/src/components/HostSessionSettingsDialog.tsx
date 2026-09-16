@@ -526,8 +526,9 @@ export default function HostSessionSettingsDialog({
           <div className="settings-row-label">
             <strong>Reconnect</strong>
             <span>
-              After a mid-session drop: none, when the window is focused, or keep retrying with
-              backoff (also on focus).
+              After a mid-session drop: none, reconnect when the window is focused, or keep
+              retrying with backoff (also on focus). While the window is focused, a failed
+              attempt keeps retrying.
             </span>
           </div>
           <select
