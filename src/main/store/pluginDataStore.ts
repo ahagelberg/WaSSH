@@ -5,7 +5,7 @@ import { join } from 'path'
 const JSON_INDENT = 2
 
 /** Filename for a plugin's private JSON data in userData */
-export function pluginDataFileName(pluginId: string, scopeId?: string): string {
+function pluginDataFileName(pluginId: string, scopeId?: string): string {
   const safe = pluginId.replace(/[^a-zA-Z0-9_-]/g, '_')
   if (!scopeId) {
     return `plugin-${safe}.json`
@@ -36,7 +36,8 @@ export class PluginDataStore {
     }
     try {
       return JSON.parse(readFileSync(path, 'utf8')) as unknown
-    } catch {
+    } catch (err) {
+      console.error(`Failed to read plugin data (${path}):`, err)
       return null
     }
   }
