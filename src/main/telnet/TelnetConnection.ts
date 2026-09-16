@@ -1,5 +1,10 @@
 import { Socket } from 'net'
-import { DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS, type ConnectionParams } from '../../shared/types'
+import {
+  DEFAULT_TERM_COLS,
+  DEFAULT_TERM_ROWS,
+  DEFAULT_TERM_TYPE,
+  type ConnectionParams
+} from '../../shared/types'
 import { ByteSession } from '../session/ByteSession'
 
 /** Telnet IAC (Interpret As Command) */
@@ -54,7 +59,7 @@ class TelnetFilter {
   private state = STATE_DATA
   private sub: number[] = []
   nawsEnabled = false
-  termType = 'xterm-256color'
+  termType = DEFAULT_TERM_TYPE
   cols = DEFAULT_TERM_COLS
   rows = DEFAULT_TERM_ROWS
 
@@ -69,15 +74,7 @@ class TelnetFilter {
   }
 
   escapeWrite(data: string): Buffer {
-    const raw = Buffer.from(data, 'utf8')
-    const out: number[] = []
-    for (const b of raw) {
-      out.push(b)
-      if (b === IAC) {
-        out.push(IAC)
-      }
-    }
-    return Buffer.from(out)
+    return Buffer.from(iacEscape(Array.from(Buffer.from(data, 'utf8'))))
   }
 
   start(): void {
@@ -88,7 +85,6 @@ class TelnetFilter {
       IAC, WILL, OPT_NAWS,
       IAC, WILL, OPT_TERMINAL_TYPE
     ])
-    this.nawsEnabled = true
   }
 
   sendNaws(): void {
@@ -340,7 +336,6 @@ export class TelnetConnection extends ByteSession {
     })
 
     filter.start()
-    filter.sendNaws()
     this.markConnected()
   }
 
