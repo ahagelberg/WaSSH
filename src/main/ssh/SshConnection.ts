@@ -19,6 +19,8 @@ import {
   SCREEN_BUSY_DO_NOT_ATTACH,
   SCREEN_BUSY_FORCE_DETACH,
   SCREEN_BUSY_SHARE,
+  SSH_FORWARD_SOURCE_IP,
+  SSH_FORWARD_SOURCE_PORT,
   SavePasswordDecision,
   SavePasswordPrompt,
   SessionStatus,
@@ -39,6 +41,10 @@ const MS_PER_SECOND = 1000
 const EXEC_NOT_FOUND_STATUS = 127
 /** Timeout for quick command captures (ms) */
 const EXEC_CAPTURE_TIMEOUT_MS = 30000
+/** known_hosts key type written for verified host keys */
+const SSH_HOST_KEY_TYPE = 'ssh-hostkey'
+/** Vault id prefix for saved passwords */
+const PASSWORD_VAULT_ID_PREFIX = 'pwd-'
 
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
@@ -71,7 +77,7 @@ function remoteSessionAttachCommand(
 export class SshConnection extends EventEmitter {
   private client: Client | null = null
   private proxyClients: Client[] = []
-  private stream: import('ssh2').ClientChannel | null = null
+  private stream: ClientChannel | null = null
   private disposed = false
   private hostKeyWait: { resolve: (d: HostKeyDecision) => void } | null = null
   private interactivePassword: string | null = null
@@ -86,6 +92,10 @@ export class SshConnection extends EventEmitter {
   private reconnectMode: ReconnectMode = DEFAULT_RECONNECT_MODE
   private intentionalDisconnect = false
   private authInputActive = false
+  /** Settles the in-flight promptTerminal() with an empty answer. */
+  private pendingTerminalPrompt: (() => void) | null = null
+  /** Serializes host-key prompts; overlapping handshakes would overwrite the single waiter. */
+  private hostKeyPromptChain: Promise<unknown> = Promise.resolve()
   private everConnected = false
   /** True while open() is connecting, before the shell stream is ready */
   private opening = false
@@ -153,7 +163,7 @@ export class SshConnection extends EventEmitter {
       return
     }
     if (decision === 'save' && this.connection.hostId) {
-      const vaultId = this.connection.passwordVaultId || `pwd-${this.connection.hostId}`
+      const vaultId = this.connection.passwordVaultId || `${PASSWORD_VAULT_ID_PREFIX}${this.connection.hostId}`
       this.vault.set(vaultId, password)
       const host = this.sessionStore.getHost(this.connection.hostId)
       if (host) {
@@ -161,12 +171,11 @@ export class SshConnection extends EventEmitter {
         host.authMethod = host.authMethod === 'none' ? 'password' : host.authMethod
         this.sessionStore.saveHost(host)
       }
-      this.connection.passwordVaultId = vaultId
-      this.connection.ephemeralPassword = ''
+      this.applySavedPassword(vaultId)
       return
     }
     const id = randomUUID()
-    const vaultId = `pwd-${id}`
+    const vaultId = `${PASSWORD_VAULT_ID_PREFIX}${id}`
     this.vault.set(vaultId, password)
     const name = hostName || `${this.connection.username}@${this.connection.host}`
     const profile = hostProfileFromConnection(this.connection, id)
@@ -174,8 +183,12 @@ export class SshConnection extends EventEmitter {
     profile.passwordVaultId = vaultId
     profile.authMethod = 'password'
     this.sessionStore.saveHost(profile)
-    this.connection.hostId = id
     this.connection.name = name
+    this.connection.hostId = id
+    this.applySavedPassword(vaultId)
+  }
+
+  private applySavedPassword(vaultId: string): void {
     this.connection.passwordVaultId = vaultId
     this.connection.ephemeralPassword = ''
   }
@@ -359,7 +372,7 @@ export class SshConnection extends EventEmitter {
       return Promise.reject(new Error('SSH session is not connected'))
     }
     return new Promise((resolve, reject) => {
-      client.forwardOut('127.0.0.1', 0, destHost, destPort, (err, stream) => {
+      client.forwardOut(SSH_FORWARD_SOURCE_IP, SSH_FORWARD_SOURCE_PORT, destHost, destPort, (err, stream) => {
         if (err) {
           reject(err)
           return
@@ -456,7 +469,7 @@ export class SshConnection extends EventEmitter {
     destPort: number
   ): Promise<Readable> {
     return new Promise((resolve, reject) => {
-      client.forwardOut('127.0.0.1', 0, destHost, destPort, (err, stream) => {
+      client.forwardOut(SSH_FORWARD_SOURCE_IP, SSH_FORWARD_SOURCE_PORT, destHost, destPort, (err, stream) => {
         if (err) {
           reject(err)
           return
@@ -519,13 +532,17 @@ export class SshConnection extends EventEmitter {
       this.authInputActive = true
       this.emit('data', label)
       let buf = ''
+      const finish = (value: string): void => {
+        this.pendingTerminalPrompt = null
+        this.off('terminalInput', onData)
+        this.authInputActive = false
+        resolve(value)
+      }
       const onData = (chunk: string): void => {
         for (const ch of chunk) {
           if (ch === '\r' || ch === '\n') {
-            this.off('terminalInput', onData)
-            this.authInputActive = false
             this.emit('data', '\r\n')
-            resolve(buf)
+            finish(buf)
             return
           }
           if (ch === '\u007f' || ch === '\b') {
@@ -546,8 +563,16 @@ export class SshConnection extends EventEmitter {
           }
         }
       }
+      this.pendingTerminalPrompt = () => finish('')
       this.on('terminalInput', onData)
     })
+  }
+
+  /** Ends the pending prompt with an empty answer when the transport goes away. */
+  private cancelTerminalPrompt(): void {
+    const cancel = this.pendingTerminalPrompt
+    this.pendingTerminalPrompt = null
+    cancel?.()
   }
 
   private async ensureTargetCredentials(): Promise<void> {
@@ -595,6 +620,12 @@ export class SshConnection extends EventEmitter {
   }
 
   private async verifyHostKey(params: ConnectionParams, key: Buffer): Promise<boolean> {
+    const prompt = this.hostKeyPromptChain.then(() => this.askHostKeyDecision(params, key))
+    this.hostKeyPromptChain = prompt.catch(() => undefined)
+    return prompt
+  }
+
+  private async askHostKeyDecision(params: ConnectionParams, key: Buffer): Promise<boolean> {
     const fingerprint = this.fingerprintOf(key)
     const existing = this.knownHosts.find(params.host, params.port)
     if (existing && existing.fingerprint === fingerprint) {
@@ -609,7 +640,7 @@ export class SshConnection extends EventEmitter {
       tabId: this.tabId,
       host: params.host,
       port: params.port,
-      keyType: 'ssh-hostkey',
+      keyType: SSH_HOST_KEY_TYPE,
       fingerprint,
       reason
     }
@@ -621,7 +652,7 @@ export class SshConnection extends EventEmitter {
     this.knownHosts.upsert({
       host: params.host,
       port: params.port,
-      keyType: 'ssh-hostkey',
+      keyType: SSH_HOST_KEY_TYPE,
       fingerprint
     })
     return true
@@ -693,9 +724,11 @@ export class SshConnection extends EventEmitter {
       }
       this.onTransportError(err)
     })
+    client.on('close', () => this.cancelTerminalPrompt())
   }
 
   private onTransportError(err: Error): void {
+    this.cancelTerminalPrompt()
     if (this.intentionalDisconnect || this.disposed || this.opening) {
       return
     }
@@ -762,7 +795,7 @@ export class SshConnection extends EventEmitter {
     destPort: number
   ): Promise<Readable> {
     return new Promise((resolve, reject) => {
-      client.forwardOut('127.0.0.1', 0, destHost, destPort, (err, stream) => {
+      client.forwardOut(SSH_FORWARD_SOURCE_IP, SSH_FORWARD_SOURCE_PORT, destHost, destPort, (err, stream) => {
         if (err) {
           reject(err)
           return
@@ -887,12 +920,15 @@ export class SshConnection extends EventEmitter {
         })
 
       client.on('close', () => {
-        if (this.intentionalDisconnect || this.disposed) {
+        if (this.intentionalDisconnect || this.disposed || !this.opening) {
           return
         }
-        if (!this.stream) {
-          this.scheduleReconnect()
-        }
+        // Closed before the interactive channel opened: fail this attempt so the
+        // reconnect policy and the awaiting connect() settle.
+        this.opening = false
+        this.emitStatus('failed', `Connection closed (${this.connection.name || this.connection.host})`)
+        this.scheduleReconnect(true)
+        resolve()
       })
     })
   }
@@ -914,6 +950,7 @@ export class SshConnection extends EventEmitter {
       this.reconnectAttempt = 0
       this.everConnected = true
       this.emitStatus('connected', statusMessage)
+      resolve()
 
       if (multiplexer) {
         // A newly created screen/tmux window only paints its first frame after a
@@ -1208,6 +1245,7 @@ export class SshConnection extends EventEmitter {
   }
 
   private closeClientOnly(): void {
+    this.cancelTerminalPrompt()
     this.tunnels.stop()
     const stream = this.stream
     this.stream = null
