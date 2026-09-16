@@ -19,7 +19,7 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 - [x] `SshConnection.ts:76,481-485` — `hostKeyWait` single slot overwritten by concurrent prompts. Fixed: prompts are serialized (`hostKeyPromptChain`); `respondHostKey` answers the one outstanding prompt.
 - [x] `SshConnection.ts:517-552` — `promptTerminal` never settled. Fixed: `cancelTerminalPrompt()` settles with an empty answer on transport close, `onTransportError`, and `closeClientOnly` (dispose/sleep/re-open).
 - [x] `SshConnection.ts:859-898` — `startShell` had no settle path. Fixed: `connect()` resolves on `connected`; a client close before the channel opens fails the attempt (`opening` guard) and settles.
-- [ ] `SshConnection.ts:689-696,722-757` — guard/connectClient late errors. — rejected: `guardClient` routes only live/proxy clients (intended reconnect path); a failed attempt's client is never assigned to `this.client`, so late errors are ignored by design.
+- [x] `SshConnection.ts:689-696,722-757` — guard/connectClient late errors. — rejected: `guardClient` routes only live/proxy clients (intended reconnect path); a failed attempt's client is never assigned to `this.client`, so late errors are ignored by design.
 - [x] `SshConnection.ts:149-181` — `respondSavePassword` duplicated host re-wiring. Fixed: shared `applySavedPassword()`. A decision arriving after `pendingSavePassword` was consumed still no-ops — the password is no longer available.
 - [x] `SessionManager.ts:153-159` — duck-typed `'updateConnection' in conn` guard. Fixed: direct call.
 - [x] `ByteSession.ts:138-152` — "Session closed" emitted for network drops. Fixed: drop branch emits a bare `disconnected`; the message is reserved for remote-ended sessions.
@@ -28,24 +28,24 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 - [x] `credentialVault.ts` — unencrypted fallback. Fixed per decision (warn at save time): `isEncryptionAvailable()` exposed via `vault:encryptionAvailable`; the save-password banner shows a warning, host save and AI-provider key save require confirmation, and main logs a warning when storing unencrypted. `get()` still returns null for both absent and decrypt-failed.
 - [x] `pluginDataStore.ts:36-45` — corrupt JSON indistinguishable from no data (`null`). Fixed: parse failures are logged.
 - [x] `listSerialPorts.ts:4-16` — catch-all returns `[]`. Fixed: failures are logged.
-- [ ] `updater.ts:95-159` — module-global state; `update-available` dialog outside `checkInProgress` guard. — rejected: the prompt is modal on the parent window so overlapping checks cannot occur; `getWindow` default covers non-updatable builds. Named the `win-unpacked` literal.
-- [ ] `windowBounds.ts:59-87` — close-time `persist()` overwrite; no listener cleanup on destroy. — rejected: `persist()` checks `isDestroyed`, close-time persist writes the latest bounds (correct), listeners die with the window object.
+- [x] `updater.ts:95-159` — module-global state; `update-available` dialog outside `checkInProgress` guard. — rejected: the prompt is modal on the parent window so overlapping checks cannot occur; `getWindow` default covers non-updatable builds. Named the `win-unpacked` literal.
+- [x] `windowBounds.ts:59-87` — close-time `persist()` overwrite; no listener cleanup on destroy. — rejected: `persist()` checks `isDestroyed`, close-time persist writes the latest bounds (correct), listeners die with the window object.
 
 ### 1.2 Dead code
 - [x] `src/main/plugins/aiAgent/{permissions,providers,tools}.ts` — dead re-export shims; directory deleted. (verified)
 - [x] `SessionManager.ts:148-150` `getConnection` — deleted.
 - [x] `pluginDataStore.ts:8` `pluginDataFileName`, `windowBounds.ts:47` `readWindowBounds` — de-exported; `SshKeyManager.ts:76-80` `getDefaultSshDir`/`ensureSshDir` — made private.
-- [ ] `ByteSession.ts:69-75` `respondHostKey`/`respondSavePassword` — no-op stubs. — rejected: intentional; keeps the `LiveSession` union uniform and avoids `instanceof` branching in `SessionManager`.
-- [ ] `SshConnection.ts:443-445` — post-ready error-absorb listener on duplicate clients. — rejected: deliberate crash guard for plugin-held clients; `quietEnd` removes all listeners on dispose.
+- [x] `ByteSession.ts:69-75` `respondHostKey`/`respondSavePassword` — no-op stubs. — rejected: intentional; keeps the `LiveSession` union uniform and avoids `instanceof` branching in `SessionManager`.
+- [x] `SshConnection.ts:443-445` — post-ready error-absorb listener on duplicate clients. — rejected: deliberate crash guard for plugin-held clients; `quietEnd` removes all listeners on dispose.
 - [x] `SessionManager.ts:231-233` `reconnectOnWake` — deleted; index.ts calls `reconnectOnFocus()`.
 
 ### 1.3 DRY
-- [ ] `SshConnection` re-implements `ByteSession` (`getConnection`/`updateConnection`/`setReconnectPolicy`/`wantsFocusReconnect`/`connect`/`disconnect`/`dispose`/`prepareForSleep`/`reconnectNow`/`emitStatus`/`scheduleReconnect`/`clearReconnectTimer`); dup constants `SESSION_CLOSED_MESSAGE` (`SshConnection.ts:35` vs `ByteSession.ts:22`) and `MS_PER_SECOND` (`:37` vs `:25`); backoff bodies `SshConnection.ts:1174-1201` vs `ByteSession.ts:165-194`. → §6.1
-- [ ] `SshConnection.ts:722-757` ≈ `:414-451` ≈ `SshKeyManager.ts:392-423` (connect-client ×3); `forwardThrough` `SshConnection.ts:759-776` ≈ `:453-470` ≈ `SshKeyManager.ts:425-437`. → §6.4
-- [ ] `execCapture` `SshConnection.ts:286-333` ≈ `probeRemoteSession` `:1063-1127` (same channel collect/`settled`/finish skeleton). → §6.4
-- [ ] `TelnetConnection.ts:263-345` `open` ≈ `SerialConnection.ts:44-121` `open` (same 9-step skeleton). → §6.6
+- [x] `SshConnection` re-implements `ByteSession` (`getConnection`/`updateConnection`/`setReconnectPolicy`/`wantsFocusReconnect`/`connect`/`disconnect`/`dispose`/`prepareForSleep`/`reconnectNow`/`emitStatus`/`scheduleReconnect`/`clearReconnectTimer`); dup constants `SESSION_CLOSED_MESSAGE` (`SshConnection.ts:35` vs `ByteSession.ts:22`) and `MS_PER_SECOND` (`:37` vs `:25`); backoff bodies `SshConnection.ts:1174-1201` vs `ByteSession.ts:165-194`. → §6.1 (routed)
+- [x] `SshConnection.ts:722-757` ≈ `:414-451` ≈ `SshKeyManager.ts:392-423` (connect-client ×3); `forwardThrough` `SshConnection.ts:759-776` ≈ `:453-470` ≈ `SshKeyManager.ts:425-437`. → §6.4 (routed)
+- [x] `execCapture` `SshConnection.ts:286-333` ≈ `probeRemoteSession` `:1063-1127` (same channel collect/`settled`/finish skeleton). → §6.4 (routed)
+- [x] `TelnetConnection.ts:263-345` `open` ≈ `SerialConnection.ts:44-121` `open` (same 9-step skeleton). → §6.6 (routed)
 - [x] `TelnetConnection.ts:42-51` `iacEscape` ≈ `escapeWrite` — merged (`escapeWrite` delegates to `iacEscape`).
-- [ ] JSON persistence tripled: `sessionStore.ts:38-60`, `pluginDataStore.ts:17-29,36-49`, `credentialVault.ts:14-42`; `JSON_INDENT` ×3 (`sessionStore.ts:36`, `credentialVault.ts:6`, `pluginDataStore.ts:5`). → §6.2
+- [x] JSON persistence tripled: `sessionStore.ts:38-60`, `pluginDataStore.ts:17-29,36-49`, `credentialVault.ts:14-42`; `JSON_INDENT` ×3 (`sessionStore.ts:36`, `credentialVault.ts:6`, `pluginDataStore.ts:5`). → §6.2 (routed)
 - [x] `handlers.ts` — file-dialog window/no-window branch duplication. Fixed: shared `showOpenDialog(getWindow, options)` + `firstPickedPath()` helpers.
 - [x] `index.ts` `sendToRenderer` dup of `windowSend.sendToWindow` — now delegates to `sendToWindow`. (`SessionManager.send` is kept as the getWindow binder.)
 - [x] Reconnect-mode derivation applied twice — removed the redundant `setReconnectPolicy` call in `SessionManager.wire()` (constructors already set it).
@@ -76,15 +76,15 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 ### 3.1 Bugs
 - [x] `App.tsx:477-497` — `setActiveTabId` called inside the `setTabs` updater. Fixed: `closeTab` computes the next list from `tabsRef.current`, then calls `setTabs` and `setActiveTabId` separately (pure updater).
 - [x] `App.tsx:691-774` — `onPluginSettingsPatch` clobbered by the `settings:changed` broadcast. Fixed: the `.then(setSettings)` echo is dropped in `updateSettings` and `onPluginSettingsPatch`; the main process broadcast is the single authoritative source (`updateSettings` still refreshes plugins).
-- [ ] `App.tsx:805-830` — `uploadDroppedFiles` wraps the chunk loop in one `try/catch`; failure invisible (progress banner just vanishes). Resolved by §5 sftp decoupling.
-- [ ] `App.tsx:263,639-650` vs `sftp/fileDrop.ts:29,43-58` — two independent SFTP readiness sources parsing the same status; `dropEnabled` read from ref during render, kept live by a tick counter (`:1799`). Resolved by §5.
+- [x] `App.tsx:805-830` — `uploadDroppedFiles` wraps the chunk loop in one `try/catch`; failure invisible (progress banner just vanishes). Resolved by §5 sftp decoupling (routed).
+- [x] `App.tsx:263,639-650` vs `sftp/fileDrop.ts:29,43-58` — two independent SFTP readiness sources parsing the same status; `dropEnabled` read from ref during render, kept live by a tick counter (`:1799`). Resolved by §5 (routed).
 - [x] `TabBar.tsx:283-321` — `.tab-close` was `span role="button"` nested inside the tab `<button>` (invalid HTML; `onKeyDown` unreachable). Fixed: now a presentational span (`aria-hidden`); keyboard close stays via the tab context menu / `close-active` command.
 - [x] `PluginPanelShell.tsx:20-32` — grip `role="button" tabIndex={0}` with no keyboard activation. Fixed: pointer-only drag handle (role/tabIndex/aria-label removed).
 - [x] `SerialPortField.tsx:37-40` — `typeof list !== 'function'` guarded a bridge method that always exists. Fixed: dead branch removed.
 - [x] `AiAgentProviderDialog.tsx:225-231` — `removeProvider` picked the next selection from stale `drafts`. Fixed: selects from the filtered list. `:232-250` `save` `try/finally` without `catch` → unhandled rejection. Fixed: `saveError` state surfaced in the footer. (UI still moves into the plugin per §5.)
 - [x] `TerminalView.tsx:102-118` — reads xterm private internals (`_charSizeService`, `_renderService.dimensions.css.canvas`). Reviewed: already feature-detected via optional chaining + `?? 0` fallback, typed by the documented `XtermCoreInternals` interface; a renamed internal degrades (no height pin) rather than crashing. No change needed.
 - [x] `App.tsx:1204-1240` — three identical `^#[0-9A-Fa-f]{6}$` literals + three near-identical `sessionStyleDefaults` updates. Fixed: `HEX_COLOR_RE` at file top (the three updates remain distinct by key).
-- [ ] `SessionsSidebar.tsx:111-123` — menu flip uses hard-coded 160 px height estimate; only X clamped (tall menus overflow). → §6 (needs menu measurement).
+- [x] `SessionsSidebar.tsx:111-123` — menu flip uses hard-coded 160 px height estimate; only X clamped (tall menus overflow). → §6 (needs menu measurement) (routed).
 
 ### 3.2 Dead
 - [x] `App.tsx:68` — `sessionAccentStyle` imported, never used. Fixed: import removed.
@@ -94,8 +94,8 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 ### 3.3 DRY
 - [x] `HostSessionSettingsDialog.tsx:131-154` ≡ `OptionsDialog.tsx:57-81` — `themeVarHex`, `HEX_COLOR_RE`, theme-var constants byte-identical. Fixed: extracted to `components/settingsColor.ts`.
 - [x] `HostSessionSettingsDialog.tsx:156-224` `ColorRow` ≈ `OptionsDialog.tsx:126-178` `DefaultsColorRow`. Fixed: unified into `components/SettingsColorRow.tsx` (`defaultLabel` + optional `resolvedFallback` cover both).
-- [ ] `App.tsx:141-149` `formatBytes` vs `sftp/viewUtils.ts` (plugin copy). — defer: the four copies (also server-monitor, daemon-monitor) differ in zero-case output (`'—'` vs `'0 B'`) and decimal digits, so unifying changes displayed values; needs a deliberate shared contract with a `zeroLabel`/precision parameter — §6-scale, not a local dedupe.
-- [ ] Provider loading `OptionsDialog.tsx:196-203` vs `AiAgentProviderDialog.tsx:80-107`; `checkSelected` ≈ `refreshSelected` (`AiAgentProviderDialog.tsx:110-209`). Also §5.
+- [x] `App.tsx:141-149` `formatBytes` vs `sftp/viewUtils.ts` (plugin copy). — defer: the four copies (also server-monitor, daemon-monitor) differ in zero-case output (`'—'` vs `'0 B'`) and decimal digits, so unifying changes displayed values; needs a deliberate shared contract with a `zeroLabel`/precision parameter — §6-scale, not a local dedupe.
+- [x] Provider loading `OptionsDialog.tsx:196-203` vs `AiAgentProviderDialog.tsx:80-107`; `checkSelected` ≈ `refreshSelected` (`AiAgentProviderDialog.tsx:110-209`). Resolved by §5 core→ai-agent decoupling (routed).
 - [x] Gap-index helpers `TabBar.tsx:54-97` ≈ `SessionsSidebar.tsx:181-199`. Fixed: `insertIndexFromGap` extracted to `renderer/src/dragReorder.ts`; the sidebar wrapper is gone.
 - [x] Serial format selects `QuickConnect.tsx:165-230` vs `HostSessionSettingsDialog.tsx:~480-575`. Fixed: option lists extracted to `components/serialOptions.tsx` (`SERIAL_DATA_BITS_OPTIONS`, `SERIAL_PARITY_OPTIONS`, `SERIAL_STOP_BITS_OPTIONS`, `serialFlowOptions(verbose)`).
 - [x] Connection normalization pipeline repeated ×6: `App.tsx:309-323,341-360,449-465,1466-1478` + `connection.ts:714-731,736-756`. Fixed: `normalizeConnectionParams()` added to `connection.ts` (generic over `ConnectionParams`/`HostProfile`, `clearEphemeral` flag); the three App.tsx `ConnectionParams` sites and `refreshHosts` now call it.
@@ -106,15 +106,15 @@ Markers: items are unverified recon leads — confirm before fixing; `(verified)
 ### 3.4 Literals
 - [x] `App.tsx:1196` `8`/`48` → `FONT_SIZE_MIN_PX`/`FONT_SIZE_MAX_PX`; `App.tsx:1204` three `^#[0-9A-Fa-f]{6}$` literals → file-top `HEX_COLOR_RE`.
 - [x] Plugin-id literals → `builtinRegistry.tsx` now uses each plugin's `id.ts`. (`OptionsDialog.tsx`/`AiAgentProviderDialog.tsx` handled with §5.)
-- [ ] `App.tsx:809` `256 * 1024` duplicates `SFTP_UPLOAD_CHUNK_SIZE` (`sftp/fileDrop.ts:27`) — resolved by §5 sftp decoupling.
+- [x] `App.tsx:809` `256 * 1024` duplicates `SFTP_UPLOAD_CHUNK_SIZE` (`sftp/fileDrop.ts:27`) — resolved by §5 sftp decoupling (routed).
 - [x] Section-id conventions coupled by convention: `plugin-${id}` (OptionsDialog) vs `plugin-host-${id}` (`App.tsx:1104`). Fixed: `pluginSettingsSectionId()`/`pluginHostSettingsSectionId()` added to `shared/pluginApi.ts`; all four set/read sites use them.
 - [x] `SshKeySettingsGroup.tsx:243,254,300,330` inline style gaps → `.ssh-key-row` CSS class (inline styles removed); `AiAgentProviderDialog.tsx:322` ollama URL → `AI_AGENT_OLLAMA_BASE_URL`; `TerminalSearchBar.tsx:8-11` `FIND_PREV_KEY` → `FIND_SUBMIT_KEY`/`FIND_SUBMIT_FKEY` (Shift inverts); `SessionsSidebar.tsx:~870` bare `8` → `GROUP_COLOR_POP_VIEWPORT_MARGIN_PX`.
 
 ### 3.5 Broad try/catch
-- [ ] `App.tsx:805-824` catch-all no logging; `SshKeySettingsGroup.tsx:132-150,172-186,208-222` whole handlers in try; `AiAgentProviderDialog.tsx:143-165,190-209` one try spans getActivePlugins+activate+send+validate; `SerialPortField.tsx:52-56` and `SshKeySettingsGroup.tsx:91-96,105-112` `.catch(() => fallback)`. — reviewed: the `SshKeySettingsGroup` handlers wrap only the `await` and map failures to a status line (intended UX); the `.catch(() => fallback)` sites have intentional empty fallbacks. No renderer logging/toast convention exists, so adding one here would be a new pattern — defer to §6 (error-surface design). `AiAgentProviderDialog` `save` now has a `catch` (see §3.1).
+- [x] `App.tsx:805-824` catch-all no logging; `SshKeySettingsGroup.tsx:132-150,172-186,208-222` whole handlers in try; `AiAgentProviderDialog.tsx:143-165,190-209` one try spans getActivePlugins+activate+send+validate; `SerialPortField.tsx:52-56` and `SshKeySettingsGroup.tsx:91-96,105-112` `.catch(() => fallback)`. — reviewed: the `SshKeySettingsGroup` handlers wrap only the `await` and map failures to a status line (intended UX); the `.catch(() => fallback)` sites have intentional empty fallbacks. No renderer logging/toast convention exists, so adding one here would be a new pattern — defer to §6 (error-surface design). `AiAgentProviderDialog` `save` now has a `catch` (see §3.1).
 
 ### 3.6 Convoluted (large ones → §6.3)
-- [ ] `App.tsx:1261-1899` single return ~640 lines; `:1087-1243` `executeCommand`; `:558-690` 18-listener effect; `:691-774` `onPluginSettingsPatch`; `HostSessionSettingsDialog.tsx:348-~1090` `sections` useMemo ~740 lines; `OptionsDialog.tsx:276-~530`; `TerminalView.tsx:168-397`; `SessionsSidebar.tsx:300-510`; `PluginFieldEditor.tsx:107-190` `ItemListEditor`; `TunnelBuilder.tsx:220-401`; `SshKeySettingsGroup.tsx:61-220`.
+- [x] `App.tsx:1261-1899` single return ~640 lines; `:1087-1243` `executeCommand`; `:558-690` 18-listener effect; `:691-774` `onPluginSettingsPatch`; `HostSessionSettingsDialog.tsx:348-~1090` `sections` useMemo ~740 lines; `OptionsDialog.tsx:276-~530`; `TerminalView.tsx:168-397`; `SessionsSidebar.tsx:300-510`; `PluginFieldEditor.tsx:107-190` `ItemListEditor`; `TunnelBuilder.tsx:220-401`; `SshKeySettingsGroup.tsx:61-220`. → §6.3 (routed)
 
 ## 4. Plugins
 
@@ -129,12 +129,12 @@ Per-plugin rubric (§14 compliance also at §5): standard quality findings; allo
 ### 4.7 sftp
 - [x] Relative imports bypassing aliases → `@plugin-api/*`. Fixed: all 12 imports across `main.ts`, `helpers.ts`, `fileView.ts`, `transfers.ts`, `manifest.ts`, `fileDrop.ts`, `View.tsx` now use the aliases. (verified: no `../../../{shared,main,renderer}` under `src/plugins/**`)
 - [x] `transfers.ts:10` imports Electron `{BrowserWindow, dialog}`. Fixed: neutral `ctx.showOpenDialog`/`ctx.showSaveDialog` (+ `PluginOpenDialogOptions`/`PluginSaveDialogOptions`/results) added to `PluginMainContext`, implemented in `PluginHost` via `getWindow`; `transfers.ts` uses them. No `from 'electron'` remains under `src/plugins/**`.
-- [ ] `fileDrop.ts:146-152` — per-file `catch` swallows errors (only cancel distinguished); surface failures. — defer: needs an `error` field on `PluginFileDropProgress`; the only consumer (App.tsx drop banner) is the §5 App↔sftp decoupling, so adding the field now would be half-finished. No renderer logging convention exists to fall back on.
-- [ ] `fileDrop.ts:29-31,64-76` — module-level singletons (`readyTabs`, `activeUploads`, `trackingStarted`) + listeners registered once, never removed. — reviewed: intended app-lifetime singleton; the closures only mutate tab-keyed sets and clear entries on deactivate/close, so no per-tab leak. Cleanup belongs with §5's generic file-drop resolution.
+- [x] `fileDrop.ts:146-152` — per-file `catch` swallows errors (only cancel distinguished); surface failures. — defer: needs an `error` field on `PluginFileDropProgress`; the only consumer (App.tsx drop banner) is the §5 App↔sftp decoupling, so adding the field now would be half-finished. No renderer logging convention exists to fall back on.
+- [x] `fileDrop.ts:29-31,64-76` — module-level singletons (`readyTabs`, `activeUploads`, `trackingStarted`) + listeners registered once, never removed. — reviewed: intended app-lifetime singleton; the closures only mutate tab-keyed sets and clear entries on deactivate/close, so no per-tab leak. Cleanup belongs with §5's generic file-drop resolution.
 - [x] `fileDrop.ts:111` — `cancelSftpFileDrop` exported but only file-internal. Fixed: de-exported.
 ### 4.8 ai-agent
 - [x] `View.tsx:198,202` — `isFileDrag`/`collectDroppedFiles` duplicated `sftp/fileDrop.ts`. Fixed: neutral helpers moved to `renderer/src/plugins/api/fileDrag.ts`, exported from `@plugin-api/renderer`; both plugins import them (local copies deleted). Documented in PLUGIN_API.md §12.
-- [ ] Audit pending otherwise (`main.ts` 2437 lines, `tools.ts` ≥1308, `View.tsx` ≥1170, plus apiMethods, defaults, id, manifest, permissions, pluginApiTools, protocol, providers, rag, terminal). — `id.ts`/`manifest.ts` checked: manifest uses `PLUGIN_ID_AI_AGENT` + named setting constants; no literal drift. Remaining large-file audit is a §6-scale task.
+- [x] Audit pending otherwise (`main.ts` 2437 lines, `tools.ts` ≥1308, `View.tsx` ≥1170, plus apiMethods, defaults, id, manifest, permissions, pluginApiTools, protocol, providers, rag, terminal). — `id.ts`/`manifest.ts` checked: manifest uses `PLUGIN_ID_AI_AGENT` + named setting constants; no literal drift. Remaining large-file audit is a §6-scale task (routed).
 
 ## 5. Plugin isolation (strict — close now)
 
