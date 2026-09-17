@@ -208,6 +208,7 @@
   font-size: 12px;
   font-weight: 600;
   word-break: break-all;
+  user-select: text;
 }
 
 .mqtt-delete-btn {
