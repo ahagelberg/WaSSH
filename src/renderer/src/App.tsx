@@ -1604,6 +1604,7 @@ export default function App() {
         <HostSessionSettingsDialog
           mode={hostEditor.mode}
           connected={hostEditor.connected}
+          tabId={hostEditor.linkTabId ?? null}
           initialSectionId={hostEditor.initialSectionId}
           initialFieldKey={hostEditor.initialFieldKey}
           hosts={hosts}

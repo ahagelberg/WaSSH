@@ -1,6 +1,7 @@
 import type { ComponentType } from 'react'
 import type { PluginViewProps, PluginSettingsViewProps, PluginRendererRegistration } from './api'
 import ServerMonitorView from '../../../plugins/builtins/server-monitor/View'
+import ServerMonitorSessionSettings from '../../../plugins/builtins/server-monitor/SessionSettings'
 import ScratchpadView from '../../../plugins/builtins/scratchpad/View'
 import MacroPadView from '../../../plugins/builtins/macro-pad/View'
 import MqttAnalyserView from '../../../plugins/builtins/mqtt-analyser/View'
@@ -17,7 +18,7 @@ import { PLUGIN_ID_AI_AGENT } from '../../../plugins/builtins/ai-agent/id'
 import { PLUGIN_ID_CONNECTION_LOGGER } from '../../../plugins/builtins/connection-logger/id'
 
 const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
-  { id: PLUGIN_ID_SERVER_MONITOR, view: ServerMonitorView },
+  { id: PLUGIN_ID_SERVER_MONITOR, view: ServerMonitorView, settingsView: ServerMonitorSessionSettings },
   { id: PLUGIN_ID_SCRATCHPAD, view: ScratchpadView },
   { id: PLUGIN_ID_MACRO_PAD, view: MacroPadView },
   { id: PLUGIN_ID_MQTT_ANALYSER, view: MqttAnalyserView },

@@ -1059,7 +1059,7 @@ export default function ServerMonitorView({
   const [series, setSeries] = useState<MonitorSeries[]>([])
   const [range, setRange] = useState<HistoryRange>(HISTORY_RANGE_DEFAULT)
   const [service, setService] = useState<MonitorServiceStatus>(MONITOR_SERVICE_INITIAL_STATUS)
-  const [sudoAction, setSudoAction] = useState<'install' | 'uninstall' | null>(null)
+  const [sudoPrompt, setSudoPrompt] = useState(false)
   const [password, setPassword] = useState('')
   const [actionError, setActionError] = useState('')
   const [procSort, setProcSort] = useState<ServerMonitorProcessSort>(
@@ -1225,13 +1225,10 @@ export default function ServerMonitorView({
     requestHistory(nextRange)
   }
 
-  const runSudoAction = async (): Promise<void> => {
-    if (!sudoAction) {
-      return
-    }
+  const runInstall = async (): Promise<void> => {
     setActionError('')
     const result = await window.wassh.sendPluginMessage(tabId, pluginId, {
-      type: sudoAction === 'install' ? 'installService' : 'uninstallService',
+      type: 'installService',
       password
     } satisfies ServerMonitorRendererMessage)
     setPassword('')
@@ -1239,7 +1236,7 @@ export default function ServerMonitorView({
       setActionError(isMonitorActionResult(result) ? result.error || 'Operation failed' : 'Operation failed')
       return
     }
-    setSudoAction(null)
+    setSudoPrompt(false)
   }
 
   const toMs = Date.now()
@@ -1316,73 +1313,6 @@ export default function ServerMonitorView({
         {snapshot?.error ? <div className="plugin-monitor-error">{snapshot.error}</div> : null}
 
         <div className="monitor-body">
-          {serviceNeedsAttention ? (
-            <div className="monitor-service-panel">
-              <div className="monitor-section-title">WaSSH Service</div>
-              <p className="monitor-service-note">
-                {service.message ||
-                  'Install WaSSH Service for retained, multi-resolution history that survives restarts.'}
-              </p>
-              {actionError ? <div className="plugin-monitor-error">{actionError}</div> : null}
-              {sudoAction ? (
-                <form
-                  className="monitor-service-sudo"
-                  onSubmit={(e) => {
-                    e.preventDefault()
-                    void runSudoAction()
-                  }}
-                >
-                  <label>
-                    Sudo password
-                    <input
-                      autoFocus
-                      type="password"
-                      autoComplete="current-password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                    />
-                  </label>
-                  <small>
-                    Kept in memory only for this operation. Leave blank for passwordless sudo.
-                  </small>
-                  <div className="monitor-service-actions">
-                    <PluginButton
-                      type="submit"
-                      disabled={operationRunning}
-                      variant={sudoAction === 'uninstall' ? 'danger' : 'primary'}
-                    >
-                      {operationRunning
-                        ? 'Working…'
-                        : sudoAction === 'install'
-                          ? service.state === 'outdated'
-                            ? 'Upgrade service'
-                            : 'Install service'
-                          : 'Uninstall completely'}
-                    </PluginButton>
-                    <PluginButton disabled={operationRunning} onClick={() => setSudoAction(null)}>
-                      Cancel
-                    </PluginButton>
-                  </div>
-                </form>
-              ) : (
-                <div className="monitor-service-actions">
-                  <PluginButton
-                    variant="primary"
-                    disabled={operationRunning}
-                    onClick={() => setSudoAction('install')}
-                  >
-                    {service.state === 'outdated' ? 'Upgrade service' : 'Install service'}
-                  </PluginButton>
-                  {service.version ? (
-                    <PluginButton variant="danger" onClick={() => setSudoAction('uninstall')}>
-                      Uninstall service
-                    </PluginButton>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          ) : null}
-
           {showCpuBlock ? (
             <div className="monitor-overview monitor-cpu-block">
               {showGauges ? (
@@ -1547,6 +1477,63 @@ export default function ServerMonitorView({
       {snapshot?.updatedAt ? (
         <div className="plugin-monitor-meta">
           Updated {new Date(snapshot.updatedAt).toLocaleTimeString()}
+        </div>
+      ) : null}
+
+      {serviceNeedsAttention ? (
+        <div className="monitor-service-panel">
+          <div className="monitor-section-title">WaSSH Service</div>
+          <p className="monitor-service-note">
+            {service.message ||
+              'Install WaSSH Service for retained, multi-resolution history that survives restarts.'}
+          </p>
+          {actionError ? <div className="plugin-monitor-error">{actionError}</div> : null}
+          {sudoPrompt ? (
+            <form
+              className="monitor-service-sudo"
+              onSubmit={(e) => {
+                e.preventDefault()
+                void runInstall()
+              }}
+            >
+              <label>
+                Sudo password
+                <input
+                  autoFocus
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </label>
+              <small>
+                Kept in memory only for this operation. Leave blank for passwordless sudo.
+              </small>
+              <div className="monitor-service-actions">
+                <PluginButton type="submit" compact variant="primary" disabled={operationRunning}>
+                  {operationRunning
+                    ? 'Working…'
+                    : service.state === 'outdated'
+                      ? 'Upgrade service'
+                      : 'Install service'}
+                </PluginButton>
+                <PluginButton compact disabled={operationRunning} onClick={() => setSudoPrompt(false)}>
+                  Cancel
+                </PluginButton>
+              </div>
+            </form>
+          ) : (
+            <div className="monitor-service-actions">
+              <PluginButton
+                compact
+                variant="primary"
+                disabled={operationRunning}
+                onClick={() => setSudoPrompt(true)}
+              >
+                {service.state === 'outdated' ? 'Upgrade service' : 'Install service'}
+              </PluginButton>
+            </div>
+          )}
         </div>
       ) : null}
     </div>

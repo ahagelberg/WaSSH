@@ -90,41 +90,60 @@
 
 .monitor-service-panel {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
   flex-shrink: 0;
-  padding: 8px;
+  margin-bottom: var(--monitor-meta-reserve);
+  padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: var(--monitor-card-radius);
 }
 
+.monitor-service-panel .monitor-section-title {
+  margin: 0;
+  font-size: 10px;
+}
+
+.monitor-service-panel .plugin-monitor-error {
+  flex-basis: 100%;
+  padding: 4px 6px;
+  font-size: 11px;
+}
+
 .monitor-service-note {
   margin: 0;
-  font-size: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
   color: var(--text-muted);
+  text-align: right;
 }
 
 .monitor-service-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  margin-left: auto;
 }
 
 .monitor-service-sudo {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
 }
 
 .monitor-service-sudo label {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 12px;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
 }
 
 .monitor-service-sudo input {
-  padding: 4px 6px;
+  padding: 3px 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-input, transparent);
@@ -132,8 +151,18 @@
 }
 
 .monitor-service-sudo small {
+  flex-basis: 100%;
   font-size: 10px;
   color: var(--text-muted);
+}
+
+.settings-dialog-body.monitor-service-dialog-body {
+  /* Single full-width column; overrides the settings dialog's nav + content grid. */
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 12px;
+  padding: 16px 20px 32px;
+  overflow: auto;
 }
 
 .monitor-section-toggle {
@@ -977,6 +1006,10 @@
     display: none;
   }
 
+  .monitor-service-panel {
+    margin-bottom: 0;
+  }
+
   .plugin-monitor-meta {
     display: none;
   }
@@ -1016,8 +1049,7 @@
   }
 
   .monitor-cpu-block,
-  .monitor-processes,
-  .monitor-service-panel {
+  .monitor-processes {
     grid-column: 1 / -1;
   }
 
@@ -1033,10 +1065,6 @@
   }
 
   .monitor-cpu-block {
-    grid-column: 1 / -1;
-  }
-
-  .monitor-service-panel {
     grid-column: 1 / -1;
   }
 

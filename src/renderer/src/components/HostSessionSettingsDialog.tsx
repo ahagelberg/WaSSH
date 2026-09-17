@@ -83,6 +83,8 @@ import {
   serialFlowOptions
 } from './serialOptions'
 import PluginSettingsFieldList from '../plugins/api/PluginSettingsFieldList'
+import { getPluginSettingsView } from '../plugins/registry'
+import DialogShell from './DialogShell'
 import TagInput from './TagInput'
 import TunnelBuilder from './TunnelBuilder'
 import SshKeySettingsGroup from './SshKeySettingsGroup'
@@ -92,6 +94,8 @@ export type HostSessionMode = 'editHost' | 'editOpenSession'
 interface Props {
   mode: HostSessionMode
   connected: boolean
+  /** Tab this dialog was opened from; null when editing a saved host. */
+  tabId: string | null
   initialSectionId?: string
   initialFieldKey?: string
   hosts: HostProfile[]
@@ -161,6 +165,7 @@ function DefaultableControl({
 export default function HostSessionSettingsDialog({
   mode,
   connected,
+  tabId,
   initialSectionId,
   initialFieldKey,
   hosts,
@@ -183,6 +188,7 @@ export default function HostSessionSettingsDialog({
   })
   const [fontFamilies, setFontFamilies] = useState<string[]>(Array.from(BUNDLED_FONT_FAMILIES))
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
+  const [settingsViewPluginId, setSettingsViewPluginId] = useState<string | null>(null)
   const [showTunnelBuilder, setShowTunnelBuilder] = useState(false)
   const identityLocked = mode === 'editOpenSession' && connected
   const editingHostId =
@@ -959,15 +965,31 @@ export default function HostSessionSettingsDialog({
         continue
       }
       const values = mergePluginSettings(schema, form.pluginSettings[plugin.id])
+      // A plugin that owns a custom editor gets a button next to its field
+      // list; the host renders that editor in a modal.
+      const hasSettingsView = Boolean(getPluginSettingsView(plugin.id))
       list.push({
         id: pluginHostSettingsSectionId(plugin.id),
         title: plugin.contributes.hostSettingsHeading || plugin.name,
         content: (
-          <PluginSettingsFieldList
-            schema={schema}
-            values={values}
-            onChange={(key, value) => patchPluginHostSetting(plugin.id, key, value)}
-          />
+          <>
+            <PluginSettingsFieldList
+              schema={schema}
+              values={values}
+              onChange={(key, value) => patchPluginHostSetting(plugin.id, key, value)}
+            />
+            {hasSettingsView ? (
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <strong>{plugin.name} settings</strong>
+                  <span>Configured in a dedicated editor.</span>
+                </div>
+                <button type="button" onClick={() => setSettingsViewPluginId(plugin.id)}>
+                  Configure…
+                </button>
+              </div>
+            ) : null}
+          </>
         )
       })
     }
@@ -1051,32 +1073,61 @@ export default function HostSessionSettingsDialog({
     onClose()
   }
 
+  const settingsViewPlugin = settingsViewPluginId
+    ? plugins.find((p) => p.id === settingsViewPluginId) ?? null
+    : null
+  const SettingsView = settingsViewPlugin ? getPluginSettingsView(settingsViewPlugin.id) : null
+
   return (
-    <SettingsDialog
-      title={mode === 'editHost' ? 'Host settings' : 'Session settings'}
-      sections={sections}
-      initialSectionId={
-        initialSectionId === 'proxy' || initialSectionId === 'remoteSession'
-          ? 'advanced'
-          : initialSectionId
-      }
-      initialFieldKey={initialFieldKey}
-      onClose={onClose}
-      footer={
-        <>
-          <button type="button" onClick={onClose}>
-            Cancel
-          </button>
-          {mode === 'editHost' && onApplyToSessions ? (
-            <button type="button" onClick={applyToSessions}>
-              Apply to sessions
+    <>
+      <SettingsDialog
+        title={mode === 'editHost' ? 'Host settings' : 'Session settings'}
+        sections={sections}
+        initialSectionId={
+          initialSectionId === 'proxy' || initialSectionId === 'remoteSession'
+            ? 'advanced'
+            : initialSectionId
+        }
+        initialFieldKey={initialFieldKey}
+        onClose={onClose}
+        footer={
+          <>
+            <button type="button" onClick={onClose}>
+              Cancel
             </button>
-          ) : null}
-          <button type="button" className="primary" onClick={handleSave}>
-            Save
-          </button>
-        </>
-      }
-    />
+            {mode === 'editHost' && onApplyToSessions ? (
+              <button type="button" onClick={applyToSessions}>
+                Apply to sessions
+              </button>
+            ) : null}
+            <button type="button" className="primary" onClick={handleSave}>
+              Save
+            </button>
+          </>
+        }
+      />
+      {settingsViewPlugin && SettingsView ? (
+        <DialogShell
+          titleId="plugin-settings-view-title"
+          title={`${settingsViewPlugin.name} settings`}
+          onClose={() => setSettingsViewPluginId(null)}
+          className="plugin-settings-view-dialog"
+        >
+          <SettingsView
+            tabId={tabId}
+            settings={mergePluginSettings(
+              settingsViewPlugin.contributes.hostSettingsSchema,
+              form.pluginSettings[settingsViewPlugin.id]
+            )}
+            onSettingsPatch={(partial) => {
+              for (const [key, value] of Object.entries(partial)) {
+                patchPluginHostSetting(settingsViewPlugin.id, key, value)
+              }
+            }}
+            onClose={() => setSettingsViewPluginId(null)}
+          />
+        </DialogShell>
+      ) : null}
+    </>
   )
 }
