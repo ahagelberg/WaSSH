@@ -7,6 +7,7 @@ import {
 } from '../../shared/types'
 import { serialConfigFrom } from '../../shared/connection'
 import { ByteSession } from '../session/ByteSession'
+import { OPEN_ATTEMPT_CANCELLED } from '../session/OpenAttempt'
 
 function flowFlags(flow: SerialFlowControl): { rtscts: boolean; xon: boolean; xoff: boolean } {
   if (flow === SERIAL_FLOW_RTSCTS) {
@@ -49,6 +50,7 @@ export class SerialConnection extends ByteSession {
     this.opening = true
     this.clearReconnectTimer()
     this.closeTransport()
+    const attempt = this.openAttempt.reset()
     this.remoteEnded = false
     this.emitStatus('connecting')
 
@@ -70,6 +72,10 @@ export class SerialConnection extends ByteSession {
       this.opening = false
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', `Serial support unavailable: ${msg}`)
+      return
+    }
+    if (this.openAttempt.isCancelled) {
+      this.opening = false
       return
     }
 
@@ -96,7 +102,11 @@ export class SerialConnection extends ByteSession {
 
     try {
       await new Promise<void>((resolve, reject) => {
+        const untrack = this.openAttempt.track(() => {
+          reject(new Error(OPEN_ATTEMPT_CANCELLED))
+        })
         port.open((err) => {
+          untrack()
           if (err) {
             reject(err)
             return
@@ -105,7 +115,13 @@ export class SerialConnection extends ByteSession {
         })
       })
     } catch (err) {
+      if (!this.openAttempt.isCurrent(attempt)) {
+        return
+      }
       this.opening = false
+      if (this.openAttempt.isCancelled) {
+        return
+      }
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
@@ -130,6 +146,7 @@ export class SerialConnection extends ByteSession {
   }
 
   protected closeTransport(): void {
+    this.openAttempt.cancel()
     const port = this.port
     this.port = null
     if (!port) {

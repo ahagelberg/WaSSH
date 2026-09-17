@@ -30,6 +30,7 @@ import {
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore } from '../store/sessionStore'
 import { TunnelManager } from './TunnelManager'
+import { OPEN_ATTEMPT_CANCELLED, OpenAttempt } from '../session/OpenAttempt'
 
 /** SSH connect ready timeout ms */
 const CONNECT_READY_TIMEOUT_MS = 20000
@@ -104,6 +105,8 @@ export class SshConnection extends EventEmitter {
   private tunnels = new TunnelManager((message) => {
     this.emit('data', `\r\n[WaSSH] ${message}\r\n`)
   })
+  /** Settles the step `open()` is awaiting when the transport is torn down */
+  private readonly openAttempt = new OpenAttempt()
 
   constructor(
     readonly tabId: string,
@@ -790,11 +793,17 @@ export class SshConnection extends EventEmitter {
         cleanup()
         reject(new Error(`Connection closed (${params.name || params.host})`))
       }
+      let untrack = (): void => {}
       const cleanup = (): void => {
+        untrack()
         client.removeListener('ready', onReady)
         client.removeListener('error', onError)
         client.removeListener('close', onClose)
       }
+      untrack = this.openAttempt.track(() => {
+        cleanup()
+        reject(new Error(OPEN_ATTEMPT_CANCELLED))
+      })
 
       client.once('ready', onReady)
       client.once('error', onError)
@@ -815,7 +824,11 @@ export class SshConnection extends EventEmitter {
     destPort: number
   ): Promise<Readable> {
     return new Promise((resolve, reject) => {
+      const untrack = this.openAttempt.track(() => {
+        reject(new Error(OPEN_ATTEMPT_CANCELLED))
+      })
       client.forwardOut(SSH_FORWARD_SOURCE_IP, SSH_FORWARD_SOURCE_PORT, destHost, destPort, (err, stream) => {
+        untrack()
         if (err) {
           reject(err)
           return
@@ -835,6 +848,7 @@ export class SshConnection extends EventEmitter {
     this.opening = true
     this.clearReconnectTimer()
     this.closeClientOnly()
+    const attempt = this.openAttempt.reset()
     this.remoteShellExited = false
     this.emitStatus('connecting')
 
@@ -885,7 +899,13 @@ export class SshConnection extends EventEmitter {
       const target = chain[chain.length - 1]
       this.client = await this.connectClient(target, sock)
     } catch (err) {
+      if (!this.openAttempt.isCurrent(attempt)) {
+        return
+      }
       this.opening = false
+      if (this.openAttempt.isCancelled) {
+        return
+      }
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeClientOnly()
@@ -911,6 +931,16 @@ export class SshConnection extends EventEmitter {
 
   private startShell(client: Client): Promise<void> {
     return new Promise((resolve) => {
+      let untrack = (): void => {}
+      const done = (): void => {
+        untrack()
+        resolve()
+      }
+      untrack = this.openAttempt.track(() => {
+        // Teardown settles the attempt so open() returns and clears `opening`.
+        this.opening = false
+        done()
+      })
       const pty: PseudoTtyOptions = {
         term: this.termType,
         cols: this.cols,
@@ -922,13 +952,19 @@ export class SshConnection extends EventEmitter {
       void this.tunnels
         .start(client, tunnelOpts.tunnels, tunnelOpts.x11Forwarding)
         .then(async () => {
+          if (this.openAttempt.isCancelled) {
+            return
+          }
           const screenPlan = await this.resolveRemoteSessionChannel(client)
+          if (this.openAttempt.isCancelled) {
+            return
+          }
           this.openInteractiveChannel(
             client,
             pty,
             channelOptions,
             screenPlan,
-            resolve
+            done
           )
         })
         .catch((err: unknown) => {
@@ -936,7 +972,7 @@ export class SshConnection extends EventEmitter {
           const msg = err instanceof Error ? err.message : String(err)
           this.emitStatus('failed', msg)
           this.scheduleReconnect(true)
-          resolve()
+          done()
         })
 
       client.on('close', () => {
@@ -948,7 +984,7 @@ export class SshConnection extends EventEmitter {
         this.opening = false
         this.emitStatus('failed', `Connection closed (${this.connection.name || this.connection.host})`)
         this.scheduleReconnect(true)
-        resolve()
+        done()
       })
     })
   }
@@ -1265,6 +1301,7 @@ export class SshConnection extends EventEmitter {
   }
 
   private closeClientOnly(): void {
+    this.openAttempt.cancel()
     this.cancelTerminalPrompt()
     this.tunnels.stop()
     const stream = this.stream

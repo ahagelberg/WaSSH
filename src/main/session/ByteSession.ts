@@ -17,6 +17,7 @@ import {
   SessionStatus,
   type ReconnectMode
 } from '../../shared/types'
+import { OpenAttempt } from './OpenAttempt'
 
 /** Status when the remote side ends the session (not a drop) */
 const SESSION_CLOSED_MESSAGE = 'Session closed'
@@ -37,6 +38,8 @@ export abstract class ByteSession extends EventEmitter {
   protected cols = DEFAULT_TERM_COLS
   protected rows = DEFAULT_TERM_ROWS
   protected termType = DEFAULT_TERM_TYPE
+  /** Settles the step `open()` is awaiting when the transport is torn down */
+  protected readonly openAttempt = new OpenAttempt()
 
   constructor(
     readonly tabId: string,

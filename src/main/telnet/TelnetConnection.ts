@@ -6,6 +6,7 @@ import {
   type ConnectionParams
 } from '../../shared/types'
 import { ByteSession } from '../session/ByteSession'
+import { OPEN_ATTEMPT_CANCELLED } from '../session/OpenAttempt'
 
 /** Telnet IAC (Interpret As Command) */
 const IAC = 255
@@ -256,6 +257,7 @@ export class TelnetConnection extends ByteSession {
     this.opening = true
     this.clearReconnectTimer()
     this.closeTransport()
+    const attempt = this.openAttempt.reset()
     this.remoteEnded = false
     this.emitStatus('connecting')
 
@@ -298,7 +300,9 @@ export class TelnetConnection extends ByteSession {
           cleanup()
           reject(err)
         }
+        let untrack = (): void => {}
         const cleanup = (): void => {
+          untrack()
           socket.removeListener('error', onErr)
           socket.removeListener('connect', onConnect)
         }
@@ -306,12 +310,22 @@ export class TelnetConnection extends ByteSession {
           cleanup()
           resolve()
         }
+        untrack = this.openAttempt.track(() => {
+          cleanup()
+          reject(new Error(OPEN_ATTEMPT_CANCELLED))
+        })
         socket.once('error', onErr)
         socket.once('connect', onConnect)
         socket.connect(port, host)
       })
     } catch (err) {
+      if (!this.openAttempt.isCurrent(attempt)) {
+        return
+      }
       this.opening = false
+      if (this.openAttempt.isCancelled) {
+        return
+      }
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
@@ -340,6 +354,7 @@ export class TelnetConnection extends ByteSession {
   }
 
   protected closeTransport(): void {
+    this.openAttempt.cancel()
     const sock = this.socket
     this.socket = null
     this.filter = null
