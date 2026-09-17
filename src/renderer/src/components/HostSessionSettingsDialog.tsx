@@ -936,26 +936,6 @@ export default function HostSessionSettingsDialog({
       content: appearanceRows
     })
 
-    if (mode === 'editOpenSession') {
-      list.push({
-        id: 'session',
-        title: 'Session',
-        content: (
-          <div className="settings-row">
-            <div className="settings-row-label">
-              <strong>Tab title</strong>
-              <span>Local display name for this tab (does not rename the saved host).</span>
-            </div>
-            <input
-              type="text"
-              value={form.name}
-              onChange={(e) => patch({ name: e.target.value })}
-            />
-          </div>
-        )
-      })
-    }
-
     for (const plugin of plugins) {
       if (!plugin.enabled) {
         continue
