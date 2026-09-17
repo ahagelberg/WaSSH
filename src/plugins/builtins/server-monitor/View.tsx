@@ -1069,6 +1069,8 @@ export default function ServerMonitorView({
   const [procStatus, setProcStatus] = useState<string | null>(null)
   const [procStatusError, setProcStatusError] = useState(false)
   const lastAt = useRef(0)
+  /** Newest bucket timestamp drawn; refreshes only fetch past this edge. */
+  const newestBucketAt = useRef(0)
   const rangeRef = useRef<HistoryRange>(HISTORY_RANGE_DEFAULT)
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -1107,15 +1109,22 @@ export default function ServerMonitorView({
     }
   }, [])
 
-  /** Ask the main process for the buckets covering the selected range. */
-  const requestHistory = (nextRange: HistoryRange): void => {
+  /**
+   * Ask the main process for the buckets covering the selected range.
+   * `sinceMs` merges into the drawn history instead of reloading it, so
+   * periodic refreshes never blank the graphs.
+   */
+  const requestHistory = (nextRange: HistoryRange, sinceMs?: number): void => {
     const toMs = Date.now()
-    const fromMs = toMs - HISTORY_RANGES[nextRange].seconds * MS_PER_SEC
-    setHistory({})
+    const windowFromMs = toMs - HISTORY_RANGES[nextRange].seconds * MS_PER_SEC
+    if (sinceMs == null) {
+      setHistory({})
+      newestBucketAt.current = 0
+    }
     void window.wassh.sendPluginMessage(tabId, pluginId, {
       type: 'requestHistory',
       bucketSeconds: HISTORY_RANGES[nextRange].tier.bucketSeconds,
-      fromMs,
+      fromMs: Math.max(windowFromMs, sinceMs ?? 0),
       toMs
     } satisfies ServerMonitorRendererMessage)
   }
@@ -1140,23 +1149,31 @@ export default function ServerMonitorView({
           return
         }
         const bucket = ev.payload
+        if (bucket.timestamp > newestBucketAt.current) {
+          newestBucketAt.current = bucket.timestamp
+        }
         setHistory((current) => {
           const points = current[bucket.seriesId] ?? []
-          if (points.some((point) => point.timestamp === bucket.timestamp)) {
-            return current
+          const point = {
+            timestamp: bucket.timestamp,
+            min: bucket.min,
+            max: bucket.max,
+            avg: bucket.avg
           }
-          return {
-            ...current,
-            [bucket.seriesId]: [
-              ...points,
-              {
-                timestamp: bucket.timestamp,
-                min: bucket.min,
-                max: bucket.max,
-                avg: bucket.avg
-              }
-            ]
+          const index = points.findIndex((existing) => existing.timestamp === bucket.timestamp)
+          const next = points.slice()
+          if (index < 0) {
+            next.push(point)
+          } else {
+            next[index] = point
           }
+          // Buckets arrive oldest first; drop the ones that left the drawn window.
+          const windowFromMs = Date.now() - HISTORY_RANGES[rangeRef.current].seconds * MS_PER_SEC
+          const kept =
+            next.length > 0 && next[0].timestamp < windowFromMs
+              ? next.filter((existing) => existing.timestamp >= windowFromMs)
+              : next
+          return { ...current, [bucket.seriesId]: kept }
         })
         return
       }
@@ -1169,7 +1186,7 @@ export default function ServerMonitorView({
         return
       }
       lastAt.current = next.updatedAt
-      requestHistory(rangeRef.current)
+      requestHistory(rangeRef.current, newestBucketAt.current)
     })
   }, [tabId, pluginId])
 
