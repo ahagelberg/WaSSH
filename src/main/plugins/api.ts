@@ -82,6 +82,11 @@ export interface PluginMainContext {
   onSideClosed: (connectionId: string, cb: (error?: string) => void) => () => void
   isSshSession: () => boolean
   openTcpStream: (host: string, port: number) => Promise<Duplex>
+  /**
+   * Open a binary duplex to a unix socket on the remote host via SSH
+   * `direct-streamlocal`. SSH-only; no side-data events.
+   */
+  openUnixStream: (socketPath: string) => Promise<Duplex>
   openSftp: () => Promise<SftpSession>
   execCapture: (command: string) => Promise<string>
   registerStreamHandler: (

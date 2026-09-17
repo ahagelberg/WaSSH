@@ -164,6 +164,7 @@ export class SessionManager {
         openSftp: () => conn.openSftp(),
         openExtraShell: () => conn.openExtraShell(),
         forwardOut: (host, port) => conn.forwardOut(host, port),
+        forwardOutStreamLocal: (socketPath) => conn.forwardOutStreamLocal(socketPath),
         openDuplicateClient: () => conn.openDuplicateClient(),
         openDirectTcp: (host, port) => openDirectTcpSocket(host, port)
       }
@@ -187,6 +188,9 @@ export class SessionManager {
       },
       forwardOut: async () => {
         throw new Error('SSH forward requires an SSH session')
+      },
+      forwardOutStreamLocal: async () => {
+        throw new Error('Unix socket forward requires an SSH session')
       },
       openDuplicateClient: async () => {
         throw new Error('Duplicate SSH requires an SSH session')

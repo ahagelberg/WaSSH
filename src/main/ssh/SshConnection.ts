@@ -383,6 +383,26 @@ export class SshConnection extends EventEmitter {
   }
 
   /**
+   * Open a channel to a unix socket on the remote host
+   * (`direct-streamlocal@openssh.com`).
+   */
+  forwardOutStreamLocal(socketPath: string): Promise<ClientChannel> {
+    const client = this.client
+    if (!client) {
+      return Promise.reject(new Error('SSH session is not connected'))
+    }
+    return new Promise((resolve, reject) => {
+      client.openssh_forwardOutStreamLocal(socketPath, (err, stream) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        resolve(stream)
+      })
+    })
+  }
+
+  /**
    * Opens an isolated SSH client using the same profile/proxy chain.
    * Does not disturb the interactive shell.
    */

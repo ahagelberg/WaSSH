@@ -1,5 +1,4 @@
 import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
-import type { MonitorSample, MonitorStreamHeader } from '@shared/monitorFrames'
 import { MonitorLadder } from '@shared/monitorLadder'
 import {
   BYTES_PER_KIB,
@@ -123,8 +122,8 @@ interface MonitorSessionState {
   service: MonitorServiceSession
   /** Ladder built from poller samples when no daemon is streaming */
   localLadder: MonitorLadder | null
-  /** Series set the renderer should draw for the active history source */
-  activeSeries: MonitorSeries[]
+  /** Series the app-side ladder records; re-announced when the daemon history drops */
+  localSeries: MonitorSeries[]
 }
 
 const sessionStates = new Map<string, MonitorSessionState>()
@@ -165,14 +164,18 @@ function pushLocalHistory(
   const series = [...localLadderSeries(), ...localTempSeries(snapshot)]
   if (!state.localLadder) {
     state.localLadder = new MonitorLadder(series)
-    state.activeSeries = series
-    const ready: MonitorMainMessage = {
-      type: 'historyReady',
-      series,
-      temperatureZones: snapshot.temperatures.map((temp) => temp.name),
-      interfaces: []
+    state.localSeries = series
+    // Announce the local series only while the app-side ladder is the active
+    // history source; when the daemon streams, its header owns the series set.
+    if (!state.service.ladder) {
+      const ready: MonitorMainMessage = {
+        type: 'historyReady',
+        series,
+        temperatureZones: snapshot.temperatures.map((temp) => temp.name),
+        interfaces: []
+      }
+      ctx.sendToRenderer(ready)
     }
-    ctx.sendToRenderer(ready)
   }
   const values: Record<string, number> = {
     [SERIES_CPU]: snapshot.cpuPercent ?? 0,
@@ -1153,13 +1156,33 @@ function stopTimer(state: MonitorSessionState): void {
 
 /**
  * Daemon stream hooks. The daemon's series set becomes the active history
- * source; poller samples keep feeding the app-side ladder so switching back
- * when the stream drops does not leave a gap.
+ * source, announced to the view so it reloads; poller samples keep feeding the
+ * app-side ladder so switching back when the stream drops does not leave a gap.
  */
-function serviceHooks(state: MonitorSessionState): MonitorServiceHooks {
+function serviceHooks(ctx: PluginMainContext, state: MonitorSessionState): MonitorServiceHooks {
   return {
     onHeader: (header) => {
-      state.activeSeries = header.series
+      const ready: MonitorMainMessage = {
+        type: 'historyReady',
+        series: header.series,
+        temperatureZones: header.temperatureZones,
+        interfaces: header.interfaces
+      }
+      ctx.sendToRenderer(ready)
+    },
+    onHistoryCleared: () => {
+      // The daemon history was dropped (uninstalled/outdated); fall back to
+      // the app-side ladder and tell the view which series it now provides.
+      if (state.localSeries.length === 0) {
+        return
+      }
+      const ready: MonitorMainMessage = {
+        type: 'historyReady',
+        series: state.localSeries,
+        temperatureZones: [],
+        interfaces: []
+      }
+      ctx.sendToRenderer(ready)
     },
     onSample: () => undefined,
     onStreamClosed: () => undefined
@@ -1175,6 +1198,7 @@ function activeLadder(state: MonitorSessionState): MonitorLadder | null {
 function sendHistory(
   ctx: PluginMainContext,
   state: MonitorSessionState,
+  requestId: number,
   bucketSeconds: number,
   fromMs: number,
   toMs: number
@@ -1191,6 +1215,7 @@ function sendHistory(
     for (const bucket of series.buckets) {
       const message: MonitorMainMessage = {
         type: 'history',
+        requestId,
         bucketSeconds,
         seriesId: series.seriesId,
         timestamp: bucket.timestamp,
@@ -1222,7 +1247,7 @@ export const serverMonitorMain: PluginMainModule = {
       poll: async () => undefined,
       service: createServiceSession(),
       localLadder: null,
-      activeSeries: []
+      localSeries: []
     }
     state.poll = () => pollSession(ctx, state)
 
@@ -1234,7 +1259,7 @@ export const serverMonitorMain: PluginMainModule = {
       sessionStates.delete(instanceKey(ctx))
     })
 
-    await probeService(ctx, state.service, serviceHooks(state))
+    await probeService(ctx, state.service, serviceHooks(ctx, state))
     void state.poll()
     armTimer(ctx, state)
   },
@@ -1247,17 +1272,17 @@ export const serverMonitorMain: PluginMainModule = {
 
     if (isMonitorRendererMessage(payload)) {
       if (payload.type === 'probeService') {
-        await probeService(ctx, state.service, serviceHooks(state))
+        await probeService(ctx, state.service, serviceHooks(ctx, state))
         return { ok: true }
       }
       if (payload.type === 'requestHistory') {
-        sendHistory(ctx, state, payload.bucketSeconds, payload.fromMs, payload.toMs)
+        sendHistory(ctx, state, payload.requestId, payload.bucketSeconds, payload.fromMs, payload.toMs)
         return { ok: true }
       }
       return runServiceAction(
         ctx,
         state.service,
-        serviceHooks(state),
+        serviceHooks(ctx, state),
         payload.type === 'installService' ? 'install' : 'uninstall',
         payload.password
       )

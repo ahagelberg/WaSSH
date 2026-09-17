@@ -307,6 +307,10 @@ export class PluginHost {
         const { stream } = await this.broker.openTcpStream(tabId, pluginId, host, port)
         return stream
       },
+      openUnixStream: async (socketPath) => {
+        const { stream } = await this.broker.openUnixStream(tabId, pluginId, socketPath)
+        return stream
+      },
       openSftp: () => this.broker.openSftp(tabId, pluginId),
       execCapture: (command) => this.broker.execCapture(tabId, command),
       registerStreamHandler: (mode, direction, handler) => {

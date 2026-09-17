@@ -18,6 +18,8 @@ export interface PluginSessionHandle {
   openSftp: () => Promise<SFTPWrapper>
   openExtraShell: () => Promise<ClientChannel>
   forwardOut: (host: string, port: number) => Promise<ClientChannel>
+  /** Open a channel to a unix socket on the remote host. */
+  forwardOutStreamLocal: (socketPath: string) => Promise<ClientChannel>
   /** Build credentials for an isolated duplicate SSH client (no secrets leave main). */
   openDuplicateClient: () => Promise<{ client: Client; dispose: () => void }>
   openDirectTcp: (host: string, port: number) => Promise<Socket>

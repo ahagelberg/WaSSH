@@ -134,26 +134,20 @@ export function isServerMonitorStatsEvent(value: unknown): value is ServerMonito
   return type === 'stats' && typeof snapshot === 'object' && snapshot !== null
 }
 
-/** Discriminant of requests the server-monitor view sends to its main module */
-export type ServerMonitorRendererMessageType =
-  | 'refresh'
-  | 'setProcessSort'
-  | 'signalProcess'
-  | 'requestHistory'
+/** Discriminant of snapshot/process requests the view sends to its main module */
+export type ServerMonitorRendererMessageType = 'refresh' | 'setProcessSort' | 'signalProcess'
 
 /**
- * Requests the server-monitor view sends via `sendPluginMessage`. Field types
- * reflect renderer-side intent only - the main module still validates every
- * field at runtime since the payload crosses the IPC boundary as `unknown`.
+ * Snapshot/process requests the server-monitor view sends via
+ * `sendPluginMessage` (service and history messages: see `serviceProtocol.ts`).
+ * Field types reflect renderer-side intent only - the main module still
+ * validates every field at runtime since the payload crosses the IPC boundary
+ * as `unknown`.
  */
 export type ServerMonitorRendererMessage =
   | { type: 'refresh' }
   | { type: 'setProcessSort'; sort: ServerMonitorProcessSort; descending?: boolean }
   | { type: 'signalProcess'; pid: number; signal: ServerMonitorProcessSignal }
-  | { type: 'probeService' }
-  | { type: 'installService'; password: string }
-  | { type: 'uninstallService'; password: string }
-  | { type: 'requestHistory'; bucketSeconds: number; fromMs: number; toMs: number }
 
 /** Narrows to a message with a recognized `type`; per-field values are still `unknown`. */
 export function isServerMonitorRendererMessageEnvelope(

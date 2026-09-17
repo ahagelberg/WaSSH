@@ -45,7 +45,7 @@ A plugin is three things:
 | `main/plugins/PluginHost.ts` | Private lifecycle and capability implementation |
 | `main/plugins/types.ts` | `PluginSessionHandle` (SessionManager→broker), `StreamTransform` |
 | `main/plugins/SessionDataPipeline.ts` | Ordered observe/intercept stream transforms |
-| `main/plugins/SideConnectionBroker.ts` | SSH-exec/shell/TCP side connections, raw TCP duplexes, SFTP channels |
+| `main/plugins/SideConnectionBroker.ts` | SSH-exec/shell/TCP side connections, raw TCP/unix duplexes, SFTP channels |
 | `main/plugins/SftpSession.ts` | Promisified SFTP wrapper |
 | `main/plugins/createPluginSystem.ts` | Wiring, restore queue |
 | `main/plugins/externalLoader.ts` | Future external-plugin scanner (stub) |
@@ -209,6 +209,7 @@ interface PluginMainModule {
 | `onSideClosed(connectionId, cb(error?)): unsubscribe` | Channel closed; both listener maps are cleared |
 | `isSshSession(): boolean` | True only when the live session is SSH (not telnet/serial) |
 | `openTcpStream(host, port): Promise<Duplex>` | Raw binary duplex for non-UTF-8 protocols; SSH `forwardOut` when SSH, else direct TCP. No side-data events |
+| `openUnixStream(socketPath): Promise<Duplex>` | Raw binary duplex to a unix socket on the remote host (SSH `direct-streamlocal`); SSH-only. No side-data events |
 | `openSftp(): Promise<SftpSession>` | SFTP channel on the live SSH connection (§9); throws for non-SSH |
 | `execCapture(command): Promise<string>` | Run on the live SSH session and return trimmed stdout (e.g. `pwd`); throws for non-SSH |
 | `registerStreamHandler(mode, direction, handler)` | PTY stream transform (§6); auto-removed on deactivate |
@@ -278,7 +279,8 @@ registerStreamHandler(mode: 'observe'|'intercept',
 
 `data`/`close` events go **both** to the main-side `onSideData`/`onSideClosed`
 listeners and to the renderer as `plugin:sideData` / `plugin:sideClosed`.
-Chunks are UTF-8-decoded buffers — for binary protocols use `openTcpStream`.
+Chunks are UTF-8-decoded buffers — for binary protocols use `openTcpStream`
+(TCP) or `openUnixStream` (unix socket on the remote host).
 Side connections for a plugin/tab are force-closed on deactivate, on session
 disconnect, and on shutdown. `write`/`close` are no-ops for unknown ids.
 Channel `close`/`error` emits a final `onSideClosed` (`error` = message).
@@ -289,8 +291,8 @@ Note: `ctx.writeToSession` does **not** re-enter the outbound pipeline.
 `PluginSessionHandle` (SessionManager→broker): `tabId`, `connection`
 (`ConnectionParams`), `isSsh`, `getSshClient()`, `exec(command)`,
 `execCapture(command)`, `openSftp()`, `openExtraShell()`,
-`forwardOut(host,port)`, `openDuplicateClient()` (`{client, dispose}`),
-`openDirectTcp(host,port)`.
+`forwardOut(host,port)`, `forwardOutStreamLocal(path)`,
+`openDuplicateClient()` (`{client, dispose}`), `openDirectTcp(host,port)`.
 
 ## 7. Plugin-to-plugin API calls
 

@@ -47,11 +47,12 @@ import {
   isMonitorActionResult,
   isMonitorMainMessage,
   MONITOR_SERVICE_INITIAL_STATUS,
+  type MonitorRendererMessage,
   type MonitorServiceStatus
 } from './serviceProtocol'
 import './styles.css'
 
-/** History ranges the view can request, keyed by the label shown in the picker */
+/** Time ranges the view can request, keyed by the label shown in the picker */
 const HISTORY_RANGES = {
   '5m': { seconds: 5 * 60, tier: LADDER_TIER_FAST },
   '1h': { seconds: 60 * 60, tier: LADDER_TIER_MEDIUM },
@@ -64,7 +65,7 @@ type HistoryRange = keyof typeof HISTORY_RANGES
 /** Range selected when the panel opens */
 const HISTORY_RANGE_DEFAULT: HistoryRange = '5m'
 
-/** Milliseconds per second (history range math) */
+/** Milliseconds per second (time range math) */
 const MS_PER_SEC = 1000
 
 /** SVG viewBox width for sparklines */
@@ -1105,6 +1106,8 @@ export default function ServerMonitorView({
   const lastAt = useRef(0)
   /** Newest bucket timestamp drawn; refreshes only fetch past this edge. */
   const newestBucketAt = useRef(0)
+  /** Id of the newest history request; responses for older ids are dropped. */
+  const historyRequestId = useRef(0)
   const rangeRef = useRef<HistoryRange>(HISTORY_RANGE_DEFAULT)
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -1155,12 +1158,14 @@ export default function ServerMonitorView({
       setHistory({})
       newestBucketAt.current = 0
     }
+    historyRequestId.current += 1
     void window.wassh.sendPluginMessage(tabId, pluginId, {
       type: 'requestHistory',
+      requestId: historyRequestId.current,
       bucketSeconds: HISTORY_RANGES[nextRange].tier.bucketSeconds,
       fromMs: Math.max(windowFromMs, sinceMs ?? 0),
       toMs
-    } satisfies ServerMonitorRendererMessage)
+    } satisfies MonitorRendererMessage)
   }
 
   useEffect(() => {
@@ -1180,9 +1185,16 @@ export default function ServerMonitorView({
         }
         if (ev.payload.type === 'historyReady') {
           setSeries(ev.payload.series)
+          // A new series set means a new history source; reload its window.
+          requestHistory(rangeRef.current)
           return
         }
         const bucket = ev.payload
+        // A newer request supersedes responses still in flight; without this,
+        // a range switch or history-source reload merges stale buckets.
+        if (bucket.requestId !== historyRequestId.current) {
+          return
+        }
         if (bucket.timestamp > newestBucketAt.current) {
           newestBucketAt.current = bucket.timestamp
         }
@@ -1281,7 +1293,7 @@ export default function ServerMonitorView({
     const result = await window.wassh.sendPluginMessage(tabId, pluginId, {
       type: 'installService',
       password
-    } satisfies ServerMonitorRendererMessage)
+    } satisfies MonitorRendererMessage)
     setPassword('')
     if (!isMonitorActionResult(result) || !result.ok) {
       setActionError(isMonitorActionResult(result) ? result.error || 'Operation failed' : 'Operation failed')
@@ -1329,20 +1341,6 @@ export default function ServerMonitorView({
       <div className="monitor-scroll">
         <div className="monitor-header">
           <div className="monitor-section-toggles" role="group" aria-label="Visible sections">
-            {showSparks ? (
-              <select
-                className="monitor-range"
-                value={range}
-                aria-label="History range"
-                onChange={(e) => selectRange(e.target.value as HistoryRange)}
-              >
-                {(Object.keys(HISTORY_RANGES) as HistoryRange[]).map((value) => (
-                  <option key={value} value={value}>
-                    {value}
-                  </option>
-                ))}
-              </select>
-            ) : null}
             {SECTION_TOGGLES.map((tog) => {
               const on = settingBool(settings, tog.key, tog.fallback)
               return (
@@ -1359,6 +1357,22 @@ export default function ServerMonitorView({
               )
             })}
           </div>
+          {showSparks ? (
+            <label className="monitor-range-field">
+              Time range
+              <select
+                className="monitor-range"
+                value={range}
+                onChange={(e) => selectRange(e.target.value as HistoryRange)}
+              >
+                {(Object.keys(HISTORY_RANGES) as HistoryRange[]).map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
         </div>
 
         {snapshot?.error ? <div className="plugin-monitor-error">{snapshot.error}</div> : null}
@@ -1536,7 +1550,7 @@ export default function ServerMonitorView({
           <div className="monitor-section-title">WaSSH Service</div>
           <p className="monitor-service-note">
             {service.message ||
-              'Install WaSSH Service for retained, multi-resolution history that survives restarts.'}
+              'Install WaSSH Service on the host for continuous multi-resolution history.'}
           </p>
           {actionError ? <div className="plugin-monitor-error">{actionError}</div> : null}
           {sudoPrompt ? (

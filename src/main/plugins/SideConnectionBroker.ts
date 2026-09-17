@@ -86,7 +86,42 @@ export class SideConnectionBroker {
     } else {
       stream = await session.openDirectTcp(destHost, port)
     }
+    return this.trackRawStream(tabId, pluginId, stream)
+  }
 
+  /**
+   * Open a binary duplex to a unix socket on the remote host
+   * (`direct-streamlocal@openssh.com`). SSH-only: a local fallback would
+   * connect to the wrong machine, so this throws instead.
+   */
+  async openUnixStream(
+    tabId: string,
+    pluginId: string,
+    socketPath: string
+  ): Promise<{ id: string; stream: Duplex }> {
+    const session = this.getSession(tabId)
+    if (!session) {
+      throw new Error('Session is not connected')
+    }
+    const path = socketPath.trim()
+    if (!path) {
+      throw new Error('Unix stream requires a socket path')
+    }
+    if (!session.isSsh || !session.getSshClient()) {
+      throw new Error('Unix stream requires an SSH session')
+    }
+    return this.trackRawStream(tabId, pluginId, await session.forwardOutStreamLocal(path))
+  }
+
+  /**
+   * Track a binary stream so tab/plugin teardown disposes it. The entry is
+   * dropped when the stream closes or errors.
+   */
+  private trackRawStream(
+    tabId: string,
+    pluginId: string,
+    stream: Duplex
+  ): { id: string; stream: Duplex } {
     const id = randomUUID()
     const dispose = (): void => {
       try {
@@ -105,7 +140,7 @@ export class SideConnectionBroker {
     return { id, stream }
   }
 
-  closeTcpStream(streamId: string): void {
+  closeRawStream(streamId: string): void {
     const entry = this.rawStreams.get(streamId)
     if (!entry) {
       return
@@ -297,7 +332,7 @@ export class SideConnectionBroker {
   closeForPlugin(tabId: string, pluginId: string): void {
     const matches = this.byTabAndPlugin(tabId, pluginId)
     this.closeMatching(this.connections, matches, (id) => this.close(id))
-    this.closeMatching(this.rawStreams, matches, (id) => this.closeTcpStream(id))
+    this.closeMatching(this.rawStreams, matches, (id) => this.closeRawStream(id))
     this.closeSftp(tabId, pluginId)
   }
 
@@ -308,14 +343,14 @@ export class SideConnectionBroker {
   closeForTab(tabId: string): void {
     const matches = this.byTab(tabId)
     this.closeMatching(this.connections, matches, (id) => this.close(id))
-    this.closeMatching(this.rawStreams, matches, (id) => this.closeTcpStream(id))
+    this.closeMatching(this.rawStreams, matches, (id) => this.closeRawStream(id))
     this.closeSftpForTab(tabId)
   }
 
   disposeAll(): void {
     const all = (): boolean => true
     this.closeMatching(this.connections, all, (id) => this.close(id))
-    this.closeMatching(this.rawStreams, all, (id) => this.closeTcpStream(id))
+    this.closeMatching(this.rawStreams, all, (id) => this.closeRawStream(id))
     this.closeMatching(this.sftpSessions, all)
   }
 

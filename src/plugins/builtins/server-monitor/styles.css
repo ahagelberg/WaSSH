@@ -75,6 +75,16 @@
   gap: 4px;
 }
 
+.monitor-range-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
 .monitor-range {
   flex: 0 0 auto;
   width: auto;

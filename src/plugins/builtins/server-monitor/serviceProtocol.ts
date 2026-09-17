@@ -33,6 +33,8 @@ export interface MonitorHistoryReadyEvent {
 /** One aggregated bucket pushed to the view. */
 export interface MonitorHistoryBucketEvent {
   type: 'history'
+  /** Request that produced this bucket; the view drops superseded responses */
+  requestId: number
   bucketSeconds: number
   seriesId: string
   timestamp: number
@@ -50,7 +52,7 @@ export type MonitorRendererMessage =
   | { type: 'probeService' }
   | { type: 'installService'; password: string }
   | { type: 'uninstallService'; password: string }
-  | { type: 'requestHistory'; bucketSeconds: number; fromMs: number; toMs: number }
+  | { type: 'requestHistory'; requestId: number; bucketSeconds: number; fromMs: number; toMs: number }
 
 export interface MonitorActionResult {
   ok: boolean
@@ -70,6 +72,7 @@ export function isMonitorRendererMessage(value: unknown): value is MonitorRender
   }
   return (
     message.type === 'requestHistory' &&
+    typeof message.requestId === 'number' &&
     typeof message.bucketSeconds === 'number' &&
     typeof message.fromMs === 'number' &&
     typeof message.toMs === 'number'
