@@ -345,6 +345,27 @@
   height: var(--monitor-spark-height);
 }
 
+.monitor-spark-plot {
+  position: relative;
+}
+
+.monitor-spark-scale {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--text-muted);
+  opacity: 0.8;
+  pointer-events: none;
+}
+
+.monitor-spark-grid {
+  stroke: color-mix(in srgb, var(--border) 80%, transparent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
 .monitor-spark-line {
   fill: none;
   stroke-width: 1.75;

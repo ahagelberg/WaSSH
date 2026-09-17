@@ -15,6 +15,7 @@ import {
   SERIES_DISK_WRITE,
   SERIES_MEM_TOTAL,
   SERIES_MEM_USED,
+  SERIES_PERCENT_MAX,
   type MonitorSeries
 } from '@shared/monitorSeries'
 import {
@@ -71,6 +72,9 @@ const SPARK_WIDTH = 120
 
 /** SVG viewBox height for sparklines */
 const SPARK_HEIGHT = 36
+
+/** Vertical inset so the line and the scale gridline never touch the plot edges */
+const SPARK_INSET = 1
 
 /** Ring gauge viewBox size */
 const GAUGE_SIZE = 72
@@ -242,7 +246,10 @@ function sparkCoords(
   const span = Math.max(1, toMs - fromMs)
   return points.map((point) => ({
     x: ((point.timestamp - fromMs) / span) * SPARK_WIDTH,
-    y: SPARK_HEIGHT - (Math.max(0, Math.min(point.avg, max)) / max) * (SPARK_HEIGHT - 2) - 1
+    y:
+      SPARK_HEIGHT -
+      (Math.max(0, Math.min(point.avg, max)) / max) * (SPARK_HEIGHT - SPARK_INSET * 2) -
+      SPARK_INSET
   }))
 }
 
@@ -284,6 +291,20 @@ function historyMax(points: HistoryPoint[]): number {
     }
   }
   return max
+}
+
+/** Byte history as a percentage of `total` (empty while the total is unknown). */
+function percentPoints(points: HistoryPoint[], total: number | undefined): HistoryPoint[] {
+  if (!total) {
+    return []
+  }
+  const scale = SERIES_PERCENT_MAX / total
+  return points.map((point) => ({
+    ...point,
+    min: point.min * scale,
+    max: point.max * scale,
+    avg: point.avg * scale
+  }))
 }
 
 function processSortValue(row: ServerMonitorProcess, sort: ServerMonitorProcessSort): string | number {
@@ -467,7 +488,8 @@ function SparkCard({
   current,
   fromMs,
   toMs,
-  scaleMax
+  scaleMax,
+  formatScale
 }: {
   title: string
   points: HistoryPoint[]
@@ -477,10 +499,12 @@ function SparkCard({
   fromMs: number
   /** Right edge of the drawn window (ms) */
   toMs: number
-  /** When set, sparklines scale to this max (rate history); else 0–100 */
+  /** When set, the sparkline scales to this ceiling (or the observed max if 0); else 0–100 */
   scaleMax?: number
+  /** Formats the scale max; defaults to a percentage */
+  formatScale?: (value: number) => string
 }): ReactElement {
-  const max = scaleMax != null ? Math.max(scaleMax, historyMax(points), 1) : 100
+  const max = scaleMax != null ? Math.max(scaleMax, historyMax(points), 1) : SERIES_PERCENT_MAX
   const line = sparkPath(points, max, fromMs, toMs)
   const area = sparkArea(points, max, fromMs, toMs)
   return (
@@ -489,15 +513,21 @@ function SparkCard({
         <span>{title}</span>
         <strong>{current}</strong>
       </div>
-      <svg
-        className="monitor-spark-svg"
-        viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
-        preserveAspectRatio="none"
-        aria-hidden="true"
-      >
-        {area ? <path className="monitor-spark-area" d={area} /> : null}
-        {line ? <path className="monitor-spark-line" d={line} fill="none" /> : null}
-      </svg>
+      <div className="monitor-spark-plot">
+        <span className="monitor-spark-scale">
+          {formatScale ? formatScale(max) : `${Math.round(max)}%`}
+        </span>
+        <svg
+          className="monitor-spark-svg"
+          viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          <path className="monitor-spark-grid" d={`M0 ${SPARK_INSET} H${SPARK_WIDTH}`} />
+          {area ? <path className="monitor-spark-area" d={area} /> : null}
+          {line ? <path className="monitor-spark-line" d={line} fill="none" /> : null}
+        </svg>
+      </div>
     </div>
   )
 }
@@ -861,6 +891,7 @@ function NetworkPanel({
             points={rxPoints}
             tone="net"
             scaleMax={capacity}
+            formatScale={formatRate}
             fromMs={fromMs}
             toMs={toMs}
             current={formatRate(totals.rxRate)}
@@ -870,6 +901,7 @@ function NetworkPanel({
             points={txPoints}
             tone="net"
             scaleMax={capacity}
+            formatScale={formatRate}
             fromMs={fromMs}
             toMs={toMs}
             current={formatRate(totals.txRate)}
@@ -992,6 +1024,7 @@ function DiskPanel({
             fromMs={fromMs}
             toMs={toMs}
             scaleMax={historyMax(readPoints)}
+            formatScale={formatRate}
             current={formatRate(snapshot?.diskReadRate)}
           />
           <SparkCard
@@ -1001,6 +1034,7 @@ function DiskPanel({
             fromMs={fromMs}
             toMs={toMs}
             scaleMax={historyMax(writePoints)}
+            formatScale={formatRate}
             current={formatRate(snapshot?.diskWriteRate)}
           />
         </div>
@@ -1387,7 +1421,7 @@ export default function ServerMonitorView({
                   />
                   <SparkCard
                     title="Memory"
-                    points={pointsFor(SERIES_MEM_USED)}
+                    points={percentPoints(pointsFor(SERIES_MEM_USED), snapshot?.memTotalBytes)}
                     tone="mem"
                     fromMs={fromMs}
                     toMs={toMs}
@@ -1415,7 +1449,7 @@ export default function ServerMonitorView({
               snapshot={snapshot}
               showGauge={showGauges}
               showSparks={showSparks}
-              usedPoints={pointsFor(SERIES_DISK_USED)}
+              usedPoints={percentPoints(pointsFor(SERIES_DISK_USED), snapshot?.diskTotalBytes)}
               readPoints={pointsFor(SERIES_DISK_READ)}
               writePoints={pointsFor(SERIES_DISK_WRITE)}
               fromMs={fromMs}
