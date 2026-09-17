@@ -28,3 +28,4 @@
 - AI Agent: Add option to include (yaml) files with prompts
 - Daemon monitor: triggers
 - AI Agent: better approval system - detect individual commands in long command list, classify them as already approved or not depending on arguments.
+- AI Agent: add support for sub-agents.
