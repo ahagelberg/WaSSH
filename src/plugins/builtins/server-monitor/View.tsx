@@ -52,18 +52,26 @@ import {
 } from './serviceProtocol'
 import './styles.css'
 
-/** Time ranges the view can request, keyed by the label shown in the picker */
+/** Time ranges the view can request, shortest first; each fits its tier's span */
 const HISTORY_RANGES = {
-  '5m': { seconds: 5 * 60, tier: LADDER_TIER_FAST },
+  '1m': { seconds: 60, tier: LADDER_TIER_FAST },
+  '10m': { seconds: 10 * 60, tier: LADDER_TIER_MEDIUM },
+  '30m': { seconds: 30 * 60, tier: LADDER_TIER_MEDIUM },
   '1h': { seconds: 60 * 60, tier: LADDER_TIER_MEDIUM },
+  '2h': { seconds: 2 * 60 * 60, tier: LADDER_TIER_SLOW },
+  '6h': { seconds: 6 * 60 * 60, tier: LADDER_TIER_SLOW },
   '24h': { seconds: 24 * 60 * 60, tier: LADDER_TIER_SLOW },
+  '2d': { seconds: 2 * 24 * 60 * 60, tier: LADDER_TIER_ARCHIVE },
   '7d': { seconds: 7 * 24 * 60 * 60, tier: LADDER_TIER_ARCHIVE }
 } as const
 
 type HistoryRange = keyof typeof HISTORY_RANGES
 
+/** Slider positions, shortest range first */
+const HISTORY_RANGE_STEPS = Object.keys(HISTORY_RANGES) as HistoryRange[]
+
 /** Range selected when the panel opens */
-const HISTORY_RANGE_DEFAULT: HistoryRange = '5m'
+const HISTORY_RANGE_DEFAULT: HistoryRange = '10m'
 
 /** Milliseconds per second (time range math) */
 const MS_PER_SEC = 1000
@@ -115,6 +123,10 @@ const CONTEXT_MENU_EDGE_PAD = 4
 
 /** Max command chars shown in process action status */
 const PROC_STATUS_CMD_MAX = 40
+
+/** Tooltip for hosts without the service, shown on the install/upgrade buttons */
+const SERVICE_HELP_FALLBACK =
+  'Install WaSSH monitor service to record stats in the background even when not connected.'
 
 type GaugeTone = 'cpu' | 'mem' | 'disk' | 'swap' | 'net'
 type SparkTone = GaugeTone
@@ -1360,17 +1372,16 @@ export default function ServerMonitorView({
           {showSparks ? (
             <label className="monitor-range-field">
               Time range
-              <select
+              <input
+                type="range"
                 className="monitor-range"
-                value={range}
-                onChange={(e) => selectRange(e.target.value as HistoryRange)}
-              >
-                {(Object.keys(HISTORY_RANGES) as HistoryRange[]).map((value) => (
-                  <option key={value} value={value}>
-                    {value}
-                  </option>
-                ))}
-              </select>
+                min={0}
+                max={HISTORY_RANGE_STEPS.length - 1}
+                step={1}
+                value={HISTORY_RANGE_STEPS.indexOf(range)}
+                onChange={(e) => selectRange(HISTORY_RANGE_STEPS[Number(e.target.value)])}
+              />
+              <span className="monitor-range-value">{range}</span>
             </label>
           ) : null}
         </div>
@@ -1548,10 +1559,6 @@ export default function ServerMonitorView({
       {serviceNeedsAttention ? (
         <div className="monitor-service-panel">
           <div className="monitor-section-title">WaSSH Service</div>
-          <p className="monitor-service-note">
-            {service.message ||
-              'Install WaSSH Service on the host for continuous multi-resolution history.'}
-          </p>
           {actionError ? <div className="plugin-monitor-error">{actionError}</div> : null}
           {sudoPrompt ? (
             <form
@@ -1575,7 +1582,13 @@ export default function ServerMonitorView({
                 Kept in memory only for this operation. Leave blank for passwordless sudo.
               </small>
               <div className="monitor-service-actions">
-                <PluginButton type="submit" compact variant="primary" disabled={operationRunning}>
+                <PluginButton
+                  type="submit"
+                  compact
+                  variant="primary"
+                  disabled={operationRunning}
+                  title={service.message || SERVICE_HELP_FALLBACK}
+                >
                   {operationRunning
                     ? 'Working…'
                     : service.state === 'outdated'
@@ -1594,6 +1607,7 @@ export default function ServerMonitorView({
                 variant="primary"
                 disabled={operationRunning}
                 onClick={() => setSudoPrompt(true)}
+                title={service.message || SERVICE_HELP_FALLBACK}
               >
                 {service.state === 'outdated' ? 'Upgrade service' : 'Install service'}
               </PluginButton>
