@@ -1,4 +1,4 @@
-export const REMOTE_SERVICE_VERSION = 3
+export const REMOTE_SERVICE_VERSION = 4
 export const REMOTE_OPERATION_SUCCESS = '__WASSH_SERVICE_OK__'
 export const REMOTE_BASE_PATH = '/usr/local/lib/wassh-service'
 export const REMOTE_EXECUTABLE_PATH = `${REMOTE_BASE_PATH}/wassh-service`
@@ -179,8 +179,8 @@ read_net() {
     rx=$1
     shift 8
     tx=$1
-    eval "net_rx_$position=\\\\$rx"
-    eval "net_tx_$position=\\\\$tx"
+    eval "net_rx_$position=\\$rx"
+    eval "net_tx_$position=\\$tx"
   done < /proc/net/dev
 }
 
@@ -190,7 +190,7 @@ read_temps() {
     value=""
     read -r value < "/sys/class/thermal/$zone/temp" 2>/dev/null || value=""
     [ -z "$value" ] && value=0
-    eval "temp_$temp_count=\\\\$value"
+    eval "temp_$temp_count=\\$value"
     temp_count=$((temp_count + 1))
   done
 }
@@ -208,7 +208,7 @@ read_iface_states() {
     operstate=""
     read -r operstate < "/sys/class/net/$name/operstate" 2>/dev/null || operstate=""
     [ "$operstate" = up ] && state=1
-    eval "iface_state_$index=\\\\$state"
+    eval "iface_state_$index=\\$state"
     index=$((index + 1))
   done
 }
@@ -286,7 +286,7 @@ stream_sample() {
     be "$temp_count" 2
     index=0
     while [ "$index" -lt "$temp_count" ]; do
-      eval "value=\\\\$temp_$index"
+      eval "value=\\$temp_$index"
       be "$value" 2
       index=$((index + 1))
     done
@@ -295,9 +295,9 @@ stream_sample() {
     be "$iface_count" 2
     index=0
     while [ "$index" -lt "$iface_count" ]; do
-      eval "state=\\\\$iface_state_$index"
-      eval "rx=\\\\$net_rx_bps_$index"
-      eval "tx=\\\\$net_tx_bps_$index"
+      eval "state=\\$iface_state_$index"
+      eval "rx=\\$net_rx_bps_$index"
+      eval "tx=\\$net_tx_bps_$index"
       be "$state" 1
       be "$rx" 4
       be "$tx" 4
@@ -352,12 +352,12 @@ while :; do
     disk_write_bps=$(( (disk_write_sectors - prev_disk_write) * DISK_SECTOR_BYTES / elapsed ))
     index=0
     while [ "$index" -lt "$iface_count" ]; do
-      eval "rx=\\\\$net_rx_$index"
-      eval "tx=\\\\$net_tx_$index"
-      eval "prev_rx=\\\\$prev_net_rx_$index"
-      eval "prev_tx=\\\\$prev_net_tx_$index"
-      eval "net_rx_bps_$index=\\\\$(( (rx - prev_rx) / elapsed ))"
-      eval "net_tx_bps_$index=\\\\$(( (tx - prev_tx) / elapsed ))"
+      eval "rx=\\$net_rx_$index"
+      eval "tx=\\$net_tx_$index"
+      eval "prev_rx=\\$prev_net_rx_$index"
+      eval "prev_tx=\\$prev_net_tx_$index"
+      eval "net_rx_bps_$index=\\$(( (rx - prev_rx) / elapsed ))"
+      eval "net_tx_bps_$index=\\$(( (tx - prev_tx) / elapsed ))"
       index=$((index + 1))
     done
   fi
@@ -365,8 +365,8 @@ while :; do
   prev_disk_write=$disk_write_sectors
   index=0
   while [ "$index" -lt "$iface_count" ]; do
-    eval "prev_net_rx_$index=\\\\$net_rx_$index"
-    eval "prev_net_tx_$index=\\\\$net_tx_$index"
+    eval "prev_net_rx_$index=\\$net_rx_$index"
+    eval "prev_net_tx_$index=\\$net_tx_$index"
     index=$((index + 1))
   done
   prev_net_at=$timestamp

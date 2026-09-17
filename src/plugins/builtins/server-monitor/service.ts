@@ -209,15 +209,6 @@ export async function probeService(
     return
   }
   const [present, version, active] = result.split('\t')
-  if (present !== 'present' || active !== 'active') {
-    setStatus(ctx, session, {
-      state: 'error',
-      streamConnected: false,
-      version,
-      message: 'WaSSH Service is installed but not running'
-    })
-    return
-  }
   const installedVersion = Number(version)
   if (installedVersion < REMOTE_SERVICE_VERSION) {
     closeStream(ctx, session)
@@ -226,6 +217,15 @@ export async function probeService(
       streamConnected: false,
       version,
       message: 'A newer version of WaSSH Service is available'
+    })
+    return
+  }
+  if (present !== 'present' || active !== 'active') {
+    setStatus(ctx, session, {
+      state: 'error',
+      streamConnected: false,
+      version,
+      message: 'WaSSH Service is installed but not running'
     })
     return
   }
