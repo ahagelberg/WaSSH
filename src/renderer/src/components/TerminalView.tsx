@@ -90,7 +90,7 @@ function positionBellLine(host: HTMLElement, term: Terminal, lineEl: HTMLElement
   lineEl.style.height = `${cellHeight}px`
 }
 
-/** xterm internals (same private surface the fit addon reads) used for re-measure/snap */
+/** xterm internals (the private surface the fit addon itself reads) */
 interface XtermCoreInternals {
   _charSizeService?: { measure: () => void }
   _renderService?: { dimensions: { css: { canvas: { height: number } } } }
@@ -103,10 +103,16 @@ interface XtermCoreInternals {
  * overflows the pane edge once the real font applies.
  */
 function fitAndSnap(term: Terminal, fit: FitAddon): void {
-  const core = term as unknown as XtermCoreInternals
+  // These live on the core, not on the public Terminal. The fit addon reads
+  // `core._renderService.dimensions` unguarded, and a core that has not opened
+  // (or has been disposed) has no render service - fitting it would throw.
+  const core = (term as unknown as { _core?: XtermCoreInternals })._core
+  if (!core?._renderService) {
+    return
+  }
   core._charSizeService?.measure()
   fit.fit()
-  const canvasHeight = core._renderService?.dimensions.css.canvas.height ?? 0
+  const canvasHeight = core._renderService.dimensions.css.canvas.height
   const element = term.element
   if (element && canvasHeight > 0) {
     element.style.height = `${canvasHeight}px`
