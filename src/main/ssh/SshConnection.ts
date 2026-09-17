@@ -34,6 +34,10 @@ import { OPEN_ATTEMPT_CANCELLED, OpenAttempt } from '../session/OpenAttempt'
 
 /** SSH connect ready timeout ms */
 const CONNECT_READY_TIMEOUT_MS = 20000
+/** Keepalive probe interval (ms); surfaces silently dropped idle links */
+const SSH_KEEPALIVE_INTERVAL_MS = 15000
+/** Missed keepalive probes before the transport is treated as dead */
+const SSH_KEEPALIVE_COUNT_MAX = 3
 /** Status when the remote shell ends (logout / exit), not a network drop */
 const SESSION_CLOSED_MESSAGE = 'Session closed'
 /** ms → whole seconds for reconnect status text */
@@ -688,6 +692,8 @@ export class SshConnection extends EventEmitter {
       port: params.port,
       username,
       readyTimeout: CONNECT_READY_TIMEOUT_MS,
+      keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+      keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
       tryKeyboard: true,
       hostVerifier: (key: Buffer, verify: (ok: boolean) => void) => {
         void this.verifyHostKey(params, key).then(verify)
