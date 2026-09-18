@@ -23,6 +23,7 @@ import { sessionStyleDefaultsFrom } from '@shared/connection'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
 import SettingsColorRow from './SettingsColorRow'
+import BackupSettingsSection from './BackupSettingsSection'
 import { TAB_COLOR_THEME_VAR, TERM_BG_THEME_VAR, TERM_FG_THEME_VAR } from './settingsColor'
 import { fontSelectOptions, listMonospaceFontFamilies } from '../fonts'
 import PluginSettingsFieldList from '../plugins/api/PluginSettingsFieldList'
@@ -189,6 +190,11 @@ export default function OptionsDialog({
             />
           </div>
         )
+      },
+      {
+        id: 'backup',
+        title: 'Backup',
+        content: <BackupSettingsSection />
       },
       {
         id: 'host-defaults',

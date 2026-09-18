@@ -103,7 +103,11 @@ const api: WasshApi = {
   onPluginMessage: (cb) =>
     on('plugin:message', (ev) => cb(ev as PluginMessageEvent)),
   onSettingsChanged: (cb) => on('settings:changed', (settings) => cb(settings as AppSettings)),
-  openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url)
+  openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
+  exportBackup: () => ipcRenderer.invoke('backup:export'),
+  pickBackupFile: () => ipcRenderer.invoke('backup:pickFile'),
+  inspectBackup: (filePath: string) => ipcRenderer.invoke('backup:inspect', filePath),
+  restoreBackup: (filePath: string) => ipcRenderer.invoke('backup:restore', filePath)
 }
 
 contextBridge.exposeInMainWorld('wassh', api)
