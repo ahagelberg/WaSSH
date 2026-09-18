@@ -12,6 +12,7 @@ import { PassThrough } from 'stream'
 import { ZipFile } from 'yazl'
 import type { PluginMainContext, SftpError, SftpSession } from '@plugin-api/main'
 import { classifySftpError, joinRemotePath } from '@plugin-api/main'
+import { ARCHIVE_EMPTY_SIZE, collectArchiveEntries } from './archiveLayout'
 import type { SftpTransferDonePayload, SftpTransferProgressPayload } from './protocol'
 
 interface FileTransferState {
@@ -56,18 +57,6 @@ export interface SftpTransferState {
   chunkUpload: SftpChunkUploadState | null
 }
 
-const ARCHIVE_EMPTY_SIZE = 0
-const ARCHIVE_ROOT_MTIME = 0
-
-interface ArchiveEntry {
-  remotePath: string
-  archivePath: string
-  size: number
-  mtime: number
-  mode: number
-  directory: boolean
-}
-
 function sendTransferDone(
   ctx: PluginMainContext,
   payload: Omit<SftpTransferDonePayload, 'type'>
@@ -84,42 +73,6 @@ function sendTransferProgress(
 
 function archiveRootName(path: string): string {
   return basename(path.replace(/\/+$/, '')) || 'archive'
-}
-
-async function collectArchiveEntries(
-  sftp: SftpSession,
-  remotePath: string,
-  archivePath: string
-): Promise<ArchiveEntry[]> {
-  const entries: ArchiveEntry[] = [
-    {
-      remotePath,
-      archivePath: `${archivePath}/`,
-      size: ARCHIVE_EMPTY_SIZE,
-      mtime: ARCHIVE_ROOT_MTIME,
-      mode: ARCHIVE_EMPTY_SIZE,
-      directory: true
-    }
-  ]
-  for (const child of await sftp.list(remotePath)) {
-    if (child.type === 'symlink' || child.type === 'other') {
-      continue
-    }
-    const childArchivePath = `${archivePath}/${child.name}`
-    if (child.type === 'directory') {
-      entries.push(...(await collectArchiveEntries(sftp, child.path, childArchivePath)))
-    } else {
-      entries.push({
-        remotePath: child.path,
-        archivePath: childArchivePath,
-        size: child.size,
-        mtime: child.mtime,
-        mode: child.mode,
-        directory: false
-      })
-    }
-  }
-  return entries
 }
 
 export async function handleDownload(
@@ -305,7 +258,8 @@ export async function handleDownloadZip(
   let outcome: 'done' | 'error' | 'cancelled' = 'done'
   let error: SftpError | undefined
   try {
-    const entries = await collectArchiveEntries(sftp, path, rootName)
+    // Empty archive path: the folder's contents land at the zip root.
+    const entries = await collectArchiveEntries((dir) => sftp.list(dir), path, '')
     const totalBytes = entries.reduce((total, entry) => total + entry.size, ARCHIVE_EMPTY_SIZE)
     const archiveDone = new Promise<void>((resolve, reject) => {
       archive.on('error', reject)
