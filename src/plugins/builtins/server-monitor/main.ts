@@ -68,6 +68,29 @@ const PROC_LIST_STABLE_MIN = 10
 /** Consecutive short samples before a shorter process list is accepted */
 const PROC_LIST_STALE_LIMIT = 3
 
+/**
+ * Section markers emitted by the sample commands. A section ends only at the
+ * next real marker (whole line), so process args containing `===` cannot cut
+ * the block short.
+ */
+const SECTION_NAMES = [
+  'META',
+  'IP',
+  'OS',
+  'CPU',
+  'MEM',
+  'DISK',
+  'DISKIO',
+  'NET',
+  'IPMAP',
+  'NETSPEED',
+  'TEMP',
+  'PROCS'
+] as const
+
+/** Lookahead matching the next section marker (must start a line) */
+const SECTION_DELIMITER = `\\n===(?:${SECTION_NAMES.join('|')})===[ \\t]*(?=\\r?\\n)`
+
 /** Milliseconds per second (rate math) */
 const MS_PER_SEC = 1000
 
@@ -348,7 +371,9 @@ function detectFamilyFromSample(raw: string): MonitorFamily {
 }
 
 function section(raw: string, name: string): string {
-  const re = new RegExp(`===${name}===\\s*([\\s\\S]*?)(?====|$)`)
+  const re = new RegExp(
+    `(?:^|\\n)===${name}===[ \\t]*\\r?\\n([\\s\\S]*?)(?=${SECTION_DELIMITER}|$)`
+  )
   const m = re.exec(raw)
   return m ? m[1].trim() : ''
 }
