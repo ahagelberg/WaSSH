@@ -93,7 +93,7 @@ function positionBellLine(host: HTMLElement, term: Terminal, lineEl: HTMLElement
 /** xterm internals (the private surface the fit addon itself reads) */
 interface XtermCoreInternals {
   _charSizeService?: { measure: () => void }
-  _renderService?: { dimensions: { css: { canvas: { height: number } } } }
+  _renderService?: { dimensions?: { css: { canvas: { height: number } } } }
 }
 
 /**
@@ -105,14 +105,16 @@ interface XtermCoreInternals {
 function fitAndSnap(term: Terminal, fit: FitAddon): void {
   // These live on the core, not on the public Terminal. The fit addon reads
   // `core._renderService.dimensions` unguarded, and a core that has not opened
-  // (or has been disposed) has no render service - fitting it would throw.
+  // (or has been disposed) has no render service, or a render service that has
+  // not measured yet has no dimensions - fitting either would throw.
   const core = (term as unknown as { _core?: XtermCoreInternals })._core
-  if (!core?._renderService) {
+  const dimensions = core?._renderService?.dimensions
+  if (!dimensions) {
     return
   }
-  core._charSizeService?.measure()
+  core?._charSizeService?.measure()
   fit.fit()
-  const canvasHeight = core._renderService.dimensions.css.canvas.height
+  const canvasHeight = dimensions.css.canvas.height
   const element = term.element
   if (element && canvasHeight > 0) {
     element.style.height = `${canvasHeight}px`
