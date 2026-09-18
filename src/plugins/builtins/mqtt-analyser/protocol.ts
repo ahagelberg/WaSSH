@@ -13,6 +13,18 @@ export type MqttAnalyserErrorKind =
   | 'unreachable'
   | 'other'
 
+/** Payload format of a saved publish message */
+export type MqttAnalyserSavedMessageMode = 'text' | 'json'
+
+/** A saved publish message that can be sent with one click */
+export interface MqttAnalyserSavedMessage {
+  id: string
+  label: string
+  topic: string
+  payload: string
+  mode: MqttAnalyserSavedMessageMode
+}
+
 /** Main → renderer status event */
 export interface MqttAnalyserStatusPayload {
   type: 'status'

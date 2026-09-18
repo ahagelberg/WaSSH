@@ -24,6 +24,7 @@
     "src/renderer/**/*",
     "src/plugins/builtins/**/View.tsx",
     "src/plugins/builtins/**/SessionSettings.tsx",
+    "src/plugins/builtins/**/Settings.tsx",
     "src/plugins/builtins/**/fileDrop.ts",
     "src/plugins/builtins/**/viewUtils.ts",
     "src/plugins/builtins/**/protocol.ts",

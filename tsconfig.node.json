@@ -29,6 +29,7 @@
     "src/plugins/**/View.tsx",
     "src/plugins/**/SessionSettings.tsx",
     "src/plugins/**/ProviderSettings.tsx",
+    "src/plugins/**/Settings.tsx",
     "src/plugins/**/fileDrop.ts",
     "src/plugins/**/viewUtils.ts",
     "src/plugins/**/styles.css"

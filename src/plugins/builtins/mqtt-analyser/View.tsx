@@ -1,15 +1,21 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
+import { createPortal } from 'react-dom'
 import './styles.css'
 import {
   MQTT_ANALYSER_BLINK_MS,
   MQTT_ANALYSER_HISTORY_LIMIT,
+  MQTT_ANALYSER_MESSAGES_COLLAPSED_DEFAULT,
+  MQTT_ANALYSER_NEW_MESSAGE_LABEL
 } from './defaults'
 import {
   type MqttAnalyserErrorKind,
+  type MqttAnalyserSavedMessage,
+  type MqttAnalyserSavedMessageMode,
   type MqttAnalyserTopicSnapshot,
   type MqttAnalyserStatusState
 } from './protocol'
 import { isMqttAnalyserMainMessage } from './protocol'
+import { jsonParseError, normalizeSavedMessages, SAVED_MESSAGE_MODES } from './viewUtils'
 import type { PluginViewProps } from '@plugin-api/renderer'
 
 type PublishMode = 'text' | 'json' | 'file'
@@ -26,8 +32,27 @@ const MQTT_SPLIT_MAX_RATIO = 0.75
 /** QoS used when clearing topics via empty retained publish */
 const MQTT_DELETE_QOS = 0 as const
 
-/** Prefix for JSON payload validation errors (also used to mark the textarea) */
-const JSON_ERROR_PREFIX = 'Invalid JSON'
+/** Minimum width of the saved-message context menu */
+const MESSAGE_MENU_MIN_WIDTH_PX = 120
+
+/** Approximate height of the saved-message context menu (edit + delete) */
+const MESSAGE_MENU_HEIGHT_PX = 62
+
+/** Gap between the cursor and the anchored context menu */
+const MENU_GAP_PX = 4
+
+/** Space kept between the context menu and the viewport edge */
+const MENU_MARGIN_PX = 4
+
+function anchorMenuAt(x: number, y: number, width: number, height: number): { left: number; top: number } {
+  const left = Math.min(x, window.innerWidth - width - MENU_MARGIN_PX)
+  const below = y + MENU_GAP_PX + height
+  const top =
+    below <= window.innerHeight
+      ? y + MENU_GAP_PX
+      : Math.max(MENU_MARGIN_PX, y - MENU_GAP_PX - height)
+  return { left: Math.max(MENU_MARGIN_PX, left), top }
+}
 
 function clampSplitRatio(ratio: number): number {
   return Math.min(MQTT_SPLIT_MAX_RATIO, Math.max(MQTT_SPLIT_MIN_RATIO, ratio))
@@ -381,7 +406,142 @@ function nextMessageId(): string {
   return `m${messageSeq}`
 }
 
-export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): ReactElement {
+interface SavedMessageDialogProps {
+  title: string
+  message: MqttAnalyserSavedMessage | null
+  /** Topic pre-filled when adding while a topic is selected */
+  initialTopic: string
+  onSave: (message: MqttAnalyserSavedMessage) => void
+  onCancel: () => void
+}
+
+function SavedMessageDialog({
+  title,
+  message,
+  initialTopic,
+  onSave,
+  onCancel
+}: SavedMessageDialogProps): ReactElement {
+  const [label, setLabel] = useState(message?.label ?? MQTT_ANALYSER_NEW_MESSAGE_LABEL)
+  const [topic, setTopic] = useState(message?.topic ?? initialTopic)
+  const [payload, setPayload] = useState(message?.payload ?? '')
+  const [mode, setMode] = useState<MqttAnalyserSavedMessageMode>(message?.mode ?? 'text')
+
+  const jsonError = mode === 'json' ? jsonParseError(payload) : null
+  const canSave = label.trim() !== '' && topic.trim() !== '' && jsonError === null
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        onCancel()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [onCancel])
+
+  const submit = (): void => {
+    if (!canSave) {
+      return
+    }
+    onSave({
+      id: message?.id ?? crypto.randomUUID(),
+      label: label.trim(),
+      topic: topic.trim(),
+      payload,
+      mode
+    })
+  }
+
+  return createPortal(
+    <div
+      className="mqtt-msg-dialog-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) {
+          onCancel()
+        }
+      }}
+    >
+      <form
+        className="mqtt-msg-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onSubmit={(e) => {
+          e.preventDefault()
+          submit()
+        }}
+      >
+        <div className="mqtt-msg-dialog-title">{title}</div>
+        <label className="mqtt-field">
+          <span>Label</span>
+          <input
+            type="text"
+            value={label}
+            autoFocus
+            placeholder="Name shown on the button"
+            onChange={(e) => setLabel(e.target.value)}
+          />
+        </label>
+        <label className="mqtt-field">
+          <span>Topic</span>
+          <input
+            type="text"
+            value={topic}
+            spellCheck={false}
+            onChange={(e) => setTopic(e.target.value)}
+          />
+        </label>
+        <div className="mqtt-publish-modes">
+          {SAVED_MESSAGE_MODES.map((m) => (
+            <button
+              key={m}
+              type="button"
+              className={mode === m ? 'active' : ''}
+              onClick={() => setMode(m)}
+            >
+              {m === 'json' ? 'JSON' : 'Text'}
+            </button>
+          ))}
+        </div>
+        <label className="mqtt-field">
+          <span>Payload</span>
+          <textarea
+            rows={6}
+            value={payload}
+            spellCheck={false}
+            aria-invalid={jsonError !== null}
+            onChange={(e) => setPayload(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault()
+                submit()
+              }
+            }}
+          />
+        </label>
+        {jsonError ? <div className="mqtt-msg-dialog-error">{jsonError}</div> : null}
+        <div className="mqtt-msg-dialog-actions">
+          <button type="button" onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="submit" className="primary" disabled={!canSave}>
+            Save
+          </button>
+        </div>
+      </form>
+    </div>,
+    document.body
+  )
+}
+
+export default function MqttAnalyserView({
+  tabId,
+  pluginId,
+  settings,
+  onSettingsPatch
+}: PluginViewProps): ReactElement {
   const [status, setStatus] = useState<MqttAnalyserStatusState>('idle')
   const [statusReason, setStatusReason] = useState<string | undefined>()
   const [errorKind, setErrorKind] = useState<MqttAnalyserErrorKind | undefined>()
@@ -399,6 +559,18 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
   const [publishError, setPublishError] = useState<string | null>(null)
   const [fileName, setFileName] = useState<string | null>(null)
   const [fileBase64, setFileBase64] = useState<string | null>(null)
+
+  const savedMessages = normalizeSavedMessages(settings.messages)
+  const messagesCollapsed =
+    settings.messagesCollapsed === undefined
+      ? MQTT_ANALYSER_MESSAGES_COLLAPSED_DEFAULT
+      : settings.messagesCollapsed === true
+  const [messageDialog, setMessageDialog] = useState<
+    { mode: 'add' } | { mode: 'edit'; id: string } | null
+  >(null)
+  const [messageMenu, setMessageMenu] = useState<{ id: string; left: number; top: number } | null>(
+    null
+  )
   const [treeRatio, setTreeRatio] = useState(MQTT_SPLIT_DEFAULT_RATIO)
   const splitRef = useRef<HTMLDivElement>(null)
   const splitterLastX = useRef(0)
@@ -529,6 +701,46 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
     void window.wassh.sendPluginMessage(tabId, pluginId, { type: 'reconnect' })
   }
 
+  /** Encode a text payload for the given publish mode; null on validation/encoding failure */
+  const encodeTextPayload = (text: string, mode: PublishMode): string | null => {
+    if (mode === 'json') {
+      const error = jsonParseError(text)
+      if (error !== null) {
+        setPublishError(error)
+        return null
+      }
+    }
+    try {
+      const normalized = mode === 'json' ? JSON.stringify(JSON.parse(text) as unknown) : text
+      return textToBase64(normalized)
+    } catch (err) {
+      setPublishError(err instanceof Error ? err.message : 'Failed to encode payload')
+      return null
+    }
+  }
+
+  const sendPublish = async (
+    topic: string,
+    payloadBase64: string,
+    qos: 0 | 1 | 2,
+    retain: boolean
+  ): Promise<void> => {
+    try {
+      const result = await window.wassh.sendPluginMessage(tabId, pluginId, {
+        type: 'publish',
+        topic,
+        payloadBase64,
+        qos,
+        retain
+      })
+      if (typeof result === 'string' && result.length > 0) {
+        setPublishError(result)
+      }
+    } catch (err) {
+      setPublishError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   const handlePublish = async (): Promise<void> => {
     setPublishError(null)
     const topic = publishTopic.trim()
@@ -549,39 +761,77 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
       }
       payloadBase64 = fileBase64
     } else {
-      let text = publishText
-      if (publishMode === 'json') {
-        try {
-          text = JSON.stringify(JSON.parse(publishText) as unknown)
-        } catch (err) {
-          const detail = err instanceof Error ? err.message : 'parse failed'
-          setPublishError(`${JSON_ERROR_PREFIX} — ${detail}`)
-          return
-        }
-      }
-      try {
-        payloadBase64 = textToBase64(text)
-      } catch (err) {
-        setPublishError(err instanceof Error ? err.message : 'Failed to encode payload')
+      const encoded = encodeTextPayload(publishText, publishMode)
+      if (encoded === null) {
         return
       }
+      payloadBase64 = encoded
     }
 
-    try {
-      const result = await window.wassh.sendPluginMessage(tabId, pluginId, {
-        type: 'publish',
-        topic,
-        payloadBase64,
-        qos: publishQos,
-        retain: publishRetain
-      })
-      if (typeof result === 'string' && result.length > 0) {
-        setPublishError(result)
-      }
-    } catch (err) {
-      setPublishError(err instanceof Error ? err.message : String(err))
-    }
+    await sendPublish(topic, payloadBase64, publishQos, publishRetain)
   }
+
+  const sendSavedMessage = async (message: MqttAnalyserSavedMessage): Promise<void> => {
+    setPublishError(null)
+    const topic = message.topic.trim()
+    if (!topic) {
+      setPublishError('Saved message has no topic')
+      return
+    }
+    if (status !== 'connected') {
+      setPublishError('Not connected')
+      return
+    }
+    const payloadBase64 = encodeTextPayload(message.payload, message.mode)
+    if (payloadBase64 === null) {
+      return
+    }
+    await sendPublish(topic, payloadBase64, publishQos, publishRetain)
+  }
+
+  const saveSavedMessages = (next: MqttAnalyserSavedMessage[]): void => {
+    onSettingsPatch({ messages: next })
+    setMessageDialog(null)
+    setMessageMenu(null)
+  }
+
+  const toggleMessagesCollapsed = (): void => {
+    onSettingsPatch({ messagesCollapsed: !messagesCollapsed })
+  }
+
+  const openMessageMenu = (id: string, x: number, y: number): void => {
+    setMessageMenu({
+      id,
+      ...anchorMenuAt(x, y, MESSAGE_MENU_MIN_WIDTH_PX, MESSAGE_MENU_HEIGHT_PX)
+    })
+  }
+
+  useEffect(() => {
+    if (!messageMenu) {
+      return
+    }
+    const close = (ev: MouseEvent): void => {
+      const target = ev.target
+      if (target instanceof Element && target.closest('.mqtt-msg-context-menu')) {
+        return
+      }
+      setMessageMenu(null)
+    }
+    const closeOnScroll = (): void => setMessageMenu(null)
+    const closeOnEscape = (ev: KeyboardEvent): void => {
+      if (ev.key === 'Escape') {
+        setMessageMenu(null)
+      }
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('scroll', closeOnScroll, true)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('scroll', closeOnScroll, true)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [messageMenu])
 
   const handleDelete = async (): Promise<void> => {
     if (selectedPath === null || status !== 'connected') {
@@ -986,9 +1236,125 @@ export default function MqttAnalyserView({ tabId, pluginId }: PluginViewProps): 
               </button>
             </div>
             {publishError ? <div className="mqtt-publish-error">{publishError}</div> : null}
+
+            <div className="mqtt-msg-section">
+              <div
+                className="mqtt-msg-head"
+                role="button"
+                tabIndex={0}
+                aria-expanded={!messagesCollapsed}
+                onClick={toggleMessagesCollapsed}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    toggleMessagesCollapsed()
+                  }
+                }}
+              >
+                <span className="mqtt-msg-collapse" aria-hidden="true">
+                  {messagesCollapsed ? '▸' : '▾'}
+                </span>
+                <span className="mqtt-msg-title">Saved</span>
+                <span className="mqtt-msg-count">{savedMessages.length}</span>
+              </div>
+              {!messagesCollapsed ? (
+                <>
+                  {savedMessages.length === 0 ? (
+                    <div className="mqtt-msg-empty">No saved messages</div>
+                  ) : (
+                    <div className="mqtt-msg-list">
+                      {savedMessages.map((message) => (
+                        <div
+                          key={message.id}
+                          className="mqtt-msg-row"
+                          role="button"
+                          tabIndex={-1}
+                          aria-label={message.label || 'Untitled'}
+                          title={`${message.topic}\n${message.payload}`}
+                          onClick={() => void sendSavedMessage(message)}
+                          onContextMenu={(e) => {
+                            e.preventDefault()
+                            openMessageMenu(message.id, e.clientX, e.clientY)
+                          }}
+                        >
+                          <span className="mqtt-msg-main">
+                            <span className="mqtt-msg-label">{message.label || 'Untitled'}</span>
+                            <span className="mqtt-msg-text">{message.topic}</span>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="primary mqtt-msg-add"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      setMessageMenu(null)
+                      setMessageDialog({ mode: 'add' })
+                    }}
+                  >
+                    ＋ Add message
+                  </button>
+                </>
+              ) : null}
+            </div>
           </div>
         </div>
       </div>
+
+      {messageMenu ? (
+        <div
+          className="mqtt-msg-context-menu"
+          role="menu"
+          style={{ left: messageMenu.left, top: messageMenu.top }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              setMessageDialog({ mode: 'edit', id: messageMenu.id })
+              setMessageMenu(null)
+            }}
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="danger"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              saveSavedMessages(savedMessages.filter((m) => m.id !== messageMenu.id))
+            }}
+          >
+            Remove
+          </button>
+        </div>
+      ) : null}
+
+      {messageDialog ? (
+        <SavedMessageDialog
+          title={messageDialog.mode === 'edit' ? 'Edit saved message' : 'Add saved message'}
+          message={
+            messageDialog.mode === 'edit'
+              ? (savedMessages.find((m) => m.id === messageDialog.id) ?? null)
+              : null
+          }
+          initialTopic={publishTopic.trim()}
+          onSave={(message) => {
+            const exists = savedMessages.some((m) => m.id === message.id)
+            saveSavedMessages(
+              exists
+                ? savedMessages.map((m) => (m.id === message.id ? message : m))
+                : [...savedMessages, message]
+            )
+          }}
+          onCancel={() => setMessageDialog(null)}
+        />
+      ) : null}
     </div>
   )
 }

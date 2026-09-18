@@ -5,6 +5,7 @@ import ServerMonitorSessionSettings from '../../../plugins/builtins/server-monit
 import ScratchpadView from '../../../plugins/builtins/scratchpad/View'
 import MacroPadView from '../../../plugins/builtins/macro-pad/View'
 import MqttAnalyserView from '../../../plugins/builtins/mqtt-analyser/View'
+import MqttAnalyserSettings from '../../../plugins/builtins/mqtt-analyser/Settings'
 import SftpView from '../../../plugins/builtins/sftp/View'
 import AiAgentView from '../../../plugins/builtins/ai-agent/View'
 import AiAgentProviderSettings from '../../../plugins/builtins/ai-agent/ProviderSettings'
@@ -21,7 +22,7 @@ const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
   { id: PLUGIN_ID_SERVER_MONITOR, view: ServerMonitorView, settingsView: ServerMonitorSessionSettings },
   { id: PLUGIN_ID_SCRATCHPAD, view: ScratchpadView },
   { id: PLUGIN_ID_MACRO_PAD, view: MacroPadView },
-  { id: PLUGIN_ID_MQTT_ANALYSER, view: MqttAnalyserView },
+  { id: PLUGIN_ID_MQTT_ANALYSER, view: MqttAnalyserView, settingsView: MqttAnalyserSettings },
   { id: PLUGIN_ID_SFTP, view: SftpView },
   { id: PLUGIN_ID_AI_AGENT, view: AiAgentView, settingsView: AiAgentProviderSettings },
   { id: PLUGIN_ID_CONNECTION_LOGGER, view: ConnectionLoggerView }
