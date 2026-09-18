@@ -201,6 +201,10 @@
   gap: 8px;
 }
 
+.mqtt-detail-topic-row .mqtt-copy-btn {
+  margin-top: 1px;
+}
+
 .mqtt-detail-topic {
   flex: 1;
   min-width: 0;
@@ -247,10 +251,37 @@
 .mqtt-history-head {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   font-size: 10px;
   color: var(--text-muted);
   margin-bottom: 4px;
+}
+
+.mqtt-copy-btn {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+}
+
+.mqtt-copy-btn:hover {
+  color: var(--text);
+}
+
+.mqtt-copy-btn.copied {
+  color: var(--accent);
+}
+
+/* Push the payload copy button to the right of the message header */
+.mqtt-history-head .mqtt-copy-btn {
+  margin-left: auto;
 }
 
 .mqtt-retain {

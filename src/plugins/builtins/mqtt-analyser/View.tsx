@@ -44,6 +44,57 @@ const MENU_GAP_PX = 4
 /** Space kept between the context menu and the viewport edge */
 const MENU_MARGIN_PX = 4
 
+/** How long the copy buttons show their "copied" confirmation (ms) */
+const COPY_FEEDBACK_MS = 1500
+
+/** Glyph shown on a copy button before and after copying */
+const COPY_GLYPH = '⧉'
+const COPIED_GLYPH = '✓'
+
+/**
+ * Small icon button that writes `text` to the clipboard and briefly confirms.
+ * Copy failures are ignored: the button simply does not confirm.
+ */
+function CopyButton({ text, label }: { text: string; label: string }): ReactElement {
+  const [copied, setCopied] = useState(false)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (timer.current) {
+        clearTimeout(timer.current)
+      }
+    }
+  }, [])
+
+  const copy = (): void => {
+    void navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopied(true)
+        if (timer.current) {
+          clearTimeout(timer.current)
+        }
+        timer.current = setTimeout(() => setCopied(false), COPY_FEEDBACK_MS)
+      })
+      .catch(() => {
+        /* clipboard unavailable — leave the button unconfirmed */
+      })
+  }
+
+  return (
+    <button
+      type="button"
+      className={`mqtt-copy-btn${copied ? ' copied' : ''}`}
+      title={copied ? 'Copied' : label}
+      aria-label={label}
+      onClick={copy}
+    >
+      {copied ? COPIED_GLYPH : COPY_GLYPH}
+    </button>
+  )
+}
+
 function anchorMenuAt(x: number, y: number, width: number, height: number): { left: number; top: number } {
   const left = Math.min(x, window.innerWidth - width - MENU_MARGIN_PX)
   const below = y + MENU_GAP_PX + height
@@ -1126,6 +1177,7 @@ export default function MqttAnalyserView({
                   <div className="mqtt-detail-topic" title={displayTopicPath(selectedPath)}>
                     {displayTopicPath(selectedPath)}
                   </div>
+                  <CopyButton text={displayTopicPath(selectedPath)} label="Copy topic" />
                   <button
                     type="button"
                     className="danger mqtt-delete-btn"
@@ -1151,17 +1203,21 @@ export default function MqttAnalyserView({
                       : 'No messages on this topic'}
                   </div>
                 ) : (
-                  selectedNode.messages.map((msg) => (
-                    <div key={msg.id} className="mqtt-history-item">
-                      <div className="mqtt-history-head">
-                        <span>{formatTime(msg.timestamp)}</span>
-                        <span>QoS {msg.qos}</span>
-                        {msg.retain ? <span className="mqtt-retain">retain</span> : null}
-                        {msg.binary ? <span>binary</span> : null}
+                  selectedNode.messages.map((msg) => {
+                    const payload = formatPayload(msg)
+                    return (
+                      <div key={msg.id} className="mqtt-history-item">
+                        <div className="mqtt-history-head">
+                          <span>{formatTime(msg.timestamp)}</span>
+                          <span>QoS {msg.qos}</span>
+                          {msg.retain ? <span className="mqtt-retain">retain</span> : null}
+                          {msg.binary ? <span>binary</span> : null}
+                          <CopyButton text={payload} label="Copy payload" />
+                        </div>
+                        <pre className="mqtt-history-payload">{payload}</pre>
                       </div>
-                      <pre className="mqtt-history-payload">{formatPayload(msg)}</pre>
-                    </div>
-                  ))
+                    )
+                  })
                 )}
               </div>
             </>
