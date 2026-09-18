@@ -18,6 +18,33 @@ export const SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT = true
 /** Signals the monitor can send to a remote process */
 export type ServerMonitorProcessSignal = 'TERM' | 'KILL'
 
+/** Signals offered in the details dialog's selection list (0–15) */
+export const SERVER_MONITOR_COMMON_SIGNALS: Array<{ name: string; number: number }> = [
+  { name: 'HUP', number: 1 },
+  { name: 'INT', number: 2 },
+  { name: 'QUIT', number: 3 },
+  { name: 'ILL', number: 4 },
+  { name: 'TRAP', number: 5 },
+  { name: 'ABRT', number: 6 },
+  { name: 'BUS', number: 7 },
+  { name: 'FPE', number: 8 },
+  { name: 'KILL', number: 9 },
+  { name: 'USR1', number: 10 },
+  { name: 'SEGV', number: 11 },
+  { name: 'USR2', number: 12 },
+  { name: 'PIPE', number: 13 },
+  { name: 'ALRM', number: 14 },
+  { name: 'TERM', number: 15 }
+]
+
+/** Signal name or number accepted by `kill -s` (e.g. `TERM`, `SIGTERM`, `15`) */
+const SIGNAL_RE = /^(?:SIG)?[A-Z][A-Z0-9]*$|^\d{1,2}$/i
+
+/** Whether a signal is safe to pass to `kill -s` on the remote host */
+export function isKillSignal(value: unknown): value is string {
+  return typeof value === 'string' && SIGNAL_RE.test(value.trim())
+}
+
 /** Valid process sort columns (for message validation) */
 export const SERVER_MONITOR_PROCESS_SORT_KEYS: ServerMonitorProcessSort[] = [
   'pid',
@@ -36,6 +63,27 @@ export function isServerMonitorProcessSort(value: unknown): value is ServerMonit
 
 export function isServerMonitorProcessSignal(value: unknown): value is ServerMonitorProcessSignal {
   return value === 'TERM' || value === 'KILL'
+}
+
+/** One labelled field in the process details dialog */
+export interface ServerMonitorProcessDetail {
+  label: string
+  value: string
+}
+
+/** One CPU-percent sample for the details dialog's history graph */
+export interface ServerMonitorProcessCpuSample {
+  /** Sample timestamp (ms since epoch) */
+  at: number
+  cpuPercent: number
+}
+/** Extra process info fetched on demand for the details dialog */
+export interface ServerMonitorProcessDetails {
+  pid: number
+  /** Fields in display order; empty values are omitted */
+  fields: ServerMonitorProcessDetail[]
+  /** CPU history from past samples (oldest first); empty when none recorded */
+  cpuHistory: ServerMonitorProcessCpuSample[]
 }
 
 /** One row from remote `ps` */
@@ -135,7 +183,11 @@ export function isServerMonitorStatsEvent(value: unknown): value is ServerMonito
 }
 
 /** Discriminant of snapshot/process requests the view sends to its main module */
-export type ServerMonitorRendererMessageType = 'refresh' | 'setProcessSort' | 'signalProcess'
+export type ServerMonitorRendererMessageType =
+  | 'refresh'
+  | 'setProcessSort'
+  | 'signalProcess'
+  | 'processDetails'
 
 /**
  * Snapshot/process requests the server-monitor view sends via
@@ -148,6 +200,15 @@ export type ServerMonitorRendererMessage =
   | { type: 'refresh' }
   | { type: 'setProcessSort'; sort: ServerMonitorProcessSort; descending?: boolean }
   | { type: 'signalProcess'; pid: number; signal: ServerMonitorProcessSignal }
+  | { type: 'signalProcess'; pid: number; signalName: string }
+  | {
+      type: 'processDetails'
+      pid: number
+      /** Window to return CPU history for, in seconds; matches the panel range */
+      windowSeconds?: number
+      /** Bucket width to downsample the history to, in seconds */
+      bucketSeconds?: number
+    }
 
 /** Narrows to a message with a recognized `type`; per-field values are still `unknown`. */
 export function isServerMonitorRendererMessageEnvelope(
@@ -161,6 +222,7 @@ export function isServerMonitorRendererMessageEnvelope(
     type === 'refresh' ||
     type === 'setProcessSort' ||
     type === 'signalProcess' ||
+    type === 'processDetails' ||
     type === 'requestHistory'
   )
 }
@@ -176,4 +238,20 @@ export function isServerMonitorActionResult(value: unknown): value is ServerMoni
     return false
   }
   return typeof (value as Partial<ServerMonitorActionResult>).ok === 'boolean'
+}
+
+/** Result of a `processDetails` request */
+export interface ServerMonitorProcessDetailsResult {
+  ok: boolean
+  error?: string
+  details?: ServerMonitorProcessDetails
+}
+
+export function isServerMonitorProcessDetailsResult(
+  value: unknown
+): value is ServerMonitorProcessDetailsResult {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  return typeof (value as Partial<ServerMonitorProcessDetailsResult>).ok === 'boolean'
 }
