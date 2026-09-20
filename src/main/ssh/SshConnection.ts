@@ -251,7 +251,15 @@ export class SshConnection extends EventEmitter {
     if (this.disposed || this.intentionalDisconnect) {
       return
     }
-    if (this.stream || this.opening) {
+    if (this.opening) {
+      return
+    }
+    // Keepalives, plus treating `close` as transport death, surface a
+    // blackholed or reset link by dropping the client. A client that is still
+    // present therefore means the session is alive, and rebuilding it here
+    // would tear down every live session on each focus event - which a native
+    // modal such as the save dialog triggers just by closing.
+    if (this.client) {
       return
     }
     this.reconnectAttempt = 0
@@ -753,7 +761,17 @@ export class SshConnection extends EventEmitter {
       }
       this.onTransportError(err)
     })
-    client.on('close', () => this.cancelTerminalPrompt())
+    // A dropped link often surfaces as `close` with no `error` (blackholed TCP,
+    // peer reset). Treat it as transport death too, or the session sits on a
+    // dead client forever: no status change, no reconnect, writes go nowhere.
+    client.on('close', () => {
+      if (this.client !== client && !this.proxyClients.includes(client)) {
+        return
+      }
+      this.onTransportError(
+        new Error(`Connection closed (${this.connection.name || this.connection.host})`)
+      )
+    })
   }
 
   private onTransportError(err: Error): void {
@@ -1076,6 +1094,10 @@ export class SshConnection extends EventEmitter {
           resolve()
           return
         }
+        // The shell channel died without an exit: the transport is gone. Drop
+        // the client here so its own `close` handler (guarded on identity) does
+        // not fire a second disconnect/reconnect for the same death.
+        this.closeClientOnly()
         this.emitStatus('disconnected', SESSION_CLOSED_MESSAGE)
         this.scheduleReconnect()
         resolve()
@@ -1269,14 +1291,13 @@ export class SshConnection extends EventEmitter {
     this.endAfterRemoteLogout()
   }
 
-  /** Backoff retry; `failedAttempt` marks a connect attempt that ended in 'failed'. */
-  private scheduleReconnect(failedAttempt = false): void {
+  /** Backoff retry for a dropped or failed transport. */
+  private scheduleReconnect(): void {
     if (
       this.intentionalDisconnect ||
       this.disposed ||
       !reconnectModeSchedulesRetry(this.reconnectMode, {
         everConnected: this.everConnected,
-        failedAttempt,
         appFocused: this.isAppFocused()
       })
     ) {

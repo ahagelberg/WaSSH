@@ -231,7 +231,9 @@ export async function handleDownload(
   )
 
   download.done = true
-  state.download = null
+  if (state.download === download) {
+    state.download = null
+  }
   if (outcome.state === 'error') {
     fsUnlink(localPath, () => {
       /* ignore */
@@ -363,7 +365,9 @@ export async function handleDownloadZip(
   }
 
   download.done = true
-  state.download = null
+  if (state.download === download) {
+    state.download = null
+  }
   if (outcome !== 'done') {
     try {
       download.remote?.destroy()
@@ -470,7 +474,9 @@ async function uploadFile(
   )
 
   upload.done = true
-  state.upload = null
+  if (state.upload === upload) {
+    state.upload = null
+  }
   sendTransferDone(ctx, {
     direction: 'upload',
     remotePath,

@@ -1,4 +1,4 @@
-import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
+import type { PluginMainContext, PluginMainModule, SessionStatus } from '@plugin-api/main'
 import { classifySftpError } from '@plugin-api/main'
 import { handleViewFile } from './fileView'
 import {
@@ -22,6 +22,9 @@ import {
   handleDownloadZip,
   handleUploadDialog,
 } from './transfers'
+
+/** Session status that means the SSH transport has come back up. */
+const SESSION_STATUS_CONNECTED: SessionStatus = 'connected'
 
 async function handleList(
   ctx: PluginMainContext,
@@ -159,6 +162,56 @@ function teardown(state: SessionState): void {
   state.sftp = null
 }
 
+/** Open the SFTP channel on the session's current transport. */
+async function openSession(ctx: PluginMainContext, state: SessionState): Promise<void> {
+  if (state.opening) {
+    return
+  }
+  state.opening = true
+  sendStatus(ctx, { state: 'connecting' })
+  try {
+    const sftp = await ctx.openSftp()
+    state.sftp = sftp
+    try {
+      state.home = await sftp.realpath('~')
+    } catch {
+      state.home = ''
+    }
+    state.cwd = await resolveCwd(ctx, state)
+    state.error = null
+    state.errorKind = null
+    sendStatus(ctx, { state: 'connected', cwd: state.cwd })
+  } catch (err) {
+    const e = classifySftpError(err)
+    state.error = e.message
+    state.errorKind = e.kind
+    sendStatus(ctx, { state: 'error', reason: e.message, errorKind: e.kind })
+  } finally {
+    state.opening = false
+  }
+}
+
+/**
+ * A rebuilt transport takes the SFTP channel down with it. ssh2 drops requests
+ * against a closed channel without reporting anything, so the dead session has
+ * to be discarded here or every later operation would hang forever. In-flight
+ * transfers are abandoned with it: their entries would otherwise block the next
+ * transfer behind a permanent "already running".
+ */
+function dropSession(state: SessionState): void {
+  cancelTransfers(state)
+  state.download = null
+  state.upload = null
+  try {
+    state.sftp?.end()
+  } catch {
+    /* ignore */
+  }
+  state.sftp = null
+  state.cwd = null
+  state.home = ''
+}
+
 async function handleMessage(
   ctx: PluginMainContext,
   state: SessionState,
@@ -213,6 +266,7 @@ export const sftpMain: PluginMainModule = {
       cwd: null,
       home: '',
       stopped: false,
+      opening: false,
       error: null,
       errorKind: null,
       download: null,
@@ -237,26 +291,7 @@ export const sftpMain: PluginMainModule = {
       return
     }
 
-    sendStatus(ctx, { state: 'connecting' })
-
-    try {
-      const sftp = await ctx.openSftp()
-      state.sftp = sftp
-      try {
-        state.home = await sftp.realpath('~')
-      } catch {
-        state.home = ''
-      }
-      state.cwd = await resolveCwd(ctx, state)
-      state.error = null
-      state.errorKind = null
-      sendStatus(ctx, { state: 'connected', cwd: state.cwd })
-    } catch (err) {
-      const e = classifySftpError(err)
-      state.error = e.message
-      state.errorKind = e.kind
-      sendStatus(ctx, { state: 'error', reason: e.message, errorKind: e.kind })
-    }
+    await openSession(ctx, state)
   },
 
   async onDeactivate(ctx) {
@@ -265,6 +300,20 @@ export const sftpMain: PluginMainModule = {
       teardown(state)
       sessionStates.delete(instanceKey(ctx))
     }
+  },
+
+  async onSessionStatus(ctx, event) {
+    const state = stateFor(ctx)
+    if (!state || state.stopped) {
+      return
+    }
+    if (event.status === SESSION_STATUS_CONNECTED) {
+      if (!state.sftp) {
+        await openSession(ctx, state)
+      }
+      return
+    }
+    dropSession(state)
   },
 
   onMessage(ctx, payload) {

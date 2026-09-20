@@ -160,14 +160,13 @@ export abstract class ByteSession extends EventEmitter {
     this.scheduleReconnect()
   }
 
-  /** Backoff retry; `failedAttempt` marks a connect attempt that ended in 'failed'. */
-  protected scheduleReconnect(failedAttempt = false): void {
+  /** Backoff retry for a dropped or failed transport. */
+  protected scheduleReconnect(): void {
     if (
       this.intentionalDisconnect ||
       this.disposed ||
       !reconnectModeSchedulesRetry(this.reconnectMode, {
         everConnected: this.everConnected,
-        failedAttempt,
         appFocused: this.isAppFocused()
       })
     ) {

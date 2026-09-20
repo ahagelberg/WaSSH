@@ -511,18 +511,18 @@ export function reconnectModeFrom(
 
 /**
  * True when a reconnect should be scheduled now. 'Always' keeps retrying a
- * session that has been up; 'On focus' retries a failed connect attempt for as
- * long as the app window keeps focus, and otherwise only reconnects on the next
- * focus change (or wake), which is what triggers the immediate attempt.
+ * session that has been up; 'On focus' retries while the app window has focus,
+ * so a link that flaps while the window stays focused still recovers instead of
+ * waiting for a focus change that never comes.
  */
 export function reconnectModeSchedulesRetry(
   mode: ReconnectMode,
-  opts: { everConnected: boolean; failedAttempt: boolean; appFocused: boolean }
+  opts: { everConnected: boolean; appFocused: boolean }
 ): boolean {
   if (mode === RECONNECT_MODE_ALWAYS) {
     return opts.everConnected
   }
-  return mode === RECONNECT_MODE_ON_FOCUS && opts.failedAttempt && opts.appFocused
+  return mode === RECONNECT_MODE_ON_FOCUS && opts.appFocused
 }
 
 /** True when window focus / wake should trigger an immediate reconnect */

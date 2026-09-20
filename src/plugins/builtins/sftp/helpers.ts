@@ -19,6 +19,8 @@ export interface SessionState extends SftpTransferState {
   cwd: string | null
   home: string
   stopped: boolean
+  /** True while an SFTP channel open is in flight. */
+  opening: boolean
   error: string | null
   errorKind: SftpErrorKind | null
   download: SftpDownloadState | null
