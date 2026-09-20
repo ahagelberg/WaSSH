@@ -1119,16 +1119,19 @@ async function fetchProcessDetails(
 
   try {
     const out = await ctx.execCapture(probe)
+    // Values span lines (/proc/PID/status, limits, environ), so only a line
+    // carrying the separator starts a group; the rest continue the last one.
     const groups = new Map<string, string>()
+    let key: string | null = null
     for (const line of out.split(/\n/)) {
       const idx = line.indexOf(DETAILS_SEP)
-      if (idx <= 0) {
+      if (idx > 0) {
+        key = line.slice(0, idx)
+        groups.set(key, line.slice(idx + DETAILS_SEP.length))
         continue
       }
-      const key = line.slice(0, idx)
-      const value = line.slice(idx + DETAILS_SEP.length).trim()
-      if (value) {
-        groups.set(key, value)
+      if (key) {
+        groups.set(key, `${groups.get(key) ?? ''}\n${line}`)
       }
     }
     return {
@@ -1486,7 +1489,9 @@ export const serverMonitorMain: PluginMainModule = {
   async onMessage(ctx, payload): Promise<ServerMonitorActionResult | undefined> {
     const state = sessionStates.get(instanceKey(ctx))
     if (!state || state.stopped) {
-      return undefined
+      // Answer instead of returning nothing: a dropped reply reaches the UI as
+      // a generic failure with no hint at what actually went wrong.
+      return { ok: false, error: 'Monitoring session is not active' }
     }
 
     if (isMonitorRendererMessage(payload)) {
