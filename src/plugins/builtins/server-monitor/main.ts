@@ -1,5 +1,5 @@
 import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
-import { MonitorLadder } from '@shared/monitorLadder'
+import { MonitorLadder, LADDER_TIERS } from '@shared/monitorLadder'
 import {
   BYTES_PER_KIB,
   SERIES_DISK_READ,
@@ -9,6 +9,7 @@ import {
   SERIES_MEM_TOTAL,
   SERIES_MEM_USED,
   SERIES_CPU,
+  SERIES_PERCENT_MAX,
   tempSeriesId,
   type MonitorSeries
 } from '@shared/monitorSeries'
@@ -24,6 +25,8 @@ import type {
   ServerMonitorActionResult,
   ServerMonitorNetIface,
   ServerMonitorProcess,
+  ServerMonitorProcessDetails,
+  ServerMonitorProcessDetailsResult,
   ServerMonitorProcessSignal,
   ServerMonitorProcessSort,
   ServerMonitorSnapshot,
@@ -31,6 +34,7 @@ import type {
   ServerMonitorTemp
 } from './protocol'
 import {
+  isKillSignal,
   isServerMonitorProcessSignal,
   isServerMonitorProcessSort,
   isServerMonitorRendererMessageEnvelope,
@@ -46,6 +50,7 @@ import {
   type MonitorServiceSession
 } from './service'
 import { isMonitorRendererMessage, type MonitorMainMessage } from './serviceProtocol'
+import { parseKeyValueBlock, parseLimits, parseParentLine } from './processDetails'
 
 /** `ps --sort=` field for each UI column */
 const PS_SORT_FIELD: Record<ServerMonitorProcessSort, string> = {
@@ -68,6 +73,29 @@ const PROC_LIST_STABLE_MIN = 10
 /** Consecutive short samples before a shorter process list is accepted */
 const PROC_LIST_STALE_LIMIT = 3
 
+/**
+ * Section markers emitted by the sample commands. A section ends only at the
+ * next real marker (whole line), so process args containing `===` cannot cut
+ * the block short.
+ */
+const SECTION_NAMES = [
+  'META',
+  'IP',
+  'OS',
+  'CPU',
+  'MEM',
+  'DISK',
+  'DISKIO',
+  'NET',
+  'IPMAP',
+  'NETSPEED',
+  'TEMP',
+  'PROCS'
+] as const
+
+/** Lookahead matching the next section marker (must start a line) */
+const SECTION_DELIMITER = `\\n===(?:${SECTION_NAMES.join('|')})===[ \\t]*(?=\\r?\\n)`
+
 /** Milliseconds per second (rate math) */
 const MS_PER_SEC = 1000
 
@@ -79,6 +107,28 @@ const KILL_EXIT_MARKER = '__EC:'
 
 /** Fixed sampling cadence shared by the poller and the daemon (ms) */
 const SAMPLE_INTERVAL_MS = SERVER_MONITOR_DEFAULT_INTERVAL_MS
+
+/** Processes tracked for CPU history (the top-N list, so all visible rows) */
+const PROC_HISTORY_MAX = SERVER_MONITOR_TOP_PROCESS_COUNT
+
+/** Series id used for a process's CPU percentage in its ladder */
+function procSeriesId(pid: number): string {
+  return `proc:${pid}`
+}
+
+/** One CPU-percent sample for a process */
+interface ProcCpuSample {
+  at: number
+  cpuPercent: number
+}
+
+/** Rolling CPU history for one process, bucketed by the shared ladder tiers */
+interface ProcCpuHistory {
+  pid: number
+  command: string
+  /** Same tiering/bucket sizes as the panel history, so ranges line up */
+  ladder: MonitorLadder
+}
 
 interface CpuJiffies {
   idle: number
@@ -116,6 +166,8 @@ interface MonitorSessionState {
   lastProcesses: ServerMonitorProcess[]
   /** Consecutive collapsed-list samples */
   shortSamples: number
+  /** Per-process CPU history from past samples, keyed by pid */
+  procHistory: Map<number, ProcCpuHistory>
   /** Most recent snapshot pushed to the renderer, for `get_snapshot` API calls */
   lastSnapshot: ServerMonitorSnapshot | null
   /** Remote daemon ("WaSSH Service") probe + stream state */
@@ -348,7 +400,9 @@ function detectFamilyFromSample(raw: string): MonitorFamily {
 }
 
 function section(raw: string, name: string): string {
-  const re = new RegExp(`===${name}===\\s*([\\s\\S]*?)(?====|$)`)
+  const re = new RegExp(
+    `(?:^|\\n)===${name}===[ \\t]*\\r?\\n([\\s\\S]*?)(?=${SECTION_DELIMITER}|$)`
+  )
   const m = re.exec(raw)
   return m ? m[1].trim() : ''
 }
@@ -1005,9 +1059,12 @@ function isValidPid(pid: unknown): pid is number {
 async function signalRemoteProcess(
   ctx: PluginMainContext,
   pid: number,
-  signal: ServerMonitorProcessSignal
+  signal: string
 ): Promise<ServerMonitorActionResult> {
-  const sig = signal === 'KILL' ? 'KILL' : 'TERM'
+  const sig = signal.trim().replace(/^SIG/i, '').toUpperCase()
+  if (!isKillSignal(sig)) {
+    return { ok: false, error: `Invalid signal: ${signal}` }
+  }
   try {
     const out = await ctx.execCapture(
       `kill -s ${sig} ${pid} 2>&1; printf '\\n${KILL_EXIT_MARKER}%s\\n' $?`
@@ -1030,6 +1087,131 @@ async function signalRemoteProcess(
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
+}
+
+/** Field separator for the details probe (unit separator, never in /proc text) */
+const DETAILS_SEP = '\u001f'
+
+/** Environment variables shown in the details dialog (newest-first cap) */
+const DETAILS_ENV_MAX = 40
+
+/**
+ * Fetch extra info about one process. Every probe is best-effort: the field is
+ * omitted when the file is unreadable (permissions, kernel thread, BSD/macOS
+ * without /proc). Runs in one exec so the dialog opens in a single round trip.
+ */
+async function fetchProcessDetails(
+  ctx: PluginMainContext,
+  pid: number
+): Promise<ServerMonitorProcessDetailsResult> {
+  const probe = [
+    `echo "STATUS${DETAILS_SEP}$(cat /proc/${pid}/status 2>/dev/null)"`,
+    `echo "CMDLINE${DETAILS_SEP}$(tr '\\0' ' ' < /proc/${pid}/cmdline 2>/dev/null)"`,
+    `echo "EXE${DETAILS_SEP}$(readlink /proc/${pid}/exe 2>/dev/null)"`,
+    `echo "CWD${DETAILS_SEP}$(readlink /proc/${pid}/cwd 2>/dev/null)"`,
+    `echo "ROOT${DETAILS_SEP}$(readlink /proc/${pid}/root 2>/dev/null)"`,
+    `echo "PARENT${DETAILS_SEP}$(ps -o ppid=,user=,lstart=,etime= -p ${pid} 2>/dev/null)"`,
+    `echo "FDS${DETAILS_SEP}$(ls /proc/${pid}/fd 2>/dev/null | wc -l)"`,
+    `echo "LIMITS${DETAILS_SEP}$(cat /proc/${pid}/limits 2>/dev/null)"`,
+    `echo "CGROUP${DETAILS_SEP}$(cat /proc/${pid}/cgroup 2>/dev/null)"`,
+    `echo "ENVIRON${DETAILS_SEP}$(tr '\\0' '\\n' < /proc/${pid}/environ 2>/dev/null | head -n ${DETAILS_ENV_MAX})"`
+  ].join('; ')
+
+  try {
+    const out = await ctx.execCapture(probe)
+    const groups = new Map<string, string>()
+    for (const line of out.split(/\n/)) {
+      const idx = line.indexOf(DETAILS_SEP)
+      if (idx <= 0) {
+        continue
+      }
+      const key = line.slice(0, idx)
+      const value = line.slice(idx + DETAILS_SEP.length).trim()
+      if (value) {
+        groups.set(key, value)
+      }
+    }
+    return {
+      ok: true,
+      details: { pid, fields: processDetailFields(pid, groups), cpuHistory: [] }
+    }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** Map the raw details probe output into labelled dialog fields */
+function processDetailFields(
+  pid: number,
+  groups: Map<string, string>
+): ServerMonitorProcessDetails['fields'] {
+  const fields: ServerMonitorProcessDetails['fields'] = []
+  const add = (label: string, value: string | undefined): void => {
+    const trimmed = (value ?? '').trim()
+    if (trimmed) {
+      fields.push({ label, value: trimmed })
+    }
+  }
+  const status = parseKeyValueBlock(groups.get('STATUS') ?? '')
+  const parent = parseParentLine(groups.get('PARENT') ?? '')
+
+  add('Command line', groups.get('CMDLINE'))
+  add('Executable', groups.get('EXE'))
+  add('Working dir', groups.get('CWD'))
+  add('Root', groups.get('ROOT'))
+  add('Parent PID', parent.ppid)
+  add('Owner', parent.user)
+  add('Started', parent.started)
+  add('Elapsed', parent.elapsed)
+  add('State', status.get('State'))
+  add('Threads', status.get('Threads'))
+  add('Owner (real)', status.get('Uid'))
+  add('Group', status.get('Gid'))
+  add('Virtual memory', status.get('VmSize'))
+  add('Resident memory', status.get('VmRSS'))
+  add('Peak memory', status.get('VmPeak'))
+  add('Open file descriptors', groups.get('FDS'))
+  add('Voluntary ctx switches', status.get('voluntary_ctxt_switches'))
+  add('Involuntary ctx switches', status.get('nonvoluntary_ctxt_switches'))
+  add('Cgroup', groups.get('CGROUP')?.split(/\n/)[0])
+
+  const limits = parseLimits(groups.get('LIMITS') ?? '')
+  for (const [label, value] of limits) {
+    add(label, value)
+  }
+
+  const environ = groups.get('ENVIRON')
+  if (environ) {
+    fields.push({ label: 'Environment', value: environ })
+  }
+
+  add('PID', String(pid))
+  return fields
+}
+
+/**
+ * Read a process's CPU history for the requested window, using the same ladder
+ * tiers as the panel so the dialog graph spans the same range. Falls back to
+ * the finest tier when the renderer does not name one.
+ */
+function processHistoryWindow(
+  entry: ProcCpuHistory | undefined,
+  windowSeconds: number | undefined,
+  bucketSeconds: number | undefined
+): ProcCpuSample[] {
+  if (!entry) {
+    return []
+  }
+  const toMs = Date.now()
+  const fromMs = windowSeconds && windowSeconds > 0 ? toMs - windowSeconds * MS_PER_SEC : 0
+  const tierSeconds =
+    bucketSeconds ?? LADDER_TIERS[0].bucketSeconds
+  const snapshot = entry.ladder.buckets(tierSeconds, fromMs, toMs)
+  const buckets = snapshot?.series[0]?.buckets ?? []
+  return buckets.map((bucket) => ({
+    at: bucket.timestamp,
+    cpuPercent: bucket.avg
+  }))
 }
 
 /** Push a stats snapshot to the view and remember it for `get_snapshot` API calls. */
@@ -1091,6 +1273,41 @@ function stabilizeProcessList(
   return procs
 }
 
+/**
+ * Fold the sample's CPU percentages into the per-process history ladders. Only
+ * pids in the current top-N list are tracked, and the map is pruned to those
+ * pids so exited processes do not accumulate.
+ */
+function recordProcessHistory(
+  state: MonitorSessionState,
+  procs: ServerMonitorProcess[],
+  at: number
+): void {
+  const seen = new Set<number>()
+  for (const proc of procs.slice(0, PROC_HISTORY_MAX)) {
+    seen.add(proc.pid)
+    let entry = state.procHistory.get(proc.pid)
+    if (!entry) {
+      const seriesId = procSeriesId(proc.pid)
+      entry = {
+        pid: proc.pid,
+        command: proc.command,
+        ladder: new MonitorLadder([
+          { id: seriesId, label: proc.command, unit: '%', kind: 'gauge', max: SERIES_PERCENT_MAX }
+        ])
+      }
+    }
+    entry.command = proc.command
+    entry.ladder.push(at, { [procSeriesId(proc.pid)]: proc.cpuPercent })
+    state.procHistory.set(proc.pid, entry)
+  }
+  for (const pid of Array.from(state.procHistory.keys())) {
+    if (!seen.has(pid)) {
+      state.procHistory.delete(pid)
+    }
+  }
+}
+
 /** One poll cycle: sample the remote host, update deltas, and push a snapshot. */
 async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): Promise<void> {
   if (state.busy || state.stopped) {
@@ -1126,6 +1343,7 @@ async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): 
     state.prevDiskIo = parsed.diskIo
 
     parsed.snapshot.processes = stabilizeProcessList(state, parsed.snapshot.processes)
+    recordProcessHistory(state, parsed.snapshot.processes, parsed.snapshot.updatedAt)
 
     pushStats(ctx, state, parsed.snapshot)
     pushLocalHistory(ctx, state, parsed.snapshot)
@@ -1242,6 +1460,7 @@ export const serverMonitorMain: PluginMainModule = {
       prevDiskIo: null,
       lastProcesses: [],
       shortSamples: 0,
+      procHistory: new Map(),
       lastSnapshot: null,
       timer: null,
       poll: async () => undefined,
@@ -1312,12 +1531,36 @@ export const serverMonitorMain: PluginMainModule = {
     }
 
     if (payload.type === 'signalProcess') {
-      if (!isValidPid(payload.pid) || !isServerMonitorProcessSignal(payload.signal)) {
-        return { ok: false, error: 'Invalid pid or signal' }
+      if (!isValidPid(payload.pid)) {
+        return { ok: false, error: 'Invalid pid' }
       }
-      const result = await signalRemoteProcess(ctx, payload.pid, payload.signal)
+      const signal =
+        typeof payload.signalName === 'string'
+          ? payload.signalName
+          : isServerMonitorProcessSignal(payload.signal)
+            ? payload.signal
+            : null
+      if (!signal) {
+        return { ok: false, error: 'Invalid signal' }
+      }
+      const result = await signalRemoteProcess(ctx, payload.pid, signal)
       if (result.ok) {
         void state.poll()
+      }
+      return result
+    }
+
+    if (payload.type === 'processDetails') {
+      if (!isValidPid(payload.pid)) {
+        return { ok: false, error: 'Invalid pid' }
+      }
+      const result = await fetchProcessDetails(ctx, payload.pid)
+      if (result.details) {
+        result.details.cpuHistory = processHistoryWindow(
+          state.procHistory.get(payload.pid),
+          typeof payload.windowSeconds === 'number' ? payload.windowSeconds : undefined,
+          typeof payload.bucketSeconds === 'number' ? payload.bucketSeconds : undefined
+        )
       }
       return result
     }

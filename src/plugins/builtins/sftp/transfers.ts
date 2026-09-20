@@ -8,9 +8,11 @@ import {
 import type { ReadStream as FsReadStream, WriteStream as FsWriteStream } from 'fs'
 import { basename } from 'path'
 import type { ReadStream as SftpReadStream, WriteStream as SftpWriteStream } from 'ssh2'
+import { PassThrough } from 'stream'
 import { ZipFile } from 'yazl'
 import type { PluginMainContext, SftpError, SftpSession } from '@plugin-api/main'
 import { classifySftpError, joinRemotePath } from '@plugin-api/main'
+import { ARCHIVE_EMPTY_SIZE, collectArchiveEntries } from './archiveLayout'
 import type { SftpTransferDonePayload, SftpTransferProgressPayload } from './protocol'
 
 interface FileTransferState {
@@ -25,6 +27,8 @@ export interface SftpDownloadState extends FileTransferState {
   local: FsWriteStream
   transferred: number
   archive?: ZipFile
+  /** Progress pass-through feeding the current archive entry, if any */
+  archiveEntry?: PassThrough
 }
 
 export interface SftpUploadState extends FileTransferState {
@@ -53,18 +57,6 @@ export interface SftpTransferState {
   chunkUpload: SftpChunkUploadState | null
 }
 
-const ARCHIVE_EMPTY_SIZE = 0
-const ARCHIVE_ROOT_MTIME = 0
-
-interface ArchiveEntry {
-  remotePath: string
-  archivePath: string
-  size: number
-  mtime: number
-  mode: number
-  directory: boolean
-}
-
 function sendTransferDone(
   ctx: PluginMainContext,
   payload: Omit<SftpTransferDonePayload, 'type'>
@@ -81,42 +73,6 @@ function sendTransferProgress(
 
 function archiveRootName(path: string): string {
   return basename(path.replace(/\/+$/, '')) || 'archive'
-}
-
-async function collectArchiveEntries(
-  sftp: SftpSession,
-  remotePath: string,
-  archivePath: string
-): Promise<ArchiveEntry[]> {
-  const entries: ArchiveEntry[] = [
-    {
-      remotePath,
-      archivePath: `${archivePath}/`,
-      size: ARCHIVE_EMPTY_SIZE,
-      mtime: ARCHIVE_ROOT_MTIME,
-      mode: ARCHIVE_EMPTY_SIZE,
-      directory: true
-    }
-  ]
-  for (const child of await sftp.list(remotePath)) {
-    if (child.type === 'symlink' || child.type === 'other') {
-      continue
-    }
-    const childArchivePath = `${archivePath}/${child.name}`
-    if (child.type === 'directory') {
-      entries.push(...(await collectArchiveEntries(sftp, child.path, childArchivePath)))
-    } else {
-      entries.push({
-        remotePath: child.path,
-        archivePath: childArchivePath,
-        size: child.size,
-        mtime: child.mtime,
-        mode: child.mode,
-        directory: false
-      })
-    }
-  }
-  return entries
 }
 
 export async function handleDownload(
@@ -304,7 +260,8 @@ export async function handleDownloadZip(
   let outcome: 'done' | 'error' | 'cancelled' = 'done'
   let error: SftpError | undefined
   try {
-    const entries = await collectArchiveEntries(sftp, path, rootName)
+    // Empty archive path: the folder's contents land at the zip root.
+    const entries = await collectArchiveEntries((dir) => sftp.list(dir), path, '')
     const totalBytes = entries.reduce((total, entry) => total + entry.size, ARCHIVE_EMPTY_SIZE)
     const archiveDone = new Promise<void>((resolve, reject) => {
       archive.on('error', reject)
@@ -333,14 +290,15 @@ export async function handleDownloadZip(
               return
             }
             const remote = sftp.createReadStream(entry.remotePath)
-            download.remote = remote
+            // yazl owns the piping, so progress is counted on a pass-through
+            // rather than with a `data` listener (which would put the remote
+            // stream into flowing mode before yazl attaches its pipe).
+            const progress = new PassThrough()
             remote.on('error', (err: Error) => {
+              progress.destroy(err)
               archive.emit('error', err)
             })
-            remote.on('data', (chunk: Buffer) => {
-              if (download.cancelled) {
-                return
-              }
+            progress.on('data', (chunk: Buffer) => {
               download.transferred += chunk.length
               sendTransferProgress(ctx, {
                 direction: 'download-zip',
@@ -349,7 +307,10 @@ export async function handleDownloadZip(
                 totalBytes
               })
             })
-            cb(null, remote)
+            remote.pipe(progress)
+            download.remote = remote
+            download.archiveEntry = progress
+            cb(null, progress)
           }
         )
       }
@@ -371,6 +332,11 @@ export async function handleDownloadZip(
   if (outcome !== 'done') {
     try {
       download.remote?.destroy()
+    } catch {
+      /* ignore */
+    }
+    try {
+      download.archiveEntry?.destroy()
     } catch {
       /* ignore */
     }
@@ -706,6 +672,11 @@ function cancelDownload(state: SftpTransferState): void {
   download.cancelled = true
   try {
     download.remote?.destroy()
+  } catch {
+    /* ignore */
+  }
+  try {
+    download.archiveEntry?.destroy()
   } catch {
     /* ignore */
   }

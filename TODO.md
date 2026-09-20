@@ -19,7 +19,7 @@
     - shows sub-tabs for each screen (possibly with different username)
     - show node info
     - show Ink in browser window
-- Daemon monitor: Monitor all hosts with daemon - including not connected
+- Host status check plugin - combined with monitor plugin maybe.
 - SCP/SFTP plugin: add edit function (text files using builtin editor) etc.
 - SCP/SFTP plugin: Allow tansfer between hosts?
 - MQTT plugin: Add history for published messages.

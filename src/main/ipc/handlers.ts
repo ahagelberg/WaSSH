@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
+import { readFileSync, writeFileSync } from 'fs'
 import {
   AppSettings,
   AppTheme,
@@ -14,6 +15,8 @@ import {
   type ConnectionParams,
   type HostsOrganization
 } from '../../shared/types'
+import { BACKUP_FILE_EXTENSION } from '../../shared/backup'
+import { exportBackup, inspectBackup, restoreBackup } from '../store/backupService'
 import { CredentialVault } from '../store/credentialVault'
 import {
   KnownHostsStore,
@@ -35,6 +38,17 @@ const EXTERNAL_URL_PROTOCOLS = new Set(['http:', 'https:'])
 /** OS dialog titles for file pickers */
 const PICK_PRIVATE_KEY_TITLE = 'Select private key'
 const PICK_DIRECTORY_TITLE = 'Select folder'
+const BACKUP_SAVE_TITLE = 'Export WaSSH settings'
+const BACKUP_OPEN_TITLE = 'Restore WaSSH settings'
+
+/** Filter shown in the backup save/open dialogs */
+const BACKUP_FILTER = { name: 'WaSSH backup (*.zip)', extensions: [BACKUP_FILE_EXTENSION] }
+
+/** Default file name for an exported backup */
+function defaultBackupFileName(): string {
+  const stamp = new Date().toISOString().slice(0, 10)
+  return `wassh-backup-${stamp}.${BACKUP_FILE_EXTENSION}`
+}
 
 /** True when a string is an http(s) URL safe to hand to the OS. */
 export function isSafeExternalUrl(url: string): boolean {
@@ -128,6 +142,70 @@ export function registerIpc(
     vault.delete(vaultId)
   })
   ipcMain.handle('vault:encryptionAvailable', () => vault.isEncryptionAvailable())
+
+  ipcMain.handle('backup:export', async () => {
+    const win = getWindow()
+    const result = win
+      ? await dialog.showSaveDialog(win, {
+          title: BACKUP_SAVE_TITLE,
+          defaultPath: defaultBackupFileName(),
+          filters: [BACKUP_FILTER]
+        })
+      : await dialog.showSaveDialog({
+          title: BACKUP_SAVE_TITLE,
+          defaultPath: defaultBackupFileName(),
+          filters: [BACKUP_FILTER]
+        })
+    if (result.canceled || !result.filePath) {
+      return { ok: false, cancelled: true }
+    }
+    try {
+      const archive = await exportBackup()
+      writeFileSync(result.filePath, archive)
+      const inspection = inspectBackup(archive)
+      return {
+        ok: true,
+        path: result.filePath,
+        entryCount: inspection.manifest?.entries.length ?? 0
+      }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('backup:inspect', (_e, filePath: string) => {
+    try {
+      return inspectBackup(readFileSync(filePath))
+    } catch (err) {
+      return { ok: false, problem: 'not-a-zip', error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('backup:restore', async (_e, filePath: string) => {
+    try {
+      const result = restoreBackup(readFileSync(filePath))
+      if (result.ok) {
+        // The vault caches its file in memory; re-read it so the restored
+        // secrets are used instead of being overwritten by the old cache.
+        vault.reload()
+        // Restored files are read fresh by the other stores; reload the window
+        // so the UI matches the restored config.
+        const win = getWindow()
+        win?.webContents.reload()
+      }
+      return result
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('backup:pickFile', () =>
+    showOpenDialog(getWindow, {
+      title: BACKUP_OPEN_TITLE,
+      properties: ['openFile'],
+      filters: [BACKUP_FILTER]
+    }).then(firstPickedPath)
+  )
 
   ipcMain.handle('session:connect', async (_e, req: ConnectRequest) => {
     await sessions.connect(req)

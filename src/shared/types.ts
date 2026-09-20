@@ -6,6 +6,11 @@ import type {
 } from './pluginApi'
 import type { TabPluginLayout } from './pluginLayout'
 import type { HostGroup, HostsOrganization } from './hostOrganization'
+import type {
+  BackupExportResult,
+  BackupImportResult,
+  BackupRestoreResult
+} from './backup'
 export type { HostGroup, HostsOrganization } from './hostOrganization'
 
 /** Default SSH port */
@@ -698,6 +703,14 @@ export interface WasshApi {
   onSettingsChanged: (cb: (settings: AppSettings) => void) => () => void
   /** Open a URL in the OS default browser */
   openExternal: (url: string) => Promise<void>
+  /** Write every config file to a user-chosen zip (shows a save dialog) */
+  exportBackup: () => Promise<BackupExportResult>
+  /** Ask for a backup zip and read its manifest without changing anything */
+  pickBackupFile: () => Promise<string | null>
+  /** Read a backup zip's manifest and report version compatibility */
+  inspectBackup: (filePath: string) => Promise<BackupImportResult>
+  /** Replace all config files from a backup zip and reload the window */
+  restoreBackup: (filePath: string) => Promise<BackupRestoreResult>
 }
 
 declare global {

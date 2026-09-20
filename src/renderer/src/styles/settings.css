@@ -124,6 +124,47 @@
   justify-self: start;
 }
 
+.settings-backup-confirm {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-radius: var(--radius);
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+.settings-backup-warn {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.settings-backup-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.settings-backup-status {
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  border: 1px solid var(--border);
+  word-break: break-word;
+}
+
+.settings-backup-status-ok {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.settings-backup-status-error {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+.settings-backup-status-warn {
+  border-color: color-mix(in srgb, var(--warning, #f0b429) 45%, var(--border));
+}
+
 .settings-row input[type='color'] {
   width: 48px;
   height: 32px;

@@ -1,5 +1,10 @@
 import type { PluginManifest } from '@plugin-api/shared'
-import { MQTT_ANALYSER_DEFAULT_HOST, MQTT_ANALYSER_DEFAULT_PORT } from './defaults'
+import {
+  MQTT_ANALYSER_DEFAULT_HOST,
+  MQTT_ANALYSER_DEFAULT_MESSAGES,
+  MQTT_ANALYSER_DEFAULT_PORT,
+  MQTT_ANALYSER_MESSAGES_COLLAPSED_DEFAULT
+} from './defaults'
 import { PLUGIN_ID_MQTT_ANALYSER } from './id'
 
 export const mqttAnalyserManifest: PluginManifest = {
@@ -12,6 +17,26 @@ export const mqttAnalyserManifest: PluginManifest = {
   contributes: {
     toolbar: { label: 'MQTT' },
     hostSettingsHeading: 'MQTT',
+    settingsHeading: 'MQTT Analyser',
+    // Saved messages are edited in a dedicated settings view.
+    settingsPresentation: 'view',
+    // Keys below exist so patch routing + merging keep the extra settings keys.
+    settingsSchema: [
+      {
+        key: 'messages',
+        label: 'Saved messages',
+        type: 'commandList',
+        default: MQTT_ANALYSER_DEFAULT_MESSAGES,
+        description: 'Label, topic, payload, and format per saved publish message.'
+      },
+      {
+        key: 'messagesCollapsed',
+        label: 'Collapse saved messages',
+        type: 'boolean',
+        default: MQTT_ANALYSER_MESSAGES_COLLAPSED_DEFAULT,
+        description: 'Whether the saved-messages section in the publish panel is collapsed.'
+      }
+    ],
     hostSettingsSchema: [
       {
         key: 'host',

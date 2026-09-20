@@ -32,6 +32,14 @@ export class CredentialVault {
     }
   }
 
+  /**
+   * Re-read the vault file. Called after a backup restore replaces it on disk,
+   * so the in-memory cache does not overwrite the restored secrets.
+   */
+  reload(): void {
+    this.load()
+  }
+
   private persist(): void {
     writeFileSync(this.path, JSON.stringify(this.cache, null, JSON_INDENT), 'utf8')
   }

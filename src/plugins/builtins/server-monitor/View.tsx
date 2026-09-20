@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
+import { createPortal } from 'react-dom'
 import type { PluginViewProps } from '@plugin-api/renderer'
 import { PluginButton } from '@plugin-api/renderer'
 import {
@@ -31,7 +32,8 @@ import {
 import type {
   ServerMonitorNetIface,
   ServerMonitorProcess,
-  ServerMonitorProcessSignal,
+  ServerMonitorProcessCpuSample,
+  ServerMonitorProcessDetails,
   ServerMonitorProcessSort,
   ServerMonitorRendererMessage,
   ServerMonitorSnapshot,
@@ -39,7 +41,9 @@ import type {
 } from './protocol'
 import {
   isServerMonitorActionResult,
+  isServerMonitorProcessDetailsResult,
   isServerMonitorStatsEvent,
+  SERVER_MONITOR_COMMON_SIGNALS,
   SERVER_MONITOR_PROCESS_SORT_DEFAULT,
   SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT
 } from './protocol'
@@ -123,6 +127,15 @@ const CONTEXT_MENU_EDGE_PAD = 4
 
 /** Max command chars shown in process action status */
 const PROC_STATUS_CMD_MAX = 40
+
+/** CPU-percent ceiling for the process history graph */
+const PROC_CPU_GRAPH_MAX = SERIES_PERCENT_MAX
+
+/** Signals offered in the details dialog's selection list */
+const PROC_SIGNALS = SERVER_MONITOR_COMMON_SIGNALS
+
+/** Signal selected by default in the details dialog */
+const PROC_SIGNAL_DEFAULT = 'TERM'
 
 /** Tooltip for hosts without the service, shown on the install/upgrade buttons */
 const SERVICE_HELP_FALLBACK =
@@ -681,8 +694,232 @@ function RateBar({
   )
 }
 
+/** Wall-clock label for a timestamp (ms) */
+function formatClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString()
+}
+
+/**
+ * Merge the fetched history with samples observed while the dialog is open,
+ * dropping the overlap so the fetched tail is not drawn twice.
+ */
+function processGraphSamples(
+  history: ServerMonitorProcessCpuSample[],
+  live: ServerMonitorProcessCpuSample[]
+): ServerMonitorProcessCpuSample[] {
+  if (live.length === 0) {
+    return history
+  }
+  const lastFetched = history[history.length - 1]?.at ?? 0
+  return [...history, ...live.filter((sample) => sample.at > lastFetched)]
+}
+
+/** CPU history graph for one process in the details dialog */
+function ProcessCpuGraph({
+  samples,
+  range
+}: {
+  samples: ServerMonitorProcessCpuSample[]
+  /** Panel range; the graph spans the same window as the panel's graphs */
+  range: HistoryRange
+}): ReactElement {
+  if (samples.length < 2) {
+    return (
+      <div className="monitor-proc-graph-empty">
+        {samples.length === 0 ? 'No CPU samples yet' : 'Waiting for more samples…'}
+      </div>
+    )
+  }
+  const toMs = samples[samples.length - 1].at
+  const fromMs = toMs - HISTORY_RANGES[range].seconds * MS_PER_SEC
+  const points: HistoryPoint[] = samples.map((sample) => ({
+    timestamp: sample.at,
+    min: sample.cpuPercent,
+    max: sample.cpuPercent,
+    avg: sample.cpuPercent
+  }))
+  const latest = samples[samples.length - 1].cpuPercent
+  const peak = historyMax(points)
+  return (
+    <div className="monitor-proc-graph">
+      <SparkCard
+        title="CPU usage"
+        points={points}
+        tone="cpu"
+        current={`${formatPercent(latest)}%`}
+        fromMs={fromMs}
+        toMs={toMs}
+        scaleMax={PROC_CPU_GRAPH_MAX}
+      />
+      <div className="monitor-proc-graph-foot">
+        <span>peak {formatPercent(peak)}%</span>
+        <span>{samples.length} samples</span>
+        <span>
+          {formatClock(fromMs)} – {formatClock(toMs)}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+/** Modal with extra process info, a CPU graph, and an arbitrary-signal control */
+function ProcessDetailsDialog({
+  tabId,
+  pluginId,
+  pid,
+  command,
+  liveSample,
+  range,
+  onClose,
+  onSignal
+}: {
+  tabId: string
+  pluginId: string
+  pid: number
+  command: string
+  /** Latest poller sample for this pid, appended to the graph as it arrives */
+  liveSample: ServerMonitorProcessCpuSample | null
+  /** Panel's selected history range; the graph uses the same window + buckets */
+  range: HistoryRange
+  onClose: () => void
+  onSignal: (signal: string) => void
+}): ReactElement {
+  const [details, setDetails] = useState<ServerMonitorProcessDetails | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [signal, setSignal] = useState<string>(PROC_SIGNAL_DEFAULT)
+  const [live, setLive] = useState<ServerMonitorProcessCpuSample[]>([])
+  const { seconds: windowSeconds, tier } = HISTORY_RANGES[range]
+  const bucketSeconds = tier.bucketSeconds
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      const response = await window.wassh.sendPluginMessage(tabId, pluginId, {
+        type: 'processDetails',
+        pid,
+        windowSeconds,
+        bucketSeconds
+      } satisfies ServerMonitorRendererMessage)
+      if (cancelled) {
+        return
+      }
+      const result = isServerMonitorProcessDetailsResult(response) ? response : null
+      if (result?.ok && result.details) {
+        setDetails(result.details)
+        return
+      }
+      setError(result?.error || 'Failed to load process details')
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [pid, tabId, pluginId, windowSeconds, bucketSeconds])
+
+  // Append each new poller sample so the graph keeps drawing while open.
+  const liveAt = liveSample?.at ?? 0
+  const livePercent = liveSample?.cpuPercent ?? 0
+  useEffect(() => {
+    if (!liveAt) {
+      return
+    }
+    setLive((prev) => {
+      const last = prev[prev.length - 1]
+      if (last && last.at >= liveAt) {
+        return prev
+      }
+      return [...prev, { at: liveAt, cpuPercent: livePercent }]
+    })
+  }, [liveAt, livePercent])
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [onClose])
+
+  return createPortal(
+    <div
+      className="monitor-dialog-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) {
+          onClose()
+        }
+      }}
+    >
+      <div className="monitor-dialog" role="dialog" aria-modal="true" aria-label={`Process ${pid}`}>
+        <div className="monitor-dialog-head">
+          <div className="monitor-dialog-title">
+            <span className="monitor-dialog-pid">PID {pid}</span>
+            <span className="monitor-dialog-cmd" title={command}>
+              {command}
+            </span>
+          </div>
+          <button type="button" className="monitor-dialog-close" onClick={onClose} aria-label="Close">
+            ✕
+          </button>
+        </div>
+
+        <div className="monitor-dialog-body">
+          {error ? <div className="plugin-monitor-error">{error}</div> : null}
+          {details ? (
+            <ProcessCpuGraph
+              samples={processGraphSamples(details.cpuHistory, live)}
+              range={range}
+            />
+          ) : null}
+          {details ? (
+            <dl className="monitor-detail-list">
+              {details.fields.map((field) => (
+                <div key={field.label} className="monitor-detail-row">
+                  <dt>{field.label}</dt>
+                  <dd title={field.value}>{field.value}</dd>
+                </div>
+              ))}
+            </dl>
+          ) : !error ? (
+            <div className="monitor-section-empty">Loading…</div>
+          ) : null}
+        </div>
+
+        <div className="monitor-dialog-foot">
+          <div className="monitor-signal-send">
+            <select
+              aria-label="Signal"
+              value={signal}
+              onChange={(e) => setSignal(e.target.value)}
+            >
+              {PROC_SIGNALS.map((entry) => (
+                <option key={entry.number} value={entry.name}>
+                  {entry.number} — SIG{entry.name}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className={signal === 'KILL' ? 'danger' : undefined}
+              onClick={() => onSignal(signal)}
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
 function ProcessTable({
+  tabId,
+  pluginId,
   rows,
+  snapshotAt,
+  range,
   sort,
   descending,
   onSort,
@@ -690,11 +927,17 @@ function ProcessTable({
   status,
   statusError
 }: {
+  tabId: string
+  pluginId: string
   rows: ServerMonitorProcess[]
+  /** Timestamp of the snapshot `rows` came from (ms) */
+  snapshotAt: number
+  /** Panel's selected history range; the details graph uses the same window */
+  range: HistoryRange
   sort: ServerMonitorProcessSort
   descending: boolean
   onSort: (sort: ServerMonitorProcessSort) => void
-  onSignal: (pid: number, signal: ServerMonitorProcessSignal, command: string) => void
+  onSignal: (pid: number, signal: string, command: string) => void
   status: string | null
   statusError: boolean
 }): ReactElement {
@@ -703,8 +946,21 @@ function ProcessTable({
     y: number
     process: ServerMonitorProcess
   } | null>(null)
+  const [detailsFor, setDetailsFor] = useState<ServerMonitorProcess | null>(null)
   const contextMenuRef = useRef<HTMLDivElement>(null)
   const sorted = sortProcesses(rows, sort, descending)
+
+  /**
+   * Latest poller CPU sample for a pid. The timestamp comes from the row's own
+   * snapshot, so the dialog can tell new samples from ones it already drew.
+   */
+  const liveSampleFor = (pid: number): ServerMonitorProcessCpuSample | null => {
+    const row = rows.find((p) => p.pid === pid)
+    if (!row) {
+      return null
+    }
+    return { at: snapshotAt, cpuPercent: row.cpuPercent }
+  }
 
   useEffect(() => {
     if (!contextMenu) {
@@ -807,6 +1063,10 @@ function ProcessTable({
                     e.preventDefault()
                     setContextMenu({ x: e.clientX, y: e.clientY, process: p })
                   }}
+                  onDoubleClick={() => {
+                    setContextMenu(null)
+                    setDetailsFor(p)
+                  }}
                 >
                   <td className="monitor-num">{p.pid}</td>
                   <td className="monitor-user" title={p.user}>
@@ -838,6 +1098,17 @@ function ProcessTable({
             className="monitor-context-item"
             role="menuitem"
             onClick={() => {
+              setDetailsFor(contextMenu.process)
+              setContextMenu(null)
+            }}
+          >
+            Details…
+          </button>
+          <button
+            type="button"
+            className="monitor-context-item"
+            role="menuitem"
+            onClick={() => {
               const { process } = contextMenu
               setContextMenu(null)
               onSignal(process.pid, 'TERM', process.command)
@@ -858,6 +1129,18 @@ function ProcessTable({
             Kill (SIGKILL)
           </button>
         </div>
+      ) : null}
+      {detailsFor ? (
+        <ProcessDetailsDialog
+          tabId={tabId}
+          pluginId={pluginId}
+          pid={detailsFor.pid}
+          command={detailsFor.command}
+          liveSample={liveSampleFor(detailsFor.pid)}
+          range={range}
+          onClose={() => setDetailsFor(null)}
+          onSignal={(signal) => onSignal(detailsFor.pid, signal, detailsFor.command)}
+        />
       ) : null}
     </div>
   )
@@ -1266,10 +1549,10 @@ export default function ServerMonitorView({
 
   const handleProcSignal = (
     pid: number,
-    signal: ServerMonitorProcessSignal,
+    signal: string,
     command: string
   ): void => {
-    const label = signal === 'KILL' ? 'SIGKILL' : 'SIGTERM'
+    const label = signal.trim().replace(/^SIG/i, '').toUpperCase()
     const shortCmd =
       command.length > PROC_STATUS_CMD_MAX
         ? `${command.slice(0, PROC_STATUS_CMD_MAX)}…`
@@ -1278,14 +1561,14 @@ export default function ServerMonitorView({
       const response = await window.wassh.sendPluginMessage(tabId, pluginId, {
         type: 'signalProcess',
         pid,
-        signal
+        signalName: label
       } satisfies ServerMonitorRendererMessage)
       const result = isServerMonitorActionResult(response) ? response : null
       if (result?.ok) {
-        showProcStatus(`${label} → ${pid} ${shortCmd}`, false)
+        showProcStatus(`SIG${label} → ${pid} ${shortCmd}`, false)
         return
       }
-      showProcStatus(result?.error || `Failed to send ${label} to ${pid}`, true)
+      showProcStatus(result?.error || `Failed to send SIG${label} to ${pid}`, true)
     })()
   }
 
@@ -1538,7 +1821,11 @@ export default function ServerMonitorView({
 
           {showProcesses ? (
             <ProcessTable
+              tabId={tabId}
+              pluginId={pluginId}
               rows={snapshot?.processes ?? []}
+              snapshotAt={snapshot?.updatedAt ?? 0}
+              range={range}
               sort={procSort}
               descending={procSortDesc}
               onSort={handleProcSort}
