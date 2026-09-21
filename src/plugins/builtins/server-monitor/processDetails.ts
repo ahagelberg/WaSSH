@@ -1,7 +1,6 @@
 /**
  * Pure parsers for the process-details dialog. Kept separate from `main.ts` so
- * they can be unit-tested without the plugin host (see
- * `scripts/check-monitor-details.ts`).
+ * they can be exercised without the plugin host.
  */
 
 /** Parse a `/proc/PID/status`-style `Key:\tValue` block */

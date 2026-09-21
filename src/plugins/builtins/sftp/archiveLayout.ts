@@ -1,7 +1,6 @@
 /**
  * Pure archive-layout helpers for the SFTP folder→zip download. Kept separate
- * from `transfers.ts` so the layout can be unit-tested without an SFTP session
- * (see `scripts/check-sftp-zip-layout.ts`).
+ * from `transfers.ts` so the layout can be resolved without an SFTP session.
  */
 
 /** Size used for directory entries (they carry no data) */
