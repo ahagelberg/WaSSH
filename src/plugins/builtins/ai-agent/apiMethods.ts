@@ -139,7 +139,7 @@ export const TOOL_DEF_REMOTE_FS_READ: PluginApiMethod = {
       },
       maxChars: {
         type: 'number',
-        description: 'Optional max characters to read (default 32000)'
+        description: 'Optional max characters to read (default 32000, max 256000)'
       }
     },
     required: ['path']
@@ -240,7 +240,7 @@ export const TOOL_DEF_LOCAL_FS_READ: PluginApiMethod = {
       },
       maxChars: {
         type: 'number',
-        description: 'Optional max characters to read (default 32000)'
+        description: 'Optional max characters to read (default 32000, max 256000)'
       }
     },
     required: ['path']

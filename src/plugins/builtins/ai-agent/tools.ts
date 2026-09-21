@@ -6,7 +6,7 @@ import type { SftpSession } from '@plugin-api/main'
 
 /** Max characters returned for web fetch or file read to prevent token overflow */
 export const MAX_FETCH_CHARS = 32_000
-export const MAX_FILE_READ_CHARS = 48_000
+export const MAX_FILE_READ_CHARS = 256_000
 export const MAX_DIR_ENTRIES = 200
 export const MAX_DEV_VIEW_LINES_DEFAULT = 300
 export const MAX_DEV_GREP_MATCHES = 100
@@ -367,9 +367,12 @@ export function closeSftpSession(ctx: PluginMainContext): void {
 export async function executeRemoteFsRead(
   ctx: PluginMainContext,
   filePath: string,
-  maxChars?: number
+  maxChars?: number,
+  /** When false, read the whole file without truncating (used by edit paths). */
+  truncate = true
 ): Promise<string> {
-  const limit = Math.min(Math.max(Number(maxChars) || 32_000, 1_000), MAX_FILE_READ_CHARS)
+  const requested = Math.max(Number(maxChars) || 32_000, 1_000)
+  const limit = truncate ? Math.min(requested, MAX_FILE_READ_CHARS) : Number.POSITIVE_INFINITY
   let sftpSession: SftpSession | null = null
   try {
     sftpSession = await getSftpSession(ctx)
@@ -604,9 +607,15 @@ export async function executeRemoteFsEdit(
   oldText: string,
   newText: string
 ): Promise<string> {
-  const current = await executeRemoteFsRead(ctx, filePath, MAX_FILE_READ_CHARS)
+  const current = await executeRemoteFsRead(ctx, filePath, undefined, false)
   if (current.startsWith('Error') || current.startsWith('Failed to open SFTP') || current === 'Remote SFTP is not available on this session.') {
     return current
+  }
+  if (current.length > MAX_FILE_READ_CHARS) {
+    return (
+      `Error: remote file "${filePath}" is larger than the ${MAX_FILE_READ_CHARS}-character edit limit, ` +
+      'so it cannot be edited safely. Edit it in smaller pieces or use a shell command instead.'
+    )
   }
   const result = applyTextReplacement(current, oldText, newText)
   if (typeof result !== 'string') {
@@ -776,13 +785,19 @@ export async function executeDevEditFile(
   newText: string
 ): Promise<string> {
   const remotePath = resolveRemotePath(cwd, filePath)
-  const current = await executeRemoteFsRead(ctx, remotePath, MAX_FILE_READ_CHARS)
+  const current = await executeRemoteFsRead(ctx, remotePath, undefined, false)
   if (
     current.startsWith('Error') ||
     current.startsWith('Failed to open SFTP') ||
     current === 'Remote SFTP is not available on this session.'
   ) {
     return current
+  }
+  if (current.length > MAX_FILE_READ_CHARS) {
+    return (
+      `Error: remote file "${remotePath}" is larger than the ${MAX_FILE_READ_CHARS}-character edit limit, ` +
+      'so it cannot be edited safely. Edit it in smaller pieces or use a shell command instead.'
+    )
   }
   const result = applyTextReplacement(current, oldText, newText)
   if (typeof result !== 'string') {
