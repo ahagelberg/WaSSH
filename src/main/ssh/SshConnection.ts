@@ -933,7 +933,7 @@ export class SshConnection extends EventEmitter {
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeClientOnly()
-      this.scheduleReconnect(true)
+      this.scheduleReconnect()
       return
     }
 
@@ -995,7 +995,7 @@ export class SshConnection extends EventEmitter {
           this.opening = false
           const msg = err instanceof Error ? err.message : String(err)
           this.emitStatus('failed', msg)
-          this.scheduleReconnect(true)
+          this.scheduleReconnect()
           done()
         })
 
@@ -1007,7 +1007,7 @@ export class SshConnection extends EventEmitter {
         // reconnect policy and the awaiting connect() settle.
         this.opening = false
         this.emitStatus('failed', `Connection closed (${this.connection.name || this.connection.host})`)
-        this.scheduleReconnect(true)
+        this.scheduleReconnect()
         done()
       })
     })
@@ -1110,7 +1110,7 @@ export class SshConnection extends EventEmitter {
           this.opening = false
           this.tunnels.stop()
           this.emitStatus('failed', err.message)
-          this.scheduleReconnect(true)
+          this.scheduleReconnect()
           resolve()
           return
         }

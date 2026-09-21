@@ -329,7 +329,7 @@ export class TelnetConnection extends ByteSession {
       const msg = err instanceof Error ? err.message : String(err)
       this.emitStatus('failed', msg)
       this.closeTransport()
-      this.scheduleReconnect(true)
+      this.scheduleReconnect()
       return
     }
 
