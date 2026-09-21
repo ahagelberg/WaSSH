@@ -1605,6 +1605,7 @@ export default function App() {
           initialSectionId={hostEditor.initialSectionId}
           initialFieldKey={hostEditor.initialFieldKey}
           hosts={hosts}
+          organization={hostsOrganization}
           initial={hostEditor.initial}
           styleDefaults={styleDefaults}
           pickPrivateKey={() => window.wassh.pickPrivateKeyFile()}

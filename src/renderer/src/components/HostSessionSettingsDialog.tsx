@@ -70,6 +70,7 @@ import {
   pluginHostSettingsSectionId,
   type PluginListItem
 } from '@shared/pluginApi'
+import { UNGROUPED_SECTION_ID, type HostsOrganization } from '@shared/hostOrganization'
 import SettingsDialog, { type SettingsSection } from './SettingsDialog'
 import ClampedNumberInput from './ClampedNumberInput'
 import SettingsColorRow from './SettingsColorRow'
@@ -99,6 +100,8 @@ interface Props {
   initialSectionId?: string
   initialFieldKey?: string
   hosts: HostProfile[]
+  /** Host list organization, used to group the jump-host options. */
+  organization: HostsOrganization
   initial: ConnectionParams | HostProfile
   /** App-level defaults used when a field is set to “Use default” */
   styleDefaults: SessionStyle
@@ -169,6 +172,7 @@ export default function HostSessionSettingsDialog({
   initialSectionId,
   initialFieldKey,
   hosts,
+  organization,
   initial,
   styleDefaults,
   onSaveHost,
@@ -199,6 +203,30 @@ export default function HostSessionSettingsDialog({
   const proxyOptions = hosts.filter(
     (h) => h.id !== editingHostId && isSshConnectionType(connectionTypeOf(h))
   )
+  const proxySections = useMemo(() => {
+    const byId = new Map(proxyOptions.map((h) => [h.id, h]))
+    const sections = organization.groups
+      .map((g) => ({
+        id: g.id,
+        name: g.name,
+        hosts: g.hostIds.map((id) => byId.get(id)).filter((h): h is HostProfile => Boolean(h))
+      }))
+      .filter((s) => s.hosts.length > 0)
+    const ungrouped = organization.ungroupedHostIds
+      .map((id) => byId.get(id))
+      .filter((h): h is HostProfile => Boolean(h))
+    if (ungrouped.length > 0) {
+      sections.push({ id: UNGROUPED_SECTION_ID, name: 'Ungrouped', hosts: ungrouped })
+    }
+    const placed = new Set(sections.flatMap((s) => s.hosts.map((h) => h.id)))
+    const orphans = proxyOptions.filter((h) => !placed.has(h.id))
+    if (orphans.length > 0) {
+      sections.push({ id: UNGROUPED_SECTION_ID, name: 'Ungrouped', hosts: orphans })
+    }
+    return sections
+  }, [proxyOptions, organization])
+  const proxyOptionLabel = (host: HostProfile): string =>
+    host.name || `${host.username}@${host.host}`
 
   const patch = (partial: Partial<ConnectionParams>): void => {
     setForm((prev) => ({ ...prev, ...partial }))
@@ -520,10 +548,14 @@ export default function HostSessionSettingsDialog({
           disabled={identityLocked}
         >
           <option value="">None (direct)</option>
-          {proxyOptions.map((h) => (
-            <option key={h.id} value={h.id}>
-              {h.name || `${h.username}@${h.host}`}
-            </option>
+          {proxySections.map((section) => (
+            <optgroup key={section.id} label={section.name}>
+              {section.hosts.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {proxyOptionLabel(h)}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
       </div>
