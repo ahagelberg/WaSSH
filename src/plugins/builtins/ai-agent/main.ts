@@ -557,9 +557,14 @@ function pruneUnresolvedTail(conversation: AiAgentConversation): void {
     if (msg.role !== 'assistant') {
       continue
     }
+    // Tool results for this turn are the contiguous run directly after it; a
+    // later assistant message starts a new turn whose results must not count.
     const callIds = new Set((msg.toolCalls ?? []).map((tc) => tc.id))
     for (let j = i + 1; j < messages.length; j += 1) {
       const later = messages[j]
+      if (later.role === 'assistant') {
+        break
+      }
       if (later.role === 'tool') {
         callIds.delete(later.toolCallId)
       }
@@ -573,9 +578,21 @@ function pruneUnresolvedTail(conversation: AiAgentConversation): void {
 }
 
 function trimHistory(conversation: AiAgentConversation): void {
-  if (conversation.messages.length > HISTORY_MAX) {
-    conversation.messages.splice(0, conversation.messages.length - HISTORY_MAX)
+  if (conversation.messages.length <= HISTORY_MAX) {
+    return
   }
+  // Cut at a turn boundary: dropping the head mid-turn would leave a tool
+  // message without the assistant message that requested it, which providers
+  // reject. Walk forward to the first assistant message that starts a turn.
+  const messages = conversation.messages
+  let cut = messages.length - HISTORY_MAX
+  while (cut < messages.length && messages[cut].role !== 'assistant') {
+    cut += 1
+  }
+  if (cut >= messages.length) {
+    cut = messages.length - HISTORY_MAX
+  }
+  messages.splice(0, cut)
 }
 
 function persistConversation(host: HostState): void {
