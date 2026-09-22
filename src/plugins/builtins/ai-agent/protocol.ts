@@ -222,3 +222,5 @@ export type AiAgentRendererMessage =
   | { type: 'openChat'; conversationId: string }
   | { type: 'deleteChat'; conversationId: string }
   | { type: 'renameChat'; conversationId: string; title: string }
+  /** Drop this user message and everything after it, so it can be edited and resent. */
+  | { type: 'rewind'; messageIndex: number }

@@ -1904,6 +1904,8 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
       return typeof message.conversationId === 'string'
     case 'renameChat':
       return typeof message.conversationId === 'string' && typeof message.title === 'string'
+    case 'rewind':
+      return typeof message.messageIndex === 'number' && Number.isInteger(message.messageIndex)
     case 'rulesChanged':
       return typeof message.rules === 'string'
     case 'select':
@@ -2150,6 +2152,24 @@ async function handleRendererMessage(
       dataFile.activeConversationId[host.hostKey] = fallback.id
     }
     saveData()
+    pushState(host)
+    return
+  }
+  if (payload.type === 'rewind') {
+    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
+      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+      return
+    }
+    const messages = host.conversation.messages
+    const target = messages[payload.messageIndex]
+    if (!target || target.role !== 'user') {
+      return
+    }
+    // Drop the target prompt and everything after it; the renderer puts the
+    // text back in the composer so it can be edited and resent.
+    messages.splice(payload.messageIndex)
+    refreshConversationTitle(host.conversation)
+    persistConversation(host)
     pushState(host)
     return
   }

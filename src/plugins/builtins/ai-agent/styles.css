@@ -490,6 +490,16 @@
   max-width: 92%;
 }
 
+.ai-agent-rewindable {
+  cursor: pointer;
+}
+
+.ai-agent-rewindable:hover .ai-agent-user-text {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
 .ai-agent-user-text,
 .ai-agent-assistant-text {
   word-break: break-word;

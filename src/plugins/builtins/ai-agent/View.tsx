@@ -653,12 +653,33 @@ export default function AiAgentView({
   const messages = conv?.messages ?? []
   const messagesRef = useRef<HTMLDivElement>(null)
 
+  /**
+   * Drop the prompt at `index` and everything after it, then put its text back
+   * in the composer so it can be edited and resent.
+   */
+  const rewindTo = (index: number): void => {
+    const message = conv?.messages[index]
+    if (!message || message.role !== 'user') {
+      return
+    }
+    send({ type: 'rewind', messageIndex: index })
+    setInput(message.text)
+    setAttach(message.usedTerminalContext === true)
+    promptInputRef.current?.focus()
+  }
+
   const messageRows: ReactElement[] = []
   for (let i = 0; i < messages.length; i += 1) {
     const msg = messages[i]
     if (msg.role === 'user') {
+      const canRewind = !running
       messageRows.push(
-        <div key={i} className="ai-agent-msg ai-agent-user">
+        <div
+          key={i}
+          className={`ai-agent-msg ai-agent-user${canRewind ? ' ai-agent-rewindable' : ''}`}
+          onClick={canRewind ? () => rewindTo(i) : undefined}
+          title={canRewind ? 'Rewind to this prompt and edit it' : undefined}
+        >
           <div className="ai-agent-msg-meta">
             {msg.attachedFiles && msg.attachedFiles.length > 0 ? (
               <span
