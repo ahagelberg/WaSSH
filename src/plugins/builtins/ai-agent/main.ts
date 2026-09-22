@@ -83,6 +83,7 @@ import {
   type AiAgentApprovalRequest,
   type AiAgentChatAttachment,
   type AiAgentConversation,
+  type AiAgentConversationMeta,
   type AiAgentConversationMsg,
   type AiAgentConversationSummary,
   type AiAgentConversationToolMsg,
@@ -90,7 +91,6 @@ import {
   type AiAgentProviderConfig,
   type AiAgentRendererMessage,
   type AiAgentRunPhase,
-  type AiAgentStateSnapshot,
   type AiAgentSudoRequest,
   type AiAgentToolOutcome
 } from './protocol'
@@ -165,13 +165,20 @@ const TERMINAL_TAIL_CHARS = 8_000
 const TERMINAL_CONTEXT_EXCERPT_CHARS = 6_000
 
 /** History entries kept per conversation (oldest trimmed) */
-const HISTORY_MAX = 1_000
+const HISTORY_MAX = 5_000
 
 /**
- * Character budget for conversation history sent to the provider in one request.
- * Independent of HISTORY_MAX: storage keeps far more than any single request needs.
+ * Context budget for the history sent to the provider in one request, in tokens.
+ * Independent of HISTORY_MAX: storage keeps far more than any single request
+ * needs, so the request budget is the binding constraint in practice.
  */
-const REQUEST_HISTORY_MAX_CHARS = 800_000
+const REQUEST_HISTORY_MAX_TOKENS = 1_000_000
+
+/** Rough characters per token, used to size history without a real tokenizer. */
+const CHARS_PER_TOKEN = 4
+
+/** Coalescing window for data-file writes (ms); every write re-serializes the file. */
+const SAVE_DEBOUNCE_MS = 300
 
 /** Remote project rules file read from the working directory */
 const PROJECT_RULES_FILE = '.wasshrules'
@@ -189,6 +196,21 @@ interface TabRuntime {
   ctx: PluginMainContext
   hostKey: string
   terminalTail: string
+  /** Conversation prefix this renderer already holds; null until it has synced. */
+  sentMessages: SentMessages | null
+}
+
+/**
+ * The part of a conversation a renderer already has, so later pushes can send
+ * only the messages it is missing. `first`/`last` are the message objects at the
+ * ends of that prefix: comparing them detects a shifted or rebuilt list (for
+ * example after the oldest messages are trimmed), which forces a full reset.
+ */
+interface SentMessages {
+  conversationId: string
+  count: number
+  first: AiAgentConversationMsg
+  last: AiAgentConversationMsg
 }
 
 interface HostState {
@@ -222,6 +244,7 @@ const hosts = new Map<string, HostState>()
 const hostRefCount = new Map<string, number>()
 let dataFile: AiAgentDataFile | null = null
 let dataWriter: PluginMainContext | null = null
+let saveTimer: ReturnType<typeof setTimeout> | null = null
 
 function isProviderConfig(value: unknown): value is AiAgentProviderConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -485,7 +508,27 @@ function loadData(ctx: PluginMainContext): void {
   }
 }
 
+/**
+ * Queue a data-file write. Every write re-serializes the whole file, and
+ * conversations are persisted after each message, so writes are coalesced and
+ * flushed at checkpoints (end of a run, teardown, conversation switch).
+ */
 function saveData(): void {
+  if (!dataFile || !dataWriter || saveTimer) {
+    return
+  }
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    flushData()
+  }, SAVE_DEBOUNCE_MS)
+}
+
+/** Write pending data now, cancelling any queued write. */
+function flushData(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer)
+    saveTimer = null
+  }
   if (dataFile && dataWriter) {
     dataWriter.setData(dataFile)
   }
@@ -505,6 +548,49 @@ function tabCtxForHost(hostKey: string): PluginMainContext | undefined {
   return undefined
 }
 
+/**
+ * Conversation part of a snapshot for one renderer. Sends only the messages it
+ * does not already have; falls back to a full reset whenever its known prefix
+ * cannot be trusted.
+ */
+function conversationUpdateFor(
+  tab: TabRuntime,
+  conv: AiAgentConversation | null
+): {
+  conversation: AiAgentConversationMeta | null
+  messageMode: 'reset' | 'append'
+  messages: AiAgentConversationMsg[]
+  sent: SentMessages | null
+} {
+  if (!conv) {
+    return { conversation: null, messageMode: 'reset', messages: [], sent: null }
+  }
+  const { messages: list, ...meta } = conv
+  const known = tab.sentMessages
+  const canAppend =
+    known !== null &&
+    known.conversationId === conv.id &&
+    known.count > 0 &&
+    list.length >= known.count &&
+    list[0] === known.first &&
+    list[known.count - 1] === known.last
+  const sent: SentMessages | null =
+    list.length > 0
+      ? {
+          conversationId: conv.id,
+          count: list.length,
+          first: list[0],
+          last: list[list.length - 1]
+        }
+      : null
+  return {
+    conversation: meta,
+    messageMode: canAppend ? 'append' : 'reset',
+    messages: canAppend ? list.slice(known.count) : list.slice(),
+    sent
+  }
+}
+
 function pushState(host: HostState): void {
   const ctx = tabCtxForHost(host.hostKey)
   // Key presence is derived live from the vault; nothing is persisted on the
@@ -517,11 +603,10 @@ function pushState(host: HostState): void {
   const ssh = Array.from(tabs.values()).some(
     (tab) => tab.hostKey === host.hostKey && tab.ctx.isSshSession()
   )
-  const snapshot: AiAgentStateSnapshot = {
-    type: 'state',
+  const common = {
+    type: 'state' as const,
     providers: dataFile?.providers ?? [],
     providerKeys,
-    conversation: host.conversation,
     conversationSummaries: listConversationSummaries(host.hostKey),
     runPhase: host.phase,
     hostKey: host.hostKey,
@@ -533,9 +618,12 @@ function pushState(host: HostState): void {
     lastError: host.lastError
   }
   for (const tab of tabs.values()) {
-    if (tab.hostKey === host.hostKey) {
-      tab.ctx.sendToRenderer(snapshot)
+    if (tab.hostKey !== host.hostKey) {
+      continue
     }
+    const update = conversationUpdateFor(tab, host.conversation)
+    tab.sentMessages = update.sent
+    tab.ctx.sendToRenderer({ ...common, ...update })
   }
 }
 
@@ -745,6 +833,7 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
       }
       clearSudoCache(host)
       hosts.delete(hostKey)
+      flushData()
     }
   } else {
     hostRefCount.set(hostKey, count)
@@ -889,12 +978,13 @@ function messageCharCount(msg: AiAgentConversationMsg): number {
  * message that requested it — providers reject that.
  */
 function outboundHistoryStart(messages: AiAgentConversationMsg[]): number {
+  const budgetChars = REQUEST_HISTORY_MAX_TOKENS * CHARS_PER_TOKEN
   let used = 0
   let start = messages.length
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const size = messageCharCount(messages[i])
     // Always keep at least the newest message, even if it alone exceeds the budget.
-    if (used + size > REQUEST_HISTORY_MAX_CHARS && start < messages.length) {
+    if (used + size > budgetChars && start < messages.length) {
       break
     }
     used += size
@@ -1620,6 +1710,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     }
     pushState(host)
     persistConversation(host)
+    flushData()
   }
 }
 
@@ -1802,7 +1893,7 @@ async function setupForTab(ctx: PluginMainContext, forceProbe: boolean): Promise
     tabs.delete(ctx.tabId)
     releaseHost(existing.hostKey, ctx)
   }
-  const tab: TabRuntime = { ctx, hostKey, terminalTail: '' }
+  const tab: TabRuntime = { ctx, hostKey, terminalTail: '', sentMessages: null }
   tabs.set(ctx.tabId, tab)
   const buffer = terminalBufferFor(ctx)
   ctx.registerStreamHandler('observe', 'inbound', (data) => {
@@ -1992,6 +2083,12 @@ async function handleRendererMessage(
     throw new Error('Invalid AI agent renderer message')
   }
   if (payload.type === 'sync') {
+    // The renderer is asking for the full picture (fresh mount, reload), so its
+    // known prefix is no longer trustworthy.
+    const syncedTab = tabs.get(ctx.tabId)
+    if (syncedTab) {
+      syncedTab.sentMessages = null
+    }
     const host = hostForCtx(ctx)
     if (host) {
       pushState(host)

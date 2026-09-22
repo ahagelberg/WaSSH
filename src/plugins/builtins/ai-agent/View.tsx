@@ -182,6 +182,32 @@ function emptyViewState(): ViewState {
   }
 }
 
+/**
+ * Rebuild the conversation from a state snapshot. Messages arrive either as the
+ * full list or as the tail appended since the previous snapshot. An append that
+ * cannot be applied locally (no copy yet, or a different chat) is displayed as
+ * given and flagged so the view can request a full sync.
+ */
+function applyConversationUpdate(
+  previous: AiAgentConversation | null,
+  payload: AiAgentStateSnapshot
+): { conversation: AiAgentConversation | null; resync: boolean } {
+  const meta = payload.conversation
+  if (!meta) {
+    return { conversation: null, resync: false }
+  }
+  if (payload.messageMode === 'append' && previous !== null && previous.id === meta.id) {
+    return {
+      conversation: { ...meta, messages: [...previous.messages, ...payload.messages] },
+      resync: false
+    }
+  }
+  return {
+    conversation: { ...meta, messages: payload.messages },
+    resync: payload.messageMode === 'append'
+  }
+}
+
 function formatChatTime(ts: number): string {
   try {
     return new Date(ts).toLocaleString(undefined, {
@@ -257,6 +283,8 @@ export default function AiAgentView({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const promptInputRef = useRef<HTMLTextAreaElement>(null)
   const titleInputRef = useRef<HTMLInputElement>(null)
+  /** Last conversation applied from a snapshot; appends extend it in place. */
+  const conversationRef = useRef<AiAgentConversation | null>(null)
   const dragDepthRef = useRef(0)
   /** Indicates that the queued message should replace the active run. */
   const forceAfterStopRef = useRef(false)
@@ -295,10 +323,15 @@ export default function AiAgentView({
         return
       }
       if (payload.type === 'state') {
+        const update = applyConversationUpdate(conversationRef.current, payload)
+        conversationRef.current = update.conversation
+        if (update.resync) {
+          send({ type: 'sync' })
+        }
         setView({
           providers: payload.providers,
           providerKeys: payload.providerKeys,
-          conversation: payload.conversation,
+          conversation: update.conversation,
           conversationSummaries: payload.conversationSummaries ?? [],
           runPhase: payload.runPhase,
           hostLabel: payload.hostLabel,

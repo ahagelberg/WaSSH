@@ -153,11 +153,22 @@ export interface AiAgentSudoRequest {
 }
 
 
+/** Conversation fields carried by every state snapshot; messages travel separately. */
+export type AiAgentConversationMeta = Omit<AiAgentConversation, 'messages'>
+
 export interface AiAgentStateSnapshot {
   type: 'state'
   providers: AiAgentProviderConfig[]
   providerKeys: string[]
-  conversation: AiAgentConversation | null
+  /** Conversation without its messages, or null when there is none. */
+  conversation: AiAgentConversationMeta | null
+  /**
+   * How to apply `messages`: 'reset' replaces the renderer's list, 'append'
+   * extends it. 'append' with an empty list means the list is unchanged.
+   */
+  messageMode: 'reset' | 'append'
+  /** Messages to apply per `messageMode`. */
+  messages: AiAgentConversationMsg[]
   conversationSummaries: AiAgentConversationSummary[]
   runPhase: AiAgentRunPhase
   hostKey: string
