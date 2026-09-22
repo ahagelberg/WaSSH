@@ -165,7 +165,13 @@ const TERMINAL_TAIL_CHARS = 8_000
 const TERMINAL_CONTEXT_EXCERPT_CHARS = 6_000
 
 /** History entries kept per conversation (oldest trimmed) */
-const HISTORY_MAX = 160
+const HISTORY_MAX = 1_000
+
+/**
+ * Character budget for conversation history sent to the provider in one request.
+ * Independent of HISTORY_MAX: storage keeps far more than any single request needs.
+ */
+const REQUEST_HISTORY_MAX_CHARS = 800_000
 
 /** Remote project rules file read from the working directory */
 const PROJECT_RULES_FILE = '.wasshrules'
@@ -834,7 +840,9 @@ async function readProjectRules(ctx: PluginMainContext): Promise<string> {
 
 function toApiMessages(conversation: AiAgentConversation): ApiMessage[] {
   const out: ApiMessage[] = []
-  for (const msg of conversation.messages) {
+  const messages = conversation.messages
+  for (let i = outboundHistoryStart(messages); i < messages.length; i += 1) {
+    const msg = messages[i]
     if (msg.role === 'user') {
       out.push({ role: 'user', content: msg.modelText ?? msg.text })
       continue
@@ -857,6 +865,44 @@ function toApiMessages(conversation: AiAgentConversation): ApiMessage[] {
     out.push({ role: 'tool', toolCallId: msg.toolCallId, content: msg.content })
   }
   return out
+}
+
+/** Approximate characters this message contributes to a request. */
+function messageCharCount(msg: AiAgentConversationMsg): number {
+  if (msg.role === 'user') {
+    return (msg.modelText ?? msg.text).length
+  }
+  if (msg.role === 'assistant') {
+    let size = (msg.text ?? '').length
+    for (const tc of msg.toolCalls ?? []) {
+      size += (tc.name ?? '').length + tc.command.length + (tc.argumentsJson ?? '').length
+    }
+    return size
+  }
+  return msg.content.length
+}
+
+/**
+ * Index of the oldest message to send, given the request budget. Walks back from
+ * the newest message and only accepts a cut at a message that can begin a
+ * request on its own, so a tool result is never sent without the assistant
+ * message that requested it — providers reject that.
+ */
+function outboundHistoryStart(messages: AiAgentConversationMsg[]): number {
+  let used = 0
+  let start = messages.length
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const size = messageCharCount(messages[i])
+    // Always keep at least the newest message, even if it alone exceeds the budget.
+    if (used + size > REQUEST_HISTORY_MAX_CHARS && start < messages.length) {
+      break
+    }
+    used += size
+    if (messages[i].role !== 'tool') {
+      start = i
+    }
+  }
+  return start
 }
 
 function abortCurrent(host: HostState): void {
