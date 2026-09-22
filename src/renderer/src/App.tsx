@@ -230,6 +230,8 @@ export default function App() {
   const activeRef = useRef(activeTabId)
   const settingsRef = useRef(settings)
   const restoredRef = useRef(false)
+  /** Mirrors restoredRef for effects that must re-run once restore completes. */
+  const [restored, setRestored] = useState(false)
   const paletteRef = useRef<HTMLDivElement>(null)
 
   tabsRef.current = tabs
@@ -291,7 +293,14 @@ export default function App() {
   }, [])
 
   const persistTabs = useCallback(() => {
-    const snapshot: TabSnapshot[] = tabsRef.current.map((t) => ({
+    const list = tabsRef.current
+    // An empty list is ambiguous: it means "the user closed every tab" only once
+    // restore has run. Before that it is just the pre-restore boot state, and
+    // writing it would erase the snapshot the restore is about to read.
+    if (list.length === 0 && !restoredRef.current) {
+      return
+    }
+    const snapshot: TabSnapshot[] = list.map((t) => ({
       id: t.id,
       connection: normalizeConnectionParams(t.connection, true),
       active: t.id === activeRef.current,
@@ -302,9 +311,13 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    // Persisting before restore completes would write the empty boot state.
+    if (!restored) {
+      return
+    }
     const timer = setTimeout(persistTabs, TAB_SNAPSHOT_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [tabs, activeTabId, persistTabs])
+  }, [tabs, activeTabId, restored, persistTabs])
 
   const connectTab = useCallback(async (tabId: string, connection: ConnectionParams) => {
     const s = settingsRef.current
@@ -378,13 +391,16 @@ export default function App() {
       const pluginList = await refreshPlugins()
       if (restoredRef.current) return
       restoredRef.current = true
+      // Unblock snapshot persistence before any early return below: after this
+      // point the in-memory tab list is authoritative, including an empty one.
+      setRestored(true)
       if (!s.reconnectOnStartup) return
       const snapshot = await window.wassh.getTabSnapshot()
       if (snapshot.length === 0) return
       // Drop plugin ids that are no longer registered (removed from the code
       // base / disabled) so their panes never come back on restored sessions.
       const available = new Set(pluginList.map((p) => p.id))
-      const restored: TabState[] = snapshot.map((t) => {
+      const restoredTabs: TabState[] = snapshot.map((t) => {
         const activePluginIds = (
           Array.isArray(t.activePluginIds) ? t.activePluginIds : []
         ).filter((id) => available.has(id))
@@ -399,10 +415,10 @@ export default function App() {
           )
         }
       })
-      setTabs(restored)
+      setTabs(restoredTabs)
       const active = snapshot.find((t) => t.active)?.id || snapshot[0]?.id || null
       setActiveTabId(active)
-      for (const t of restored) {
+      for (const t of restoredTabs) {
         const ids = t.activePluginIds
         if (ids.length > 0) await window.wassh.queuePluginRestore(t.id, ids)
         void connectTab(t.id, t.connection)
