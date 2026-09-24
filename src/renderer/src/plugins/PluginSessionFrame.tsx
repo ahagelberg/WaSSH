@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -55,6 +56,15 @@ type DropTarget =
   | { kind: 'edge'; edge: DockEdge; insert: 'inner' | 'outer' }
   | { kind: 'leaf'; pluginId: string; zone: LeafSplitZone }
 
+/** In-progress dock resize: the size it started at plus the size shown now. */
+interface DockDrag {
+  edge: DockEdge
+  /** Dock size when the drag started (px) */
+  startSize: number
+  /** Dock size currently shown (px) */
+  size: number
+}
+
 /** True when `target` selects the given edge + insert side. */
 function isDropZone(
   target: DropTarget | null,
@@ -78,10 +88,26 @@ function DropZone({
 /** Splitter bar thickness between panes (must match --plugin-splitter-size). */
 const PLUGIN_SPLITTER_SIZE_PX = 4
 
-/**
- * Largest a dock on `edge` may become so the terminal / mid area keeps at least
- * MIN_DOCK_SIZE_PX and the dock cannot overflow the session frame.
- */
+/** Shared, never-replaced path of a dock's layout root (keeps memo props stable). */
+const ROOT_SPLIT_PATH: number[] = []
+
+/** Layout field holding the size of each dock. */
+const DOCK_SIZE_KEY = {
+  left: 'leftWidthPx',
+  right: 'rightWidthPx',
+  top: 'topHeightPx',
+  bottom: 'bottomHeightPx'
+} as const satisfies Record<DockEdge, keyof TabPluginLayout>
+
+function dockSizePx(layout: TabPluginLayout, edge: DockEdge): number {
+  return layout[DOCK_SIZE_KEY[edge]]
+}
+
+function withDockSize(layout: TabPluginLayout, edge: DockEdge, sizePx: number): TabPluginLayout {
+  return { ...layout, [DOCK_SIZE_KEY[edge]]: sizePx }
+}
+
+/** Largest a dock on `edge` may become so the terminal / mid keeps MIN_DOCK_SIZE_PX. */
 function dockMaxSizePx(
   frame: HTMLElement | null,
   cur: TabPluginLayout,
@@ -100,18 +126,8 @@ function dockMaxSizePx(
       ? 'bottom'
       : 'top'
   const hasOther = cur[other] !== null
-  const otherPx = hasOther
-    ? horizontal
-      ? other === 'left'
-        ? cur.leftWidthPx
-        : cur.rightWidthPx
-      : other === 'top'
-        ? cur.topHeightPx
-        : cur.bottomHeightPx
-    : 0
   const reserved =
-    otherPx +
-    (hasOther ? PLUGIN_SPLITTER_SIZE_PX : 0) +
+    (hasOther ? dockSizePx(cur, other) + PLUGIN_SPLITTER_SIZE_PX : 0) +
     PLUGIN_SPLITTER_SIZE_PX +
     MIN_DOCK_SIZE_PX
   return Math.max(MIN_DOCK_SIZE_PX, avail - reserved)
@@ -133,18 +149,10 @@ function fitDocksToFrame(
     if (!next[edge]) {
       continue
     }
-    const key =
-      edge === 'left'
-        ? ('leftWidthPx' as const)
-        : edge === 'right'
-          ? ('rightWidthPx' as const)
-          : edge === 'top'
-            ? ('topHeightPx' as const)
-            : ('bottomHeightPx' as const)
     const max = dockMaxSizePx(frame, next, edge)
-    const clamped = Math.max(MIN_DOCK_SIZE_PX, Math.min(next[key], max))
-    if (clamped !== next[key]) {
-      next = { ...next, [key]: clamped }
+    const clamped = Math.max(MIN_DOCK_SIZE_PX, Math.min(dockSizePx(next, edge), max))
+    if (clamped !== dockSizePx(next, edge)) {
+      next = withDockSize(next, edge, clamped)
     }
   }
   return next
@@ -170,14 +178,26 @@ function zoneFromPoint(rect: DOMRect, clientX: number, clientY: number): LeafSpl
   return 'bottom'
 }
 
+/**
+ * Splitter bar between panes. Reports the total pointer travel since the drag
+ * began, so callers size from a fixed origin: per-event deltas drift because
+ * `pointermove` renders coalesce and the size a caller reads back can be stale.
+ * `onDragEnd` lets callers hold the live size locally and commit once.
+ */
 function DockSplitter({
   orientation,
-  onDrag
+  onDragStart,
+  onDrag,
+  onDragEnd
 }: {
   orientation: 'vertical' | 'horizontal'
-  onDrag: (deltaPx: number) => void
-}) {
-  const last = useRef(0)
+  onDragStart: () => void
+  onDrag: (totalDeltaPx: number) => void
+  onDragEnd: () => void
+}): ReactElement {
+  const origin = useRef(0)
+  const pos = (e: ReactPointerEvent<HTMLDivElement> | PointerEvent): number =>
+    orientation === 'vertical' ? e.clientX : e.clientY
   return (
     <div
       className={`plugin-splitter plugin-splitter-${orientation}`}
@@ -189,40 +209,21 @@ function DockSplitter({
         }
         e.preventDefault()
         e.currentTarget.setPointerCapture(e.pointerId)
-        last.current = orientation === 'vertical' ? e.clientX : e.clientY
+        origin.current = pos(e)
+        onDragStart()
       }}
       onPointerMove={(e) => {
         if (!e.currentTarget.hasPointerCapture(e.pointerId)) {
           return
         }
-        const pos = orientation === 'vertical' ? e.clientX : e.clientY
-        const delta = pos - last.current
-        last.current = pos
-        if (delta !== 0) {
-          onDrag(delta)
-        }
+        onDrag(pos(e) - origin.current)
       }}
+      onLostPointerCapture={onDragEnd}
     />
   )
 }
 
-function LayoutTreeView({
-  node,
-  edge,
-  path,
-  tabId,
-  hostId,
-  active,
-  plugins,
-  settings,
-  hostPluginSettings,
-  draggingId,
-  dropTarget,
-  onPluginSettingsPatch,
-  onClose,
-  onGripPointerDown,
-  onSplitRatioChange
-}: {
+interface LayoutTreeViewProps {
   node: LayoutNode
   edge: DockEdge | 'overlay'
   path: number[]
@@ -238,8 +239,31 @@ function LayoutTreeView({
   onClose: (pluginId: string) => void
   onGripPointerDown: (pluginId: string, event: ReactPointerEvent) => void
   onSplitRatioChange: (edge: DockEdge | 'overlay', path: number[], ratio: number) => void
-}): ReactNode {
+}
+
+function LayoutTreeViewNode({
+  node,
+  edge,
+  path,
+  tabId,
+  hostId,
+  active,
+  plugins,
+  settings,
+  hostPluginSettings,
+  draggingId,
+  dropTarget,
+  onPluginSettingsPatch,
+  onClose,
+  onGripPointerDown,
+  onSplitRatioChange
+}: LayoutTreeViewProps): ReactNode {
   const splitRef = useRef<HTMLDivElement>(null)
+  /** Live ratio while a splitter in this node is dragged; null when idle. */
+  const [dragRatio, setDragRatio] = useState<number | null>(null)
+  const dragRef = useRef<{ startRatio: number; ratio: number } | null>(null)
+  // Stable child paths: new arrays on every render would defeat the memo above.
+  const childPaths = useMemo(() => [[...path, 0], [...path, 1]], [path])
 
   if (node.kind === 'leaf') {
     const plugin = plugins.find((p) => p.id === node.pluginId)
@@ -291,16 +315,17 @@ function LayoutTreeView({
   }
 
   const isRow = node.direction === 'row'
+  const ratio = dragRatio ?? node.ratio
   return (
     <div
       ref={splitRef}
       className={`plugin-layout-split plugin-layout-split-${node.direction}`}
     >
-      <div className="plugin-layout-split-pane" style={{ flexGrow: node.ratio, flexBasis: 0 }}>
+      <div className="plugin-layout-split-pane" style={{ flexGrow: ratio, flexBasis: 0 }}>
         <LayoutTreeView
           node={node.a}
           edge={edge}
-          path={[...path, 0]}
+          path={childPaths[0]}
           tabId={tabId}
           hostId={hostId}
           active={active}
@@ -317,24 +342,37 @@ function LayoutTreeView({
       </div>
       <DockSplitter
         orientation={isRow ? 'vertical' : 'horizontal'}
-        onDrag={(deltaPx) => {
+        onDragStart={() => {
+          dragRef.current = { startRatio: node.ratio, ratio: node.ratio }
+        }}
+        onDrag={(totalDeltaPx) => {
+          const drag = dragRef.current
           const total = isRow
             ? (splitRef.current?.clientWidth ?? 0)
             : (splitRef.current?.clientHeight ?? 0)
-          if (total <= 0) {
+          if (!drag || total <= 0) {
             return
           }
-          onSplitRatioChange(edge, path, clampSplitRatio(node.ratio + deltaPx / total, total))
+          drag.ratio = clampSplitRatio(drag.startRatio + totalDeltaPx / total, total)
+          setDragRatio(drag.ratio)
+        }}
+        onDragEnd={() => {
+          const drag = dragRef.current
+          dragRef.current = null
+          setDragRatio(null)
+          if (drag && drag.ratio !== node.ratio) {
+            onSplitRatioChange(edge, path, drag.ratio)
+          }
         }}
       />
       <div
         className="plugin-layout-split-pane"
-        style={{ flexGrow: 1 - node.ratio, flexBasis: 0 }}
+        style={{ flexGrow: 1 - ratio, flexBasis: 0 }}
       >
         <LayoutTreeView
           node={node.b}
           edge={edge}
-          path={[...path, 1]}
+          path={childPaths[1]}
           tabId={tabId}
           hostId={hostId}
           active={active}
@@ -352,6 +390,13 @@ function LayoutTreeView({
     </div>
   )
 }
+
+/**
+ * One dock's layout tree. Memoized because resizing a dock re-renders the frame,
+ * and the plugin views inside (a long chat list is expensive to reconcile) must
+ * not re-render for a resize they do not take part in.
+ */
+const LayoutTreeView = memo(LayoutTreeViewNode)
 
 export default function PluginSessionFrame({
   tabId,
@@ -371,6 +416,13 @@ export default function PluginSessionFrame({
   const terminalRef = useRef<HTMLDivElement>(null)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
+  /**
+   * Live dock size while its splitter is dragged: held locally (and mirrored in
+   * a ref, since the pointer can outrun a render) so the resize does not push a
+   * full app render through on every move.
+   */
+  const [dockDrag, setDockDrag] = useState<DockDrag | null>(null)
+  const dockDragRef = useRef<DockDrag | null>(null)
   const dragPluginRef = useRef<string | null>(null)
   const layoutRef = useRef(layout)
   const onLayoutChangeRef = useRef(onLayoutChange)
@@ -552,32 +604,42 @@ export default function PluginSessionFrame({
     [commitLayout]
   )
 
-  const resizeDock = (edge: DockEdge, delta: number): void => {
-    const next = { ...layoutRef.current }
-    const max = dockMaxSizePx(frameRef.current, next, edge)
-    const clampSize = (value: number): number =>
-      Math.max(MIN_DOCK_SIZE_PX, Math.min(value, max))
-    if (edge === 'left') {
-      next.leftWidthPx = clampSize(next.leftWidthPx + delta)
-    } else if (edge === 'right') {
-      next.rightWidthPx = clampSize(next.rightWidthPx - delta)
-    } else if (edge === 'top') {
-      next.topHeightPx = clampSize(next.topHeightPx + delta)
-    } else {
-      next.bottomHeightPx = clampSize(next.bottomHeightPx - delta)
+  const onDockDragStart = useCallback((edge: DockEdge) => {
+    const size = dockSizePx(layoutRef.current, edge)
+    const drag: DockDrag = { edge, startSize: size, size }
+    dockDragRef.current = drag
+    setDockDrag(drag)
+  }, [])
+
+  /** Size the dragged dock from its start size, so coalesced moves cannot drift. */
+  const onDockDrag = useCallback((edge: DockEdge, totalDeltaPx: number) => {
+    const drag = dockDragRef.current
+    if (!drag || drag.edge !== edge) {
+      return
     }
-    commitLayout(next)
-  }
+    const grow = edge === 'left' || edge === 'top' ? totalDeltaPx : -totalDeltaPx
+    const max = dockMaxSizePx(frameRef.current, layoutRef.current, edge)
+    const next: DockDrag = {
+      ...drag,
+      size: Math.max(MIN_DOCK_SIZE_PX, Math.min(drag.startSize + grow, max))
+    }
+    dockDragRef.current = next
+    setDockDrag(next)
+  }, [])
+
+  const onDockDragEnd = useCallback(() => {
+    const drag = dockDragRef.current
+    dockDragRef.current = null
+    setDockDrag(null)
+    if (drag) {
+      commitLayout(withDockSize(layoutRef.current, drag.edge, drag.size))
+    }
+  }, [commitLayout])
 
   const renderDock = (edge: DockEdge, node: LayoutNode): ReactNode => {
+    const size = dockDrag?.edge === edge ? dockDrag.size : dockSizePx(displayLayout, edge)
     const sizeStyle: CSSProperties =
-      edge === 'left'
-        ? { width: displayLayout.leftWidthPx }
-        : edge === 'right'
-          ? { width: displayLayout.rightWidthPx }
-          : edge === 'top'
-            ? { height: displayLayout.topHeightPx }
-            : { height: displayLayout.bottomHeightPx }
+      edge === 'left' || edge === 'right' ? { width: size } : { height: size }
 
     return (
       <div
@@ -589,7 +651,7 @@ export default function PluginSessionFrame({
         <LayoutTreeView
           node={node}
           edge={edge}
-          path={[]}
+          path={ROOT_SPLIT_PATH}
           tabId={tabId}
           hostId={hostId}
           active={active}
@@ -642,7 +704,12 @@ export default function PluginSessionFrame({
       {displayLayout.top ? (
         <>
           {renderDock('top', displayLayout.top)}
-          <DockSplitter orientation="horizontal" onDrag={(d) => resizeDock('top', d)} />
+          <DockSplitter
+            orientation="horizontal"
+            onDragStart={() => onDockDragStart('top')}
+            onDrag={(d) => onDockDrag('top', d)}
+            onDragEnd={onDockDragEnd}
+          />
         </>
       ) : null}
 
@@ -650,7 +717,12 @@ export default function PluginSessionFrame({
         {displayLayout.left ? (
           <>
             {renderDock('left', displayLayout.left)}
-            <DockSplitter orientation="vertical" onDrag={(d) => resizeDock('left', d)} />
+            <DockSplitter
+              orientation="vertical"
+              onDragStart={() => onDockDragStart('left')}
+              onDrag={(d) => onDockDrag('left', d)}
+              onDragEnd={onDockDragEnd}
+            />
           </>
         ) : null}
 
@@ -684,7 +756,12 @@ export default function PluginSessionFrame({
 
         {displayLayout.right ? (
           <>
-            <DockSplitter orientation="vertical" onDrag={(d) => resizeDock('right', d)} />
+            <DockSplitter
+              orientation="vertical"
+              onDragStart={() => onDockDragStart('right')}
+              onDrag={(d) => onDockDrag('right', d)}
+              onDragEnd={onDockDragEnd}
+            />
             {renderDock('right', displayLayout.right)}
           </>
         ) : null}
@@ -692,7 +769,12 @@ export default function PluginSessionFrame({
 
       {displayLayout.bottom ? (
         <>
-          <DockSplitter orientation="horizontal" onDrag={(d) => resizeDock('bottom', d)} />
+          <DockSplitter
+            orientation="horizontal"
+            onDragStart={() => onDockDragStart('bottom')}
+            onDrag={(d) => onDockDrag('bottom', d)}
+            onDragEnd={onDockDragEnd}
+          />
           {renderDock('bottom', displayLayout.bottom)}
         </>
       ) : null}
@@ -702,7 +784,7 @@ export default function PluginSessionFrame({
           <LayoutTreeView
             node={displayLayout.overlay}
             edge="overlay"
-            path={[]}
+            path={ROOT_SPLIT_PATH}
             tabId={tabId}
             hostId={hostId}
             active={active}
