@@ -602,10 +602,32 @@ export default function AiAgentView({
     dispatchChat(toSend)
   }
 
-  const clearQueue = (): void => {
+  /**
+   * Drop the queued message. Marks it as drained so the queue effect cannot send
+   * it any more, and cancels a pending send-now request.
+   */
+  const popQueue = (): QueuedMessage | null => {
+    const msg = queued
     forceAfterStopRef.current = false
-    drainedQueueIdRef.current = queued?.id ?? null
+    drainedQueueIdRef.current = msg?.id ?? null
     setQueued(null)
+    return msg
+  }
+
+  const clearQueue = (): void => {
+    popQueue()
+  }
+
+  /** Move the queued message back into the composer so it can be edited. */
+  const editQueue = (): void => {
+    const msg = popQueue()
+    if (!msg) {
+      return
+    }
+    setInput(msg.text)
+    setAttach(msg.attachTerminal)
+    setAttachments(msg.attachments)
+    promptInputRef.current?.focus()
   }
 
   const hostRuleList = (key: string): string[] => {
@@ -1153,6 +1175,13 @@ export default function AiAgentView({
               <span className="ai-agent-queue-hint">
                 {busy ? 'Enter again to send now' : 'Press Enter to send'}
               </span>
+              <button
+                type="button"
+                title="Move back to the prompt input for editing"
+                onClick={editQueue}
+              >
+                Edit
+              </button>
               <button type="button" title="Discard queued message" onClick={clearQueue}>
                 ×
               </button>
