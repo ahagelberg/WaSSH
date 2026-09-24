@@ -14,6 +14,7 @@ import {
   HostsOrganization,
   SavePasswordPrompt,
   SessionStatus,
+  SessionStatusEvent,
   TAB_SNAPSHOT_DEBOUNCE_MS,
   TabSnapshot
 } from '@shared/types'
@@ -82,6 +83,45 @@ const CONNECTION_BANNER_STATUSES = new Set<SessionStatus>([
   'reconnecting'
 ])
 
+/**
+ * Next failure reason for a session after a status event. A failed attempt, or a
+ * dropped transport, reports the reason and then reports a reconnect attempt in
+ * the same breath; without keeping the reason the user never gets to read it.
+ * A connection that comes up clears it.
+ */
+function failureMessageAfter(
+  ev: SessionStatusEvent,
+  previous: string | undefined
+): string | undefined {
+  if (ev.status === 'connected') {
+    return undefined
+  }
+  if (ev.status === 'failed' || ev.status === 'disconnected') {
+    return ev.message ?? previous
+  }
+  return previous
+}
+
+/**
+ * Banner line for a session, or null when there is nothing worth showing: the
+ * status detail, plus the reason the last attempt failed when the detail has
+ * moved on to something else (a reconnect attempt, or a bare 'connecting').
+ */
+function connectionBannerText(tab: TabState): string | null {
+  const reason = tab.failureMessage === tab.statusMessage ? undefined : tab.failureMessage
+  if (tab.status === 'connected') {
+    return tab.statusMessage ?? null
+  }
+  const detail =
+    CONNECTION_BANNER_STATUSES.has(tab.status) && tab.statusMessage
+      ? `${tab.status}: ${tab.statusMessage}`
+      : null
+  if (detail && reason) {
+    return `${detail} — ${reason}`
+  }
+  return detail ?? reason ?? null
+}
+
 interface PaletteCommand {
   id: string
   title: string
@@ -133,6 +173,8 @@ interface TabState {
   connection: ConnectionParams
   status: SessionStatus
   statusMessage?: string
+  /** Reason the session last failed or dropped, kept until it connects again */
+  failureMessage?: string
   hostKeyPrompt?: HostKeyPrompt
   savePasswordPrompt?: SavePasswordPrompt
   activePluginIds: string[]
@@ -516,7 +558,14 @@ export default function App() {
       }
       setTabs((prev) =>
         prev.map((t) =>
-          t.id === ev.tabId ? { ...t, status: ev.status, statusMessage: ev.message } : t
+          t.id === ev.tabId
+            ? {
+                ...t,
+                status: ev.status,
+                statusMessage: ev.message,
+                failureMessage: failureMessageAfter(ev, t.failureMessage)
+              }
+            : t
         )
       )
       if (ev.status === 'connected') {
@@ -731,8 +780,7 @@ export default function App() {
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
   const activeStyle = activeTab ? resolveSessionStyle(activeTab.connection, styleDefaults) : null
-  const activeTabHasConnectionBanner =
-    !!activeTab?.statusMessage && CONNECTION_BANNER_STATUSES.has(activeTab.status)
+  const activeTabBannerText = activeTab ? connectionBannerText(activeTab) : null
   const activeTabCanReconnect =
     activeTab?.status === 'disconnected' ||
     activeTab?.status === 'failed' ||
@@ -1349,15 +1397,11 @@ export default function App() {
             </div>
           ) : null}
 
-          {activeTab && activeTabHasConnectionBanner ? (
+          {activeTab && activeTabBannerText ? (
             <div
               className={`inline-banner ${activeTab.status === 'connected' ? 'warn' : 'info'}`}
             >
-              <div className="msg">
-                {activeTab.status === 'connected'
-                  ? activeTab.statusMessage
-                  : `${activeTab.status}: ${activeTab.statusMessage}`}
-              </div>
+              <div className="msg">{activeTabBannerText}</div>
               {activeTabCanReconnect ? (
                 <button
                   type="button"
