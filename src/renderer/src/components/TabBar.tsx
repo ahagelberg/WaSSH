@@ -32,11 +32,7 @@ interface TabMenu {
   x: number
   y: number
   canSaveAsHost: boolean
-  canReconnect: boolean
 }
-
-/** Statuses where a manual reconnect is useful */
-const RECONNECT_STATUSES = new Set<SessionStatus>(['disconnected', 'failed'])
 
 interface DragState {
   id: string
@@ -260,8 +256,7 @@ export default function TabBar({
               id: tab.id,
               x: e.clientX,
               y: e.clientY,
-              canSaveAsHost: tab.canSaveAsHost,
-              canReconnect: RECONNECT_STATUSES.has(tab.status)
+              canSaveAsHost: tab.canSaveAsHost
             })
           }}
         >
@@ -299,11 +294,10 @@ export default function TabBar({
           role="menu"
           style={{ left: menu.x, top: menu.y }}
         >
-          {menu.canReconnect ? (
-            <button type="button" role="menuitem" onClick={() => run(onReconnect)}>
-              Reconnect
-            </button>
-          ) : null}
+          {/* Always offered: it drops any live session and connects again. */}
+          <button type="button" role="menuitem" onClick={() => run(onReconnect)}>
+            Reconnect
+          </button>
           <button type="button" role="menuitem" onClick={() => run(onConfigure)}>
             Session settings
           </button>
