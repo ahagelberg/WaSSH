@@ -629,6 +629,7 @@ export default function AiAgentView({
       } else if (decision === 'denyAlways') {
         patchHostRules(AI_AGENT_SETTING_HOST_DENY_RULES, request.subject)
       }
+      // 'allowSession' is main-process state only: it must not persist.
     }
     send({ type: 'approval', requestId: request.requestId, decision })
   }
@@ -1075,6 +1076,11 @@ export default function AiAgentView({
                 <button type="button" onClick={() => handleApproval('allow')}>
                   Approve once
                 </button>
+                {view.pendingApproval.kind === 'command' ? (
+                  <button type="button" onClick={() => handleApproval('allowSession')}>
+                    Allow all commands in this session
+                  </button>
+                ) : null}
                 <button type="button" onClick={() => handleApproval('deny')}>
                   Deny once
                 </button>

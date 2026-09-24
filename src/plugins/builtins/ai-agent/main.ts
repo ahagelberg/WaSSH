@@ -79,6 +79,7 @@ import {
   AI_AGENT_TOOL_TERMINAL_WRITE,
   AI_AGENT_TOOL_WEB_FETCH,
   AI_AGENT_TOOL_WEB_SEARCH,
+  type AiAgentApprovalDecision,
   type AiAgentApprovalKind,
   type AiAgentApprovalRequest,
   type AiAgentChatAttachment,
@@ -96,7 +97,7 @@ import {
 } from './protocol'
 import type { PluginMainContext, PluginMainModule } from '@plugin-api/main'
 import type { PluginApiMethod } from '@plugin-api/shared'
-import { decideCommand } from './permissions'
+import { ALLOW_ALL_PATTERN, decideCommand } from './permissions'
 import {
   complete,
   embed,
@@ -221,7 +222,7 @@ interface HostState {
   extraAllow: string[]
   extraDeny: string[]
   pendingApproval: AiAgentApprovalRequest | null
-  approvalResolve: ((decision: string) => void) | null
+  approvalResolve: ((decision: AiAgentApprovalDecision) => void) | null
   pendingSudo: AiAgentSudoRequest | null
   sudoResolve: ((password: string | null) => void) | null
   /** In-memory only — never persisted or sent to the renderer */
@@ -1113,11 +1114,17 @@ function isToolEnabled(activeTools: PluginApiMethod[], toolName: string): boolea
   return activeTools.some((tool) => tool.name === toolName)
 }
 
-function applyApprovalDecision(host: HostState, subject: string, decision: string): boolean {
+function applyApprovalDecision(
+  host: HostState,
+  subject: string,
+  decision: AiAgentApprovalDecision
+): boolean {
   if (decision === 'allowAlways') {
     host.extraAllow.push(subject)
   } else if (decision === 'denyAlways') {
     host.extraDeny.push(subject)
+  } else if (decision === 'allowSession') {
+    host.extraAllow.push(ALLOW_ALL_PATTERN)
   }
   return decision !== 'deny' && decision !== 'denyAlways'
 }
@@ -1141,7 +1148,11 @@ function toolResultMessage(
   return { role: 'tool', toolCallId, name, command, content, outcome, truncated }
 }
 
-async function askApproval(host: HostState, kind: AiAgentApprovalKind, subject: string): Promise<string> {
+async function askApproval(
+  host: HostState,
+  kind: AiAgentApprovalKind,
+  subject: string
+): Promise<AiAgentApprovalDecision> {
   host.pendingApproval = {
     requestId: randomUUID(),
     kind,
@@ -1150,7 +1161,7 @@ async function askApproval(host: HostState, kind: AiAgentApprovalKind, subject: 
   }
   host.phase = 'ask'
   pushState(host)
-  const decision = await new Promise<string>((resolve) => {
+  const decision = await new Promise<AiAgentApprovalDecision>((resolve) => {
     host.approvalResolve = resolve
   })
   host.approvalResolve = null
@@ -1463,13 +1474,15 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             host.extraAllow,
             host.extraDeny
           )
-          let action: string = decision
+          let action: AiAgentApprovalDecision
           if (decision === 'ask') {
             action = await askApproval(host, 'command', command)
             if (!host.inRun) {
               keepRunning = false
               break
             }
+          } else {
+            action = decision
           }
           if (!applyApprovalDecision(host, command, action)) {
             conv.messages.push(toolResultMessage(tc.id, toolName, command, '', 'denied', false))
@@ -2054,7 +2067,8 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
         (message.decision === 'allow' ||
           message.decision === 'deny' ||
           message.decision === 'allowAlways' ||
-          message.decision === 'denyAlways')
+          message.decision === 'denyAlways' ||
+          message.decision === 'allowSession')
       )
     case 'sudoPassword':
       return (

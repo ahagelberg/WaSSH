@@ -205,7 +205,8 @@ export interface AiAgentChatAttachment {
   binary: boolean
 }
 
-export type AiAgentApprovalDecision = 'allow' | 'deny' | 'allowAlways' | 'denyAlways'
+/** 'allowSession' allows every later command until this host's session ends (in-memory only). */
+export type AiAgentApprovalDecision = 'allow' | 'deny' | 'allowAlways' | 'denyAlways' | 'allowSession'
 
 export type AiAgentRendererMessage =
   | { type: 'sync' }

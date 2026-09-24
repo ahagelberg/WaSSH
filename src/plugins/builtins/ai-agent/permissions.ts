@@ -2,6 +2,9 @@ import { AI_AGENT_RULE_REGEX_PREFIX } from './protocol'
 
 export type RuleDecision = 'allow' | 'deny' | 'ask'
 
+/** Rule pattern matching every command, used by "allow all commands this session". */
+export const ALLOW_ALL_PATTERN = '*'
+
 /** Regex special characters escaped outside `*` (kept as glob wildcard). */
 const REGEX_SPECIAL_CHARS = /[.+?^${}()|[\]\\]/g
 
