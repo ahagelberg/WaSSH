@@ -18,6 +18,7 @@ import {
   AI_AGENT_OLLAMA_PROVIDER_ID
 } from './defaults'
 import { aiAgentVaultId } from './id'
+import { approvalScopes, type ApprovalScope } from './permissions'
 import {
   AI_AGENT_PROTOCOL_ANTHROPIC,
   AI_AGENT_PROTOCOL_OPENAI,
@@ -259,6 +260,14 @@ async function readAttachment(file: File): Promise<AiAgentChatAttachment> {
   }
 }
 
+/** "Always allow/deny" scope currently being chosen for the pending approval. */
+type ApprovalScopeChoice = 'allow' | 'deny'
+
+/** Label for one "always allow/deny" scope button. */
+function approvalScopeLabel(scope: ApprovalScope): string {
+  return scope.wordCount === 0 ? 'Exactly this command' : `Starts with: ${scope.text}`
+}
+
 export default function AiAgentView({
   tabId,
   pluginId,
@@ -278,6 +287,7 @@ export default function AiAgentView({
   const [toast, setToast] = useState<{ kind: 'error' | 'info'; text: string } | null>(null)
   const [queued, setQueued] = useState<QueuedMessage | null>(null)
   const [sudoPassword, setSudoPassword] = useState('')
+  const [scopeChoice, setScopeChoice] = useState<ApprovalScopeChoice | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sudoInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -345,6 +355,7 @@ export default function AiAgentView({
         setToolOutput({})
         setEditingId(null)
         setTitleDraft('')
+        setScopeChoice(null)
         if (payload.runPhase !== 'ask_sudo') {
           setSudoPassword('')
         }
@@ -640,20 +651,38 @@ export default function AiAgentView({
     onSettingsPatch({ [key]: next })
   }
 
-  const handleApproval = (decision: AiAgentApprovalDecision): void => {
+  const handleApproval = (decision: AiAgentApprovalDecision, pattern?: string): void => {
     const request = view.pendingApproval
     if (!request) {
       return
     }
     if (request.kind === 'command') {
       if (decision === 'allowAlways') {
-        patchHostRules(AI_AGENT_SETTING_HOST_ALLOW_RULES, request.subject)
+        patchHostRules(AI_AGENT_SETTING_HOST_ALLOW_RULES, pattern ?? request.subject)
       } else if (decision === 'denyAlways') {
-        patchHostRules(AI_AGENT_SETTING_HOST_DENY_RULES, request.subject)
+        patchHostRules(AI_AGENT_SETTING_HOST_DENY_RULES, pattern ?? request.subject)
       }
       // 'allowSession' is main-process state only: it must not persist.
     }
-    send({ type: 'approval', requestId: request.requestId, decision })
+    setScopeChoice(null)
+    send({ type: 'approval', requestId: request.requestId, decision, pattern })
+  }
+
+  const pickApprovalScope = (scope: ApprovalScope): void => {
+    if (scopeChoice === 'allow') {
+      handleApproval('allowAlways', scope.pattern)
+    } else if (scopeChoice === 'deny') {
+      handleApproval('denyAlways', scope.pattern)
+    }
+  }
+
+  /** "Always" buttons: commands pick a rule scope first, actions (permissions) apply at once. */
+  const startAlwaysChoice = (choice: ApprovalScopeChoice): void => {
+    if (view.pendingApproval?.kind === 'command') {
+      setScopeChoice(choice)
+      return
+    }
+    handleApproval(choice === 'allow' ? 'allowAlways' : 'denyAlways')
   }
 
   const submitSudoPassword = (password: string | null): void => {
@@ -1094,25 +1123,51 @@ export default function AiAgentView({
                 {view.pendingApproval.kind === 'command' ? 'Approve command?' : 'Approve action?'}
               </div>
               <pre className="ai-agent-approval-command">{view.pendingApproval.subject}</pre>
-              <div className="ai-agent-approval-actions">
-                <button type="button" onClick={() => handleApproval('allow')}>
-                  Approve once
-                </button>
-                {view.pendingApproval.kind === 'command' ? (
-                  <button type="button" onClick={() => handleApproval('allowSession')}>
-                    Allow all commands in this session
+              {scopeChoice ? (
+                <div className="ai-agent-approval-scopes">
+                  <div className="ai-agent-approval-hint">
+                    {scopeChoice === 'allow' ? 'Always allow commands:' : 'Always deny commands:'}
+                  </div>
+                  {approvalScopes(view.pendingApproval.subject).map((scope) => (
+                    <button
+                      key={scope.pattern}
+                      type="button"
+                      className={scopeChoice === 'deny' ? 'ai-agent-danger' : undefined}
+                      title={scope.pattern}
+                      onClick={() => pickApprovalScope(scope)}
+                    >
+                      {approvalScopeLabel(scope)}
+                    </button>
+                  ))}
+                  <button type="button" onClick={() => setScopeChoice(null)}>
+                    Back
                   </button>
-                ) : null}
-                <button type="button" onClick={() => handleApproval('deny')}>
-                  Deny once
-                </button>
-                <button type="button" onClick={() => handleApproval('allowAlways')}>
-                  Always allow
-                </button>
-                <button type="button" className="ai-agent-danger" onClick={() => handleApproval('denyAlways')}>
-                  Always deny
-                </button>
-              </div>
+                </div>
+              ) : (
+                <div className="ai-agent-approval-actions">
+                  <button type="button" onClick={() => handleApproval('allow')}>
+                    Approve once
+                  </button>
+                  {view.pendingApproval.kind === 'command' ? (
+                    <button type="button" onClick={() => handleApproval('allowSession')}>
+                      Allow all commands in this session
+                    </button>
+                  ) : null}
+                  <button type="button" onClick={() => handleApproval('deny')}>
+                    Deny once
+                  </button>
+                  <button type="button" onClick={() => startAlwaysChoice('allow')}>
+                    Always allow
+                  </button>
+                  <button
+                    type="button"
+                    className="ai-agent-danger"
+                    onClick={() => startAlwaysChoice('deny')}
+                  >
+                    Always deny
+                  </button>
+                </div>
+              )}
             </div>
           ) : null}
 

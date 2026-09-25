@@ -214,6 +214,12 @@ interface SentMessages {
   last: AiAgentConversationMsg
 }
 
+/** Renderer's answer to askApproval: the decision plus the rule scope it chose, if any. */
+interface AiAgentApprovalAnswer {
+  decision: AiAgentApprovalDecision
+  pattern?: string
+}
+
 interface HostState {
   hostKey: string
   hostLabel: string
@@ -222,7 +228,7 @@ interface HostState {
   extraAllow: string[]
   extraDeny: string[]
   pendingApproval: AiAgentApprovalRequest | null
-  approvalResolve: ((decision: AiAgentApprovalDecision) => void) | null
+  approvalResolve: ((answer: AiAgentApprovalAnswer) => void) | null
   pendingSudo: AiAgentSudoRequest | null
   sudoResolve: ((password: string | null) => void) | null
   /** In-memory only — never persisted or sent to the renderer */
@@ -1117,12 +1123,14 @@ function isToolEnabled(activeTools: PluginApiMethod[], toolName: string): boolea
 function applyApprovalDecision(
   host: HostState,
   subject: string,
-  decision: AiAgentApprovalDecision
+  decision: AiAgentApprovalDecision,
+  pattern?: string
 ): boolean {
+  const rule = pattern ?? subject
   if (decision === 'allowAlways') {
-    host.extraAllow.push(subject)
+    host.extraAllow.push(rule)
   } else if (decision === 'denyAlways') {
-    host.extraDeny.push(subject)
+    host.extraDeny.push(rule)
   } else if (decision === 'allowSession') {
     host.extraAllow.push(ALLOW_ALL_PATTERN)
   }
@@ -1152,7 +1160,7 @@ async function askApproval(
   host: HostState,
   kind: AiAgentApprovalKind,
   subject: string
-): Promise<AiAgentApprovalDecision> {
+): Promise<AiAgentApprovalAnswer> {
   host.pendingApproval = {
     requestId: randomUUID(),
     kind,
@@ -1161,12 +1169,12 @@ async function askApproval(
   }
   host.phase = 'ask'
   pushState(host)
-  const decision = await new Promise<AiAgentApprovalDecision>((resolve) => {
+  const answer = await new Promise<AiAgentApprovalAnswer>((resolve) => {
     host.approvalResolve = resolve
   })
   host.approvalResolve = null
   host.pendingApproval = null
-  return decision
+  return answer
 }
 
 function parseJsonArgs(jsonStr: string): Record<string, unknown> {
@@ -1475,8 +1483,11 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             host.extraDeny
           )
           let action: AiAgentApprovalDecision
+          let scopePattern: string | undefined
           if (decision === 'ask') {
-            action = await askApproval(host, 'command', command)
+            const answer = await askApproval(host, 'command', command)
+            action = answer.decision
+            scopePattern = answer.pattern
             if (!host.inRun) {
               keepRunning = false
               break
@@ -1484,7 +1495,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           } else {
             action = decision
           }
-          if (!applyApprovalDecision(host, command, action)) {
+          if (!applyApprovalDecision(host, command, action, scopePattern)) {
             conv.messages.push(toolResultMessage(tc.id, toolName, command, '', 'denied', false))
             pushState(host)
             persistConversation(host)
@@ -1587,7 +1598,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           continue
         }
         if (permission === 'ask') {
-          const decision = await askApproval(host, 'permission', displayCommand)
+          const { decision } = await askApproval(host, 'permission', displayCommand)
           if (!host.inRun) {
             keepRunning = false
             break
@@ -2064,6 +2075,7 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
     case 'approval':
       return (
         typeof message.requestId === 'string' &&
+        (message.pattern === undefined || typeof message.pattern === 'string') &&
         (message.decision === 'allow' ||
           message.decision === 'deny' ||
           message.decision === 'allowAlways' ||
@@ -2186,7 +2198,7 @@ async function handleRendererMessage(
       const resolve = host.approvalResolve
       if (resolve) {
         host.approvalResolve = null
-        resolve(payload.decision)
+        resolve({ decision: payload.decision, pattern: payload.pattern })
         if (host.inRun) {
           host.phase = 'running'
         }
@@ -2211,7 +2223,7 @@ async function handleRendererMessage(
     if (host.phase === 'ask' && host.approvalResolve) {
       const resolve = host.approvalResolve
       host.approvalResolve = null
-      resolve('deny')
+      resolve({ decision: 'deny' })
     }
     if (host.phase === 'ask_sudo' && host.sudoResolve) {
       const resolve = host.sudoResolve

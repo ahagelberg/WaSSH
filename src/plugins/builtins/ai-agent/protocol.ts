@@ -222,7 +222,8 @@ export type AiAgentRendererMessage =
   | { type: 'stop' }
   | { type: 'resume' }
   | { type: 'discardPaused' }
-  | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision }
+  /** `pattern` is the rule list entry an 'allowAlways'/'denyAlways' decision saves. */
+  | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision; pattern?: string }
   | { type: 'sudoPassword'; requestId: string; password: string | null }
   | { type: 'rulesChanged'; rules: string }
   | { type: 'select'; providerId: string; model: string }

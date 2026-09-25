@@ -897,6 +897,27 @@
   padding: 3px 8px;
 }
 
+.ai-agent-approval-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ai-agent-approval-scopes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.ai-agent-approval-scopes button {
+  font-size: 11px;
+  padding: 3px 8px;
+  text-align: left;
+  word-break: break-all;
+}
+
 .ai-agent-sudo {
   flex-shrink: 0;
   border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--border));
