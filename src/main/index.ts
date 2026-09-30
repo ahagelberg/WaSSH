@@ -61,6 +61,18 @@ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
 /** Cooldown before another auto-reload after a renderer module-link error. */
 const DEV_MODULE_RELOAD_COOLDOWN_MS = 10_000
 
+/** First delay before retrying a dev-server load that failed (ms). */
+const DEV_LOAD_RETRY_INITIAL_MS = 1_000
+
+/** Ceiling for the dev-server load retry delay (ms). */
+const DEV_LOAD_RETRY_MAX_MS = 5_000
+
+/** Consecutive dev-server load retries before giving up. */
+const DEV_LOAD_RETRY_ATTEMPTS = 10
+
+/** Chromium error code for a navigation superseded by a newer one. */
+const ERR_ABORTED_CODE = -3
+
 /** Whether the machine has suspended since startup (module-graph corruptions only follow sleep). */
 let rendererSuspended = false
 
@@ -213,6 +225,7 @@ function createWindow(): void {
   // never registered), blacking out the window. Reload once (rate-limited) when a
   // module-link error is reported so the page reboots from a clean module graph.
   if (process.env.ELECTRON_RENDERER_URL) {
+    const devRendererUrl = process.env.ELECTRON_RENDERER_URL
     let moduleReloadAvailableAt = 0
     mainWindow.webContents.on('console-message', (details) => {
       // Only recover after a sleep/wake cycle — before that, a module error is a
@@ -236,6 +249,45 @@ function createWindow(): void {
       moduleReloadAvailableAt = now + DEV_MODULE_RELOAD_COOLDOWN_MS
       mainWindow?.webContents.reload()
     })
+
+    // That reload can itself be caught by sleep/wake and fail with
+    // ERR_NETWORK_IO_SUSPENDED, leaving Chromium's error page up. That page
+    // reports nothing, so nothing here would recover it; retry the load until the
+    // dev server answers again.
+    let loadRetryTimer: ReturnType<typeof setTimeout> | null = null
+    let loadRetryDelayMs = DEV_LOAD_RETRY_INITIAL_MS
+    let loadRetries = 0
+
+    mainWindow.webContents.on('did-finish-load', () => {
+      if (loadRetryTimer) {
+        clearTimeout(loadRetryTimer)
+        loadRetryTimer = null
+      }
+      loadRetryDelayMs = DEV_LOAD_RETRY_INITIAL_MS
+      loadRetries = 0
+    })
+
+    mainWindow.webContents.on(
+      'did-fail-load',
+      (_event, errorCode, _description, _url, isMainFrame) => {
+        if (!isMainFrame || errorCode === ERR_ABORTED_CODE || loadRetryTimer) {
+          return
+        }
+        if (loadRetries >= DEV_LOAD_RETRY_ATTEMPTS) {
+          return
+        }
+        loadRetries += 1
+        const delay = loadRetryDelayMs
+        loadRetryDelayMs = Math.min(loadRetryDelayMs * 2, DEV_LOAD_RETRY_MAX_MS)
+        loadRetryTimer = setTimeout(() => {
+          loadRetryTimer = null
+          const win = mainWindow
+          if (win && !win.isDestroyed()) {
+            void win.webContents.loadURL(devRendererUrl).catch(() => undefined)
+          }
+        }, delay)
+      }
+    )
   }
 
   mainWindow.webContents.on('before-input-event', (event, input) => {
@@ -255,7 +307,10 @@ function createWindow(): void {
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+    // A start whose dev-server request is suspended (machine waking, server not
+    // listening yet) reports through did-fail-load, which retries until the server
+    // answers; swallowing the rejection avoids a second, unactionable warning.
+    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL).catch(() => undefined)
   } else {
     void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
