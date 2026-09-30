@@ -565,7 +565,7 @@ not part of the shared plugin API. Summary of their main-renderer messages:
 | scratchpad | — (renderer-driven; main is a no-op hook) | — |
 | mqtt-analyser | `publish` / `reconnect` | `status` → `MqttAnalyserStatusPayload`; `message` → `MqttAnalyserMessagePayload` |
 | sftp | `getStatus`, `list`, `mkdir`, `rename`, `chmod`, `delete`, `download`, `viewFile`, `uploadDialog`, `uploadStart`/`uploadChunk`/`uploadEnd`, `cancel`, `resetCwd` | `status`, `listResult`, `opResult`, `transferProgress`, `transferDone`, `viewFileResult` → `SftpViewFilePayload` |
-| ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `approval` (`{requestId, kind: 'command'\|'permission', decision}`), `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `refreshModels`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
+| ai-agent | `sync`, `probe`, `chat`, `stop`, `resume`, `discardPaused`, `dismissError`, `approval` (`{requestId, kind: 'command'\|'permission', decision}`), `sudoPassword`, `rulesChanged`, `select`, `providersChanged`, `refreshModels`, `newChat`, `openChat`, `deleteChat` | `state` → `AiAgentStateSnapshot` (incl. `pendingApproval`/`pendingSudo`), `delta`, `toast` |
 
 `contributes.api` methods (§7) declared by server-monitor (`get_snapshot`),
 mqtt-analyser (`get_topics`, `get_topic_value`, `publish`), macro-pad

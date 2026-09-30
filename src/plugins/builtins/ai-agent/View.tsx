@@ -1125,7 +1125,18 @@ export default function AiAgentView({
             </div>
           ) : null}
 
-          {view.lastError ? <div className="ai-agent-error-bar">{view.lastError}</div> : null}
+          {view.lastError ? (
+            <div className="ai-agent-error-bar">
+              <span>{view.lastError}</span>
+              <button
+                type="button"
+                title="Dismiss this error"
+                onClick={() => send({ type: 'dismissError' })}
+              >
+                ×
+              </button>
+            </div>
+          ) : null}
 
           <div className="ai-agent-messages" ref={messagesRef}>
             {transcriptEmpty ? (

@@ -2040,6 +2040,7 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
     case 'stop':
     case 'resume':
     case 'discardPaused':
+    case 'dismissError':
       return true
     case 'providersChanged':
       return Array.isArray(message.providers) && message.providers.every(isProviderConfig)
@@ -2113,6 +2114,14 @@ async function handleRendererMessage(
   }
   if (payload.type === 'probe') {
     await setupForTab(ctx, true)
+    return
+  }
+  if (payload.type === 'dismissError') {
+    const host = hostForCtx(ctx)
+    if (host) {
+      host.lastError = undefined
+      pushState(host)
+    }
     return
   }
   if (payload.type === 'providersChanged') {

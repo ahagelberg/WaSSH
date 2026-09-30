@@ -222,6 +222,8 @@ export type AiAgentRendererMessage =
   | { type: 'stop' }
   | { type: 'resume' }
   | { type: 'discardPaused' }
+  /** Acknowledge the run error shown in the view. */
+  | { type: 'dismissError' }
   | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision }
   | { type: 'sudoPassword'; requestId: string; password: string | null }
   | { type: 'rulesChanged'; rules: string }

@@ -957,12 +957,26 @@
 
 .ai-agent-error-bar {
   flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   padding: 4px var(--gap);
   font-size: 11px;
   color: var(--danger);
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.ai-agent-error-bar span {
+  flex: 1;
+  min-width: 0;
   word-break: break-word;
+}
+
+.ai-agent-error-bar button {
+  flex-shrink: 0;
+  padding: 0 6px;
+  font-size: 12px;
 }
 
 .ai-agent-toast {
