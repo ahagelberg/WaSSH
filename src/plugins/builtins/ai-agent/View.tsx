@@ -1,4 +1,6 @@
 import {
+  memo,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -26,6 +28,7 @@ import {
   type AiAgentApprovalDecision,
   type AiAgentChatAttachment,
   type AiAgentConversation,
+  type AiAgentConversationMsg,
   type AiAgentConversationSummary,
   type AiAgentConversationToolMsg,
   type AiAgentDeltaPayload,
@@ -144,13 +147,203 @@ const MARKDOWN_COMPONENTS: Components = {
   }
 }
 
-function MarkdownText({ text }: { text: string }): ReactElement {
+/**
+ * Markdown is parsed on every render, so memoize on the text: the composer lives
+ * in the same component, and each keystroke would otherwise re-parse every
+ * message in the conversation.
+ */
+const MarkdownText = memo(function MarkdownText({
+  text
+}: {
+  text: string
+}): ReactElement {
   return (
     <Markdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS} skipHtml>
       {text}
     </Markdown>
   )
+})
+
+interface MessageListProps {
+  messages: AiAgentConversationMsg[]
+  /** A run is in progress: tool calls may still be streaming their output */
+  running: boolean
+  /** Assistant text streamed so far during the current run */
+  stream: string
+  /** Output streamed so far, by tool call id */
+  toolOutput: Record<string, string>
+  /** Put the prompt at `index` back into the composer for editing */
+  onRewind: (index: number) => void
+  /** Stop the current run */
+  onStop: () => void
 }
+
+/**
+ * Chat transcript. Memoized so typing in the composer (which re-renders the view
+ * that owns it) does not walk and re-render every message of a long chat.
+ */
+const MessageList = memo(function MessageList({
+  messages,
+  running,
+  stream,
+  toolOutput,
+  onRewind,
+  onStop
+}: MessageListProps): ReactElement {
+  const rows: ReactElement[] = []
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i]
+    if (msg.role === 'user') {
+      const canRewind = !running
+      rows.push(
+        <div
+          key={i}
+          className={`ai-agent-msg ai-agent-user${canRewind ? ' ai-agent-rewindable' : ''}`}
+          onClick={canRewind ? () => onRewind(i) : undefined}
+          title={canRewind ? 'Rewind to this prompt and edit it' : undefined}
+        >
+          <div className="ai-agent-msg-meta">
+            {msg.attachedFiles && msg.attachedFiles.length > 0 ? (
+              <span
+                className="ai-agent-ctx-tag"
+                title={msg.attachedFiles.join(', ')}
+              >
+                +{msg.attachedFiles.length} file{msg.attachedFiles.length === 1 ? '' : 's'}
+              </span>
+            ) : null}
+            {msg.usedTerminalContext ? (
+              <span className="ai-agent-ctx-tag" title="Recent terminal output was attached">
+                +terminal
+              </span>
+            ) : null}
+          </div>
+          <div className="ai-agent-user-text"><MarkdownText text={msg.text} /></div>
+        </div>
+      )
+      continue
+    }
+    if (msg.role === 'assistant') {
+      const toolChildren: ReactElement[] = []
+      for (const tc of msg.toolCalls ?? []) {
+        const outputs: AiAgentConversationToolMsg[] = []
+        for (let j = i + 1; j < messages.length; j += 1) {
+          const later = messages[j]
+          if (later.role === 'assistant') {
+            break
+          }
+          if (later.role === 'tool' && later.toolCallId === tc.id) {
+            outputs.push(later)
+          }
+        }
+        const isCurrentlyRunning = running && outputs.length === 0
+        const body =
+          outputs.length === 0 ? (
+            toolOutput[tc.id] ? (
+              <div className="ai-agent-tool-out">
+                <div className="ai-agent-tool-meta">
+                  <span className="ai-agent-tool-status running">running</span>
+                  {isCurrentlyRunning ? (
+                    <button
+                      type="button"
+                      className="ai-agent-tool-stop-btn"
+                      title="Stop command"
+                      onClick={onStop}
+                    >
+                      Stop
+                    </button>
+                  ) : null}
+                </div>
+                <pre className="ai-agent-out">{toolOutput[tc.id]}</pre>
+              </div>
+            ) : (
+              <div className="ai-agent-tool-meta">
+                <span className={`ai-agent-tool-status${isCurrentlyRunning ? ' running' : ''}`}>
+                  {isCurrentlyRunning ? 'running…' : 'interrupted'}
+                </span>
+                {isCurrentlyRunning ? (
+                  <button
+                    type="button"
+                    className="ai-agent-tool-stop-btn"
+                    title="Stop command"
+                    onClick={onStop}
+                  >
+                    Stop
+                  </button>
+                ) : null}
+              </div>
+            )
+          ) : (
+            outputs.map((out, k) => (
+              <div key={k} className="ai-agent-tool-out">
+                <div className="ai-agent-tool-meta">
+                  <span className={`ai-agent-tool-outcome ${out.outcome}`}>
+                    {outcomeLabel(out.outcome)}
+                  </span>
+                  {out.truncated ? <span>truncated</span> : null}
+                </div>
+                {out.content ? (
+                  <pre className="ai-agent-out">{out.content}</pre>
+                ) : (
+                  <span className="ai-agent-tool-empty">(no output)</span>
+                )}
+              </div>
+            ))
+          )
+        const badge = toolBadge(tc.name)
+        toolChildren.push(
+          <div key={tc.id} className="ai-agent-tool">
+            <div className="ai-agent-tool-command">
+              <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
+              <span className="ai-agent-tool-cmd-text">{tc.command.startsWith('$') ? tc.command : `$ ${tc.command}`}</span>
+            </div>
+            {body}
+          </div>
+        )
+      }
+      rows.push(
+        <div key={i} className="ai-agent-msg ai-agent-assistant">
+          {msg.text ? <div className="ai-agent-assistant-text"><MarkdownText text={msg.text} /></div> : null}
+          {toolChildren}
+          {msg.stopped ? <div className="ai-agent-interrupted">interrupted</div> : null}
+        </div>
+      )
+      continue
+    }
+    const badge = toolBadge(msg.name)
+    rows.push(
+      <div key={i} className="ai-agent-tool">
+        <div className="ai-agent-tool-command">
+          <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
+          <span className="ai-agent-tool-cmd-text">{msg.command.startsWith('$') ? msg.command : `$ ${msg.command}`}</span>
+        </div>
+        <span className={`ai-agent-tool-outcome ${msg.outcome}`}>{outcomeLabel(msg.outcome)}</span>
+      </div>
+    )
+  }
+
+  if (running && stream) {
+    rows.push(
+      <div key="stream" className="ai-agent-msg ai-agent-assistant">
+        <div className="ai-agent-assistant-text"><MarkdownText text={stream} /></div>
+      </div>
+    )
+  } else if (running) {
+    rows.push(
+      <div key="thinking" className="ai-agent-msg ai-agent-assistant">
+        <div className="ai-agent-thinking" aria-live="polite">
+          Thinking
+          <span className="ai-agent-thinking-dots" aria-hidden="true">
+            <span>.</span>
+            <span>.</span>
+            <span>.</span>
+          </span>
+        </div>
+      </div>
+    )
+  }
+
+  return <>{rows}</>
+})
 
 interface ViewState {
   providers: AiAgentProviderConfig[]
@@ -293,9 +486,12 @@ export default function AiAgentView({
   /** Prevents repeated initial model refreshes for the Ollama preset. */
   const mountedOllamaRefreshRef = useRef(false)
 
-  const send = (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
-    void window.wassh.sendPluginMessage(tabId, pluginId, payload)
-  }
+  const send = useCallback(
+    (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
+      void window.wassh.sendPluginMessage(tabId, pluginId, payload)
+    },
+    [tabId, pluginId]
+  )
 
   const showToast = (kind: 'error' | 'info', text: string): void => {
     setToast({ kind, text })
@@ -713,168 +909,25 @@ export default function AiAgentView({
    * Drop the prompt at `index` and everything after it, then put its text back
    * in the composer so it can be edited and resent.
    */
-  const rewindTo = (index: number): void => {
-    const message = conv?.messages[index]
-    if (!message || message.role !== 'user') {
-      return
-    }
-    send({ type: 'rewind', messageIndex: index })
-    setInput(message.text)
-    setAttach(message.usedTerminalContext === true)
-    promptInputRef.current?.focus()
-  }
-
-  const messageRows: ReactElement[] = []
-  for (let i = 0; i < messages.length; i += 1) {
-    const msg = messages[i]
-    if (msg.role === 'user') {
-      const canRewind = !running
-      messageRows.push(
-        <div
-          key={i}
-          className={`ai-agent-msg ai-agent-user${canRewind ? ' ai-agent-rewindable' : ''}`}
-          onClick={canRewind ? () => rewindTo(i) : undefined}
-          title={canRewind ? 'Rewind to this prompt and edit it' : undefined}
-        >
-          <div className="ai-agent-msg-meta">
-            {msg.attachedFiles && msg.attachedFiles.length > 0 ? (
-              <span
-                className="ai-agent-ctx-tag"
-                title={msg.attachedFiles.join(', ')}
-              >
-                +{msg.attachedFiles.length} file{msg.attachedFiles.length === 1 ? '' : 's'}
-              </span>
-            ) : null}
-            {msg.usedTerminalContext ? (
-              <span className="ai-agent-ctx-tag" title="Recent terminal output was attached">
-                +terminal
-              </span>
-            ) : null}
-          </div>
-          <div className="ai-agent-user-text"><MarkdownText text={msg.text} /></div>
-        </div>
-      )
-      continue
-    }
-    if (msg.role === 'assistant') {
-      const toolChildren: ReactElement[] = []
-      for (const tc of msg.toolCalls ?? []) {
-        const outputs: AiAgentConversationToolMsg[] = []
-        for (let j = i + 1; j < messages.length; j += 1) {
-          const later = messages[j]
-          if (later.role === 'assistant') {
-            break
-          }
-          if (later.role === 'tool' && later.toolCallId === tc.id) {
-            outputs.push(later)
-          }
-        }
-        const isCurrentlyRunning = running && outputs.length === 0
-        const body =
-          outputs.length === 0 ? (
-            toolOutput[tc.id] ? (
-              <div className="ai-agent-tool-out">
-                <div className="ai-agent-tool-meta">
-                  <span className="ai-agent-tool-status running">running</span>
-                  {isCurrentlyRunning ? (
-                    <button
-                      type="button"
-                      className="ai-agent-tool-stop-btn"
-                      title="Stop command"
-                      onClick={() => send({ type: 'stop' })}
-                    >
-                      Stop
-                    </button>
-                  ) : null}
-                </div>
-                <pre className="ai-agent-out">{toolOutput[tc.id]}</pre>
-              </div>
-            ) : (
-              <div className="ai-agent-tool-meta">
-                <span className={`ai-agent-tool-status${isCurrentlyRunning ? ' running' : ''}`}>
-                  {isCurrentlyRunning ? 'running…' : 'interrupted'}
-                </span>
-                {isCurrentlyRunning ? (
-                  <button
-                    type="button"
-                    className="ai-agent-tool-stop-btn"
-                    title="Stop command"
-                    onClick={() => send({ type: 'stop' })}
-                  >
-                    Stop
-                  </button>
-                ) : null}
-              </div>
-            )
-          ) : (
-            outputs.map((out, k) => (
-              <div key={k} className="ai-agent-tool-out">
-                <div className="ai-agent-tool-meta">
-                  <span className={`ai-agent-tool-outcome ${out.outcome}`}>
-                    {outcomeLabel(out.outcome)}
-                  </span>
-                  {out.truncated ? <span>truncated</span> : null}
-                </div>
-                {out.content ? (
-                  <pre className="ai-agent-out">{out.content}</pre>
-                ) : (
-                  <span className="ai-agent-tool-empty">(no output)</span>
-                )}
-              </div>
-            ))
-          )
-        const badge = toolBadge(tc.name)
-        toolChildren.push(
-          <div key={tc.id} className="ai-agent-tool">
-            <div className="ai-agent-tool-command">
-              <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
-              <span className="ai-agent-tool-cmd-text">{tc.command.startsWith('$') ? tc.command : `$ ${tc.command}`}</span>
-            </div>
-            {body}
-          </div>
-        )
+  const rewindTo = useCallback(
+    (index: number): void => {
+      const message = conv?.messages[index]
+      if (!message || message.role !== 'user') {
+        return
       }
-      messageRows.push(
-        <div key={i} className="ai-agent-msg ai-agent-assistant">
-          {msg.text ? <div className="ai-agent-assistant-text"><MarkdownText text={msg.text} /></div> : null}
-          {toolChildren}
-          {msg.stopped ? <div className="ai-agent-interrupted">interrupted</div> : null}
-        </div>
-      )
-      continue
-    }
-    const badge = toolBadge(msg.name)
-    messageRows.push(
-      <div key={i} className="ai-agent-tool">
-        <div className="ai-agent-tool-command">
-          <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
-          <span className="ai-agent-tool-cmd-text">{msg.command.startsWith('$') ? msg.command : `$ ${msg.command}`}</span>
-        </div>
-        <span className={`ai-agent-tool-outcome ${msg.outcome}`}>{outcomeLabel(msg.outcome)}</span>
-      </div>
-    )
-  }
+      send({ type: 'rewind', messageIndex: index })
+      setInput(message.text)
+      setAttach(message.usedTerminalContext === true)
+      promptInputRef.current?.focus()
+    },
+    [conv, send]
+  )
 
-  if (running && stream) {
-    messageRows.push(
-      <div key="stream" className="ai-agent-msg ai-agent-assistant">
-        <div className="ai-agent-assistant-text"><MarkdownText text={stream} /></div>
-      </div>
-    )
-  } else if (running) {
-    messageRows.push(
-      <div key="thinking" className="ai-agent-msg ai-agent-assistant">
-        <div className="ai-agent-thinking" aria-live="polite">
-          Thinking
-          <span className="ai-agent-thinking-dots" aria-hidden="true">
-            <span>.</span>
-            <span>.</span>
-            <span>.</span>
-          </span>
-        </div>
-      </div>
-    )
-  }
+  const stopRun = useCallback((): void => {
+    send({ type: 'stop' })
+  }, [send])
+
+  const transcriptEmpty = messages.length === 0 && !running
 
   useEffect(() => {
     const el = messagesRef.current
@@ -1075,7 +1128,7 @@ export default function AiAgentView({
           {view.lastError ? <div className="ai-agent-error-bar">{view.lastError}</div> : null}
 
           <div className="ai-agent-messages" ref={messagesRef}>
-            {messageRows.length === 0 ? (
+            {transcriptEmpty ? (
               <div className="ai-agent-empty">
                 {providers.length === 0
                   ? 'No model providers configured yet. Configure one in Options.'
@@ -1084,7 +1137,14 @@ export default function AiAgentView({
                     : 'Connect an SSH session to use the AI agent.'}
               </div>
             ) : (
-              messageRows
+              <MessageList
+                messages={messages}
+                running={running}
+                stream={stream}
+                toolOutput={toolOutput}
+                onRewind={rewindTo}
+                onStop={stopRun}
+              />
             )}
           </div>
 
