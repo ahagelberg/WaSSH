@@ -33,6 +33,7 @@
     "src/plugins/builtins/**/defaults.ts",
     "src/plugins/builtins/**/manifest.ts",
     "src/plugins/builtins/ai-agent/apiMethods.ts",
+    "src/plugins/builtins/ai-agent/permissions.ts",
     "src/plugins/builtins/ai-agent/pluginApiTools.ts",
     "src/plugins/builtins/ai-agent/ProviderSettings.tsx",
     "src/shared/**/*"
