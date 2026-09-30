@@ -519,6 +519,9 @@
 .ai-agent-user-text p,
 .ai-agent-assistant-text p {
   margin: 0 0 8px;
+  /* Markdown turns a single newline into a soft break (a plain "\n"); without
+     pre-wrap the bubble collapses those line feeds into spaces. */
+  white-space: pre-wrap;
 }
 
 .ai-agent-user-text h1,
