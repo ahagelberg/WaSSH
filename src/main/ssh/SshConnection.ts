@@ -614,7 +614,12 @@ export class SshConnection extends EventEmitter {
     let username = this.usernameFor(this.connection)
     if (!username) {
       this.emitStatus('authenticating', 'Username required')
-      username = (await this.promptTerminal('login as: ', false)).trim()
+      while (!username) {
+        username = (await this.promptTerminal('login as: ', false)).trim()
+        if (!username && (this.disposed || this.intentionalDisconnect || this.openAttempt.isCancelled)) {
+          return
+        }
+      }
       this.interactiveUsername = username
       this.connection.username = username
     }
@@ -903,7 +908,7 @@ export class SshConnection extends EventEmitter {
     }
 
     await this.ensureTargetCredentials()
-    if (this.disposed || this.intentionalDisconnect) {
+    if (this.disposed || this.intentionalDisconnect || this.openAttempt.isCancelled) {
       this.opening = false
       return
     }
