@@ -209,6 +209,7 @@ export default function TabBar({
         <button
           key={tab.id}
           type="button"
+          title={tab.title}
           data-tab-id={tab.id}
           className={`tab${tab.active && draggingId !== tab.id ? ' active' : ''}${draggingId === tab.id ? ' dragging' : ''}`}
           data-tab-color={tab.tabColor || undefined}
