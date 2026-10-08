@@ -139,6 +139,12 @@ export interface SshTunnel {
   destPort: number
 }
 
+export interface TunnelTemplate {
+  id: string
+  name: string
+  tunnel: Omit<SshTunnel, 'id'>
+}
+
 /** Default terminal columns/rows before first fit */
 export const DEFAULT_TERM_COLS = 80
 export const DEFAULT_TERM_ROWS = 24
@@ -493,6 +499,7 @@ export interface AppSettings {
   pluginPanelPlacements: Record<string, PluginViewPlacement>
   /** Stacking order of plugin panels (earlier = first in slot) */
   pluginPanelOrder: string[]
+  tunnelTemplates: TunnelTemplate[]
   /** Defaults for new hosts / quick connect; hosts with “use default” inherit these */
   sessionStyleDefaults: SessionStyleDefaults
 }
@@ -532,6 +539,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pluginSettings: {},
   pluginPanelPlacements: {},
   pluginPanelOrder: [],
+  tunnelTemplates: [],
   sessionStyleDefaults: { ...DEFAULT_SESSION_STYLE_DEFAULTS }
 }
 

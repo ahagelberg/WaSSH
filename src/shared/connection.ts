@@ -79,6 +79,7 @@ import {
   type SerialParity,
   type SerialStopBits,
   type SshTunnel,
+  type TunnelTemplate,
   type TunnelType
 } from './types'
 import { normalizeHostPluginSettings } from './pluginApi'
@@ -369,6 +370,30 @@ export function tunnelConfigFrom(
     x11Forwarding:
       typeof src?.x11Forwarding === 'boolean' ? src.x11Forwarding : DEFAULT_X11_FORWARDING
   }
+}
+
+export function normalizeTunnelTemplates(value: unknown): TunnelTemplate[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const templates: TunnelTemplate[] = []
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' ||
+      !raw.id.trim() || typeof raw.name !== 'string' || !raw.name.trim() ||
+      !raw.tunnel || typeof raw.tunnel !== 'object' || Array.isArray(raw.tunnel)) {
+      continue
+    }
+    const tunnel = raw.tunnel
+    if (typeof tunnel.listenHost !== 'string' || typeof tunnel.destHost !== 'string') {
+      continue
+    }
+    if (templates.some((template) => template.id === raw.id)) {
+      continue
+    }
+    const { id: _id, ...config } = normalizeTunnel(tunnel, templates.length)
+    templates.push({ id: raw.id, name: raw.name.trim(), tunnel: config })
+  }
+  return templates
 }
 
 export function emptyTunnel(): SshTunnel {

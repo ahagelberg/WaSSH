@@ -430,6 +430,23 @@
   justify-self: start;
 }
 
+.settings-tunnel-template-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+}
+
+.settings-tunnel-template-controls select,
+.settings-tunnel-template-controls input {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-tunnel-actions {
+  display: grid;
+  gap: var(--gap);
+}
+
 .tag-input {
   display: flex;
   flex-wrap: wrap;

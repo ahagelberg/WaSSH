@@ -49,6 +49,7 @@ import {
   type SerialParity,
   type SerialStopBits,
   type SshTunnel,
+  type TunnelTemplate,
   type TunnelType
 } from '@shared/types'
 import {
@@ -194,6 +195,12 @@ export default function HostSessionSettingsDialog({
   const [plugins, setPlugins] = useState<PluginListItem[]>([])
   const [settingsViewPluginId, setSettingsViewPluginId] = useState<string | null>(null)
   const [showTunnelBuilder, setShowTunnelBuilder] = useState(false)
+  const [tunnelTemplates, setTunnelTemplates] = useState<TunnelTemplate[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState('')
+  const [templateTunnel, setTemplateTunnel] = useState<SshTunnel | null>(null)
+  const [templateName, setTemplateName] = useState('')
+  const [templateBusy, setTemplateBusy] = useState(false)
+  const [templateError, setTemplateError] = useState('')
   const identityLocked = mode === 'editOpenSession' && connected
   const editingHostId =
     mode === 'editHost' && 'id' in initial ? initial.id : form.hostId || ''
@@ -276,6 +283,26 @@ export default function HostSessionSettingsDialog({
 
   useEffect(() => {
     void window.wassh.listPlugins().then(setPlugins)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const unsubscribe = window.wassh.onSettingsChanged((settings) => {
+      setTunnelTemplates(settings.tunnelTemplates)
+    })
+    void window.wassh.getSettings().then((settings) => {
+      if (!cancelled) {
+        setTunnelTemplates(settings.tunnelTemplates)
+      }
+    }).catch((error: unknown) => {
+      if (!cancelled) {
+        setTemplateError(String(error))
+      }
+    })
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
   }, [])
 
   const sections: SettingsSection[] = useMemo(() => {
@@ -815,6 +842,45 @@ export default function HostSessionSettingsDialog({
       patch({ tunnels: form.tunnels.filter((t) => t.id !== id) })
     }
 
+    const selectedTemplate = tunnelTemplates.find((template) => template.id === selectedTemplateId)
+    const updateTemplates = async (
+      update: (templates: TunnelTemplate[]) => TunnelTemplate[]
+    ): Promise<boolean> => {
+      setTemplateBusy(true)
+      setTemplateError('')
+      let settings
+      try {
+        settings = await window.wassh.getSettings()
+        settings = await window.wassh.setSettings({
+          tunnelTemplates: update(settings.tunnelTemplates)
+        })
+      } catch (error) {
+        setTemplateError(String(error))
+        setTemplateBusy(false)
+        return false
+      }
+      setTunnelTemplates(settings.tunnelTemplates)
+      setTemplateBusy(false)
+      return true
+    }
+    const saveTemplate = async (): Promise<void> => {
+      const name = templateName.trim()
+      if (!templateTunnel || !name) {
+        return
+      }
+      const { id: _id, ...tunnel } = templateTunnel
+      const template: TunnelTemplate = { id: crypto.randomUUID(), name, tunnel }
+      if (await updateTemplates((templates) => [...templates, template])) {
+        setSelectedTemplateId(template.id)
+        setTemplateTunnel(null)
+      }
+    }
+    const deleteTemplate = async (): Promise<void> => {
+      if (await updateTemplates((templates) => templates.filter((template) => template.id !== selectedTemplateId))) {
+        setSelectedTemplateId('')
+      }
+    }
+
     const tunnelRows = (
       <>
         <div className="settings-row">
@@ -838,6 +904,71 @@ export default function HostSessionSettingsDialog({
             </span>
           </div>
           <div className="settings-tunnel-list">
+            {showTunnelBuilder ? (
+              <TunnelBuilder
+                sshEndpoint={sshEndpoint}
+                existing={form.tunnels}
+                onAdd={(tunnel) => {
+                  patch({ tunnels: [...form.tunnels, tunnel] })
+                  setShowTunnelBuilder(false)
+                }}
+                onCancel={() => setShowTunnelBuilder(false)}
+              />
+            ) : (
+              <button
+                type="button"
+                className="settings-tunnel-add"
+                onClick={() => setShowTunnelBuilder(true)}
+              >
+                Add tunnel
+              </button>
+            )}
+            <div className="settings-tunnel-template-controls">
+              <select
+                aria-label="Global tunnel template"
+                value={selectedTemplate?.id ?? ''}
+                disabled={templateBusy}
+                onChange={(event) => setSelectedTemplateId(event.target.value)}
+              >
+                <option value="">Select template</option>
+                {tunnelTemplates.map((template) => (
+                  <option key={template.id} value={template.id}>{template.name}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={!selectedTemplate || templateBusy}
+                onClick={() => {
+                  if (selectedTemplate) {
+                    patch({ tunnels: [...form.tunnels, { ...selectedTemplate.tunnel, id: crypto.randomUUID() }] })
+                  }
+                }}
+              >
+                Add from template
+              </button>
+              <button type="button" disabled={!selectedTemplate || templateBusy} onClick={() => void deleteTemplate()}>
+                Delete template
+              </button>
+            </div>
+            {templateTunnel ? (
+              <div className="settings-tunnel-template-controls">
+                <input
+                  type="text"
+                  aria-label="Template name"
+                  placeholder="Template name"
+                  value={templateName}
+                  disabled={templateBusy}
+                  onChange={(event) => setTemplateName(event.target.value)}
+                />
+                <button type="button" disabled={!templateName.trim() || templateBusy} onClick={() => void saveTemplate()}>
+                  Save template
+                </button>
+                <button type="button" disabled={templateBusy} onClick={() => setTemplateTunnel(null)}>
+                  Cancel
+                </button>
+              </div>
+            ) : null}
+            {templateError ? <div role="alert">{templateError}</div> : null}
             {form.tunnels.map((tunnel) => {
               const isDynamic = tunnel.type === TUNNEL_TYPE_DYNAMIC
               return (
@@ -903,31 +1034,25 @@ export default function HostSessionSettingsDialog({
                       })
                     }
                   />
-                  <button type="button" onClick={() => removeTunnel(tunnel.id)}>
-                    Remove
-                  </button>
+                  <div className="settings-tunnel-actions">
+                    <button
+                      type="button"
+                      disabled={templateBusy}
+                      onClick={() => {
+                        setTemplateTunnel({ ...tunnel })
+                        setTemplateName('')
+                        setTemplateError('')
+                      }}
+                    >
+                      Save template
+                    </button>
+                    <button type="button" onClick={() => removeTunnel(tunnel.id)}>
+                      Remove
+                    </button>
+                  </div>
                 </div>
               )
             })}
-            {showTunnelBuilder ? (
-              <TunnelBuilder
-                sshEndpoint={sshEndpoint}
-                existing={form.tunnels}
-                onAdd={(tunnel) => {
-                  patch({ tunnels: [...form.tunnels, tunnel] })
-                  setShowTunnelBuilder(false)
-                }}
-                onCancel={() => setShowTunnelBuilder(false)}
-              />
-            ) : (
-              <button
-                type="button"
-                className="settings-tunnel-add"
-                onClick={() => setShowTunnelBuilder(true)}
-              >
-                Add tunnel
-              </button>
-            )}
           </div>
         </div>
       </>
@@ -1022,7 +1147,13 @@ export default function HostSessionSettingsDialog({
     isSerial,
     styleDefaults,
     plugins,
-    showTunnelBuilder
+    showTunnelBuilder,
+    tunnelTemplates,
+    selectedTemplateId,
+    templateTunnel,
+    templateName,
+    templateBusy,
+    templateError
   ])
 
   const buildHostProfile = (): HostProfile => {

@@ -16,7 +16,7 @@ import {
   type ConnectionParams,
   type ReconnectMode
 } from '../../shared/types'
-import { sessionStyleOverridesFrom, tunnelConfigFrom, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
+import { sessionStyleOverridesFrom, tunnelConfigFrom, normalizeTunnelTemplates, protocolConfigFrom, sessionStyleDefaultsFrom, reconnectModeFrom, screenConfigFrom } from '../../shared/connection'
 import { normalizeTabPluginLayout } from '../../shared/pluginLayout'
 import { normalizeHostPluginSettings } from '../../shared/pluginApi'
 import { DEFAULT_ENABLED_PLUGIN_IDS } from '../plugins/builtinRegistry'
@@ -403,6 +403,7 @@ export class SettingsStore {
       pluginSettings,
       pluginPanelPlacements,
       pluginPanelOrder,
+      tunnelTemplates: normalizeTunnelTemplates(rest.tunnelTemplates),
       sessionStyleDefaults
     }
   }
@@ -410,7 +411,7 @@ export class SettingsStore {
   set(partial: Partial<AppSettings>): AppSettings {
     const merged = { ...this.get(), ...partial }
     const theme: AppTheme = merged.theme === 'light' ? 'light' : DEFAULT_THEME
-    const next = { ...merged, theme }
+    const next = { ...merged, theme, tunnelTemplates: normalizeTunnelTemplates(merged.tunnelTemplates) }
     writeJson(SETTINGS_FILE, next)
     return next
   }
