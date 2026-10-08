@@ -7,4 +7,5 @@ release
 *.tsbuildinfo
 out/
 .aider*
-.github/
+.github
+PROJECT_CONTEXT.md
