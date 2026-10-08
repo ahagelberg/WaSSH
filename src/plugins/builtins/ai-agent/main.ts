@@ -25,6 +25,7 @@ import {
   AI_AGENT_REMOTE_FS_BUNDLES,
   AI_AGENT_TERMINAL_METHODS,
   AI_AGENT_WEB_ACCESS_ALL_METHODS,
+  TOOL_DEF_ASK_USER,
   TOOL_DEF_RUN_COMMAND
 } from './apiMethods'
 import { aiAgentManifest } from './manifest'
@@ -61,6 +62,7 @@ import {
   AI_AGENT_TOOL_DEV_GREP,
   AI_AGENT_TOOL_DEV_LIST_DIR,
   AI_AGENT_TOOL_DEV_VIEW_FILE,
+  AI_AGENT_TOOL_ASK_USER,
   AI_AGENT_TOOL_GET_CURRENT_TIME,
   AI_AGENT_TOOL_LOCAL_FS_LIST,
   AI_AGENT_TOOL_LOCAL_FS_READ,
@@ -90,6 +92,7 @@ import {
   type AiAgentConversationToolMsg,
   type AiAgentDataFile,
   type AiAgentProviderConfig,
+  type AiAgentQuestionRequest,
   type AiAgentRendererMessage,
   type AiAgentRunPhase,
   type AiAgentSudoRequest,
@@ -229,6 +232,8 @@ interface HostState {
   extraDeny: string[]
   pendingApproval: AiAgentApprovalRequest | null
   approvalResolve: ((answer: AiAgentApprovalAnswer) => void) | null
+  pendingQuestion: AiAgentQuestionRequest | null
+  questionResolve: ((selected: number[] | null) => void) | null
   pendingSudo: AiAgentSudoRequest | null
   sudoResolve: ((password: string | null) => void) | null
   /** In-memory only — never persisted or sent to the renderer */
@@ -620,6 +625,7 @@ function pushState(host: HostState): void {
     hostLabel: host.hostLabel,
     ssh,
     pendingApproval: host.pendingApproval,
+    pendingQuestion: host.pendingQuestion,
     pendingSudo: host.pendingSudo,
     rules: dataFile?.rules ?? '',
     lastError: host.lastError
@@ -790,6 +796,8 @@ function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext):
       extraDeny: [],
       pendingApproval: null,
       approvalResolve: null,
+      pendingQuestion: null,
+      questionResolve: null,
       pendingSudo: null,
       sudoResolve: null,
       sudoPassword: null,
@@ -832,6 +840,8 @@ function releaseHost(hostKey: string, ctx: PluginMainContext): void {
       host.extraDeny = []
       host.approvalResolve = null
       host.pendingApproval = null
+      host.questionResolve = null
+      host.pendingQuestion = null
       if (host.sudoResolve) {
         const resolve = host.sudoResolve
         host.sudoResolve = null
@@ -1022,6 +1032,12 @@ function pauseHost(host: HostState): void {
   }
   host.pendingApproval = null
   host.approvalResolve = null
+  if (host.questionResolve) {
+    const resolve = host.questionResolve
+    host.questionResolve = null
+    resolve(null)
+  }
+  host.pendingQuestion = null
   if (host.sudoResolve) {
     const resolve = host.sudoResolve
     host.sudoResolve = null
@@ -1175,6 +1191,28 @@ async function askApproval(
   host.approvalResolve = null
   host.pendingApproval = null
   return answer
+}
+
+async function askUser(
+  host: HostState,
+  question: string,
+  options: string[],
+  multiSelect: boolean
+): Promise<number[] | null> {
+  host.pendingQuestion = {
+    requestId: randomUUID(),
+    question,
+    options,
+    multiSelect
+  }
+  host.phase = 'ask'
+  pushState(host)
+  const selected = await new Promise<number[] | null>((resolve) => {
+    host.questionResolve = resolve
+  })
+  host.questionResolve = null
+  host.pendingQuestion = null
+  return selected
 }
 
 function parseJsonArgs(jsonStr: string): Record<string, unknown> {
@@ -1335,6 +1373,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
 
   const activeTools: PluginApiMethod[] = [
     TOOL_DEF_RUN_COMMAND,
+    TOOL_DEF_ASK_USER,
     ...allowedGroupMethods(
       PLUGIN_ID_AI_AGENT,
       AI_AGENT_GROUP_WEB_ACCESS,
@@ -1448,6 +1487,54 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
               displayCommand,
               `Tool "${toolName}" is disabled for this conversation.`,
               'denied',
+              false
+            )
+          )
+          pushState(host)
+          persistConversation(host)
+          continue
+        }
+
+        if (toolName === AI_AGENT_TOOL_ASK_USER) {
+          const question = typeof toolArgs.question === 'string' ? toolArgs.question.trim() : ''
+          const rawOptions = Array.isArray(toolArgs.options) ? toolArgs.options : []
+          const options = rawOptions.map((option) => typeof option === 'string' ? option.trim() : '')
+          if (!question || options.length < 2 || options.some((option) => !option)) {
+            conv.messages.push(
+              toolResultMessage(
+                tc.id,
+                toolName,
+                displayCommand,
+                'A question and at least two non-empty options are required.',
+                'error',
+                false
+              )
+            )
+            pushState(host)
+            persistConversation(host)
+            continue
+          }
+          const selected = await askUser(host, question, options, toolArgs.multiSelect === true)
+          if (!host.inRun) {
+            keepRunning = false
+            break
+          }
+          if (selected === null || host.stopped) {
+            conv.messages.push(
+              toolResultMessage(tc.id, toolName, question, 'The user cancelled the question.', 'cancelled', false)
+            )
+            pushState(host)
+            persistConversation(host)
+            keepRunning = false
+            break
+          }
+          conv.messages.push(
+            toolResultMessage(
+              tc.id,
+              toolName,
+              question,
+              JSON.stringify(selected.map((index) => options[index])),
+              'ok',
               false
             )
           )
@@ -2083,6 +2170,12 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
           message.decision === 'denyAlways' ||
           message.decision === 'allowSession')
       )
+    case 'questionResponse':
+      return (
+        typeof message.requestId === 'string' &&
+        Array.isArray(message.selected) &&
+        message.selected.every((index) => typeof index === 'number' && Number.isInteger(index))
+      )
     case 'sudoPassword':
       return (
         typeof message.requestId === 'string' &&
@@ -2216,6 +2309,29 @@ async function handleRendererMessage(
     }
     return
   }
+  if (payload.type === 'questionResponse') {
+    const request = host.pendingQuestion
+    const selected = payload.selected
+    if (
+      host.phase === 'ask' &&
+      request &&
+      request.requestId === payload.requestId &&
+      host.questionResolve &&
+      selected.length > 0 &&
+      new Set(selected).size === selected.length &&
+      selected.every((index) => index >= 0 && index < request.options.length) &&
+      (request.multiSelect || selected.length === 1)
+    ) {
+      const resolve = host.questionResolve
+      host.questionResolve = null
+      resolve(selected)
+      if (host.inRun) {
+        host.phase = 'running'
+      }
+      pushState(host)
+    }
+    return
+  }
   if (payload.type === 'sudoPassword') {
     if (host.phase === 'ask_sudo' && host.pendingSudo?.requestId === payload.requestId) {
       const resolve = host.sudoResolve
@@ -2234,6 +2350,12 @@ async function handleRendererMessage(
       host.approvalResolve = null
       resolve({ decision: 'deny' })
     }
+    if (host.phase === 'ask' && host.questionResolve) {
+      const resolve = host.questionResolve
+      host.questionResolve = null
+      resolve(null)
+    }
+    host.pendingQuestion = null
     if (host.phase === 'ask_sudo' && host.sudoResolve) {
       const resolve = host.sudoResolve
       host.sudoResolve = null

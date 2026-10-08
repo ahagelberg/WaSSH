@@ -16,6 +16,7 @@ export const AI_AGENT_SETTING_WEB_SEARCH_API_KEY = 'webSearchApiKey'
 export type AiAgentWebSearchProvider = 'bing' | 'brave' | 'google' | 'duckduckgo' | 'custom'
 
 export const AI_AGENT_TOOL_RUN_COMMAND = 'run_command'
+export const AI_AGENT_TOOL_ASK_USER = 'ask_user'
 export const AI_AGENT_TOOL_WEB_FETCH = 'web_fetch'
 export const AI_AGENT_TOOL_WEB_SEARCH = 'web_search'
 export const AI_AGENT_TOOL_REMOTE_FS_READ = 'remote_fs_read_file'
@@ -152,6 +153,13 @@ export interface AiAgentSudoRequest {
   command: string
 }
 
+export interface AiAgentQuestionRequest {
+  requestId: string
+  question: string
+  options: string[]
+  multiSelect: boolean
+}
+
 
 /** Conversation fields carried by every state snapshot; messages travel separately. */
 export type AiAgentConversationMeta = Omit<AiAgentConversation, 'messages'>
@@ -175,6 +183,7 @@ export interface AiAgentStateSnapshot {
   hostLabel: string
   ssh: boolean
   pendingApproval: AiAgentApprovalRequest | null
+  pendingQuestion: AiAgentQuestionRequest | null
   pendingSudo: AiAgentSudoRequest | null
   rules: string
   lastError?: string
@@ -226,6 +235,7 @@ export type AiAgentRendererMessage =
   | { type: 'dismissError' }
   /** `pattern` is the rule list entry an 'allowAlways'/'denyAlways' decision saves. */
   | { type: 'approval'; requestId: string; decision: AiAgentApprovalDecision; pattern?: string }
+  | { type: 'questionResponse'; requestId: string; selected: number[] }
   | { type: 'sudoPassword'; requestId: string; password: string | null }
   | { type: 'rulesChanged'; rules: string }
   | { type: 'select'; providerId: string; model: string }

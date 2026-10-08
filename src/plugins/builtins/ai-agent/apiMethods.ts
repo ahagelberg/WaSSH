@@ -13,6 +13,7 @@ import {
   AI_AGENT_TOOL_DEV_GREP,
   AI_AGENT_TOOL_DEV_LIST_DIR,
   AI_AGENT_TOOL_DEV_VIEW_FILE,
+  AI_AGENT_TOOL_ASK_USER,
   AI_AGENT_TOOL_GET_CURRENT_TIME,
   AI_AGENT_TOOL_LOCAL_FS_LIST,
   AI_AGENT_TOOL_LOCAL_FS_READ,
@@ -61,6 +62,32 @@ export const TOOL_DEF_GET_CURRENT_TIME: PluginApiMethod = {
   parameters: {
     type: 'object',
     properties: {}
+  }
+}
+
+export const TOOL_DEF_ASK_USER: PluginApiMethod = {
+  name: AI_AGENT_TOOL_ASK_USER,
+  description:
+    'Ask the user to choose from options when their preference or missing information affects what to do next. ' +
+    'Provide at least two concise options. Set multiSelect to true when the user may choose more than one option.',
+  parameters: {
+    type: 'object',
+    properties: {
+      question: {
+        type: 'string',
+        description: 'The question to show the user'
+      },
+      options: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'The available choices, with at least two options'
+      },
+      multiSelect: {
+        type: 'boolean',
+        description: 'Whether the user may select multiple options (defaults to false)'
+      }
+    },
+    required: ['question', 'options']
   }
 }
 

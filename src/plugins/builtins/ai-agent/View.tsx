@@ -35,6 +35,7 @@ import {
   type AiAgentDeltaPayload,
   type AiAgentProviderConfig,
   type AiAgentProviderProtocol,
+  type AiAgentQuestionRequest,
   type AiAgentStateSnapshot,
   type AiAgentToastPayload,
   type AiAgentToolOutputPayload
@@ -356,6 +357,7 @@ interface ViewState {
   hostLabel: string
   ssh: boolean
   pendingApproval: AiAgentStateSnapshot['pendingApproval']
+  pendingQuestion: AiAgentStateSnapshot['pendingQuestion']
   pendingSudo: AiAgentStateSnapshot['pendingSudo']
   rules: string
   lastError?: string
@@ -371,6 +373,7 @@ function emptyViewState(): ViewState {
     hostLabel: '',
     ssh: false,
     pendingApproval: null,
+    pendingQuestion: null,
     pendingSudo: null,
     rules: ''
   }
@@ -468,6 +471,10 @@ export default function AiAgentView({
   onSettingsPatch
 }: PluginViewProps): ReactElement {
   const [view, setView] = useState<ViewState>(emptyViewState)
+  const [questionSelection, setQuestionSelection] = useState<{
+    requestId: string
+    selected: number[]
+  } | null>(null)
   const [stream, setStream] = useState('')
   const [toolOutput, setToolOutput] = useState<Record<string, string>>({})
   const [input, setInput] = useState('')
@@ -543,6 +550,7 @@ export default function AiAgentView({
           hostLabel: payload.hostLabel,
           ssh: payload.ssh,
           pendingApproval: payload.pendingApproval,
+          pendingQuestion: payload.pendingQuestion,
           pendingSudo: payload.pendingSudo,
           rules: payload.rules,
           lastError: payload.lastError
@@ -888,6 +896,32 @@ export default function AiAgentView({
     }
     send({ type: 'sudoPassword', requestId: request.requestId, password })
     setSudoPassword('')
+  }
+
+  const selectedQuestionOptions = (request: AiAgentQuestionRequest): number[] =>
+    questionSelection?.requestId === request.requestId ? questionSelection.selected : []
+
+  const selectQuestionOption = (request: AiAgentQuestionRequest, index: number): void => {
+    const selected = selectedQuestionOptions(request)
+    const next = request.multiSelect
+      ? selected.includes(index)
+        ? selected.filter((selectedIndex) => selectedIndex !== index)
+        : [...selected, index]
+      : [index]
+    setQuestionSelection({ requestId: request.requestId, selected: next })
+  }
+
+  const submitQuestion = (): void => {
+    const request = view.pendingQuestion
+    if (!request) {
+      return
+    }
+    const selected = selectedQuestionOptions(request)
+    if (selected.length === 0) {
+      return
+    }
+    send({ type: 'questionResponse', requestId: request.requestId, selected })
+    setQuestionSelection(null)
   }
 
   useEffect(() => {
@@ -1242,6 +1276,33 @@ export default function AiAgentView({
             </div>
           ) : null}
 
+          {view.runPhase === 'ask' && view.pendingQuestion ? (
+            <fieldset className="ai-agent-question">
+              <legend>{view.pendingQuestion.question}</legend>
+              <div className="ai-agent-question-options">
+                {view.pendingQuestion.options.map((option, index) => (
+                  <label className="ai-agent-question-option" key={index}>
+                    <input
+                      type={view.pendingQuestion?.multiSelect ? 'checkbox' : 'radio'}
+                      name={`ai-agent-question-${view.pendingQuestion!.requestId}`}
+                      checked={selectedQuestionOptions(view.pendingQuestion!).includes(index)}
+                      onChange={() => selectQuestionOption(view.pendingQuestion!, index)}
+                    />
+                    <span>{option}</span>
+                  </label>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="ai-agent-question-submit"
+                disabled={selectedQuestionOptions(view.pendingQuestion).length === 0}
+                onClick={submitQuestion}
+              >
+                Submit answer
+              </button>
+            </fieldset>
+          ) : null}
+
           {view.runPhase === 'ask_sudo' && view.pendingSudo ? (
             <div className="ai-agent-sudo">
               <div className="ai-agent-sudo-title">Sudo password required</div>
@@ -1362,7 +1423,9 @@ export default function AiAgentView({
             ) : null}
 
             <div className={`ai-agent-phase-bar ${phaseClass}`}>
-              {PHASE_LABELS[view.runPhase] ?? view.runPhase}
+              {view.runPhase === 'ask' && view.pendingQuestion
+                ? 'Waiting for your answer'
+                : PHASE_LABELS[view.runPhase] ?? view.runPhase}
             </div>
 
             {attachments.length > 0 ? (

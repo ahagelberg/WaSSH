@@ -921,6 +921,50 @@
   word-break: break-all;
 }
 
+.ai-agent-question {
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, var(--text-muted));
+  border-radius: var(--radius);
+  background: var(--bg-panel-2);
+  padding: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.ai-agent-question legend {
+  font-weight: 600;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.ai-agent-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ai-agent-question-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.ai-agent-question-option input {
+  flex-shrink: 0;
+  margin: 2px 0 0;
+}
+
+.ai-agent-question-submit {
+  margin-top: 6px;
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
 .ai-agent-sudo {
   flex-shrink: 0;
   border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--border));
