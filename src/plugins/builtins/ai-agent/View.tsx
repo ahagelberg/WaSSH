@@ -13,7 +13,6 @@ import './styles.css'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
   AI_AGENT_DEFAULT_CHAT_TITLE,
-  AI_AGENT_DEFAULT_PROVIDERS,
   AI_AGENT_MAX_ATTACHMENT_BYTES,
   AI_AGENT_MAX_ATTACHMENT_CHARS,
   AI_AGENT_MAX_ATTACHMENTS,
@@ -86,7 +85,7 @@ const PHASE_LABELS: PhaseLabel = {
   ask: 'Waiting for approval',
   ask_sudo: 'Waiting for sudo password',
   paused: 'Paused',
-  no_session: 'No SSH session'
+  no_session: 'No active session'
 }
 
 function isOllamaLike(provider: { id: string }): boolean {
@@ -503,14 +502,7 @@ export default function AiAgentView({
   /** Prevents repeated initial model refreshes for the Ollama preset. */
   const mountedOllamaRefreshRef = useRef(false)
 
-  const send = useCallback(
-    (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
-      void window.wassh.sendPluginMessage(tabId, pluginId, payload)
-    },
-    [tabId, pluginId]
-  )
-
-  const showToast = (kind: 'error' | 'info', text: string): void => {
+  const showToast = useCallback((kind: 'error' | 'info', text: string): void => {
     setToast({ kind, text })
     if (toastTimer.current) {
       clearTimeout(toastTimer.current)
@@ -519,7 +511,16 @@ export default function AiAgentView({
       toastTimer.current = null
       setToast(null)
     }, 5000)
-  }
+  }, [])
+
+  const send = useCallback(
+    (payload: Parameters<typeof window.wassh.sendPluginMessage>[2]): void => {
+      void window.wassh.sendPluginMessage(tabId, pluginId, payload).catch((error: unknown) => {
+        showToast('error', error instanceof Error ? error.message : String(error))
+      })
+    },
+    [tabId, pluginId, showToast]
+  )
 
   useEffect(() => {
     const off = window.wassh.onPluginMessage((ev) => {
@@ -672,10 +673,6 @@ export default function AiAgentView({
     }
     if (!activeModel) {
       showToast('error', 'Pick a model first.')
-      return false
-    }
-    if (!view.ssh) {
-      showToast('error', 'The AI agent needs an SSH session to run commands.')
       return false
     }
     return true
@@ -1206,9 +1203,7 @@ export default function AiAgentView({
               <div className="ai-agent-empty">
                 {providers.length === 0
                   ? 'No model providers configured yet. Configure one in Options.'
-                  : view.ssh
-                    ? 'Ask the agent to inspect or change something on this host. It can run commands when you approve them.'
-                    : 'Connect an SSH session to use the AI agent.'}
+                  : 'Ask the agent to help with this session. It can use terminal tools when you approve them.'}
               </div>
             ) : (
               <MessageList
@@ -1516,7 +1511,7 @@ export default function AiAgentView({
                 className={busy ? 'ai-agent-danger' : undefined}
                 onClick={busy ? () => send({ type: 'stop' }) : handleSend}
                 disabled={
-                  busy ? false : (!input.trim() && attachments.length === 0 && !queued) || !view.ssh
+                  busy ? false : (!input.trim() && attachments.length === 0 && !queued)
                 }
                 title={busy ? 'Stop the current run' : 'Send message'}
               >

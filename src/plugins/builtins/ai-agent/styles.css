@@ -24,6 +24,26 @@
   border-right: 1px solid var(--border);
 }
 
+.ai-agent-provider-dialog-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0 8px;
+}
+
+.ai-agent-provider-dialog-list-header strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.ai-agent-provider-dialog-list-header > button {
+  display: inline-flex;
+  width: auto;
+  flex-shrink: 0;
+  padding: 6px 9px;
+}
+
 .ai-agent-provider-dialog-list button {
   display: grid;
   gap: 3px;
@@ -65,6 +85,40 @@
   min-width: 0;
   overflow: auto;
   padding: 20px 24px 28px;
+}
+
+.ai-agent-provider-dialog-editor h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.ai-agent-provider-template-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  max-width: 520px;
+}
+
+.ai-agent-provider-template-list button {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 11px 12px;
+  color: var(--text);
+  text-align: left;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.ai-agent-provider-template-list button:hover {
+  border-color: var(--accent);
+}
+
+.ai-agent-provider-template-list button span {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .ai-agent-provider-dialog-editor > label {
@@ -147,6 +201,18 @@
 
 .ai-agent-provider-dialog-editor > .ai-agent-danger {
   justify-self: start;
+}
+
+@media (max-width: 720px) {
+  .ai-agent-provider-dialog-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ai-agent-provider-dialog-list {
+    max-height: 180px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
 }
 
 .ai-agent-header {

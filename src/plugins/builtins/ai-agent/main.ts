@@ -3,7 +3,6 @@ import {
   AI_AGENT_CONVERSATIONS_PER_HOST_MAX,
   AI_AGENT_DATA_VERSION,
   AI_AGENT_DEFAULT_CHAT_TITLE,
-  AI_AGENT_DEFAULT_PROVIDERS,
   AI_AGENT_DEFAULT_WEB_SEARCH_PROVIDER,
   AI_AGENT_RAG_GLOBAL_SCOPE_ID,
   AI_AGENT_TITLE_MAX_CHARS,
@@ -547,7 +546,7 @@ function flushData(): void {
 }
 
 function findProvider(providerId: string): AiAgentProviderConfig | undefined {
-  const list = dataFile?.providers && dataFile.providers.length > 0 ? dataFile.providers : AI_AGENT_DEFAULT_PROVIDERS
+  const list = dataFile?.providers ?? []
   return list.find((p) => p.id === providerId)
 }
 
@@ -866,7 +865,8 @@ interface PromptAdditions {
 function systemPrompt(
   host: HostState,
   additions: PromptAdditions,
-  activeTools: PluginApiMethod[]
+  activeTools: PluginApiMethod[],
+  sshSession: boolean
 ): string {
   const conv = host.conversation
   const cwd = conv?.cwd || '/'
@@ -874,7 +874,7 @@ function systemPrompt(
   const hasTerminalTools = activeTools.some((t) => t.name.startsWith('terminal_'))
   const toolDescriptions = activeTools.map((t) => `- ${t.name}: ${t.description}`)
   const base = [
-    `You are an AI development agent connected to the remote host "${host.hostLabel}".`,
+    `You are an AI development agent connected to the active WaSSH session "${host.hostLabel}".`,
     `Current working directory: ${cwd}`,
     '',
     'You have access to tools to interact with the environment and system. Call tools whenever needed to gather facts or take actions.',
@@ -887,8 +887,15 @@ function systemPrompt(
     ...(hasTerminalTools
       ? [
           '- You share the user\u2019s live terminal. Anything you type appears in their session and they can see it.',
-          '- Prefer run_command for ordinary non-interactive commands; it is isolated and returns output directly.',
-          '- Use terminal_write / terminal_send_keys only for interactive programs (vim, top, ssh, REPLs) or when you must act in the user\u2019s own shell.',
+          ...(sshSession
+            ? [
+                '- Prefer run_command for ordinary non-interactive commands; it is isolated and returns output directly.',
+                '- Use terminal_write / terminal_send_keys for interactive programs (vim, top, ssh, REPLs) or when you must act in the user\u2019s own shell.'
+              ]
+            : [
+                '- This session has no isolated command runner. Use terminal_write to enter commands in the active session and terminal_wait to observe the result.',
+                '- Terminal commands share the user\u2019s live session; avoid changing prompts or interrupting programs the user may be using.'
+              ]),
           '- After typing into the terminal, call terminal_wait to observe the result before deciding the next step.',
           '- terminal_read shows the current screen contents, including output from commands the user ran themselves.'
         ]
@@ -1360,6 +1367,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
     return
   }
   const settings = ctx.getSettings()
+    const sshSession = ctx.isSshSession()
   const hostAllow = listSetting(settings, AI_AGENT_SETTING_HOST_ALLOW_RULES)
   const hostDeny = listSetting(settings, AI_AGENT_SETTING_HOST_DENY_RULES)
   const appAllow = listSetting(settings, AI_AGENT_SETTING_DEFAULT_ALLOW_RULES)
@@ -1372,7 +1380,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
   }
 
   const activeTools: PluginApiMethod[] = [
-    TOOL_DEF_RUN_COMMAND,
+    ...(sshSession ? [TOOL_DEF_RUN_COMMAND] : []),
     TOOL_DEF_ASK_USER,
     ...allowedGroupMethods(
       PLUGIN_ID_AI_AGENT,
@@ -1380,13 +1388,15 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
       AI_AGENT_WEB_ACCESS_ALL_METHODS,
       settings
     ),
-    ...allowedGroupMethodsWithBundles(
-      PLUGIN_ID_AI_AGENT,
-      AI_AGENT_GROUP_REMOTE_FS,
-      AI_AGENT_REMOTE_FILESYSTEM_METHODS,
-      AI_AGENT_REMOTE_FS_BUNDLES,
-      settings
-    ),
+    ...(sshSession
+      ? allowedGroupMethodsWithBundles(
+          PLUGIN_ID_AI_AGENT,
+          AI_AGENT_GROUP_REMOTE_FS,
+          AI_AGENT_REMOTE_FILESYSTEM_METHODS,
+          AI_AGENT_REMOTE_FS_BUNDLES,
+          settings
+        )
+      : []),
     ...allowedGroupMethodsWithBundles(
       PLUGIN_ID_AI_AGENT,
       AI_AGENT_GROUP_LOCAL_FS,
@@ -1427,7 +1437,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         apiKey,
         protocol: provider.protocol,
         model: conv.activeModel,
-        system: systemPrompt(host, promptAdditions, activeTools),
+        system: systemPrompt(host, promptAdditions, activeTools, sshSession),
         messages: toApiMessages(conv),
         tools: activeTools,
         maxTokens: MAX_TOKENS,
@@ -1988,7 +1998,7 @@ async function setupForTab(ctx: PluginMainContext, forceProbe: boolean): Promise
   }
   const isSsh = ctx.isSshSession()
   const hostKey = probe ? probe.hostKey : `tab:${ctx.tabId}`
-  const hostLabel = probe ? probe.hostLabel : isSsh ? 'SSH session' : 'Session'
+  const hostLabel = probe ? probe.hostLabel : isSsh ? 'SSH session' : 'Interactive session'
 
   const existing = tabs.get(ctx.tabId)
   if (existing && existing.hostKey === hostKey) {
@@ -2494,10 +2504,6 @@ async function handleRendererMessage(
     return
   }
   if (payload.type === 'chat') {
-    if (!ctx.isSshSession()) {
-      pushToast(host, 'error', 'The AI agent needs an SSH session to run commands.')
-      return
-    }
     if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
       pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
       return
@@ -2555,6 +2561,9 @@ async function handleApiCall(
   const args = params && typeof params === 'object' ? (params as Record<string, unknown>) : {}
 
   if (method === AI_AGENT_TOOL_RUN_COMMAND) {
+    if (!ctx.isSshSession()) {
+      throw new Error('Isolated run_command is only available for SSH. Use the live terminal tools for this session.')
+    }
     const host = hostForCtx(ctx)
     if (!host) {
       throw new Error('No active AI Agent conversation on this tab')

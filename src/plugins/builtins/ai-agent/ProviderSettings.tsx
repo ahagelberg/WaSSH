@@ -3,7 +3,8 @@ import type { PluginSettingsViewProps } from '@plugin-api/renderer'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
   AI_AGENT_DEFAULT_PROVIDERS,
-  AI_AGENT_OLLAMA_BASE_URL
+  AI_AGENT_OLLAMA_BASE_URL,
+  AI_AGENT_OLLAMA_PROVIDER_ID
 } from './defaults'
 import { PLUGIN_ID_AI_AGENT, aiAgentVaultId } from './id'
 import {
@@ -68,7 +69,7 @@ function toDraft(provider: AiAgentProviderConfig, hasKey: boolean): DraftProvide
 export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewProps): ReactElement {
   const [drafts, setDrafts] = useState<DraftProvider[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [templateId, setTemplateId] = useState(PROVIDER_TEMPLATES[0].id)
+  const [addingProvider, setAddingProvider] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
@@ -81,8 +82,7 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
       if (cancelled) return
       const data = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
       const stored = Array.isArray(data.providers) ? data.providers.filter(isProvider) : []
-      const providers = stored.length > 0 ? stored : AI_AGENT_DEFAULT_PROVIDERS
-      void Promise.all(providers.map(async (provider) =>
+      void Promise.all(stored.map(async (provider) =>
         toDraft(provider, Boolean(await window.wassh.getSecret(aiAgentVaultId(provider.id))))
       )).then((next) => {
         if (!cancelled) {
@@ -96,6 +96,9 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
   }, [])
 
   const selected = drafts.find((provider) => provider.id === selectedId) ?? null
+  const selectedIsCustom = selected ? !BUILTIN_PROVIDER_IDS.has(selected.id) : false
+  const canEditBaseUrl = selectedIsCustom || selected?.id === AI_AGENT_OLLAMA_PROVIDER_ID
+  const needsApiKey = selected?.id !== AI_AGENT_OLLAMA_PROVIDER_ID
   const selectedIsChecking = selected ? checkingProviderIds.has(selected.id) : false
   const selectedCheckMessage = selected ? checkMessages[selected.id] : undefined
   const updateSelected = (patch: Partial<DraftProvider>): void => {
@@ -206,19 +209,24 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
     }
   }
 
-  const addProvider = (): void => {
-    const template = PROVIDER_TEMPLATES.find((item) => item.id === templateId) ?? PROVIDER_TEMPLATES[0]
+  const addProvider = (template: AiAgentProviderConfig): void => {
     const existing = BUILTIN_PROVIDER_IDS.has(template.id)
       ? drafts.find((provider) => provider.id === template.id)
       : undefined
     if (existing) {
       setSelectedId(existing.id)
+      setAddingProvider(false)
       return
     }
     const provider = toDraft({ ...template, id: BUILTIN_PROVIDER_IDS.has(template.id) ? template.id : newProviderId() }, false)
     setDrafts((current) => [...current, provider])
     setSelectedId(provider.id)
+    setAddingProvider(false)
   }
+
+  const availableTemplates = PROVIDER_TEMPLATES.filter(
+    (template) => !BUILTIN_PROVIDER_IDS.has(template.id) || !drafts.some((provider) => provider.id === template.id)
+  )
 
   const removeProvider = async (): Promise<void> => {
     if (!selected) return
@@ -226,6 +234,7 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
     const remaining = drafts.filter((provider) => provider.id !== selected.id)
     setDrafts(remaining)
     setSelectedId(remaining[0]?.id ?? null)
+    setAddingProvider(false)
   }
 
   const save = async (): Promise<void> => {
@@ -254,6 +263,18 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
         models: provider.models.map((model) => model.trim()).filter(Boolean)
       }))
       await window.wassh.setPluginData(PLUGIN_ID_AI_AGENT, { ...current, providers })
+      if (tabId) {
+        const activePlugins = await window.wassh.getActivePlugins(tabId)
+        if (!activePlugins.includes(PLUGIN_ID_AI_AGENT)) {
+          await window.wassh.activatePlugin(tabId, PLUGIN_ID_AI_AGENT)
+        }
+        await window.wassh.sendPluginMessage(tabId, PLUGIN_ID_AI_AGENT, {
+          type: 'providersChanged',
+          providers
+        })
+      } else {
+        window.dispatchEvent(new CustomEvent('ai-agent-providers-changed', { detail: providers }))
+      }
       onClose()
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err))
@@ -270,6 +291,13 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
     <>
       <div className="settings-dialog-body ai-agent-provider-dialog-body">
         <div className="ai-agent-provider-dialog-list">
+          <div className="ai-agent-provider-dialog-list-header">
+            <strong>Configured providers</strong>
+            <button type="button" className="primary" onClick={() => {
+              setSelectedId(null)
+              setAddingProvider(true)
+            }}>Add</button>
+          </div>
           {drafts.map((provider) => (
             <button
               type="button"
@@ -284,15 +312,35 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
           {drafts.length === 0 ? <p>No providers configured.</p> : null}
         </div>
         <div className="ai-agent-provider-dialog-editor">
-          {selected ? (
+          {addingProvider ? (
             <>
-              <label>Name<input value={selected.name} onChange={(event) => updateSelected({ name: event.target.value })} /></label>
-              <label>Protocol<select value={selected.protocol} onChange={(event) => updateSelected({ protocol: event.target.value as AiAgentProviderProtocol })}>
-                <option value={AI_AGENT_PROTOCOL_OPENAI}>OpenAI compatible</option>
-                <option value={AI_AGENT_PROTOCOL_ANTHROPIC}>Anthropic</option>
-              </select></label>
-              <label>Base URL<input value={selected.baseUrl} placeholder={selected.protocol === AI_AGENT_PROTOCOL_ANTHROPIC ? AI_AGENT_ANTHROPIC_BASE_URL : AI_AGENT_OLLAMA_BASE_URL} onChange={(event) => updateSelected({ baseUrl: event.target.value })} /></label>
-              <label>API key<input type="password" value={selected.draftKey} placeholder={selected.hasKey ? 'Key stored — type to replace' : 'API key'} autoComplete="off" onChange={(event) => updateSelected({ draftKey: event.target.value })} /></label>
+              <h3>Add a provider</h3>
+              <div className="ai-agent-provider-template-list">
+                {availableTemplates.map((template) => (
+                  <button type="button" key={template.id} onClick={() => addProvider(template)}>
+                    <strong>{template.name}</strong>
+                    <span>{BUILTIN_PROVIDER_IDS.has(template.id) ? 'Hosted or local service' : protocolLabel(template.protocol)}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : selected ? (
+            <>
+              {selectedIsCustom ? (
+                <>
+                  <label>Name<input value={selected.name} onChange={(event) => updateSelected({ name: event.target.value })} /></label>
+                  <label>Protocol<select value={selected.protocol} onChange={(event) => updateSelected({ protocol: event.target.value as AiAgentProviderProtocol })}>
+                    <option value={AI_AGENT_PROTOCOL_OPENAI}>OpenAI compatible</option>
+                    <option value={AI_AGENT_PROTOCOL_ANTHROPIC}>Anthropic</option>
+                  </select></label>
+                </>
+              ) : <h3>{selected.name}</h3>}
+              {canEditBaseUrl ? (
+                <label>{selectedIsCustom ? 'Base URL' : 'Server URL'}<input value={selected.baseUrl} placeholder={selected.protocol === AI_AGENT_PROTOCOL_ANTHROPIC ? AI_AGENT_ANTHROPIC_BASE_URL : AI_AGENT_OLLAMA_BASE_URL} onChange={(event) => updateSelected({ baseUrl: event.target.value })} /></label>
+              ) : null}
+              {needsApiKey ? (
+                <label>API key<input type="password" value={selected.draftKey} placeholder={selected.hasKey ? 'Key stored — type to replace' : 'API key'} autoComplete="off" onChange={(event) => updateSelected({ draftKey: event.target.value })} /></label>
+              ) : null}
               <div className="ai-agent-provider-model-row">
                 <label>Available models<output className="ai-agent-provider-models">{selected.models.length > 0 ? selected.models.join(', ') : 'Models load automatically when available.'}</output></label>
                 <button type="button" className="primary" disabled={selectedIsChecking || !tabId || !selected.baseUrl.trim()} onClick={() => void refreshSelected()}>
@@ -311,14 +359,10 @@ export default function ProviderSettings({ tabId, onClose }: PluginSettingsViewP
                 </output>
               ) : null}
             </>
-          ) : <p>Select a provider to configure it.</p>}
+          ) : <p>{drafts.length === 0 ? 'No providers configured. Add a provider to get started.' : 'Select a provider to configure it.'}</p>}
         </div>
       </div>
       <div className="settings-footer">
-        <select aria-label="Provider template" value={templateId} onChange={(event) => setTemplateId(event.target.value)}>
-          {PROVIDER_TEMPLATES.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}
-        </select>
-        <button type="button" onClick={addProvider}>Add provider</button>
         {saveError ? <output className="ai-agent-provider-check-message is-error">{saveError}</output> : <span />}
         <button type="button" onClick={onClose}>Cancel</button>
         <button type="button" className="primary" disabled={loading || saving} onClick={() => void save()}>Save</button>
