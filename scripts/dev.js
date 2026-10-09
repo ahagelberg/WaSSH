@@ -1,5 +1,6 @@
 const { spawn } = require('node:child_process')
 
+const electronViteArgs = ['dev']
 const env = { ...process.env }
 if (process.platform === 'linux') {
   for (const key of [
@@ -11,6 +12,9 @@ if (process.platform === 'linux') {
   ]) {
     delete env[key]
   }
+  if (process.env.WAYLAND_DISPLAY) {
+    electronViteArgs.push('--', '--ozone-platform=x11')
+  }
 }
 
 const isSnapConfined =
@@ -20,7 +24,7 @@ const isSnapConfined =
     process.env.GTK_EXE_PREFIX?.startsWith('/snap/'))
 
 let command = 'electron-vite'
-let args = ['dev']
+let args = electronViteArgs
 let childEnv = env
 let shell = process.platform === 'win32'
 
@@ -47,8 +51,8 @@ if (isSnapConfined) {
   ]
 
   for (const key of sessionVariables) {
-    if (process.env[key]) {
-      systemdArgs.push(`--setenv=${key}=${process.env[key]}`)
+    if (env[key]) {
+      systemdArgs.push(`--setenv=${key}=${env[key]}`)
     }
   }
 
@@ -60,7 +64,7 @@ if (isSnapConfined) {
   ]
     .filter(Boolean)
     .join(':')
-  systemdArgs.push(`--setenv=PATH=${hostPath}`, '--', 'electron-vite', 'dev')
+  systemdArgs.push(`--setenv=PATH=${hostPath}`, '--', 'electron-vite', ...electronViteArgs)
   command = 'systemd-run'
   args = systemdArgs
   childEnv = process.env

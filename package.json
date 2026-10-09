@@ -115,6 +115,9 @@
     },
     "linux": {
       "icon": "res/WaSSH program icon.png",
+      "executableArgs": [
+        "--ozone-platform=x11"
+      ],
       "target": [
         "AppImage",
         "deb",
@@ -124,6 +127,12 @@
       "category": "Development",
       "maintainer": "Andreas Hagelberg <andreas@hagelberg.name>",
       "syncDesktopName": true
+    },
+    "appImage": {
+      "executableArgs": [
+        "--no-sandbox",
+        "--ozone-platform=x11"
+      ]
     },
     "portable": {
       "artifactName": "WaSSH-${version}-win-portable-${arch}.${ext}"
