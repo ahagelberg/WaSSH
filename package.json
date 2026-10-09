@@ -13,7 +13,7 @@
     "node": ">=24.21.0 <25"
   },
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node scripts/dev.js",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "setup-native": "node scripts/setup-native.js",
@@ -114,6 +114,7 @@
       "artifactName": "WaSSH-${version}-mac-${arch}.${ext}"
     },
     "linux": {
+      "icon": "res/WaSSH program icon.png",
       "target": [
         "AppImage",
         "deb",
