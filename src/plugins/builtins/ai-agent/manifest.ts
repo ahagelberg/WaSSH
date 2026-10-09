@@ -49,7 +49,7 @@ export const aiAgentManifest: PluginManifest = {
   activation: 'manual',
   source: 'builtin',
   contributes: {
-    toolbar: { label: 'AI' },
+    toolbar: { label: 'AI Agent' },
     settingsHeading: 'AI agent',
     settingsPresentation: 'view',
     settingsSchema: [
