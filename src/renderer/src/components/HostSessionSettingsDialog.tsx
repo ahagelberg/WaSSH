@@ -5,6 +5,7 @@ import {
   BELL_MODE_SYSTEM,
   BUNDLED_FONT_FAMILIES,
   CONNECTION_TYPE_SERIAL,
+  CONNECTION_TYPE_LOCAL,
   CONNECTION_TYPE_SSH,
   CONNECTION_TYPE_TELNET,
   CURSOR_STYLE_BAR,
@@ -207,6 +208,7 @@ export default function HostSessionSettingsDialog({
   const connType = connectionTypeOf(form)
   const isSsh = isSshConnectionType(connType)
   const isSerial = connType === CONNECTION_TYPE_SERIAL
+  const isLocal = connType === CONNECTION_TYPE_LOCAL
   const proxyOptions = hosts.filter(
     (h) => h.id !== editingHostId && isSshConnectionType(connectionTypeOf(h))
   )
@@ -265,7 +267,7 @@ export default function HostSessionSettingsDialog({
     const prevDefault = defaultPortForType(prevType)
     const nextDefault = defaultPortForType(next)
     const port =
-      next === CONNECTION_TYPE_SERIAL
+      next === CONNECTION_TYPE_SERIAL || next === CONNECTION_TYPE_LOCAL
         ? 0
         : form.port === prevDefault || form.port === 0
           ? nextDefault
@@ -273,8 +275,16 @@ export default function HostSessionSettingsDialog({
     patch({
       connectionType: next,
       port,
+      host: next === CONNECTION_TYPE_LOCAL ? '' : form.host,
+      username: next === CONNECTION_TYPE_LOCAL ? '' : form.username,
+      authMethod: next === CONNECTION_TYPE_LOCAL ? 'none' : form.authMethod,
+      reconnectMode: next === CONNECTION_TYPE_LOCAL ? RECONNECT_MODE_NONE : form.reconnectMode,
       proxyHostId: next === CONNECTION_TYPE_SSH ? form.proxyHostId : ''
     })
+    if (next === CONNECTION_TYPE_LOCAL) {
+      setPassword('')
+      setPassphrase('')
+    }
   }
 
   useEffect(() => {
@@ -333,7 +343,7 @@ export default function HostSessionSettingsDialog({
         <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
           <div className="settings-row-label">
             <strong>Type</strong>
-            <span>SSH, Telnet, or serial.</span>
+            <span>SSH, Telnet, serial, or a local terminal.</span>
           </div>
           <select
             value={connType}
@@ -343,6 +353,7 @@ export default function HostSessionSettingsDialog({
             <option value={CONNECTION_TYPE_SSH}>SSH</option>
             <option value={CONNECTION_TYPE_TELNET}>Telnet</option>
             <option value={CONNECTION_TYPE_SERIAL}>Serial</option>
+            <option value={CONNECTION_TYPE_LOCAL}>Local terminal</option>
           </select>
         </div>
         {isSerial ? (
@@ -439,7 +450,7 @@ export default function HostSessionSettingsDialog({
               </select>
             </div>
           </>
-        ) : (
+        ) : isLocal ? null : (
           <>
             <div className={`settings-row${identityLocked ? ' readonly' : ''}`}>
               <div className="settings-row-label">
@@ -475,13 +486,14 @@ export default function HostSessionSettingsDialog({
           <div className="settings-row-label">
             <strong>Reconnect</strong>
             <span>
-              After a mid-session drop: none, reconnect when the window is focused, or keep
-              retrying with backoff (also on focus). While the window is focused, a failed
-              attempt keeps retrying.
+              {isLocal
+                ? 'Local shells do not reconnect after their process exits.'
+                : 'After a mid-session drop: none, reconnect when the window is focused, or keep retrying with backoff (also on focus). While the window is focused, a failed attempt keeps retrying.'}
             </span>
           </div>
           <select
             value={form.reconnectMode}
+            disabled={isLocal}
             onChange={(e) => patch({ reconnectMode: e.target.value as ReconnectMode })}
           >
             <option value={RECONNECT_MODE_NONE}>None</option>
@@ -1145,6 +1157,7 @@ export default function HostSessionSettingsDialog({
     connType,
     isSsh,
     isSerial,
+    isLocal,
     styleDefaults,
     plugins,
     showTunnelBuilder,
@@ -1164,18 +1177,22 @@ export default function HostSessionSettingsDialog({
       id,
       name:
         form.name ||
-        (isSerial
-          ? form.host
-          : form.username
-            ? `${form.username}@${form.host}`
-            : form.host),
+        (isLocal
+          ? 'Local terminal'
+          : isSerial
+            ? form.host
+            : form.username
+              ? `${form.username}@${form.host}`
+              : form.host),
       host: form.host,
       port: form.port,
-      username: form.username,
-      passwordVaultId: form.passwordVaultId || `pwd-${id}`,
-      privateKeyPath: form.privateKeyPath,
-      passphraseVaultId: form.passphraseVaultId || (passphrase ? `pp-${id}` : ''),
-      authMethod: form.authMethod,
+      username: isLocal ? '' : form.username,
+      passwordVaultId: isLocal ? '' : form.passwordVaultId || `pwd-${id}`,
+      privateKeyPath: isLocal ? '' : form.privateKeyPath,
+      passphraseVaultId: isLocal
+        ? ''
+        : form.passphraseVaultId || (passphrase ? `pp-${id}` : ''),
+      authMethod: isLocal ? 'none' : form.authMethod,
       proxyHostId: isSsh ? form.proxyHostId || '' : '',
       ...protocolConfigFrom(form),
       ...sessionStyleOverridesFrom(form),

@@ -112,14 +112,17 @@ function ensureSsh2() {
   runNodeScript(join(SSH2_DIR, 'install.js'))
 }
 
-function rebuildSerialport() {
-  if (!existsSync(join(ROOT, 'node_modules', 'serialport'))) {
+function rebuildElectronNatives() {
+  const modules = ['serialport', 'node-pty'].filter((name) =>
+    existsSync(join(ROOT, 'node_modules', name))
+  )
+  if (modules.length === 0) {
     return
   }
   if (!existsSync(ELECTRON_REBUILD)) {
     return
   }
-  const args = ['-f', '-w', 'serialport']
+  const args = ['-f', ...modules.flatMap((name) => ['-w', name])]
   const targetArch = process.env.npm_config_arch || process.env.TARGET_ARCH
   if (targetArch) {
     args.push('-a', targetArch)
@@ -131,10 +134,10 @@ function rebuildSerialport() {
     env: process.env
   })
   if (result.status !== 0) {
-    console.warn('electron-rebuild serialport failed; serial connections may not work until rebuild succeeds')
+    console.warn(`electron-rebuild ${modules.join(', ')} failed; native connections may not work until rebuild succeeds`)
   }
 }
 
 ensureElectron()
 ensureSsh2()
-rebuildSerialport()
+rebuildElectronNatives()

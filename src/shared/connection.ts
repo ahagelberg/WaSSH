@@ -3,6 +3,7 @@ import {
   BELL_MODE_INVERT_WINDOW,
   BELL_MODE_SYSTEM,
   BUNDLED_FONT_FAMILIES,
+  CONNECTION_TYPE_LOCAL,
   CONNECTION_TYPE_SERIAL,
   CONNECTION_TYPE_SSH,
   CONNECTION_TYPE_TELNET,
@@ -416,7 +417,8 @@ export function connectionTypeOf(
   if (
     value === CONNECTION_TYPE_SSH ||
     value === CONNECTION_TYPE_TELNET ||
-    value === CONNECTION_TYPE_SERIAL
+    value === CONNECTION_TYPE_SERIAL ||
+    value === CONNECTION_TYPE_LOCAL
   ) {
     return value
   }
@@ -431,7 +433,7 @@ export function defaultPortForType(type: ConnectionType): number {
   if (type === CONNECTION_TYPE_TELNET) {
     return DEFAULT_TELNET_PORT
   }
-  if (type === CONNECTION_TYPE_SERIAL) {
+  if (type === CONNECTION_TYPE_SERIAL || type === CONNECTION_TYPE_LOCAL) {
     return 0
   }
   return DEFAULT_SSH_PORT
@@ -690,6 +692,9 @@ export function sessionTitle(
   if (trimmed) {
     return trimmed
   }
+  if (connectionTypeOf(c) === CONNECTION_TYPE_LOCAL) {
+    return 'Local terminal'
+  }
   if (connectionTypeOf(c) === CONNECTION_TYPE_SERIAL) {
     return c.host || 'Serial'
   }
@@ -699,16 +704,21 @@ export function sessionTitle(
   return c.host || 'Session'
 }
 
-export function hostDisplayName(host: Pick<HostProfile, 'name' | 'host'>): string {
+export function hostDisplayName(
+  host: Pick<HostProfile, 'name' | 'host' | 'connectionType'>
+): string {
   const trimmed = (host.name ?? '').trim()
   if (trimmed) {
     return trimmed
   }
-  return host.host ?? ''
+  return host.host || (connectionTypeOf(host) === CONNECTION_TYPE_LOCAL ? 'Local terminal' : '')
 }
 
 export function hostSubtitle(host: HostProfile): string {
   const type = connectionTypeOf(host)
+  if (type === CONNECTION_TYPE_LOCAL) {
+    return 'Local terminal'
+  }
   if (type === CONNECTION_TYPE_SERIAL) {
     return `${host.host} · ${serialFormatLabel(serialConfigFrom(host))}`
   }

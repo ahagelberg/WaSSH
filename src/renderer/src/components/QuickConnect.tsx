@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
   CONNECTION_TYPE_SERIAL,
+  CONNECTION_TYPE_LOCAL,
   CONNECTION_TYPE_SSH,
   CONNECTION_TYPE_TELNET,
   DEFAULT_CONNECTION_TYPE,
@@ -40,6 +41,9 @@ function quickName(
   host: string,
   username: string
 ): string {
+  if (type === CONNECTION_TYPE_LOCAL) {
+    return 'Local terminal'
+  }
   if (type === CONNECTION_TYPE_SERIAL) {
     return host
   }
@@ -72,7 +76,8 @@ export default function QuickConnect({ onConnect }: Props) {
 
   const submit = (): void => {
     const trimmed = host.trim()
-    if (!trimmed) {
+    const isLocal = type === CONNECTION_TYPE_LOCAL
+    if (!trimmed && !isLocal) {
       return
     }
     const serial = protocolConfigFrom({
@@ -86,8 +91,11 @@ export default function QuickConnect({ onConnect }: Props) {
     onConnect({
       ...emptyConnectionParams(type),
       name: quickName(type, trimmed, username.trim()),
-      host: trimmed,
-      port: type === CONNECTION_TYPE_SERIAL ? 0 : Number(port) || defaultPortForType(type),
+      host: isLocal ? '' : trimmed,
+      port:
+        type === CONNECTION_TYPE_SERIAL || isLocal
+          ? 0
+          : Number(port) || defaultPortForType(type),
       username: type === CONNECTION_TYPE_SSH ? username.trim() : '',
       authMethod: type === CONNECTION_TYPE_SSH && password ? 'password' : 'none',
       ...serial,
@@ -108,9 +116,10 @@ export default function QuickConnect({ onConnect }: Props) {
           <option value={CONNECTION_TYPE_SSH}>SSH</option>
           <option value={CONNECTION_TYPE_TELNET}>Telnet</option>
           <option value={CONNECTION_TYPE_SERIAL}>Serial</option>
+                  <option value={CONNECTION_TYPE_LOCAL}>Local terminal</option>
         </select>
       </div>
-      {type === CONNECTION_TYPE_SERIAL ? (
+      {type === CONNECTION_TYPE_LOCAL ? null : type === CONNECTION_TYPE_SERIAL ? (
         <>
           <div className="field-row">
             <label htmlFor="qc-serial-port">Port</label>

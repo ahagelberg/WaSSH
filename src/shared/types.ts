@@ -1,3 +1,5 @@
+/** ssh | telnet | serial | local; missing in old files = ssh */
+/** ssh | telnet | serial | local; missing in old files = ssh */
 import type {
   PluginActiveStateEvent,
   PluginListItem,
@@ -22,11 +24,13 @@ export const DEFAULT_TELNET_PORT = 23
 export const CONNECTION_TYPE_SSH = 'ssh'
 export const CONNECTION_TYPE_TELNET = 'telnet'
 export const CONNECTION_TYPE_SERIAL = 'serial'
+export const CONNECTION_TYPE_LOCAL = 'local'
 
 export type ConnectionType =
   | typeof CONNECTION_TYPE_SSH
   | typeof CONNECTION_TYPE_TELNET
   | typeof CONNECTION_TYPE_SERIAL
+  | typeof CONNECTION_TYPE_LOCAL
 
 /** Default protocol for saved hosts and quick connect */
 export const DEFAULT_CONNECTION_TYPE: ConnectionType = CONNECTION_TYPE_SSH

@@ -1,6 +1,7 @@
 import { BrowserWindow } from 'electron'
 import {
   CONNECTION_TYPE_SERIAL,
+  CONNECTION_TYPE_LOCAL,
   CONNECTION_TYPE_TELNET,
   ConnectRequest,
   HostKeyDecision,
@@ -12,6 +13,7 @@ import { connectionTypeOf } from '../../shared/connection'
 import { CredentialVault } from '../store/credentialVault'
 import { KnownHostsStore, SessionStore } from '../store/sessionStore'
 import { SerialConnection } from '../serial/SerialConnection'
+import { LocalConnection } from '../session/LocalConnection'
 import { TelnetConnection } from '../telnet/TelnetConnection'
 import { SshConnection } from './SshConnection'
 import type { SessionDataPipeline } from '../plugins/SessionDataPipeline'
@@ -19,7 +21,7 @@ import type { PluginSessionHandle } from '../plugins/types'
 import { openDirectTcpSocket } from '../plugins/SideConnectionBroker'
 import { sendToWindow } from '../windowSend'
 
-type LiveSession = SshConnection | TelnetConnection | SerialConnection
+type LiveSession = SshConnection | TelnetConnection | SerialConnection | LocalConnection
 
 export class SessionManager {
   private sessions = new Map<string, LiveSession>()
@@ -84,7 +86,9 @@ export class SessionManager {
     this.disconnect(req.tabId)
     const type = connectionTypeOf(req.connection)
     let conn: LiveSession
-    if (type === CONNECTION_TYPE_TELNET) {
+    if (type === CONNECTION_TYPE_LOCAL) {
+      conn = new LocalConnection(req.tabId, req.connection, this.isAppFocused)
+    } else if (type === CONNECTION_TYPE_TELNET) {
       conn = new TelnetConnection(req.tabId, req.connection, this.isAppFocused)
     } else if (type === CONNECTION_TYPE_SERIAL) {
       conn = new SerialConnection(req.tabId, req.connection, this.isAppFocused)
