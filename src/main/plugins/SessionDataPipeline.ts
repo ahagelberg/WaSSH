@@ -1,5 +1,7 @@
 import type { StreamHandlerRegistration, StreamTransform } from './types'
 
+const RECENT_INBOUND_MAX_CHARS = 64_000
+
 interface Entry {
   pluginId: string
   mode: 'observe' | 'intercept'
@@ -13,10 +15,12 @@ interface Entry {
 export class SessionDataPipeline {
   private inbound = new Map<string, Entry[]>()
   private outbound = new Map<string, Entry[]>()
+  private recentInbound = new Map<string, string>()
 
   clearTab(tabId: string): void {
     this.inbound.delete(tabId)
     this.outbound.delete(tabId)
+    this.recentInbound.delete(tabId)
   }
 
   unregisterPlugin(tabId: string, pluginId: string): void {
@@ -44,7 +48,18 @@ export class SessionDataPipeline {
   }
 
   processInbound(tabId: string, data: string): string | null {
-    return this.process(this.inbound.get(tabId) ?? [], data)
+    const output = this.process(this.inbound.get(tabId) ?? [], data)
+    if (output !== null) {
+      const combined = (this.recentInbound.get(tabId) ?? '') + output
+      this.recentInbound.set(tabId, combined.slice(-RECENT_INBOUND_MAX_CHARS))
+    }
+    return output
+  }
+
+  getRecentInbound(tabId: string, maxChars = RECENT_INBOUND_MAX_CHARS): string {
+    const output = this.recentInbound.get(tabId) ?? ''
+    const limit = Math.max(0, Math.floor(maxChars))
+    return limit === 0 ? '' : output.slice(-limit)
   }
 
   processOutbound(tabId: string, data: string): string | null {

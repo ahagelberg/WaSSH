@@ -72,6 +72,8 @@ export interface PluginMainContext {
   setData: (data: unknown, scopeId?: string) => void
   /** Saved host id, or a stable tab-local scope for unsaved sessions. */
   getSessionScopeId: () => string
+  /** Read recent terminal output retained in memory for this session. */
+  getRecentTerminalOutput: (maxChars?: number) => string
   /** Read a vault secret (DPAPI/safeStorage encrypted); null when absent. */
   getSecret: (vaultId: string) => string | null
   sendToRenderer: (payload: unknown) => void

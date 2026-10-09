@@ -110,6 +110,7 @@ import {
 } from './providers'
 import { searchKnowledgeBase } from './rag'
 import {
+  stripAnsi,
   executeTerminalKeys,
   executeTerminalRead,
   executeTerminalWait,
@@ -198,7 +199,6 @@ const SUDO_AUTH_FAILED_MARKER = '[wassh: sudo authentication failed]'
 interface TabRuntime {
   ctx: PluginMainContext
   hostKey: string
-  terminalTail: string
   /** Conversation prefix this renderer already holds; null until it has synced. */
   sentMessages: SentMessages | null
 }
@@ -2014,12 +2014,11 @@ async function setupForTab(ctx: PluginMainContext, forceProbe: boolean): Promise
     tabs.delete(ctx.tabId)
     releaseHost(existing.hostKey, ctx)
   }
-  const tab: TabRuntime = { ctx, hostKey, terminalTail: '', sentMessages: null }
+  const tab: TabRuntime = { ctx, hostKey, sentMessages: null }
   tabs.set(ctx.tabId, tab)
   const buffer = terminalBufferFor(ctx)
   ctx.registerStreamHandler('observe', 'inbound', (data) => {
     buffer.append(data)
-    tab.terminalTail = buffer.text(TERMINAL_TAIL_CHARS)
     return data
   })
   const host = ensureHost(hostKey, hostLabel, ctx)
@@ -2113,9 +2112,11 @@ function chatMessageWithContext(
   if (attachments && attachments.length > 0) {
     parts.push(attachments.map(formatAttachmentForModel).join('\n\n'))
   }
-  if (attachTerminal && tab.terminalTail) {
-    const tail = tab.terminalTail.slice(-TERMINAL_CONTEXT_EXCERPT_CHARS)
-    parts.push(`${TERMINAL_CONTEXT_MARKER.trim()}\n${tail}`)
+  if (attachTerminal) {
+    const tail = stripAnsi(tab.ctx.getRecentTerminalOutput(TERMINAL_TAIL_CHARS)).slice(
+      -TERMINAL_CONTEXT_EXCERPT_CHARS
+    )
+    parts.push(`${TERMINAL_CONTEXT_MARKER.trim()}\n${tail || '[No terminal output captured yet.]'}`)
   }
   return parts.join('\n\n')
 }

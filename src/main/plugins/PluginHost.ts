@@ -262,6 +262,7 @@ export class PluginHost {
         this.pluginData.set(pluginId, data, scopeId)
       },
       getSessionScopeId: () => this.broker.getConnectionParams(tabId)?.hostId || `tab:${tabId}`,
+      getRecentTerminalOutput: (maxChars) => this.pipeline.getRecentInbound(tabId, maxChars),
       getSecret: (vaultId: string) => this.vault.get(vaultId),
       sendToRenderer: (payload: unknown) => {
         this.send('plugin:message', {
