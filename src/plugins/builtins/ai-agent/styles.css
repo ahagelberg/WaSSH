@@ -988,7 +988,14 @@
 }
 
 .ai-agent-question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-self: stretch;
   flex-shrink: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   border: 1px solid color-mix(in srgb, var(--border) 75%, var(--text-muted));
   border-radius: var(--radius);
   background: var(--bg-panel-2);
@@ -998,16 +1005,24 @@
   min-width: 0;
 }
 
-.ai-agent-question legend {
+.ai-agent-question-title {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   font-weight: 600;
   font-size: 12px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .ai-agent-question-options {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  width: 100%;
+  min-width: 0;
 }
 
 .ai-agent-question-option {
@@ -1021,8 +1036,18 @@
 }
 
 .ai-agent-question-option input {
-  flex-shrink: 0;
+  flex: 0 0 14px;
+  width: 14px;
+  min-width: 14px;
+  max-width: 14px;
+  height: 14px;
+  padding: 0;
   margin: 2px 0 0;
+}
+
+.ai-agent-question-option span {
+  flex: 1;
+  min-width: 0;
 }
 
 .ai-agent-question-submit {

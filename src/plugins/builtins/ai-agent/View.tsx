@@ -1272,8 +1272,17 @@ export default function AiAgentView({
           ) : null}
 
           {view.runPhase === 'ask' && view.pendingQuestion ? (
-            <fieldset className="ai-agent-question">
-              <legend>{view.pendingQuestion.question}</legend>
+            <section
+              className="ai-agent-question"
+              role="group"
+              aria-labelledby={`ai-agent-question-${view.pendingQuestion.requestId}`}
+            >
+              <div
+                className="ai-agent-question-title"
+                id={`ai-agent-question-${view.pendingQuestion.requestId}`}
+              >
+                {view.pendingQuestion.question}
+              </div>
               <div className="ai-agent-question-options">
                 {view.pendingQuestion.options.map((option, index) => (
                   <label className="ai-agent-question-option" key={index}>
@@ -1295,7 +1304,7 @@ export default function AiAgentView({
               >
                 Submit answer
               </button>
-            </fieldset>
+            </section>
           ) : null}
 
           {view.runPhase === 'ask_sudo' && view.pendingSudo ? (
