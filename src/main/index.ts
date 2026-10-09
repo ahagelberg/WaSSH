@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, powerMonitor, shell } from 'electron'
+import { app, BrowserWindow, Menu, nativeImage, powerMonitor, shell } from 'electron'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import {
@@ -170,6 +170,14 @@ function createWindow(): void {
   const saved = settingsStore?.get().windowBounds ?? null
   const restored = restoreWindowBounds(saved)
   const theme = settingsStore?.get().theme ?? DEFAULT_THEME
+  const windowIcon =
+    process.platform === 'linux'
+      ? nativeImage.createFromPath(
+          app.isPackaged
+            ? join(process.resourcesPath, 'wassh-icon.png')
+            : join(app.getAppPath(), 'res', 'WaSSH program icon.png')
+        )
+      : null
   applyChromeTheme(theme, null)
 
   mainWindow = new BrowserWindow({
@@ -189,6 +197,9 @@ function createWindow(): void {
       sandbox: false
     }
   })
+  if (windowIcon && !windowIcon.isEmpty()) {
+    mainWindow.setIcon(windowIcon)
+  }
 
   applyChromeTheme(theme, mainWindow)
 

@@ -86,6 +86,12 @@
       "!node_modules/**/prebuilds/win32-arm64/**",
       "!node_modules/**/prebuilds/win32-ia32/**"
     ],
+    "extraResources": [
+      {
+        "from": "res/WaSSH program icon.png",
+        "to": "wassh-icon.png"
+      }
+    ],
     "asarUnpack": [
       "**/*.node",
       "**/node_modules/node-pty/**/*"
