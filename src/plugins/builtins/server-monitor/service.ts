@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process'
+import { createConnection } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { PluginMainContext } from '@plugin-api/main'
 import {
@@ -25,6 +27,8 @@ import {
 
 /** Delay before re-probing when the daemon stream drops unexpectedly */
 const MONITOR_RECONNECT_DELAY_MS = 5000
+const SERVICE_COMMAND_TIMEOUT_MS = 120_000
+const SERVICE_COMMAND_MAX_BUFFER_BYTES = 4 * 1024 * 1024
 
 export interface MonitorServiceSession {
   status: MonitorServiceStatus
@@ -123,6 +127,91 @@ export function closeStream(ctx: PluginMainContext, session: MonitorServiceSessi
   stream.destroy()
 }
 
+/** Run the same generated service command on the selected SSH or local host. */
+export function runHostCommand(
+  ctx: PluginMainContext,
+  command: string,
+  stdin?: string
+): Promise<string> {
+  if (ctx.isLocalSession()) {
+    if (process.platform !== 'linux' && process.platform !== 'darwin' && process.platform !== 'freebsd') {
+      return Promise.reject(new Error('Local monitor commands require Linux, macOS, or FreeBSD'))
+    }
+    return new Promise((resolve, reject) => {
+      const child = execFile(
+        '/bin/sh',
+        ['-c', command],
+        {
+          timeout: SERVICE_COMMAND_TIMEOUT_MS,
+          maxBuffer: SERVICE_COMMAND_MAX_BUFFER_BYTES
+        },
+        (error, stdout, stderr) => {
+          if (error) {
+            reject(new Error(stderr.trim() || stdout.trim() || error.message))
+            return
+          }
+          resolve(stdout.trim())
+        }
+      )
+      child.stdin?.end(stdin ?? '')
+    })
+  }
+  if (!ctx.isSshSession()) {
+    return Promise.reject(new Error('This operation requires an SSH or local Unix session'))
+  }
+  if (stdin === undefined) {
+    return ctx.execCapture(command)
+  }
+  return new Promise((resolve, reject) => {
+    let connectionId: string | null = null
+    let output = ''
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let offData = (): void => undefined
+    let offClosed = (): void => undefined
+    let settled = false
+    const finish = (error?: string): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      offData()
+      offClosed()
+      if (error) {
+        reject(new Error(error))
+      } else {
+        resolve(output)
+      }
+    }
+    void ctx.openSideConnection({ kind: 'ssh-exec', command }).then((id) => {
+      connectionId = id
+      offData = ctx.onSideData(id, (data) => {
+        output += data
+      })
+      offClosed = ctx.onSideClosed(id, (error) => finish(error))
+      ctx.writeSideConnection(id, stdin)
+      timer = setTimeout(() => {
+        const idToClose = connectionId
+        finish('Timed out while running WaSSH Service command')
+        if (idToClose) {
+          ctx.closeSideConnection(idToClose)
+        }
+      }, SERVICE_COMMAND_TIMEOUT_MS)
+    }).catch((error: unknown) => {
+      finish(error instanceof Error ? error.message : String(error))
+    })
+  })
+}
+
+function openServiceStream(ctx: PluginMainContext): Promise<Duplex> {
+  if (ctx.isLocalSession()) {
+    return Promise.resolve(createConnection(REMOTE_SOCKET_PATH))
+  }
+  return ctx.openUnixStream(REMOTE_SOCKET_PATH)
+}
+
 /** Fold one decoded sample into the ladder and forward it to the view. */
 function consumeSample(
   session: MonitorServiceSession,
@@ -174,7 +263,7 @@ async function startStream(
   closeStream(ctx, session)
   session.decoder.reset()
 
-  const stream = await ctx.openUnixStream(REMOTE_SOCKET_PATH)
+  const stream = await openServiceStream(ctx)
   if (session.disposed || generation !== session.streamGeneration) {
     stream.destroy()
     return
@@ -254,7 +343,7 @@ export async function probeService(
 ): Promise<void> {
   const generation = ++session.probeGeneration
   setStatus(ctx, session, { state: 'probing', streamConnected: false })
-  if (!ctx.isSshSession()) {
+  if (!ctx.isSshSession() && !ctx.isLocalSession()) {
     clearHistory(session, hooks)
     setStatus(ctx, session, {
       state: 'error',
@@ -265,7 +354,7 @@ export async function probeService(
   }
   let result: string
   try {
-    result = await ctx.execCapture(buildProbeCommand())
+    result = await runHostCommand(ctx, buildProbeCommand())
   } catch (error) {
     if (generation !== session.probeGeneration) {
       return
@@ -364,19 +453,7 @@ export async function runServiceAction(
   })
   const command = action === 'install' ? buildInstallCommand() : buildUninstallCommand()
   try {
-    const connectionId = await ctx.openSideConnection({ kind: 'ssh-exec', command })
-    const output = await new Promise<string>((resolve) => {
-      let captured = ''
-      const offData = ctx.onSideData(connectionId, (data) => {
-        captured += data
-      })
-      const offClosed = ctx.onSideClosed(connectionId, () => {
-        offData()
-        offClosed()
-        resolve(captured)
-      })
-      ctx.writeSideConnection(connectionId, `${password}\n`)
-    })
+    const output = await runHostCommand(ctx, command, `${password}\n`)
     if (!output.split(/\r?\n/).includes(REMOTE_OPERATION_SUCCESS)) {
       const message = output.trim() || `Failed to ${action} WaSSH Service`
       setStatus(ctx, session, { state: 'error', streamConnected: false, message })

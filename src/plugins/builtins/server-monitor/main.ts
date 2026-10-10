@@ -45,6 +45,7 @@ import {
   closeStream,
   createServiceSession,
   probeService,
+  runHostCommand,
   runServiceAction,
   type MonitorServiceHooks,
   type MonitorServiceSession
@@ -1056,17 +1057,18 @@ function isValidPid(pid: unknown): pid is number {
   return typeof pid === 'number' && Number.isInteger(pid) && pid > 0
 }
 
-async function signalRemoteProcess(
+async function signalProcess(
   ctx: PluginMainContext,
   pid: number,
   signal: string
 ): Promise<ServerMonitorActionResult> {
   const sig = signal.trim().replace(/^SIG/i, '').toUpperCase()
-  if (!isKillSignal(sig)) {
-    return { ok: false, error: `Invalid signal: ${signal}` }
+    if (!isKillSignal(sig)) {
+      return { ok: false, error: `Invalid signal: ${signal}` }
   }
   try {
-    const out = await ctx.execCapture(
+      const out = await runHostCommand(
+      ctx,
       `kill -s ${sig} ${pid} 2>&1; printf '\\n${KILL_EXIT_MARKER}%s\\n' $?`
     )
     const marker = `${KILL_EXIT_MARKER}`
@@ -1118,7 +1120,7 @@ async function fetchProcessDetails(
   ].join('; ')
 
   try {
-    const out = await ctx.execCapture(probe)
+    const out = await runHostCommand(ctx, probe)
     // Values span lines (/proc/PID/status, limits, environ), so only a line
     // carrying the separator starts a group; the rest continue the last one.
     const groups = new Map<string, string>()
@@ -1224,12 +1226,16 @@ function pushStats(ctx: PluginMainContext, state: MonitorSessionState, snapshot:
   ctx.sendToRenderer(event)
 }
 
-/**
- * Run one `ssh-exec` sample: open a side connection, buffer its output until
- * the remote command exits (connection closes) or `EXEC_WAIT_MS` elapses,
- * then close it and resolve with everything captured.
+/** Run one monitor sample locally or over an SSH side connection. SSH output
+ * is buffered until the remote command exits or `EXEC_WAIT_MS` elapses.
  */
 async function runExecSample(ctx: PluginMainContext, command: string): Promise<string> {
+  if (ctx.isLocalSession()) {
+    return runHostCommand(ctx, command)
+  }
+  if (!ctx.isSshSession()) {
+    throw new Error('System monitoring requires an SSH or local terminal session')
+  }
   const connectionId = await ctx.openSideConnection({ kind: 'ssh-exec', command })
   let buf = ''
   const offData = ctx.onSideData(connectionId, (chunk) => {
@@ -1456,7 +1462,7 @@ export const serverMonitorMain: PluginMainModule = {
       busy: false,
       processSort: SERVER_MONITOR_PROCESS_SORT_DEFAULT,
       processSortDesc: SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
-      family: 'linux',
+      family: process.platform === 'darwin' ? 'macos' : process.platform === 'freebsd' ? 'freebsd' : 'linux',
       prevCpu: null,
       prevCores: [],
       prevNet: null,
@@ -1548,7 +1554,7 @@ export const serverMonitorMain: PluginMainModule = {
       if (!signal) {
         return { ok: false, error: 'Invalid signal' }
       }
-      const result = await signalRemoteProcess(ctx, payload.pid, signal)
+      const result = await signalProcess(ctx, payload.pid, signal)
       if (result.ok) {
         void state.poll()
       }

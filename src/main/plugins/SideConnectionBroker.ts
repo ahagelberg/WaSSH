@@ -9,6 +9,8 @@ import type {
   SideConnectionOpenRequest
 } from '../../shared/pluginApi'
 import type { ConnectionParams } from '../../shared/types'
+import { CONNECTION_TYPE_LOCAL } from '../../shared/types'
+import { connectionTypeOf } from '../../shared/connection'
 import { sendToWindow } from '../windowSend'
 import { SftpSession } from './SftpSession'
 import type { PluginSessionHandle } from './types'
@@ -54,6 +56,10 @@ export class SideConnectionBroker {
 
   isSshSession(tabId: string): boolean {
     return this.getSession(tabId)?.isSsh ?? false
+  }
+
+  isLocalSession(tabId: string): boolean {
+    return connectionTypeOf(this.getSession(tabId)?.connection) === CONNECTION_TYPE_LOCAL
   }
 
   /** Live connection params for a tab, if connected */
