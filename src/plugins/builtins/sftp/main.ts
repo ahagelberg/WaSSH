@@ -102,9 +102,6 @@ async function runOp(
       case 'chmod':
         await sftp.chmod(payload.path, payload.mode)
         break
-      case 'delete':
-        await sftp.delete(payload.path)
-        break
     }
     sendOpResult(ctx, { op, path: subject, ok: true })
   } catch (err) {
@@ -117,6 +114,32 @@ async function runOp(
       errorKind: e.kind
     })
   }
+}
+
+async function handleDelete(
+  ctx: PluginMainContext,
+  state: SessionState,
+  paths: string[]
+): Promise<void> {
+  const failures: Array<{ path: string; error: string }> = []
+  let deleted = 0
+  for (const path of paths) {
+    try {
+      if (!state.sftp) {
+        throw new Error('File session is not connected')
+      }
+      await state.sftp.delete(path)
+      deleted += 1
+    } catch (err) {
+      failures.push({ path, error: classifySftpError(err).message })
+    }
+  }
+  ctx.sendToRenderer({
+    type: 'deleteResult',
+    total: paths.length,
+    deleted,
+    failures
+  })
 }
 
 async function handleResetCwd(ctx: PluginMainContext, state: SessionState): Promise<void> {
@@ -233,8 +256,10 @@ async function handleMessage(
     case 'mkdir':
     case 'rename':
     case 'chmod':
-    case 'delete':
       await runOp(ctx, state, payload)
+      break
+    case 'delete':
+      await handleDelete(ctx, state, payload.paths)
       break
     case 'download':
       await handleDownload(ctx, state, payload.path)

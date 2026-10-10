@@ -31,7 +31,7 @@ export interface SessionState extends SftpTransferState {
 
 export type SftpOpMessage = Extract<
   SftpRendererMessage,
-  { type: 'mkdir' | 'rename' | 'chmod' | 'delete' }
+  { type: 'mkdir' | 'rename' | 'chmod' }
 >
 
 export const sessionStates = new Map<string, SessionState>()

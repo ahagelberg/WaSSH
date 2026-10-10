@@ -39,7 +39,7 @@ type SftpDialog =
   | { kind: 'mkdir' }
   | { kind: 'rename'; path: string; name: string }
   | { kind: 'chmod'; path: string; mode: number }
-  | { kind: 'delete'; path: string; name: string }
+  | { kind: 'delete'; paths: string[]; names: string[] }
   | null
 
 interface SftpViewer {
@@ -220,6 +220,20 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           } else {
             setDialogError(payload.error ?? 'Operation failed')
             showNotice(payload.error ?? 'Operation failed')
+          }
+          return
+        }
+        case 'deleteResult': {
+          setDialog(null)
+          setDialogError(null)
+          if (payload.failures.length > 0) {
+            const firstFailure = payload.failures[0]
+            showNotice(
+              `Deleted ${payload.deleted} of ${payload.total} items; ${firstFailure.path}: ${firstFailure.error}`
+            )
+          }
+          if (pathRef.current) {
+            requestList(pathRef.current)
           }
           return
         }
@@ -462,7 +476,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         }
         await send({ type: 'chmod', path: dialog.path, mode })
       } else if (dialog.kind === 'delete') {
-        await send({ type: 'delete', path: dialog.path })
+        await send({ type: 'delete', paths: dialog.paths })
       }
     } catch (err) {
       setDialogError(err instanceof Error ? err.message : String(err))
@@ -478,6 +492,16 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
       setDialogInput(d.name)
     } else if (d?.kind === 'chmod') {
       setDialogInput(octalMode(d.mode))
+    }
+  }
+
+  const openDeleteDialog = (items: SftpEntry[]): void => {
+    if (items.length > 0) {
+      openDialog({
+        kind: 'delete',
+        paths: items.map((entry) => entry.path),
+        names: items.map((entry) => entry.name)
+      })
     }
   }
 
@@ -524,7 +548,12 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           {dialog.kind === 'delete' ? (
             <div className="sftp-modal-body">
               <p>
-                Delete <strong>{dialog.name}</strong>? This cannot be undone.
+                {dialog.names.length === 1 ? (
+                  <>Delete <strong>{dialog.names[0]}</strong>?</>
+                ) : (
+                  <>Delete <strong>{dialog.names.length} items</strong>?</>
+                )}{' '}
+                This cannot be undone.
               </p>
               {dialogError && <p className="sftp-modal-error">{dialogError}</p>}
             </div>
@@ -690,7 +719,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             )}
             <div className="sftp-context-sep" />
             {item('Delete', '🗑', true, () =>
-              openDialog({ kind: 'delete', path: entry.path, name: entry.name })
+              openDeleteDialog(selectedPaths.has(entry.path) ? selectedEntries : [entry])
             )}
           </>
         ) : (
@@ -932,13 +961,9 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         <button
           type="button"
           className="sftp-btn sftp-btn-danger"
-          disabled={!connected || !selected}
-          title="Delete selected item"
-          onClick={() => {
-            if (selected) {
-              openDialog({ kind: 'delete', path: selected.path, name: selected.name })
-            }
-          }}
+          disabled={!connected || selectedPathsInOrder().length === 0}
+          title="Delete selected items"
+          onClick={() => openDeleteDialog(selectedEntries)}
         >
           🗑 Delete
         </button>
@@ -1054,7 +1079,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
                 onKeyDown={(e) => {
                   if (e.key === 'Delete' && connected) {
                     e.preventDefault()
-                    openDialog({ kind: 'delete', path: entry.path, name: entry.name })
+                    openDeleteDialog(selectedPaths.has(entry.path) ? selectedEntries : [entry])
                   }
                 }}
                 onContextMenu={(e) => {

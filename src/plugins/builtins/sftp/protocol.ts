@@ -30,7 +30,7 @@ export interface SftpListPayload {
   errorKind?: SftpErrorKind
 }
 
-export type SftpOpName = 'mkdir' | 'rename' | 'chmod' | 'delete'
+export type SftpOpName = 'mkdir' | 'rename' | 'chmod'
 
 /** Main → renderer: result of a mutating operation */
 export interface SftpOpResultPayload {
@@ -40,6 +40,13 @@ export interface SftpOpResultPayload {
   ok: boolean
   error?: string
   errorKind?: SftpErrorKind
+}
+
+export interface SftpDeleteResultPayload {
+  type: 'deleteResult'
+  total: number
+  deleted: number
+  failures: Array<{ path: string; error: string }>
 }
 
 export type SftpTransferDirection = 'upload' | 'download' | 'download-zip' | 'copy'
@@ -102,6 +109,7 @@ export type SftpMainPayload =
   | SftpStatusPayload
   | SftpListPayload
   | SftpOpResultPayload
+  | SftpDeleteResultPayload
   | SftpTransferProgressPayload
   | SftpTransferDonePayload
   | SftpClipboardStatePayload
@@ -115,7 +123,7 @@ export type SftpRendererMessage =
   | { type: 'mkdir'; path: string }
   | { type: 'rename'; oldPath: string; newPath: string }
   | { type: 'chmod'; path: string; mode: number }
-  | { type: 'delete'; path: string }
+  | { type: 'delete'; paths: string[] }
   | { type: 'download'; path: string }
   | { type: 'downloadZip'; path: string }
   | { type: 'copy'; paths: string[] }
