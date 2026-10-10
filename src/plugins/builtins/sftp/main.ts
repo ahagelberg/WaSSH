@@ -13,6 +13,7 @@ import {
   type SftpOpMessage
 } from './helpers'
 import type { SftpListPayload, SftpRendererMessage } from './protocol'
+import { clearClipboardFor, copyFilesToClipboard, pasteFilesFromClipboard, sendClipboardState } from './clipboard'
 import {
   cancelTransfers,
   handleChunkUploadChunk,
@@ -21,6 +22,7 @@ import {
   handleDownload,
   handleDownloadZip,
   handleUploadDialog,
+  handleUploadUris,
 } from './transfers'
 
 /** Session status that means the SSH transport has come back up. */
@@ -39,7 +41,7 @@ async function handleList(
       path: target,
       cwd: state.cwd || '/',
       entries: [],
-      error: 'SFTP session is not connected',
+      error: 'File session is not connected',
       errorKind: 'connection'
     } satisfies SftpListPayload)
     return
@@ -83,7 +85,7 @@ async function runOp(
       op,
       path: subject,
       ok: false,
-      error: 'SFTP session is not connected',
+      error: 'File session is not connected',
       errorKind: 'connection'
     })
     return
@@ -121,7 +123,7 @@ async function handleResetCwd(ctx: PluginMainContext, state: SessionState): Prom
   if (!state.sftp) {
     sendStatus(ctx, {
       state: 'error',
-      reason: 'SFTP session is not connected',
+      reason: 'File session is not connected',
       errorKind: 'connection'
     })
     return
@@ -140,13 +142,14 @@ async function handleResetCwd(ctx: PluginMainContext, state: SessionState): Prom
 }
 
 function handleGetStatus(ctx: PluginMainContext, state: SessionState): void {
+  sendClipboardState(ctx)
   if (state.sftp) {
     sendStatus(ctx, { state: 'connected', cwd: state.cwd || '/' })
     return
   }
   sendStatus(ctx, {
     state: 'error',
-    reason: state.error || 'SFTP session is not connected',
+    reason: state.error || 'File session is not connected',
     errorKind: state.errorKind || 'other'
   })
 }
@@ -162,7 +165,7 @@ function teardown(state: SessionState): void {
   state.sftp = null
 }
 
-/** Open the SFTP channel on the session's current transport. */
+/** Open the file session for the active transport. */
 async function openSession(ctx: PluginMainContext, state: SessionState): Promise<void> {
   if (state.opening) {
     return
@@ -170,7 +173,9 @@ async function openSession(ctx: PluginMainContext, state: SessionState): Promise
   state.opening = true
   sendStatus(ctx, { state: 'connecting' })
   try {
-    const sftp = await ctx.openSftp()
+    const sftp = ctx.isLocalSession()
+      ? await ctx.openLocalFileSystem()
+      : await ctx.openSftp()
     state.sftp = sftp
     try {
       state.home = await sftp.realpath('~')
@@ -199,6 +204,7 @@ async function openSession(ctx: PluginMainContext, state: SessionState): Promise
  * transfer behind a permanent "already running".
  */
 function dropSession(state: SessionState): void {
+  clearClipboardFor(state)
   cancelTransfers(state)
   state.download = null
   state.upload = null
@@ -236,11 +242,19 @@ async function handleMessage(
     case 'downloadZip':
       await handleDownloadZip(ctx, state, payload.path)
       break
+    case 'copy':
+      await copyFilesToClipboard(ctx, state, payload.paths)
+      break
+    case 'paste':
+      await pasteFilesFromClipboard(ctx, state, payload.path)
+      break
     case 'viewFile':
       await handleViewFile(ctx, state.sftp, payload.path)
       break
     case 'uploadDialog':
       return handleUploadDialog(ctx, state, payload.path)
+    case 'uploadUris':
+      return handleUploadUris(ctx, state, payload.uris, payload.path)
     case 'uploadStart':
       await handleChunkUploadStart(ctx, state, payload)
       break
@@ -262,6 +276,7 @@ async function handleMessage(
 export const sftpMain: PluginMainModule = {
   async onActivate(ctx) {
     const state: SessionState = {
+      ctx,
       sftp: null,
       cwd: null,
       home: '',
@@ -276,17 +291,18 @@ export const sftpMain: PluginMainModule = {
     sessionStates.set(instanceKey(ctx), state)
 
     ctx.onDeactivateCleanup(() => {
+      clearClipboardFor(state)
       teardown(state)
       sessionStates.delete(instanceKey(ctx))
     })
 
-    if (!ctx.isSshSession()) {
-      state.error = 'SFTP requires an SSH session'
+    if (!ctx.isSshSession() && !ctx.isLocalSession()) {
+      state.error = 'Files are available for SSH and Local sessions'
       state.errorKind = 'not_ssh'
       sendStatus(ctx, {
         state: 'error',
         errorKind: 'not_ssh',
-        reason: 'SFTP requires an SSH session'
+        reason: 'Files are available for SSH and Local sessions'
       })
       return
     }
@@ -297,6 +313,7 @@ export const sftpMain: PluginMainModule = {
   async onDeactivate(ctx) {
     const state = stateFor(ctx)
     if (state) {
+      clearClipboardFor(state)
       teardown(state)
       sessionStates.delete(instanceKey(ctx))
     }

@@ -1,3 +1,22 @@
+import {
+  createReadStream as fsCreateReadStream,
+  createWriteStream as fsCreateWriteStream
+} from 'node:fs'
+import {
+  chmod as fsChmod,
+  lstat as fsLstat,
+  mkdir as fsMkdir,
+  readdir as fsReaddir,
+  realpath as fsRealpath,
+  rename as fsRename,
+  rmdir as fsRmdir,
+  stat as fsStat,
+  unlink as fsUnlink
+} from 'node:fs/promises'
+import type { Stats as NodeStats } from 'node:fs'
+import { homedir } from 'node:os'
+import { join, isAbsolute, resolve, sep } from 'node:path'
+import type { Readable, Writable } from 'node:stream'
 import type {
   FileEntryWithStats,
   SFTPWrapper,
@@ -36,11 +55,59 @@ export interface SftpError {
   kind: SftpErrorKind
 }
 
+export interface PluginFileStats {
+  size: number
+  mode: number
+  mtime: Date | number
+  uid: number
+  gid: number
+  isDirectory: () => boolean
+}
+
+export interface PluginFileSession {
+  list: (path: string) => Promise<SftpEntry[]>
+  mkdir: (path: string) => Promise<void>
+  rename: (oldPath: string, newPath: string) => Promise<void>
+  chmod: (path: string, mode: number) => Promise<void>
+  delete: (path: string) => Promise<void>
+  stat: (path: string) => Promise<PluginFileStats>
+  lstat: (path: string) => Promise<PluginFileStats>
+  statSafe: (path: string) => Promise<PluginFileStats | null>
+  realpath: (path: string) => Promise<string>
+  createReadStream: (path: string) => Readable
+  createWriteStream: (path: string, options?: { autoClose?: boolean }) => Writable
+  finishWrite: (stream: Writable) => Promise<void>
+  end: () => void
+}
+
 /** Map a thrown SFTP error to a structured { message, kind } pair. */
 export function classifySftpError(err: unknown): SftpError {
   const raw = err instanceof Error ? err : new Error(String(err))
   const code = (err as { code?: number | string } | null)?.code
   let kind: SftpErrorKind = 'other'
+  if (typeof code === 'string') {
+    switch (code) {
+      case 'ENOENT':
+        kind = 'not_found'
+        break
+      case 'EACCES':
+      case 'EPERM':
+        kind = 'permission'
+        break
+      case 'ENOTDIR':
+        kind = 'not_dir'
+        break
+      case 'EEXIST':
+        kind = 'exists'
+        break
+      case 'ENOTCONN':
+        kind = 'connection'
+        break
+      case 'ENOTEMPTY':
+        kind = 'io'
+        break
+    }
+  }
   if (typeof code === 'number') {
     switch (code) {
       case SFTP_STATUS.NO_SUCH_FILE:
@@ -149,7 +216,7 @@ function compareListEntries(a: SftpEntry, b: SftpEntry): number {
 }
 
 /** Promisified wrapper around an ssh2 SFTPWrapper (one per live SSH client). */
-export class SftpSession {
+export class SftpSession implements PluginFileSession {
   private readonly sftp: SFTPWrapper
 
   constructor(sftp: SFTPWrapper) {
@@ -276,11 +343,136 @@ export class SftpSession {
     return this.runVoid((callback) => this.sftp.close(handle, callback))
   }
 
+  async finishWrite(stream: Writable): Promise<void> {
+    const writable = stream as unknown as { handle?: Buffer | null }
+    if (writable.handle) {
+      await this.close(writable.handle)
+      writable.handle = null
+    }
+  }
+
   end(): void {
     try {
       this.sftp.end()
     } catch {
       // already closed
     }
+  }
+}
+
+function localPath(path: string): string {
+  const trimmed = path.trim()
+  const home = homedir()
+  const expanded = trimmed === '~'
+    ? home
+    : trimmed.startsWith('~/') || trimmed.startsWith('~\\')
+      ? join(home, trimmed.slice(2))
+      : trimmed
+  return resolve(isAbsolute(expanded) ? expanded : join(home, expanded || '.'))
+}
+
+function displayLocalPath(path: string): string {
+  return path.split(sep).join('/')
+}
+
+/** Filesystem-backed implementation for the Local terminal session. */
+export class LocalFileSession implements PluginFileSession {
+  private ended = false
+
+  private assertOpen(): void {
+    if (this.ended) {
+      throw Object.assign(new Error('Local file session is closed'), { code: 'ENOTCONN' })
+    }
+  }
+
+  async list(path: string): Promise<SftpEntry[]> {
+    this.assertOpen()
+    const directory = localPath(path)
+    const entries = await fsReaddir(directory, { withFileTypes: true })
+    const mapped = await Promise.all(entries.map(async (entry) => {
+      const stats = await fsLstat(join(directory, entry.name))
+      return {
+        name: entry.name,
+        path: joinRemotePath(displayLocalPath(directory), entry.name),
+        type: entryTypeFromMode(stats.mode),
+        size: stats.size,
+        mode: stats.mode,
+        modeSymbolic: symbolicMode(stats.mode),
+        mtime: stats.mtimeMs,
+        uid: stats.uid,
+        gid: stats.gid
+      } satisfies SftpEntry
+    }))
+    return mapped.sort(compareListEntries)
+  }
+
+  async mkdir(path: string): Promise<void> {
+    this.assertOpen()
+    await fsMkdir(localPath(path))
+  }
+
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    this.assertOpen()
+    await fsRename(localPath(oldPath), localPath(newPath))
+  }
+
+  async chmod(path: string, mode: number): Promise<void> {
+    this.assertOpen()
+    await fsChmod(localPath(path), mode)
+  }
+
+  async delete(path: string): Promise<void> {
+    this.assertOpen()
+    const target = localPath(path)
+    const stats = await fsLstat(target)
+    if (stats.isDirectory()) {
+      for (const entry of await fsReaddir(target)) {
+        await this.delete(joinRemotePath(displayLocalPath(target), entry))
+      }
+      await fsRmdir(target)
+    } else {
+      await fsUnlink(target)
+    }
+  }
+
+  async stat(path: string): Promise<NodeStats> {
+    this.assertOpen()
+    return fsStat(localPath(path))
+  }
+
+  async lstat(path: string): Promise<NodeStats> {
+    this.assertOpen()
+    return fsLstat(localPath(path))
+  }
+
+  async statSafe(path: string): Promise<NodeStats | null> {
+    try {
+      return await this.stat(path)
+    } catch {
+      return null
+    }
+  }
+
+  async realpath(path: string): Promise<string> {
+    this.assertOpen()
+    return displayLocalPath(await fsRealpath(localPath(path)))
+  }
+
+  createReadStream(path: string): Readable {
+    this.assertOpen()
+    return fsCreateReadStream(localPath(path))
+  }
+
+  createWriteStream(path: string, _options?: { autoClose?: boolean }): Writable {
+    this.assertOpen()
+    return fsCreateWriteStream(localPath(path))
+  }
+
+  async finishWrite(_stream: Writable): Promise<void> {
+    return
+  }
+
+  end(): void {
+    this.ended = true
   }
 }

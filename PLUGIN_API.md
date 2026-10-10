@@ -46,7 +46,7 @@ A plugin is three things:
 | `main/plugins/types.ts` | `PluginSessionHandle` (SessionManager→broker), `StreamTransform` |
 | `main/plugins/SessionDataPipeline.ts` | Ordered observe/intercept stream transforms |
 | `main/plugins/SideConnectionBroker.ts` | SSH-exec/shell/TCP side connections, raw TCP/unix duplexes, SFTP channels |
-| `main/plugins/SftpSession.ts` | Promisified SFTP wrapper |
+| `main/plugins/SftpSession.ts` | Shared file-session contract and SSH/Local adapters |
 | `main/plugins/createPluginSystem.ts` | Wiring, restore queue |
 | `main/plugins/externalLoader.ts` | Future external-plugin scanner (stub) |
 | `plugins/builtins/<id>/*` | Self-contained built-ins: manifest, protocol, main module, view, helpers, and private CSS |
@@ -208,9 +208,11 @@ interface PluginMainModule {
 | `onSideData(connectionId, cb(data)): unsubscribe` | Data from a side channel (main-side listener) |
 | `onSideClosed(connectionId, cb(error?)): unsubscribe` | Channel closed; both listener maps are cleared |
 | `isSshSession(): boolean` | True only when the live session is SSH (not telnet/serial) |
+| `isLocalSession(): boolean` | True only for WaSSH's Local terminal session |
 | `openTcpStream(host, port): Promise<Duplex>` | Raw binary duplex for non-UTF-8 protocols; SSH `forwardOut` when SSH, else direct TCP. No side-data events |
 | `openUnixStream(socketPath): Promise<Duplex>` | Raw binary duplex to a unix socket on the remote host (SSH `direct-streamlocal`); SSH-only. No side-data events |
 | `openSftp(): Promise<SftpSession>` | SFTP channel on the live SSH connection (§9); throws for non-SSH |
+| `openLocalFileSystem(): Promise<PluginFileSession>` | Host filesystem adapter for a Local session; throws for other session types (§9) |
 | `execCapture(command): Promise<string>` | Run on the live SSH session and return trimmed stdout (e.g. `pwd`); throws for non-SSH |
 | `registerStreamHandler(mode, direction, handler)` | PTY stream transform (§6); auto-removed on deactivate |
 | `onDeactivateCleanup(fn)` | Register cleanup; always runs on deactivate/disable/tab close |
@@ -220,6 +222,7 @@ interface PluginMainModule {
 | `setSettingValue(key, value)` | Persist one key of this plugin's own app-wide stored settings (§4) |
 | `showOpenDialog(options): Promise<{canceled, filePaths}>` | Native open-file/directory dialog. `options`: `{title?, buttonLabel?, defaultPath?, properties?('openFile'\|'openDirectory'\|'multiSelections'), filters?({name, extensions[]})}`. No Electron types are exposed |
 | `showSaveDialog(options): Promise<{canceled, filePath?}>` | Native save-file dialog. `options`: `{title?, buttonLabel?, defaultPath?, filters?}`. `filePath` is `undefined` when cancelled |
+| `writeClipboardFileUris(paths): Promise<void>` | Publish local file paths as `text/uri-list` plus GNOME's copied-files format where supported |
 | `listPlugins(): PluginListItem[]` | Every loaded plugin (built-in + external) with its manifest and `enabled` flag. Use it to discover other plugins' contributions without importing them |
 
 ### `PluginMainModule.getSettingsSchema` (optional)
@@ -399,18 +402,28 @@ capabilities.
   demand; modules needing a connection gate on `isSshSession()` and re-check on
   each activation after reconnect.
 
-## 9. SFTP (`SftpSession`)
+## 9. File Sessions (`PluginFileSession`)
 
-`ctx.openSftp()` throws unless the live session is SSH. The wrapper is
-promisified over one ssh2 `SFTPWrapper` (`entry.sftp`):
+`ctx.openSftp()` throws unless the live session is SSH. `ctx.openLocalFileSystem()`
+throws unless the live session is Local. Both return `PluginFileSession`, so a
+plugin can share file-browser and transfer logic across the two transports.
+The SSH implementation wraps one ssh2 `SFTPWrapper` (`entry.sftp`); the Local
+implementation uses the host filesystem and resolves relative paths from the
+user's home directory:
 
 `list(path)` → `SftpEntry[]` · `mkdir(path)` · `rename(old, new)` ·
-`chmod(path, mode)` · `unlink(path)` · `rmdir(path)` · `delete(path)`
-(recursive, lstat-based, never follows symlinks) · `stat(path)` /
+`chmod(path, mode)` · `delete(path)` (recursive, lstat-based, never follows
+symlinks) · `stat(path)` /
 `lstat(path)` / `statSafe(path)` (null instead of reject) /
-`realpath(path)` (OpenSSH tilde expansion when available) ·
+`realpath(path)` (OpenSSH tilde expansion on SSH; native canonical path on Local) ·
 `createReadStream(path)` · `createWriteStream(path, opts?)` ·
-`close(handle)` · `end()`.
+`finishWrite(stream)` waits for the transport to finish committing an ended
+write stream · `end()`. `SftpSession` additionally exposes `unlink`, `rmdir`, and
+`close(handle)`.
+
+`writeClipboardFileUris(paths)` publishes Local paths as file URLs for
+compatible desktop file managers. File-manager paste into WaSSH accepts
+clipboard `File` items and `text/uri-list`; native format support varies by OS.
 
 Errors reject as `{ message, kind }` with `kind: SftpErrorKind` =
 `not_ssh | not_found | permission | not_dir | exists | name_in_use | io |

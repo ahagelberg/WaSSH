@@ -1,4 +1,5 @@
-import { BrowserWindow, dialog } from 'electron'
+import { BrowserWindow, ClipboardItem, clipboard, dialog } from 'electron'
+import { pathToFileURL } from 'node:url'
 import type {
   PluginActiveStateEvent,
   PluginListItem,
@@ -11,6 +12,7 @@ import type { SettingsStore, SessionStore } from '../store/sessionStore'
 import type { PluginDataStore } from '../store/pluginDataStore'
 import type { CredentialVault } from '../store/credentialVault'
 import { sendToWindow } from '../windowSend'
+import { LocalFileSession } from './SftpSession'
 import { loadExternalPlugins } from './externalLoader'
 import { BUILTIN_MANIFESTS, BUILTIN_PLUGIN_DEFINITIONS } from './builtinRegistry'
 import type { SessionDataPipeline } from './SessionDataPipeline'
@@ -304,6 +306,13 @@ export class PluginHost {
         }
       },
       isSshSession: () => this.broker.isSshSession(tabId),
+      isLocalSession: () => this.broker.isLocalSession(tabId),
+      openLocalFileSystem: async () => {
+        if (!this.broker.isLocalSession(tabId)) {
+          throw new Error('Local filesystem access requires a Local terminal session')
+        }
+        return new LocalFileSession()
+      },
       openTcpStream: async (host, port) => {
         const { stream } = await this.broker.openTcpStream(tabId, pluginId, host, port)
         return stream
@@ -332,6 +341,16 @@ export class PluginHost {
       },
       showOpenDialog: (options) => this.showOpenDialog(options),
       showSaveDialog: (options) => this.showSaveDialog(options),
+      writeClipboardFileUris: async (paths) => {
+        const uris = paths.map((path) => pathToFileURL(path).href)
+        const uriList = `${uris.join('\r\n')}\r\n`
+        await clipboard.write([
+          new ClipboardItem({
+            'text/uri-list': new Blob([uriList], { type: 'text/uri-list' }),
+            'x-special/gnome-copied-files': new Blob([`copy\n${uris.join('\n')}`])
+          })
+        ])
+      },
       listPlugins: () => this.listPlugins()
     }
 
@@ -360,14 +379,14 @@ export class PluginHost {
     if (!instance) {
       return
     }
-    // Closing the SFTP Files browser must not disable terminal drop-upload:
-    // keep the module running headless while the session is still SSH. The
-    // renderer already removed the plugin from its view state locally.
+    // Keep file sessions alive headless so their paths remain available to
+    // another session's file panel after the source panel is closed.
     const registration = this.registrations.get(pluginId)
     const retainBackground =
       registration?.retainBackgroundOnViewClose &&
       (registration.backgroundActivation === 'session' ||
-        (registration.backgroundActivation === 'ssh' && this.broker.isSshSession(tabId)))
+        (registration.backgroundActivation === 'ssh' &&
+          (this.broker.isSshSession(tabId) || this.broker.isLocalSession(tabId))))
     if (!force && retainBackground) {
       instance.announced = false
       return

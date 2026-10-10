@@ -30,7 +30,7 @@ import { collectDroppedFiles, isFileDrag } from '@plugin-api/renderer'
 import './styles.css'
 
 interface TransferProgress {
-  direction: 'upload' | 'download' | 'download-zip'
+  direction: 'upload' | 'download' | 'download-zip' | 'copy'
   transferred: number
   total: number
 }
@@ -71,6 +71,8 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   const [loading, setLoading] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set())
+  const [clipboardCount, setClipboardCount] = useState(0)
   const [dialog, setDialog] = useState<SftpDialog>(null)
   const [dialogInput, setDialogInput] = useState('')
   const [dialogError, setDialogError] = useState<string | null>(null)
@@ -85,6 +87,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
 
   const requestedRef = useRef<string | null>(null)
   const pathRef = useRef<string | null>(null)
+  const lastSelectedPathRef = useRef<string | null>(null)
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   pathRef.current = path
 
@@ -193,11 +196,16 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           if (payload.error) {
             setListError(payload.error)
             setEntries([])
+            setSelectedPath(null)
+            setSelectedPaths(new Set())
           } else {
             setListError(null)
             setEntries(payload.entries)
             setSelectedPath((prev) =>
               prev && payload.entries.some((e) => e.path === prev) ? prev : null
+            )
+            setSelectedPaths((prev) =>
+              new Set([...prev].filter((selected) => payload.entries.some((e) => e.path === selected)))
             )
           }
           return
@@ -251,6 +259,17 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             }
           } else if (payload.direction === 'download-zip') {
             showNotice(`Downloaded ${baseName(payload.remotePath)} as ZIP`)
+          }
+          return
+        }
+        case 'clipboardState': {
+          setClipboardCount(payload.available ? payload.count : 0)
+          return
+        }
+        case 'clipboardResult': {
+          showNotice(payload.message)
+          if (payload.action === 'paste' && payload.ok && pathRef.current) {
+            requestList(pathRef.current)
           }
           return
         }
@@ -356,6 +375,16 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   }, [contextMenu])
 
   const selected = entries.find((e) => e.path === selectedPath) ?? null
+  const selectedEntries = entries.filter((entry) => selectedPaths.has(entry.path))
+  const copyPaths = (paths: string[]): void => {
+    if (paths.length > 0) {
+      void send({ type: 'copy', paths })
+    }
+  }
+  const selectedPathsInOrder = (): string[] => {
+    const paths = selectedEntries.map((entry) => entry.path)
+    return paths.length > 0 ? paths : selectedPath ? [selectedPath] : []
+  }
   const zipTarget = selected?.type === 'directory' ? selected.path : !selected && path ? path : null
   const parentDir = path ? parentPath(path) : null
 
@@ -368,6 +397,40 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     if (entry.type === 'directory') {
       navigate(entry.path)
     }
+  }
+
+  const selectEntry = (
+    entryPath: string,
+    modifiers: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }
+  ): void => {
+    const anchor = lastSelectedPathRef.current
+    if (modifiers.shiftKey && anchor) {
+      const start = entries.findIndex((entry) => entry.path === anchor)
+      const end = entries.findIndex((entry) => entry.path === entryPath)
+      if (start >= 0 && end >= 0) {
+        const next = new Set(modifiers.ctrlKey || modifiers.metaKey ? selectedPaths : [])
+        for (const entry of entries.slice(Math.min(start, end), Math.max(start, end) + 1)) {
+          next.add(entry.path)
+        }
+        setSelectedPaths(next)
+        setSelectedPath(entryPath)
+        return
+      }
+    }
+    if (modifiers.ctrlKey || modifiers.metaKey) {
+      const next = new Set(selectedPaths)
+      if (next.has(entryPath)) {
+        next.delete(entryPath)
+      } else {
+        next.add(entryPath)
+      }
+      setSelectedPaths(next)
+      setSelectedPath(next.has(entryPath) ? entryPath : Array.from(next).at(-1) ?? null)
+    } else {
+      setSelectedPaths(new Set([entryPath]))
+      setSelectedPath(entryPath)
+    }
+    lastSelectedPathRef.current = entryPath
   }
 
   const submitDialog = async (): Promise<void> => {
@@ -602,6 +665,13 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           <>
             {entry.type === 'directory' &&
               item('Open', '📂', false, () => navigate(entry.path))}
+            {item('Copy', '⧉', false, () =>
+              copyPaths(
+                selectedPaths.has(entry.path)
+                  ? selectedPathsInOrder()
+                  : [entry.path]
+              )
+            )}
             {entry.type === 'file' &&
               item('View', '👁', false, () => openViewer(entry))}
             {entry.type === 'file' &&
@@ -625,6 +695,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           </>
         ) : (
           <>
+            {clipboardCount > 0 &&
+              item('Paste', '▣', false, () => {
+                void send({ type: 'paste', path: path ?? undefined })
+              })}
             {item('New folder', '+', false, () => openDialog({ kind: 'mkdir' }))}
             {item('Upload files…', '⬆', false, () => openFilePicker())}
             {path &&
@@ -690,6 +764,49 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
   return (
     <div
       className="sftp-view"
+      onKeyDown={(e) => {
+        const target = e.target as HTMLElement
+        if (target.closest('input, textarea, [contenteditable="true"], .sftp-modal, .sftp-viewer')) {
+          return
+        }
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+          const paths = selectedPathsInOrder()
+          if (paths.length > 0) {
+            e.preventDefault()
+            e.stopPropagation()
+            copyPaths(paths)
+          }
+        }
+      }}
+      onPaste={(e) => {
+        const target = e.target as HTMLElement
+        if (target.closest('input, textarea, [contenteditable="true"], .sftp-modal, .sftp-viewer')) {
+          return
+        }
+        const files = collectDroppedFiles(e.clipboardData)
+        if (files.length > 0) {
+          e.preventDefault()
+          if (connected) {
+            void uploadDroppedFiles(files)
+          }
+          return
+        }
+        const uriList = e.clipboardData.getData('text/uri-list') ||
+          e.clipboardData.getData('x-special/gnome-copied-files').replace(/^(copy|cut)\n/, '')
+        const uris = uriList
+          .split(/\r?\n/)
+          .map((uri) => uri.trim())
+          .filter((uri) => uri.startsWith('file://'))
+        if (uris.length > 0 && connected) {
+          e.preventDefault()
+          void send({ type: 'uploadUris', uris, path: pathRef.current ?? undefined })
+          return
+        }
+        if (connected && clipboardCount > 0) {
+          e.preventDefault()
+          void send({ type: 'paste', path: pathRef.current ?? undefined })
+        }
+      }}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -701,10 +818,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           {status === 'connected'
             ? `Connected — uploads go to ${cwd ?? '/'}`
             : status === 'connecting'
-              ? 'Connecting SFTP…'
+              ? 'Connecting…'
               : status === 'error'
-                ? statusReason ?? 'SFTP error'
-                : 'SFTP not connected'}
+                ? statusReason ?? 'File session error'
+                : 'Files not connected'}
         </span>
         {connected && (
           <button
@@ -766,6 +883,24 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           onClick={() => openFilePicker()}
         >
           ⬆ Upload…
+        </button>
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || selectedPathsInOrder().length === 0}
+          title="Copy selected files or folders"
+          onClick={() => copyPaths(selectedPathsInOrder())}
+        >
+          ⧉ Copy
+        </button>
+        <button
+          type="button"
+          className="sftp-btn"
+          disabled={!connected || clipboardCount === 0}
+          title={clipboardCount > 0 ? `Paste ${clipboardCount} copied item${clipboardCount === 1 ? '' : 's'} here` : 'No copied files'}
+          onClick={() => void send({ type: 'paste', path: path ?? undefined })}
+        >
+          ▣ Paste{clipboardCount > 0 ? ` (${clipboardCount})` : ''}
         </button>
         <span className="sftp-toolbar-sep" />
         <button
@@ -872,6 +1007,7 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             return
           }
           setSelectedPath(null)
+          setSelectedPaths(new Set())
           setContextMenu({ x: e.clientX, y: e.clientY, entry: null })
         }}
       >
@@ -909,9 +1045,9 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
               <tr
                 key={entry.path}
                 tabIndex={-1}
-                className={`sftp-row${entry.path === selectedPath ? ' selected' : ''}${entry.type === 'directory' ? ' dir' : ''}`}
+                className={`sftp-row${selectedPaths.has(entry.path) ? ' selected' : ''}${entry.type === 'directory' ? ' dir' : ''}`}
                 onClick={(e) => {
-                  setSelectedPath(entry.path)
+                  selectEntry(entry.path, e)
                   e.currentTarget.focus({ preventScroll: true })
                 }}
                 onDoubleClick={() => openEntry(entry)}
@@ -927,7 +1063,11 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
                   }
                   e.preventDefault()
                   e.stopPropagation()
-                  setSelectedPath(entry.path)
+                  if (!selectedPaths.has(entry.path)) {
+                    setSelectedPath(entry.path)
+                    setSelectedPaths(new Set([entry.path]))
+                    lastSelectedPathRef.current = entry.path
+                  }
                   setContextMenu({ x: e.clientX, y: e.clientY, entry })
                 }}
               >
@@ -977,7 +1117,9 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
             <div key={remotePath} className="sftp-transfer">
               <div className="sftp-transfer-label">
                 <span>
-                  {t.direction === 'upload'
+                  {t.direction === 'copy'
+                    ? '⇄ Copy'
+                    : t.direction === 'upload'
                     ? '⬆ Upload'
                     : t.direction === 'download-zip'
                       ? '⬇ Download ZIP'

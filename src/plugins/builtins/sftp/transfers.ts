@@ -2,17 +2,20 @@ import { once } from 'events'
 import {
   createReadStream as fsCreateReadStream,
   createWriteStream as fsCreateWriteStream,
+  realpathSync as fsRealpathSync,
   statSync as fsStatSync,
   unlink as fsUnlink
 } from 'fs'
 import type { ReadStream as FsReadStream, WriteStream as FsWriteStream } from 'fs'
-import { basename } from 'path'
-import type { ReadStream as SftpReadStream, WriteStream as SftpWriteStream } from 'ssh2'
-import { PassThrough } from 'stream'
+import { basename, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { PassThrough } from 'node:stream'
+import type { Readable, Writable } from 'node:stream'
 import { ZipFile } from 'yazl'
-import type { PluginMainContext, SftpError, SftpSession } from '@plugin-api/main'
+import type { PluginFileSession, PluginMainContext, SftpError } from '@plugin-api/main'
 import { classifySftpError, joinRemotePath } from '@plugin-api/main'
 import { ARCHIVE_EMPTY_SIZE, collectArchiveEntries } from './archiveLayout'
+import { availableCopyPath } from './filePaths'
 import type { SftpTransferDonePayload, SftpTransferProgressPayload } from './protocol'
 
 interface FileTransferState {
@@ -23,7 +26,7 @@ interface FileTransferState {
 }
 
 export interface SftpDownloadState extends FileTransferState {
-  remote: SftpReadStream | null
+  remote: Readable | null
   local: FsWriteStream
   transferred: number
   archive?: ZipFile
@@ -32,7 +35,7 @@ export interface SftpDownloadState extends FileTransferState {
 }
 
 export interface SftpUploadState extends FileTransferState {
-  remote: SftpWriteStream
+  remote: Writable
   local: FsReadStream
   transferred: number
 }
@@ -44,12 +47,12 @@ export interface SftpChunkUploadState {
   remotePath: string
   total: number
   received: number
-  write: SftpWriteStream | null
+  write: Writable | null
   queue: Promise<void>
 }
 
 export interface SftpTransferState {
-  sftp: SftpSession | null
+  sftp: PluginFileSession | null
   cwd: string | null
   stopped: boolean
   download: SftpDownloadState | null
@@ -86,7 +89,7 @@ export async function handleDownload(
       direction: 'download',
       remotePath: path,
       state: 'error',
-      error: 'SFTP session is not connected',
+      error: 'File session is not connected',
       errorKind: 'connection'
     })
     return
@@ -215,7 +218,7 @@ export async function handleDownloadZip(
       direction: 'download-zip',
       remotePath: path,
       state: 'error',
-      error: 'SFTP session is not connected',
+      error: 'File session is not connected',
       errorKind: 'connection'
     })
     return
@@ -286,7 +289,7 @@ export async function handleDownloadZip(
           },
           (cb) => {
             if (download.cancelled) {
-              cb(new Error('Transfer cancelled'), null as unknown as SftpReadStream)
+              cb(new Error('Transfer cancelled'), null as unknown as Readable)
               return
             }
             const remote = sftp.createReadStream(entry.remotePath)
@@ -376,7 +379,16 @@ async function uploadFile(
     size = 0
   }
   const name = basename(localPath)
-  const remotePath = joinRemotePath(targetDir, name)
+  let remotePath = joinRemotePath(targetDir, name)
+  if (ctx.isLocalSession()) {
+    try {
+      if (resolve(fsRealpathSync(localPath)) === resolve(await sftp.realpath(remotePath))) {
+        remotePath = await availableCopyPath(sftp, targetDir, name)
+      }
+    } catch {
+      /* The write stream reports unresolved source or destination paths. */
+    }
+  }
   const remote = sftp.createWriteStream(remotePath)
   const local = fsCreateReadStream(localPath)
   const upload: SftpUploadState = {
@@ -482,6 +494,36 @@ export async function handleUploadDialog(
   return uploaded
 }
 
+export async function handleUploadUris(
+  ctx: PluginMainContext,
+  state: SftpTransferState,
+  uris: string[],
+  path?: string
+): Promise<number> {
+  if (!state.sftp) {
+    return 0
+  }
+  const targetDir = path?.trim() || state.cwd || '/tmp'
+  let uploaded = 0
+  for (const uri of uris) {
+    if (state.stopped) {
+      break
+    }
+    try {
+      const localPath = fileURLToPath(uri)
+      if (!fsStatSync(localPath).isFile()) {
+        continue
+      }
+      if (await uploadFile(ctx, state, localPath, targetDir)) {
+        uploaded += 1
+      }
+    } catch {
+      /* Ignore non-file URLs and entries the OS clipboard no longer exposes. */
+    }
+  }
+  return uploaded
+}
+
 export async function handleChunkUploadStart(
   ctx: PluginMainContext,
   state: SftpTransferState,
@@ -495,7 +537,7 @@ export async function handleChunkUploadStart(
       direction: 'upload',
       remotePath: joinRemotePath(targetDir, payload.name),
       state: 'error',
-      error: 'SFTP session is not connected',
+      error: 'File session is not connected',
       errorKind: 'connection'
     })
     return
@@ -617,12 +659,9 @@ export async function handleChunkUploadEnd(
       if (chunkUpload.cancelled) {
         return
       }
-      // ssh2 marks WriteStream finished before the server confirms close, so
-      // wait for the remote close before refreshing the directory listing.
-      const handle = (write as unknown as { handle?: Buffer | null }).handle
-      if (sftp && handle) {
+      if (sftp) {
         try {
-          await sftp.close(handle)
+          await sftp.finishWrite(write)
         } catch (err) {
           if (chunkUpload.cancelled) {
             return
@@ -641,7 +680,6 @@ export async function handleChunkUploadEnd(
           })
           return
         }
-        ;(write as unknown as { handle?: Buffer | null }).handle = null
       }
       try {
         write.destroy()

@@ -42,7 +42,7 @@ export interface SftpOpResultPayload {
   errorKind?: SftpErrorKind
 }
 
-export type SftpTransferDirection = 'upload' | 'download' | 'download-zip'
+export type SftpTransferDirection = 'upload' | 'download' | 'download-zip' | 'copy'
 
 /** Main → renderer: byte progress for an active transfer */
 export interface SftpTransferProgressPayload {
@@ -61,6 +61,20 @@ export interface SftpTransferDonePayload {
   state: 'done' | 'error' | 'cancelled'
   error?: string
   errorKind?: SftpErrorKind
+}
+
+export interface SftpClipboardStatePayload {
+  type: 'clipboardState'
+  available: boolean
+  count: number
+  names: string[]
+}
+
+export interface SftpClipboardResultPayload {
+  type: 'clipboardResult'
+  action: 'copy' | 'paste'
+  ok: boolean
+  message: string
 }
 
 /** Main → renderer: content fetched for the in-panel file viewer */
@@ -90,6 +104,8 @@ export type SftpMainPayload =
   | SftpOpResultPayload
   | SftpTransferProgressPayload
   | SftpTransferDonePayload
+  | SftpClipboardStatePayload
+  | SftpClipboardResultPayload
   | SftpViewFilePayload
 
 /** Renderer → main SFTP commands */
@@ -102,8 +118,11 @@ export type SftpRendererMessage =
   | { type: 'delete'; path: string }
   | { type: 'download'; path: string }
   | { type: 'downloadZip'; path: string }
+  | { type: 'copy'; paths: string[] }
+  | { type: 'paste'; path?: string }
   | { type: 'viewFile'; path: string }
   | { type: 'uploadDialog'; path?: string }
+  | { type: 'uploadUris'; uris: string[]; path?: string }
   | { type: 'uploadStart'; name: string; size: number; path?: string }
   | { type: 'uploadChunk'; name: string; data: Uint8Array }
   | { type: 'uploadEnd'; name: string }
@@ -119,7 +138,10 @@ export const SFTP_RENDERER_MESSAGE_TYPES = new Set<SftpRendererMessage['type']>(
   'delete',
   'download',
   'downloadZip',
+  'copy',
+  'paste',
   'uploadDialog',
+  'uploadUris',
   'uploadStart',
   'uploadChunk',
   'uploadEnd',

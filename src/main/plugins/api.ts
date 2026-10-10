@@ -10,13 +10,13 @@ import type {
 export type { PluginApiListing, PluginListItem } from '../../shared/pluginApi'
 import type { SessionStatus } from '../../shared/types'
 export type { SessionStatus } from '../../shared/types'
-import type { SftpSession } from './SftpSession'
+import type { PluginFileSession, SftpSession } from './SftpSession'
 import type { StreamTransform } from './types'
 // Re-exported deliberately: plugins get the SFTP session type and the two
 // shared error/path helpers through the API entry (`@plugin-api/main`) instead
 // of importing `./SftpSession` internals directly.
 export { classifySftpError, joinRemotePath } from './SftpSession'
-export type { SftpError, SftpSession } from './SftpSession'
+export type { PluginFileSession, PluginFileStats, SftpError, SftpSession } from './SftpSession'
 
 export interface PluginSessionStatusEvent {
   status: SessionStatus
@@ -83,6 +83,8 @@ export interface PluginMainContext {
   onSideData: (connectionId: string, cb: (data: string) => void) => () => void
   onSideClosed: (connectionId: string, cb: (error?: string) => void) => () => void
   isSshSession: () => boolean
+  isLocalSession: () => boolean
+  openLocalFileSystem: () => Promise<PluginFileSession>
   openTcpStream: (host: string, port: number) => Promise<Duplex>
   /**
    * Open a binary duplex to a unix socket on the remote host via SSH
@@ -113,6 +115,8 @@ export interface PluginMainContext {
   showOpenDialog: (options: PluginOpenDialogOptions) => Promise<PluginOpenDialogResult>
   /** Native save-file dialog; returns the picked path (`undefined` when cancelled). */
   showSaveDialog: (options: PluginSaveDialogOptions) => Promise<PluginSaveDialogResult>
+  /** Publish local paths as a system file-URI clipboard item where supported. */
+  writeClipboardFileUris: (paths: string[]) => Promise<void>
   /**
    * Every loaded plugin (built-in + external) with its manifest and enabled
    * flag. Use this to discover and aggregate other plugins' contributions

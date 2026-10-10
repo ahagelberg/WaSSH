@@ -1,5 +1,5 @@
 import type { PluginMainContext } from '@plugin-api/main'
-import { joinRemotePath, type SftpSession } from '@plugin-api/main'
+import { joinRemotePath, type PluginFileSession } from '@plugin-api/main'
 import type {
   SftpErrorKind,
   SftpOpResultPayload,
@@ -15,7 +15,8 @@ import type {
 } from './transfers'
 
 export interface SessionState extends SftpTransferState {
-  sftp: SftpSession | null
+  ctx: PluginMainContext
+  sftp: PluginFileSession | null
   cwd: string | null
   home: string
   stopped: boolean
@@ -66,13 +67,15 @@ export function sendOpResult(
 }
 
 export async function resolveCwd(ctx: PluginMainContext, state: SessionState): Promise<string> {
-  try {
-    const pwd = (await ctx.execCapture('pwd')).trim()
-    if (pwd && pwd.startsWith('/')) {
-      return pwd
+  if (!ctx.isLocalSession()) {
+    try {
+      const pwd = (await ctx.execCapture('pwd')).trim()
+      if (pwd && pwd.startsWith('/')) {
+        return pwd
+      }
+    } catch {
+      /* fall through to home-based resolution */
     }
-  } catch {
-    /* fall through to home-based resolution */
   }
 
   const sftp = state.sftp

@@ -3,9 +3,9 @@ import { PLUGIN_ID_SFTP, SFTP_PANEL_VIEW_ID } from './id'
 
 export const sftpManifest: PluginManifest = {
   id: PLUGIN_ID_SFTP,
-  name: 'SFTP files',
+  name: 'Files',
   version: '1.0.0',
-  description: 'Remote file manager over SFTP with drag-and-drop upload onto the terminal.',
+  description: 'Browse and manage files for SSH and Local sessions.',
   activation: 'manual',
   source: 'builtin',
   contributes: {

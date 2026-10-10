@@ -1,4 +1,4 @@
-import type { PluginMainContext, SftpSession } from '@plugin-api/main'
+import type { PluginFileSession, PluginMainContext } from '@plugin-api/main'
 import { classifySftpError } from '@plugin-api/main'
 import type { SftpViewFilePayload } from './protocol'
 
@@ -50,7 +50,7 @@ function decodeViewText(buf: Buffer): string {
   return buf.toString('latin1')
 }
 
-function readViewBytes(sftp: SftpSession, path: string): Promise<Buffer> {
+function readViewBytes(sftp: PluginFileSession, path: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const remote = sftp.createReadStream(path)
     const chunks: Buffer[] = []
@@ -91,11 +91,11 @@ function readViewBytes(sftp: SftpSession, path: string): Promise<Buffer> {
 
 export async function handleViewFile(
   ctx: PluginMainContext,
-  sftp: SftpSession | null,
+  sftp: PluginFileSession | null,
   path: string
 ): Promise<void> {
   if (!sftp) {
-    sendViewFileError(ctx, path, { message: 'SFTP session is not connected', kind: 'connection' })
+    sendViewFileError(ctx, path, { message: 'File session is not connected', kind: 'connection' })
     return
   }
 
