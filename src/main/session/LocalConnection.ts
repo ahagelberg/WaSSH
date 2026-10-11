@@ -51,8 +51,13 @@ export class LocalConnection extends ByteSession {
   }
 
   resize(cols: number, rows: number): void {
-    this.cols = Math.max(1, Math.floor(cols))
-    this.rows = Math.max(1, Math.floor(rows))
+    const nextCols = Math.max(1, Math.floor(cols))
+    const nextRows = Math.max(1, Math.floor(rows))
+    if (nextCols === this.cols && nextRows === this.rows) {
+      return
+    }
+    this.cols = nextCols
+    this.rows = nextRows
     try {
       this.terminal?.resize(this.cols, this.rows)
     } catch {
