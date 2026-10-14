@@ -114,7 +114,22 @@ function toAnthropicMessages(messages: ApiMessage[]): Record<string, unknown>[] 
   const out: Record<string, unknown>[] = []
   for (const m of messages) {
     if (m.role === 'user') {
-      out.push({ role: 'user', content: m.content })
+      const last = out[out.length - 1]
+      if (last && last.role === 'user') {
+        // Anthropic requires strictly alternating roles, so consecutive user
+        // turns are folded into one: a carry-over summary followed by the
+        // user's question, or a prompt after tool output that never got an
+        // assistant reply. Tool-result blocks stay first in the turn.
+        const previous = Array.isArray(last.content)
+          ? (last.content as unknown[])
+          : [{ type: 'text', text: typeof last.content === 'string' ? last.content : '' }]
+        out[out.length - 1] = {
+          role: 'user',
+          content: [...previous, { type: 'text', text: m.content }]
+        }
+      } else {
+        out.push({ role: 'user', content: m.content })
+      }
       continue
     }
     if (m.role === 'tool') {
