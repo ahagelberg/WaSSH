@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { ImageAddon } from '@xterm/addon-image'
 import { SearchAddon } from '@xterm/addon-search'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -182,9 +183,11 @@ export default function TerminalView({
       theme: xtermThemeFromHost(host)
     })
     const fit = new FitAddon()
+    const image = new ImageAddon()
     const search = new SearchAddon()
     const unicode = new Unicode11Addon()
     term.loadAddon(fit)
+    term.loadAddon(image)
     term.loadAddon(search)
     term.loadAddon(unicode)
     term.loadAddon(
