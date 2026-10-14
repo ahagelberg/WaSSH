@@ -27,6 +27,11 @@
   ],
   "exclude": [
     "src/plugins/**/View.tsx",
+    "src/plugins/**/ContainerDetail.tsx",
+    "src/plugins/**/ContainerShell.tsx",
+    "src/plugins/**/CreateContainerDialog.tsx",
+    "src/plugins/**/EngineDialog.tsx",
+    "src/plugins/**/ResourcePanels.tsx",
     "src/plugins/**/SessionSettings.tsx",
     "src/plugins/**/ProviderSettings.tsx",
     "src/plugins/**/Settings.tsx",

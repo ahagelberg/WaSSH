@@ -4,6 +4,8 @@ import { aiAgentMain } from '../../plugins/builtins/ai-agent/main'
 import { aiAgentManifest } from '../../plugins/builtins/ai-agent/manifest'
 import { connectionLoggerMain } from '../../plugins/builtins/connection-logger/main'
 import { connectionLoggerManifest } from '../../plugins/builtins/connection-logger/manifest'
+import { dockerManagerMain } from '../../plugins/builtins/docker-manager/main'
+import { dockerManagerManifest } from '../../plugins/builtins/docker-manager/manifest'
 import { macroPadMain } from '../../plugins/builtins/macro-pad/main'
 import { macroPadManifest } from '../../plugins/builtins/macro-pad/manifest'
 import { mqttAnalyserMain } from '../../plugins/builtins/mqtt-analyser/main'
@@ -45,6 +47,10 @@ export const BUILTIN_PLUGIN_DEFINITIONS: BuiltinPluginDefinition[] = [
       module: connectionLoggerMain,
       backgroundActivation: 'session'
     }
+  },
+  {
+    manifest: dockerManagerManifest,
+    registration: { id: dockerManagerManifest.id, module: dockerManagerMain }
   }
 ]
 

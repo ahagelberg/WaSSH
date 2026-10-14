@@ -10,6 +10,7 @@ import SftpView from '../../../plugins/builtins/sftp/View'
 import AiAgentView from '../../../plugins/builtins/ai-agent/View'
 import AiAgentProviderSettings from '../../../plugins/builtins/ai-agent/ProviderSettings'
 import ConnectionLoggerView from '../../../plugins/builtins/connection-logger/View'
+import DockerManagerView from '../../../plugins/builtins/docker-manager/View'
 import { PLUGIN_ID_SERVER_MONITOR } from '../../../plugins/builtins/server-monitor/id'
 import { PLUGIN_ID_SCRATCHPAD } from '../../../plugins/builtins/scratchpad/id'
 import { PLUGIN_ID_MACRO_PAD } from '../../../plugins/builtins/macro-pad/id'
@@ -17,6 +18,7 @@ import { PLUGIN_ID_MQTT_ANALYSER } from '../../../plugins/builtins/mqtt-analyser
 import { PLUGIN_ID_SFTP } from '../../../plugins/builtins/sftp/id'
 import { PLUGIN_ID_AI_AGENT } from '../../../plugins/builtins/ai-agent/id'
 import { PLUGIN_ID_CONNECTION_LOGGER } from '../../../plugins/builtins/connection-logger/id'
+import { PLUGIN_ID_DOCKER_MANAGER } from '../../../plugins/builtins/docker-manager/id'
 
 const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
   { id: PLUGIN_ID_SERVER_MONITOR, view: ServerMonitorView, settingsView: ServerMonitorSessionSettings },
@@ -25,7 +27,8 @@ const BUILTIN_RENDERER_PLUGINS: PluginRendererRegistration[] = [
   { id: PLUGIN_ID_MQTT_ANALYSER, view: MqttAnalyserView, settingsView: MqttAnalyserSettings },
   { id: PLUGIN_ID_SFTP, view: SftpView },
   { id: PLUGIN_ID_AI_AGENT, view: AiAgentView, settingsView: AiAgentProviderSettings },
-  { id: PLUGIN_ID_CONNECTION_LOGGER, view: ConnectionLoggerView }
+  { id: PLUGIN_ID_CONNECTION_LOGGER, view: ConnectionLoggerView },
+  { id: PLUGIN_ID_DOCKER_MANAGER, view: DockerManagerView }
 ]
 
 const VIEW_REGISTRY = new Map<string, ComponentType<PluginViewProps>>(
