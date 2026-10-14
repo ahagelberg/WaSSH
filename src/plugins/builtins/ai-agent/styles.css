@@ -1050,6 +1050,14 @@
   min-width: 0;
 }
 
+.ai-agent-question-other {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  resize: vertical;
+  font: inherit;
+}
+
 .ai-agent-question-submit {
   margin-top: 6px;
   font-size: 11px;

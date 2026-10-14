@@ -473,6 +473,7 @@ export default function AiAgentView({
   const [questionSelection, setQuestionSelection] = useState<{
     requestId: string
     selected: number[]
+    otherText: string
   } | null>(null)
   const [stream, setStream] = useState('')
   const [toolOutput, setToolOutput] = useState<Record<string, string>>({})
@@ -905,7 +906,14 @@ export default function AiAgentView({
         ? selected.filter((selectedIndex) => selectedIndex !== index)
         : [...selected, index]
       : [index]
-    setQuestionSelection({ requestId: request.requestId, selected: next })
+    setQuestionSelection({ requestId: request.requestId, selected: next, otherText: '' })
+  }
+
+  const questionOtherText = (request: AiAgentQuestionRequest): string =>
+    questionSelection?.requestId === request.requestId ? questionSelection.otherText : ''
+
+  const setQuestionOtherText = (request: AiAgentQuestionRequest, otherText: string): void => {
+    setQuestionSelection({ requestId: request.requestId, selected: [], otherText })
   }
 
   const submitQuestion = (): void => {
@@ -914,10 +922,11 @@ export default function AiAgentView({
       return
     }
     const selected = selectedQuestionOptions(request)
-    if (selected.length === 0) {
+    const otherText = questionOtherText(request).trim()
+    if (selected.length === 0 && !otherText) {
       return
     }
-    send({ type: 'questionResponse', requestId: request.requestId, selected })
+    send({ type: 'questionResponse', requestId: request.requestId, selected, otherText })
     setQuestionSelection(null)
   }
 
@@ -1296,10 +1305,21 @@ export default function AiAgentView({
                   </label>
                 ))}
               </div>
+              <textarea
+                className="ai-agent-question-other"
+                aria-label="Your answer if none of the options fit"
+                placeholder="None of these? Type another answer…"
+                rows={2}
+                value={questionOtherText(view.pendingQuestion)}
+                onChange={(event) => setQuestionOtherText(view.pendingQuestion!, event.target.value)}
+              />
               <button
                 type="button"
                 className="ai-agent-question-submit"
-                disabled={selectedQuestionOptions(view.pendingQuestion).length === 0}
+                disabled={
+                  selectedQuestionOptions(view.pendingQuestion).length === 0 &&
+                  !questionOtherText(view.pendingQuestion).trim()
+                }
                 onClick={submitQuestion}
               >
                 Submit answer

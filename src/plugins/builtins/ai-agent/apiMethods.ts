@@ -69,7 +69,8 @@ export const TOOL_DEF_ASK_USER: PluginApiMethod = {
   name: AI_AGENT_TOOL_ASK_USER,
   description:
     'Ask the user to choose from options when their preference or missing information affects what to do next. ' +
-    'Provide at least two concise options. Set multiSelect to true when the user may choose more than one option.',
+    'Provide at least two concise options. The user can also enter a free-text answer if none fit. ' +
+    'Set multiSelect to true when the user may choose more than one option.',
   parameters: {
     type: 'object',
     properties: {

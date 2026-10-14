@@ -222,6 +222,11 @@ interface AiAgentApprovalAnswer {
   pattern?: string
 }
 
+interface AiAgentQuestionAnswer {
+  selected: number[]
+  otherText: string
+}
+
 interface HostState {
   hostKey: string
   hostLabel: string
@@ -232,7 +237,7 @@ interface HostState {
   pendingApproval: AiAgentApprovalRequest | null
   approvalResolve: ((answer: AiAgentApprovalAnswer) => void) | null
   pendingQuestion: AiAgentQuestionRequest | null
-  questionResolve: ((selected: number[] | null) => void) | null
+  questionResolve: ((answer: AiAgentQuestionAnswer | null) => void) | null
   pendingSudo: AiAgentSudoRequest | null
   sudoResolve: ((password: string | null) => void) | null
   /** In-memory only — never persisted or sent to the renderer */
@@ -1205,7 +1210,7 @@ async function askUser(
   question: string,
   options: string[],
   multiSelect: boolean
-): Promise<number[] | null> {
+): Promise<AiAgentQuestionAnswer | null> {
   host.pendingQuestion = {
     requestId: randomUUID(),
     question,
@@ -1214,12 +1219,12 @@ async function askUser(
   }
   host.phase = 'ask'
   pushState(host)
-  const selected = await new Promise<number[] | null>((resolve) => {
+  const answer = await new Promise<AiAgentQuestionAnswer | null>((resolve) => {
     host.questionResolve = resolve
   })
   host.questionResolve = null
   host.pendingQuestion = null
-  return selected
+  return answer
 }
 
 function parseJsonArgs(jsonStr: string): Record<string, unknown> {
@@ -1524,12 +1529,12 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
             persistConversation(host)
             continue
           }
-          const selected = await askUser(host, question, options, toolArgs.multiSelect === true)
+          const answer = await askUser(host, question, options, toolArgs.multiSelect === true)
           if (!host.inRun) {
             keepRunning = false
             break
           }
-          if (selected === null || host.stopped) {
+          if (answer === null || host.stopped) {
             conv.messages.push(
               toolResultMessage(tc.id, toolName, question, 'The user cancelled the question.', 'cancelled', false)
             )
@@ -1543,7 +1548,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
               tc.id,
               toolName,
               question,
-              JSON.stringify(selected.map((index) => options[index])),
+              answer.otherText || JSON.stringify(answer.selected.map((index) => options[index])),
               'ok',
               false
             )
@@ -2185,7 +2190,8 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
       return (
         typeof message.requestId === 'string' &&
         Array.isArray(message.selected) &&
-        message.selected.every((index) => typeof index === 'number' && Number.isInteger(index))
+        message.selected.every((index) => typeof index === 'number' && Number.isInteger(index)) &&
+        (message.otherText === undefined || typeof message.otherText === 'string')
       )
     case 'sudoPassword':
       return (
@@ -2323,19 +2329,23 @@ async function handleRendererMessage(
   if (payload.type === 'questionResponse') {
     const request = host.pendingQuestion
     const selected = payload.selected
+    const otherText = payload.otherText?.trim() ?? ''
+    const validSelection = Boolean(request) &&
+      selected.length > 0 &&
+      new Set(selected).size === selected.length &&
+      selected.every((index) => index >= 0 && index < (request?.options.length ?? 0)) &&
+      (request?.multiSelect === true || selected.length === 1)
+    const validOtherText = otherText.length > 0 && selected.length === 0
     if (
       host.phase === 'ask' &&
       request &&
       request.requestId === payload.requestId &&
       host.questionResolve &&
-      selected.length > 0 &&
-      new Set(selected).size === selected.length &&
-      selected.every((index) => index >= 0 && index < request.options.length) &&
-      (request.multiSelect || selected.length === 1)
+      (validSelection || validOtherText)
     ) {
       const resolve = host.questionResolve
       host.questionResolve = null
-      resolve(selected)
+      resolve({ selected, otherText: validOtherText ? otherText : '' })
       if (host.inRun) {
         host.phase = 'running'
       }
