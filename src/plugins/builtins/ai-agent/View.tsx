@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactElement
@@ -10,6 +11,7 @@ import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import './styles.css'
 
+import { parseSlashInput, type AiAgentSlashCommand } from './commands'
 import {
   AI_AGENT_ANTHROPIC_BASE_URL,
   AI_AGENT_DEFAULT_CHAT_TITLE,
@@ -310,10 +312,22 @@ const MessageList = memo(function MessageList({
       )
       continue
     }
+    if (msg.role === 'summary') {
+      rows.push(
+        <div
+          key={i}
+          className="ai-agent-msg ai-agent-summary"
+          title="Handoff summary — part of this chat and sent to the model as context"
+        >
+          <div className="ai-agent-summary-label">Summary</div>
+          <div className="ai-agent-assistant-text"><MarkdownText text={msg.text} /></div>
+        </div>
+      )
+      continue
+    }
     const badge = toolBadge(msg.name)
     rows.push(
-      <div key={i} className="ai-agent-tool">
-        <div className="ai-agent-tool-command">
+      <div key={i} className="ai-agent-tool">        <div className="ai-agent-tool-command">
           <span className={`ai-agent-tool-badge ${badge.className}`}>{badge.label}</span>
           <span className="ai-agent-tool-cmd-text">{msg.command.startsWith('$') ? msg.command : `$ ${msg.command}`}</span>
         </div>
@@ -353,6 +367,8 @@ interface ViewState {
   conversation: AiAgentConversation | null
   conversationSummaries: AiAgentConversationSummary[]
   runPhase: AiAgentStateSnapshot['runPhase']
+  /** True while this chat is being summarized on the main process side. */
+  summarizing: boolean
   hostLabel: string
   ssh: boolean
   pendingApproval: AiAgentStateSnapshot['pendingApproval']
@@ -369,6 +385,7 @@ function emptyViewState(): ViewState {
     conversation: null,
     conversationSummaries: [],
     runPhase: 'no_session',
+    summarizing: false,
     hostLabel: '',
     ssh: false,
     pendingApproval: null,
@@ -488,6 +505,8 @@ export default function AiAgentView({
   const [queued, setQueued] = useState<QueuedMessage | null>(null)
   const [sudoPassword, setSudoPassword] = useState('')
   const [scopeChoice, setScopeChoice] = useState<ApprovalScopeChoice | null>(null)
+  /** Highlighted entry in the slash-command list. */
+  const [commandIndex, setCommandIndex] = useState(0)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sudoInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -549,6 +568,7 @@ export default function AiAgentView({
           conversation: update.conversation,
           conversationSummaries: payload.conversationSummaries ?? [],
           runPhase: payload.runPhase,
+          summarizing: payload.summarizing === true,
           hostLabel: payload.hostLabel,
           ssh: payload.ssh,
           pendingApproval: payload.pendingApproval,
@@ -615,8 +635,12 @@ export default function AiAgentView({
     (activeProvider ? conv?.lastSelectedModelByProvider[activeProvider.id] : '') ||
     activeProvider?.models[0] ||
     ''
+  const summarizing = view.summarizing
   const busy =
-    view.runPhase === 'running' || view.runPhase === 'ask' || view.runPhase === 'ask_sudo'
+    summarizing ||
+    view.runPhase === 'running' ||
+    view.runPhase === 'ask' ||
+    view.runPhase === 'ask_sudo'
 
   useEffect(() => {
     if (mountedOllamaRefreshRef.current) {
@@ -768,8 +792,59 @@ export default function AiAgentView({
     }
   }
 
+  const slashInput = useMemo(() => parseSlashInput(input), [input])
+  const slashMatches = slashInput?.matches ?? []
+  const slashMenuOpen = slashMatches.length > 0
+  const slashPrefix = slashInput?.prefix
+  const highlightedIndex =
+    slashMatches.length > 0 ? Math.min(commandIndex, slashMatches.length - 1) : 0
+  /** Command that a bare slash word would run if it were sent right now. */
+  const highlightedCommand = slashMatches[highlightedIndex] ?? null
+
+  // Re-anchor the highlight whenever the command word itself changes, wherever
+  // that change came from (typing, rewinding a message, a generated brief).
+  useEffect(() => {
+    setCommandIndex(0)
+  }, [slashPrefix])
+
+  /**
+   * Run one composer command. Commands act on the host directly instead of
+   * entering the conversation, so they are refused — never queued — while busy.
+   */
+  const runSlashCommand = (command: AiAgentSlashCommand): void => {
+    if (busy) {
+      showToast('info', 'The agent is busy — stop it or wait for the current run.')
+      return
+    }
+    const providerId = activeProvider?.id ?? ''
+    const model = activeModel
+    if (command.name === 'new' && !providerId) {
+      showToast('error', 'No model providers configured — configure one in Options.')
+      return
+    }
+    setInput('')
+    setHistoryOpen(false)
+    if (command.name === 'new') {
+      send({ type: 'newChat', providerId, model })
+      return
+    }
+    send({
+      type: 'summarize',
+      newChat: command.name === 'transfer',
+      providerId,
+      model
+    })
+  }
+
   const handleSend = (): void => {
     const text = input.trim()
+
+    // Only a bare command word is a command. Text that merely starts with a
+    // slash — a path, an unknown word — is sent to the model as usual.
+    if (slashInput && highlightedCommand) {
+      runSlashCommand(highlightedCommand)
+      return
+    }
 
     if (busy) {
       if (queued) {
@@ -1015,7 +1090,7 @@ export default function AiAgentView({
   }, [input])
 
 
-  const phaseClass = view.runPhase
+  const phaseClass = view.summarizing ? 'running' : view.runPhase
   const providerOptions =
     providers.length > 0 ? (
       <>
@@ -1449,7 +1524,9 @@ export default function AiAgentView({
             <div className={`ai-agent-phase-bar ${phaseClass}`}>
               {view.runPhase === 'ask' && view.pendingQuestion
                 ? 'Waiting for your answer'
-                : PHASE_LABELS[view.runPhase] ?? view.runPhase}
+                : summarizing
+                  ? 'Summarizing chat…'
+                  : PHASE_LABELS[view.runPhase] ?? view.runPhase}
             </div>
 
             {attachments.length > 0 ? (
@@ -1495,6 +1572,27 @@ export default function AiAgentView({
               }}
             />
 
+            {slashMenuOpen ? (
+              <ul className="ai-agent-command-list" role="listbox" aria-label="Commands">
+                {slashMatches.map((command, index) => (
+                  <li key={command.name}>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={index === highlightedIndex}
+                      className={`ai-agent-command-item${index === highlightedIndex ? ' active' : ''}`}
+                      title={command.description}
+                      onMouseEnter={() => setCommandIndex(index)}
+                      onClick={() => runSlashCommand(command)}
+                    >
+                      <span className="ai-agent-command-name">{command.label}</span>
+                      <span className="ai-agent-command-desc">{command.description}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+
             <div className="ai-agent-inputbar">
               <div className="ai-agent-input-actions">
                 <button
@@ -1525,10 +1623,32 @@ export default function AiAgentView({
                     ? queued
                       ? 'Enter again to send queued message now…'
                       : 'Queue a follow-up… (Enter to queue)'
-                    : 'Message the agent… (Shift+Enter for newline, or drop files)'
+                    : 'Message the agent… (Shift+Enter for newline, / for commands)'
                 }
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
+                  if (slashMenuOpen) {
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault()
+                      setCommandIndex((prev) => (prev + 1) % slashMatches.length)
+                      return
+                    }
+                    if (e.key === 'ArrowUp') {
+                      e.preventDefault()
+                      setCommandIndex(
+                        (prev) => (prev - 1 + slashMatches.length) % slashMatches.length
+                      )
+                      return
+                    }
+                    if (e.key === 'Tab') {
+                      const target = slashMatches[highlightedIndex]
+                      if (target) {
+                        e.preventDefault()
+                        setInput(`/${target.name}`)
+                        return
+                      }
+                    }
+                  }
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
                     handleSend()

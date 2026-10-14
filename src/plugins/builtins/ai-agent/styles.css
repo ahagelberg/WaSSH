@@ -372,6 +372,51 @@
   background: var(--bg-panel-2);
 }
 
+/* Slash-command list, shown above the input while a "/word" is being typed */
+.ai-agent-command-list {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel-2);
+}
+
+.ai-agent-command-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  text-align: left;
+}
+
+.ai-agent-command-item.active {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.ai-agent-command-name {
+  flex-shrink: 0;
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.ai-agent-command-desc {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
 .ai-agent-input-actions {
   flex-shrink: 0;
   display: flex;
@@ -694,6 +739,24 @@
 .ai-agent-assistant {
   align-self: flex-start;
   max-width: 100%;
+}
+
+/* Generated handoff brief, kept inline in the transcript */
+.ai-agent-summary {
+  align-self: stretch;
+  max-width: 100%;
+  padding: 6px 8px;
+  border: 1px dashed color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-panel-2));
+}
+
+.ai-agent-summary-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warn);
 }
 
 .ai-agent-code {

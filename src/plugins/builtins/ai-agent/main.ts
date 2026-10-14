@@ -196,6 +196,32 @@ const SUDO_COMMAND_RE = /\bsudo\b/
 /** Marker printed when sudo -S / -n authentication fails inside the exec wrapper */
 const SUDO_AUTH_FAILED_MARKER = '[wassh: sudo authentication failed]'
 
+/** Shown whenever a message arrives while a run or a summary is in flight. */
+const BUSY_TOAST_TEXT = 'The agent is busy — stop it or wait for the current run.'
+
+/** max_tokens for a generated chat summary; the prompt asks for far less */
+const SUMMARY_MAX_TOKENS = 512
+
+/** Transcript budget handed to the summarizer, in characters (~30k tokens). */
+const SUMMARY_TRANSCRIPT_MAX_CHARS = 120_000
+
+/** Instruction for the summarizer: it sees the transcript, not the live session. */
+const SUMMARY_SYSTEM_PROMPT = [
+  'You compress a chat between a user and an AI agent into a terse handoff note. Your reader is a fresh assistant with no access to the original conversation.',
+  '',
+  'Hard limit: 150 words. Bullets only, grouped under these bold labels, skipping any group with nothing worth saying:',
+  '- **Goal** — one sentence.',
+  '- **State** — only facts that were expensive to obtain: exact paths, versions, error strings, what is already done or left running.',
+  '- **Next** — one to three concrete steps.',
+  '',
+  'Rules:',
+  '- Be terse: short phrases, not sentences. No preamble, no closing line.',
+  '- Never restate anything a single command would reveal (file listings, OS trivia, defaults).',
+  '- Report tool outcomes, not tool chatter.',
+  '- State only facts from the transcript; mark uncertain things as uncertain.',
+  '- Reply with the note alone.'
+].join('\n')
+
 interface TabRuntime {
   ctx: PluginMainContext
   hostKey: string
@@ -252,6 +278,8 @@ interface HostState {
   streamingToolCallId: string | null
   stopped: boolean
   inRun: boolean
+  /** True while a summary request is running; blocks new sends like a live run. */
+  summarizing: boolean
   lastError?: string
 }
 
@@ -625,6 +653,7 @@ function pushState(host: HostState): void {
     providerKeys,
     conversationSummaries: listConversationSummaries(host.hostKey),
     runPhase: host.phase,
+    summarizing: host.summarizing,
     hostKey: host.hostKey,
     hostLabel: host.hostLabel,
     ssh,
@@ -650,6 +679,19 @@ function pushToast(host: HostState, kind: 'error' | 'info', text: string): void 
       tab.ctx.sendToRenderer({ type: 'toast', kind, text })
     }
   }
+}
+
+/**
+ * Whether this host is mid-work. A summary holds the same claim on the host as a
+ * run, so sends, chat switches and renames are refused while one is in flight.
+ */
+function isHostBusy(host: HostState): boolean {
+  return (
+    host.summarizing ||
+    host.phase === 'running' ||
+    host.phase === 'ask' ||
+    host.phase === 'ask_sudo'
+  )
 }
 
 function pushDelta(host: HostState, text: string): void {
@@ -733,6 +775,37 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
+/**
+ * Switch the host to a fresh chat, keeping the provider/model selection. An
+ * already-empty chat is reused rather than replaced, so repeated uses do not
+ * litter the history with identical blank entries.
+ */
+function applyNewChat(host: HostState, providerId: string, model: string): void {
+  const conversation = host.conversation
+  if (!conversation) {
+    return
+  }
+  if (conversation.messages.length === 0) {
+    conversation.activeProviderId = providerId
+    conversation.activeModel = model
+    if (providerId && model) {
+      conversation.lastSelectedModelByProvider[providerId] = model
+    }
+    conversation.title = AI_AGENT_DEFAULT_CHAT_TITLE
+    persistConversation(host)
+    return
+  }
+  persistConversation(host)
+  host.conversation = createConversation(
+    host.hostKey,
+    host.hostLabel,
+    providerId,
+    model,
+    conversation.cwd || '/'
+  )
+  persistConversation(host)
+}
+
 /** Single-quote shell escape for paths embedded in commands */
 interface ProbeResult {
   hostKey: string
@@ -812,7 +885,8 @@ function ensureHost(hostKey: string, hostLabel: string, ctx: PluginMainContext):
       runCtx: null,
       streamingToolCallId: null,
       stopped: false,
-      inRun: false
+      inRun: false,
+      summarizing: false
     }
     hosts.set(hostKey, host)
   } else if (host.conversation) {
@@ -980,6 +1054,13 @@ function toApiMessages(conversation: AiAgentConversation): ApiMessage[] {
       })
       continue
     }
+    if (msg.role === 'summary') {
+      out.push({
+        role: 'user',
+        content: `[Summary of the earlier conversation]\n\n${msg.text}`
+      })
+      continue
+    }
     out.push({ role: 'tool', toolCallId: msg.toolCallId, content: msg.content })
   }
   return out
@@ -996,6 +1077,9 @@ function messageCharCount(msg: AiAgentConversationMsg): number {
       size += (tc.name ?? '').length + tc.command.length + (tc.argumentsJson ?? '').length
     }
     return size
+  }
+  if (msg.role === 'summary') {
+    return msg.text.length
   }
   return msg.content.length
 }
@@ -2126,6 +2210,149 @@ function chatMessageWithContext(
   return parts.join('\n\n')
 }
 
+/** One transcript entry for the summarizer; tool calls are kept as outcomes. */
+function transcriptEntry(msg: AiAgentConversationMsg): string {
+  if (msg.role === 'user') {
+    return `## User\n${msg.modelText ?? msg.text}`
+  }
+  if (msg.role === 'assistant') {
+    const lines = ['## Assistant']
+    const text = msg.text?.trim()
+    if (text) {
+      lines.push(text)
+    }
+    for (const call of msg.toolCalls ?? []) {
+      lines.push(`[tool call] ${call.name || RUN_COMMAND_TOOL_NAME}: ${call.command}`)
+    }
+    return lines.join('\n')
+  }
+  if (msg.role === 'summary') {
+    return `## Summary of the earlier conversation\n${msg.text}`
+  }
+  return `## Tool result (${msg.name || 'tool'}, ${msg.outcome})\n${msg.content}`
+}
+
+/**
+ * Render the conversation as plain text for the summarizer. When the transcript
+ * exceeds its budget the oldest entries are dropped: the newest state is what
+ * the next chat has to continue from, and the goal survives in the brief.
+ */
+function conversationTranscript(conversation: AiAgentConversation): string {
+  const entries = conversation.messages.map(transcriptEntry)
+  let used = 0
+  let start = entries.length
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const size = entries[i].length + 2
+    if (used + size > SUMMARY_TRANSCRIPT_MAX_CHARS && start < entries.length) {
+      break
+    }
+    used += size
+    start = i
+  }
+  const body = entries.slice(start).join('\n\n')
+  if (start === 0) {
+    return body
+  }
+  return `[The oldest ${start} transcript entries were omitted to fit the request budget.]\n\n${body}`
+}
+
+/**
+ * Compress the current chat into a handoff brief, using the provider and model
+ * already selected for that chat. The brief never joins the conversation: it is
+ * delivered to the requesting tab, which offers it as the opening prompt of the
+ * next chat.
+ */
+async function summarizeConversation(
+  host: HostState,
+  tab: TabRuntime,
+  options: { newChat: boolean; providerId: string; model: string }
+): Promise<void> {
+  const conversation = host.conversation
+  if (!conversation) {
+    return
+  }
+  if (conversation.messages.length === 0) {
+    pushToast(host, 'info', 'This chat is empty — nothing to summarize yet.')
+    return
+  }
+  const provider = findProvider(conversation.activeProviderId)
+  if (!provider) {
+    pushToast(host, 'error', 'No model provider configured — configure one in Options.')
+    return
+  }
+  if (!conversation.activeModel) {
+    pushToast(host, 'error', 'Pick a model for this conversation first.')
+    return
+  }
+  const apiKey = tab.ctx.getSecret(aiAgentVaultId(provider.id)) ?? ''
+  if (!apiKey && provider.protocol === AI_AGENT_PROTOCOL_ANTHROPIC) {
+    pushToast(host, 'error', `No API key set for provider "${provider.name}".`)
+    return
+  }
+
+  const controller = new AbortController()
+  host.controller = controller
+  host.stopped = false
+  host.summarizing = true
+  pushState(host)
+
+  let brief = ''
+  try {
+    const result = await complete({
+      baseUrl: provider.baseUrl,
+      apiKey,
+      protocol: provider.protocol,
+      model: conversation.activeModel,
+      system: SUMMARY_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            `Active session: ${host.hostLabel}`,
+            `Working directory: ${conversation.cwd || '/'}`,
+            '',
+            'Conversation transcript:',
+            '',
+            conversationTranscript(conversation)
+          ].join('\n')
+        }
+      ],
+      maxTokens: SUMMARY_MAX_TOKENS,
+      signal: controller.signal,
+      onDelta: () => {
+        /* The brief is handed over in one piece, so there is no stream to show. */
+      }
+    })
+    brief = result.text.trim()
+  } catch (error) {
+    if (!host.stopped) {
+      pushToast(host, 'error', error instanceof Error ? error.message : String(error))
+    }
+  } finally {
+    host.controller = null
+    host.summarizing = false
+    host.stopped = false
+  }
+
+  if (!brief) {
+    pushState(host)
+    return
+  }
+  if (options.newChat) {
+    applyNewChat(host, options.providerId, options.model)
+  }
+  const target = host.conversation
+  if (!target) {
+    pushState(host)
+    return
+  }
+  // The brief joins the transcript: visible in the chat and available to the
+  // model as context, but never placed in the composer.
+  target.messages.push({ role: 'summary', text: brief })
+  persistConversation(host)
+  pushState(host)
+}
+
 function isChatAttachment(value: unknown): value is AiAgentChatAttachment {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return false
@@ -2176,6 +2403,12 @@ function isRendererMessage(payload: unknown): payload is AiAgentRendererMessage 
     case 'select':
     case 'newChat':
       return typeof message.providerId === 'string' && typeof message.model === 'string'
+    case 'summarize':
+      return (
+        typeof message.newChat === 'boolean' &&
+        typeof message.providerId === 'string' &&
+        typeof message.model === 'string'
+      )
     case 'approval':
       return (
         typeof message.requestId === 'string' &&
@@ -2366,6 +2599,10 @@ async function handleRendererMessage(
   if (payload.type === 'stop') {
     host.stopped = true
     abortCurrent(host)
+    if (host.summarizing) {
+      // The summarize flow clears its own flag and pushes state once it unwinds.
+      return
+    }
     if (host.phase === 'ask' && host.approvalResolve) {
       const resolve = host.approvalResolve
       host.approvalResolve = null
@@ -2397,37 +2634,30 @@ async function handleRendererMessage(
     pushState(host)
     return
   }
+  if (payload.type === 'summarize') {
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
+      return
+    }
+    void summarizeConversation(host, tab, {
+      newChat: payload.newChat,
+      providerId: payload.providerId,
+      model: payload.model
+    })
+    return
+  }
   if (payload.type === 'newChat') {
-    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
-      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
       return
     }
-    if (host.conversation.messages.length === 0) {
-      host.conversation.activeProviderId = payload.providerId
-      host.conversation.activeModel = payload.model
-      if (payload.providerId && payload.model) {
-        host.conversation.lastSelectedModelByProvider[payload.providerId] = payload.model
-      }
-      host.conversation.title = AI_AGENT_DEFAULT_CHAT_TITLE
-      persistConversation(host)
-      pushState(host)
-      return
-    }
-    persistConversation(host)
-    host.conversation = createConversation(
-      host.hostKey,
-      host.hostLabel,
-      payload.providerId,
-      payload.model,
-      host.conversation.cwd || '/'
-    )
-    persistConversation(host)
+    applyNewChat(host, payload.providerId, payload.model)
     pushState(host)
     return
   }
   if (payload.type === 'openChat') {
-    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
-      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
       return
     }
     const next = dataFile?.conversations[payload.conversationId]
@@ -2444,8 +2674,8 @@ async function handleRendererMessage(
     return
   }
   if (payload.type === 'deleteChat') {
-    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
-      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
       return
     }
     if (!dataFile) {
@@ -2477,8 +2707,8 @@ async function handleRendererMessage(
     return
   }
   if (payload.type === 'rewind') {
-    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
-      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
       return
     }
     const messages = host.conversation.messages
@@ -2495,8 +2725,8 @@ async function handleRendererMessage(
     return
   }
   if (payload.type === 'renameChat') {
-    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
-      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
       return
     }
     if (!dataFile) {
@@ -2515,8 +2745,8 @@ async function handleRendererMessage(
     return
   }
   if (payload.type === 'chat') {
-    if (host.phase === 'running' || host.phase === 'ask' || host.phase === 'ask_sudo') {
-      pushToast(host, 'info', 'The agent is busy — stop it or wait for the current run.')
+    if (isHostBusy(host)) {
+      pushToast(host, 'info', BUSY_TOAST_TEXT)
       return
     }
     pruneUnresolvedTail(host.conversation)

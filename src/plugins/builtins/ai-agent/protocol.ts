@@ -111,10 +111,20 @@ export interface AiAgentConversationToolMsg {
   truncated: boolean
 }
 
+/**
+ * A generated handoff brief. It renders as its own entry in the transcript and
+ * is sent to the model as user context, but never enters the composer.
+ */
+export interface AiAgentConversationSummaryMsg {
+  role: 'summary'
+  text: string
+}
+
 export type AiAgentConversationMsg =
   | AiAgentConversationUserMsg
   | AiAgentConversationAssistantMsg
   | AiAgentConversationToolMsg
+  | AiAgentConversationSummaryMsg
 
 export interface AiAgentConversation {
   id: string
@@ -179,6 +189,8 @@ export interface AiAgentStateSnapshot {
   messages: AiAgentConversationMsg[]
   conversationSummaries: AiAgentConversationSummary[]
   runPhase: AiAgentRunPhase
+  /** True while this chat is being compressed into carry-over context. */
+  summarizing: boolean
   hostKey: string
   hostLabel: string
   ssh: boolean
@@ -231,6 +243,12 @@ export type AiAgentRendererMessage =
   | { type: 'stop' }
   | { type: 'resume' }
   | { type: 'discardPaused' }
+  /**
+   * Summarize this chat into a handoff brief for the next one. With `newChat`
+   * (the /transfer command) a fresh chat is created first and the brief targets
+   * it; otherwise the brief stays with the current chat.
+   */
+  | { type: 'summarize'; newChat: boolean; providerId: string; model: string }
   /** Acknowledge the run error shown in the view. */
   | { type: 'dismissError' }
   /** `pattern` is the rule list entry an 'allowAlways'/'denyAlways' decision saves. */
