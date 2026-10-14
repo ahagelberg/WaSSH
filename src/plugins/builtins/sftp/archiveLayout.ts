@@ -1,3 +1,5 @@
+import { posix } from 'node:path'
+
 /**
  * Pure archive-layout helpers for the SFTP folder→zip download. Kept separate
  * from `transfers.ts` so the layout can be resolved without an SFTP session.
@@ -63,6 +65,49 @@ export async function collectArchiveEntries(
         size: child.size,
         mtime: child.mtime,
         mode: child.mode,
+        directory: false
+      })
+    }
+  }
+  return entries
+}
+
+/** Selected files are added at the archive root; selected folders keep their names. */
+export async function collectSelectedArchiveEntries(
+  listDir: ArchiveListDir,
+  remotePaths: string[]
+): Promise<ArchiveEntry[]> {
+  const parentListings = new Map<string, Promise<ArchiveRemoteEntry[]>>()
+  const entries: ArchiveEntry[] = []
+
+  for (const remotePath of remotePaths) {
+    const parent = posix.dirname(remotePath)
+    let listing = parentListings.get(parent)
+    if (!listing) {
+      listing = listDir(parent)
+      parentListings.set(parent, listing)
+    }
+    const selected = (await listing).find((entry) => entry.path === remotePath)
+    if (!selected || selected.type === 'symlink' || selected.type === 'other') {
+      continue
+    }
+    if (selected.type === 'directory') {
+      entries.push({
+        remotePath: selected.path,
+        archivePath: `${selected.name}/`,
+        size: ARCHIVE_EMPTY_SIZE,
+        mtime: selected.mtime,
+        mode: selected.mode,
+        directory: true
+      })
+      entries.push(...(await collectArchiveEntries(listDir, selected.path, selected.name)))
+    } else {
+      entries.push({
+        remotePath: selected.path,
+        archivePath: selected.name,
+        size: selected.size,
+        mtime: selected.mtime,
+        mode: selected.mode,
         directory: false
       })
     }

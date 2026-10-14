@@ -262,10 +262,12 @@ async function handleMessage(
       await handleDelete(ctx, state, payload.paths)
       break
     case 'download':
-      await handleDownload(ctx, state, payload.path)
+      for (const path of payload.paths) {
+        await handleDownload(ctx, state, path)
+      }
       break
     case 'downloadZip':
-      await handleDownloadZip(ctx, state, payload.path)
+      await handleDownloadZip(ctx, state, 'paths' in payload ? payload.paths : payload.path)
       break
     case 'copy':
       await copyFilesToClipboard(ctx, state, payload.paths)

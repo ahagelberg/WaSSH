@@ -14,7 +14,11 @@ import type { Readable, Writable } from 'node:stream'
 import { ZipFile } from 'yazl'
 import type { PluginFileSession, PluginMainContext, SftpError } from '@plugin-api/main'
 import { classifySftpError, joinRemotePath } from '@plugin-api/main'
-import { ARCHIVE_EMPTY_SIZE, collectArchiveEntries } from './archiveLayout'
+import {
+  ARCHIVE_EMPTY_SIZE,
+  collectArchiveEntries,
+  collectSelectedArchiveEntries
+} from './archiveLayout'
 import { availableCopyPath } from './filePaths'
 import type { SftpTransferDonePayload, SftpTransferProgressPayload } from './protocol'
 
@@ -210,8 +214,10 @@ export async function handleDownload(
 export async function handleDownloadZip(
   ctx: PluginMainContext,
   state: SftpTransferState,
-  path: string
+  target: string | string[]
 ): Promise<void> {
+  const paths = Array.isArray(target) ? target : null
+  const path = Array.isArray(target) ? target.join(', ') : target
   const sftp = state.sftp
   if (!sftp) {
     sendTransferDone(ctx, {
@@ -234,9 +240,13 @@ export async function handleDownloadZip(
     return
   }
 
-  const rootName = archiveRootName(path)
+  const rootName = Array.isArray(target)
+    ? target.length === 1
+      ? archiveRootName(target[0])
+      : 'selection'
+    : archiveRootName(path)
   const result = await ctx.showSaveDialog({
-    title: 'Save folder as ZIP',
+    title: paths ? 'Save selection as ZIP' : 'Save folder as ZIP',
     defaultPath: `${rootName}.zip`,
     buttonLabel: 'Download',
     filters: [{ name: 'ZIP archive (*.zip)', extensions: ['zip'] }]
@@ -264,7 +274,9 @@ export async function handleDownloadZip(
   let error: SftpError | undefined
   try {
     // Empty archive path: the folder's contents land at the zip root.
-    const entries = await collectArchiveEntries((dir) => sftp.list(dir), path, '')
+    const entries = paths
+      ? await collectSelectedArchiveEntries((dir) => sftp.list(dir), paths)
+      : await collectArchiveEntries((dir) => sftp.list(dir), path, '')
     const totalBytes = entries.reduce((total, entry) => total + entry.size, ARCHIVE_EMPTY_SIZE)
     const archiveDone = new Promise<void>((resolve, reject) => {
       archive.on('error', reject)

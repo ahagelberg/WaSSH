@@ -399,7 +399,10 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
     const paths = selectedEntries.map((entry) => entry.path)
     return paths.length > 0 ? paths : selectedPath ? [selectedPath] : []
   }
-  const zipTarget = selected?.type === 'directory' ? selected.path : !selected && path ? path : null
+  const selectedFiles = (): string[] =>
+    selectedEntries.filter((entry) => entry.type === 'file').map((entry) => entry.path)
+  const zipPaths = selectedPathsInOrder()
+  const zipTarget = zipPaths.length === 0 ? path : null
   const parentDir = path ? parentPath(path) : null
 
   const navigate = (target: string): void => {
@@ -705,11 +708,17 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
               item('View', '👁', false, () => openViewer(entry))}
             {entry.type === 'file' &&
               item('Download', '⬇', false, () => {
-                void send({ type: 'download', path: entry.path })
+                const paths = selectedPaths.has(entry.path)
+                  ? selectedFiles()
+                  : [entry.path]
+                void send({ type: 'download', paths })
               })}
             {entry.type === 'directory' &&
               item('Download as ZIP', '⬇', false, () => {
-                void send({ type: 'downloadZip', path: entry.path })
+                const paths = selectedPaths.has(entry.path)
+                  ? selectedPathsInOrder()
+                  : [entry.path]
+                void send({ type: 'downloadZip', paths })
               })}
             {item('Rename', '✎', false, () =>
               openDialog({ kind: 'rename', path: entry.path, name: entry.name })
@@ -971,11 +980,12 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
         <button
           type="button"
           className="sftp-btn"
-          disabled={!connected || !selected || selected.type !== 'file'}
-          title="Download selected file"
+          disabled={!connected || selectedFiles().length === 0}
+          title="Download selected files"
           onClick={() => {
-            if (selected) {
-              void send({ type: 'download', path: selected.path })
+            const paths = selectedFiles()
+            if (paths.length > 0) {
+              void send({ type: 'download', paths })
             }
           }}
         >
@@ -986,12 +996,14 @@ export default function SftpView({ tabId, pluginId }: PluginViewProps): ReactEle
           className="sftp-btn"
           disabled={!connected || !zipTarget}
           title={
-            selected?.type === 'directory'
-              ? 'Download selected folder as a ZIP archive'
+            zipPaths.length > 0
+              ? 'Download selected items as a ZIP archive'
               : 'Download current folder as a ZIP archive'
           }
           onClick={() => {
-            if (zipTarget) {
+            if (zipPaths.length > 0) {
+              void send({ type: 'downloadZip', paths: zipPaths })
+            } else if (zipTarget) {
               void send({ type: 'downloadZip', path: zipTarget })
             }
           }}

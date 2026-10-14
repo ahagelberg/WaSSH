@@ -124,8 +124,9 @@ export type SftpRendererMessage =
   | { type: 'rename'; oldPath: string; newPath: string }
   | { type: 'chmod'; path: string; mode: number }
   | { type: 'delete'; paths: string[] }
-  | { type: 'download'; path: string }
+  | { type: 'download'; paths: string[] }
   | { type: 'downloadZip'; path: string }
+  | { type: 'downloadZip'; paths: string[] }
   | { type: 'copy'; paths: string[] }
   | { type: 'paste'; path?: string }
   | { type: 'viewFile'; path: string }
