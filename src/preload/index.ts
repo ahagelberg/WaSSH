@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppSettings,
+  AppMenuSection,
   ConnectRequest,
   ConnectionParams,
   HostKeyDecision,
@@ -32,6 +33,9 @@ function on(
 }
 
 const api: WasshApi = {
+  isWindows: process.platform === 'win32',
+  showAppMenu: (section: AppMenuSection, x: number, y: number) =>
+    ipcRenderer.invoke('app:showMenu', section, x, y),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (partial: Partial<AppSettings>) => ipcRenderer.invoke('settings:set', partial),
   listHosts: () => ipcRenderer.invoke('hosts:list'),

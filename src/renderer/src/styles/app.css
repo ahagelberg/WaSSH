@@ -2,6 +2,7 @@
   --sidebar-width: 240px;
   --sidebar-collapsed-width: 40px;
   --titlebar-height: 36px;
+  --titlebar-controls-width: 138px;
   --tabbar-height: 36px;
   --banner-height: auto;
   --font-ui: "Segoe UI", "IBM Plex Sans", sans-serif;
@@ -176,6 +177,51 @@ textarea:focus {
 
 .app-shell.sidebar-collapsed {
   grid-template-columns: var(--sidebar-collapsed-width) 1fr;
+}
+
+.app-shell.windows-titlebar {
+  grid-template-rows: var(--titlebar-height) minmax(0, 1fr);
+}
+
+.window-titlebar {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  height: var(--titlebar-height);
+  padding: 0 var(--titlebar-controls-width) 0 10px;
+  background: var(--bg-app);
+  -webkit-app-region: drag;
+}
+
+.window-titlebar-brand {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.window-titlebar-menu {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  -webkit-app-region: no-drag;
+}
+
+.window-titlebar-menu-button {
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+}
+
+.window-titlebar-menu-button:hover,
+.window-titlebar-menu-button:focus-visible {
+  border-color: transparent;
+  background: var(--bg-panel-2);
+  outline: none;
 }
 
 .sidebar-column {

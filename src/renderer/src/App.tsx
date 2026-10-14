@@ -64,6 +64,8 @@ import { sessionTerminalStyle } from './sessionStyleCss'
 import PluginToolbar from './plugins/host/PluginToolbar'
 import PluginSessionFrame from './plugins/PluginSessionFrame'
 
+const APP_MENU_SECTIONS = ['File', 'Edit', 'Session', 'View', 'Help'] as const
+
 /** Closed session settings retained for Ctrl+Shift+T reopen */
 const CLOSED_SESSION_RETENTION_MS = 60 * 60 * 1000
 
@@ -1216,7 +1218,29 @@ export default function App() {
   }, [openPalette])
 
   return (
-    <div className={`app-shell${settings.sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+    <div
+      className={`app-shell${settings.sidebarCollapsed ? ' sidebar-collapsed' : ''}${window.wassh.isWindows ? ' windows-titlebar' : ''}`}
+    >
+      {window.wassh.isWindows ? (
+        <div className="window-titlebar">
+          <span className="window-titlebar-brand">WaSSH</span>
+          <nav className="window-titlebar-menu" aria-label="Application menu">
+            {APP_MENU_SECTIONS.map((section) => (
+              <button
+                key={section}
+                type="button"
+                className="window-titlebar-menu-button"
+                onClick={(event) => {
+                  const bounds = event.currentTarget.getBoundingClientRect()
+                  void window.wassh.showAppMenu(section, bounds.left, bounds.bottom)
+                }}
+              >
+                {section}
+              </button>
+            ))}
+          </nav>
+        </div>
+      ) : null}
       <div className="sidebar-column">
         <SessionsSidebar
           hosts={hosts}

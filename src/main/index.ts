@@ -1,10 +1,11 @@
-import { app, BrowserWindow, Menu, nativeImage, powerMonitor, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, powerMonitor, shell } from 'electron'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import {
   DEFAULT_THEME,
   DEFAULT_WINDOW_MIN_HEIGHT,
   DEFAULT_WINDOW_MIN_WIDTH,
+  AppMenuSection,
   TAB_CLOSE_KEY,
   TAB_CYCLE_KEY,
   TAB_CYCLE_NEXT,
@@ -44,6 +45,8 @@ const RECONNECT_ACCELERATOR = 'CommandOrControl+R'
 
 /** Accelerator for Session > Reconnect All */
 const RECONNECT_ALL_ACCELERATOR = 'CommandOrControl+Shift+R'
+
+const CUSTOM_TITLEBAR_HEIGHT = 36
 
 /** Network resets that happen on sleep/wake; must not crash the main process */
 const TRANSIENT_NETWORK_ERROR_CODES = new Set([
@@ -161,6 +164,7 @@ let mainWindow: BrowserWindow | null = null
 let sessions: SessionManager | null = null
 let settingsStore: SettingsStore | null = null
 let pluginSystem: ReturnType<typeof createPluginSystem> | null = null
+let appMenuSections = new Map<AppMenuSection, Menu>()
 
 function getWindow(): BrowserWindow | null {
   return mainWindow
@@ -190,6 +194,16 @@ function createWindow(): void {
     backgroundColor: THEME_WINDOW_BACKGROUND[theme],
     show: false,
     title: APP_NAME,
+    ...(process.platform === 'win32'
+      ? {
+          titleBarStyle: 'hidden' as const,
+          titleBarOverlay: {
+            color: THEME_WINDOW_BACKGROUND[theme],
+            symbolColor: theme === 'dark' ? '#e8eaed' : '#1b1d21',
+            height: CUSTOM_TITLEBAR_HEIGHT
+          }
+        }
+      : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -197,6 +211,9 @@ function createWindow(): void {
       sandbox: false
     }
   })
+  if (process.platform === 'win32') {
+    mainWindow.setMenuBarVisibility(false)
+  }
   if (windowIcon && !windowIcon.isEmpty()) {
     mainWindow.setIcon(windowIcon)
   }
@@ -451,8 +468,24 @@ function installAppMenu(): void {
       ]
     }
   ]
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+  const menu = Menu.buildFromTemplate(template)
+  appMenuSections = new Map(
+    (['File', 'Edit', 'Session', 'View', 'Help'] as const).flatMap((section) => {
+      const submenu = menu.items.find((item) => item.label === section)?.submenu
+      return submenu ? [[section, submenu]] : []
+    })
+  )
+  Menu.setApplicationMenu(menu)
 }
+
+ipcMain.handle('app:showMenu', (event, section: AppMenuSection, x: number, y: number) => {
+  const win = getWindow()
+  const menu = appMenuSections.get(section)
+  if (!win || event.sender !== win.webContents || !menu || !Number.isFinite(x) || !Number.isFinite(y)) {
+    return
+  }
+  menu.popup({ window: win, x, y })
+})
 
 installProcessErrorGuards()
 pinUserDataPath()

@@ -650,6 +650,8 @@ export interface SshKeyRetrieveResult {
 }
 
 export interface WasshApi {
+  isWindows: boolean
+  showAppMenu: (section: AppMenuSection, x: number, y: number) => Promise<void>
   getSettings: () => Promise<AppSettings>
   setSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
   listHosts: () => Promise<HostProfile[]>
@@ -724,6 +726,8 @@ export interface WasshApi {
   /** Replace all config files from a backup zip and reload the window */
   restoreBackup: (filePath: string) => Promise<BackupRestoreResult>
 }
+
+export type AppMenuSection = 'File' | 'Edit' | 'Session' | 'View' | 'Help'
 
 declare global {
   interface Window {

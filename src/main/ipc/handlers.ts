@@ -65,6 +65,12 @@ export function applyChromeTheme(theme: AppTheme, win: BrowserWindow | null): vo
   nativeTheme.themeSource = theme
   if (win && !win.isDestroyed()) {
     win.setBackgroundColor(THEME_WINDOW_BACKGROUND[theme])
+    if (process.platform === 'win32') {
+      win.setTitleBarOverlay({
+        color: THEME_WINDOW_BACKGROUND[theme],
+        symbolColor: theme === 'dark' ? '#e8eaed' : '#1b1d21'
+      })
+    }
   }
 }
 
