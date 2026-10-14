@@ -38,6 +38,9 @@ const MESSAGE_MENU_MIN_WIDTH_PX = 120
 /** Approximate height of the saved-message context menu (edit + delete) */
 const MESSAGE_MENU_HEIGHT_PX = 62
 
+/** Approximate height of the topic context menu (delete) */
+const TOPIC_MENU_HEIGHT_PX = 34
+
 /** Gap between the cursor and the anchored context menu */
 const MENU_GAP_PX = 4
 
@@ -622,6 +625,11 @@ export default function MqttAnalyserView({
   const [messageMenu, setMessageMenu] = useState<{ id: string; left: number; top: number } | null>(
     null
   )
+  const [topicMenu, setTopicMenu] = useState<{
+    path: string
+    left: number
+    top: number
+  } | null>(null)
   const [treeRatio, setTreeRatio] = useState(MQTT_SPLIT_DEFAULT_RATIO)
   const splitRef = useRef<HTMLDivElement>(null)
   const splitterLastX = useRef(0)
@@ -851,9 +859,19 @@ export default function MqttAnalyserView({
   }
 
   const openMessageMenu = (id: string, x: number, y: number): void => {
+    setTopicMenu(null)
     setMessageMenu({
       id,
       ...anchorMenuAt(x, y, MESSAGE_MENU_MIN_WIDTH_PX, MESSAGE_MENU_HEIGHT_PX)
+    })
+  }
+
+  const openTopicMenu = (path: string, x: number, y: number): void => {
+    setMessageMenu(null)
+    setSelectedPath(path)
+    setTopicMenu({
+      path,
+      ...anchorMenuAt(x, y, MESSAGE_MENU_MIN_WIDTH_PX, TOPIC_MENU_HEIGHT_PX)
     })
   }
 
@@ -863,15 +881,23 @@ export default function MqttAnalyserView({
     }
     const close = (ev: MouseEvent): void => {
       const target = ev.target
-      if (target instanceof Element && target.closest('.mqtt-msg-context-menu')) {
+      if (
+        target instanceof Element &&
+        target.closest('.mqtt-msg-context-menu, .mqtt-topic-context-menu')
+      ) {
         return
       }
       setMessageMenu(null)
+      setTopicMenu(null)
     }
-    const closeOnScroll = (): void => setMessageMenu(null)
+    const closeOnScroll = (): void => {
+      setMessageMenu(null)
+      setTopicMenu(null)
+    }
     const closeOnEscape = (ev: KeyboardEvent): void => {
       if (ev.key === 'Escape') {
         setMessageMenu(null)
+        setTopicMenu(null)
       }
     }
     document.addEventListener('mousedown', close)
@@ -882,13 +908,13 @@ export default function MqttAnalyserView({
       document.removeEventListener('scroll', closeOnScroll, true)
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [messageMenu])
+  }, [messageMenu, topicMenu])
 
-  const handleDelete = async (): Promise<void> => {
-    if (selectedPath === null || status !== 'connected') {
+  const handleDelete = async (path = selectedPath): Promise<void> => {
+    if (path === null || status !== 'connected') {
       return
     }
-    const node = findNode(root, selectedPath)
+    const node = findNode(root, path)
     if (!node) {
       return
     }
@@ -903,7 +929,8 @@ export default function MqttAnalyserView({
       })
       setRoot((prev) => clearTopicMessages(prev, path))
     }
-    setSelectedPath(null)
+    setSelectedPath((current) => (current === path ? null : current))
+    setTopicMenu(null)
   }
 
   const onFileChange = async (file: File | null): Promise<void> => {
@@ -992,6 +1019,10 @@ export default function MqttAnalyserView({
               .join(' ')}
             data-mqtt-path={child.path}
             onClick={() => setSelectedPath(child.path)}
+            onContextMenu={(e) => {
+              e.preventDefault()
+              openTopicMenu(child.path, e.clientX, e.clientY)
+            }}
             onDoubleClick={() => {
               if (hasChildren) {
                 toggleExpand(child.path)
@@ -1387,6 +1418,26 @@ export default function MqttAnalyserView({
             }}
           >
             Remove
+          </button>
+        </div>
+      ) : null}
+
+      {topicMenu ? (
+        <div
+          className="mqtt-msg-context-menu mqtt-topic-context-menu"
+          role="menu"
+          style={{ left: topicMenu.left, top: topicMenu.top }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            className="danger"
+            disabled={status !== 'connected'}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => void handleDelete(topicMenu.path)}
+          >
+            Delete
           </button>
         </div>
       ) : null}

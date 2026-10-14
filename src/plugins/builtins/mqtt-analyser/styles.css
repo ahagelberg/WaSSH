@@ -538,6 +538,11 @@ button.mqtt-msg-collapse:hover {
   color: var(--danger);
 }
 
+.mqtt-msg-context-menu button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
 .mqtt-msg-dialog-backdrop {
   position: fixed;
   inset: 0;
