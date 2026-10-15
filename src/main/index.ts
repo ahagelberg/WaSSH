@@ -484,7 +484,7 @@ ipcMain.handle('app:showMenu', (event, section: AppMenuSection, x: number, y: nu
   if (!win || event.sender !== win.webContents || !menu || !Number.isFinite(x) || !Number.isFinite(y)) {
     return
   }
-  menu.popup({ window: win, x, y })
+  menu.popup({ window: win, x: Math.round(x), y: Math.round(y) })
 })
 
 installProcessErrorGuards()
