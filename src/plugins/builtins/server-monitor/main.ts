@@ -379,7 +379,7 @@ function buildWindowsCommand(sort: ServerMonitorProcessSort, descending: boolean
     "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { $_.IPAddress }",
     "Write-Output '===OS==='", '"PRETTY_NAME=$($os.Caption)"',
     "Write-Output '===CPU==='",
-    '"percent $([math]::Round((Get-Counter \'\\Processor(_Total)\\% Processor Time\').CounterSamples[0].CookedValue, 1))"',
+    '$counter = Get-Counter \'\\Processor(*)\\% Processor Time\'; "percent $([math]::Round(($counter.CounterSamples | Where-Object { $_.InstanceName -eq \'_Total\' }).CookedValue, 1))"; $counter.CounterSamples | Where-Object { $_.InstanceName -ne \'_Total\' } | ForEach-Object { "core$($_.InstanceName) $([math]::Round($_.CookedValue, 1))" }',
     "Write-Output '===MEM==='", '"MemTotal: $($os.TotalVisibleMemorySize) kB"',
     '"MemAvailable: $($os.FreePhysicalMemory) kB"', '"MemFree: $($os.FreePhysicalMemory) kB"',
     '"SwapTotal: $($os.TotalVirtualMemorySize - $os.TotalVisibleMemorySize) kB"',
@@ -810,6 +810,22 @@ function parseWindowsCpuPercent(block: string): number | null {
   return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null
 }
 
+/** Windows exposes per-core CPU as direct percentages from Performance Counters. */
+function parseWindowsCpuCores(block: string): number[] {
+  const cores: number[] = []
+  for (const line of block.split(/\n/)) {
+    const match = /^core\S*\s+([\d.,]+)/i.exec(line.trim())
+    if (!match) {
+      continue
+    }
+    const percent = Number(match[1].replace(',', '.'))
+    if (Number.isFinite(percent)) {
+      cores.push(Math.max(0, Math.min(100, percent)))
+    }
+  }
+  return cores
+}
+
 /** BSD `ps -A -r -o …` rows (thread count not available on all BSD flavors). */
 function parseBsdProcesses(block: string): ServerMonitorProcess[] {
   const rows: ServerMonitorProcess[] = []
@@ -1029,12 +1045,17 @@ function parseSample(
   const { hostname, uptimeSec, load1, load5, load15, procsRunning, procsTotal, distro, kernel, cpuCount, ips } =
     parseCommonMeta(raw)
 
-  const { aggregate: cpu, cores } = parseCpuBlock(section(raw, 'CPU'))
-  let cpuPercent: number | null = family === 'windows' ? parseWindowsCpuPercent(section(raw, 'CPU')) : null
+  const cpuBlock = section(raw, 'CPU')
+  const { aggregate: cpu, cores } = family === 'windows'
+    ? { aggregate: null, cores: [] as CpuJiffies[] }
+    : parseCpuBlock(cpuBlock)
+  let cpuPercent: number | null = family === 'windows' ? parseWindowsCpuPercent(cpuBlock) : null
   if (family !== 'windows' && cpu && prevCpu) {
     cpuPercent = cpuPercentFromDelta(cpu, prevCpu)
   }
-  const cpuCores: Array<number | null> = cores.map((core, i) => {
+  const cpuCores: Array<number | null> = family === 'windows'
+    ? parseWindowsCpuCores(cpuBlock)
+    : cores.map((core, i) => {
     const prev = prevCores[i]
     return prev ? cpuPercentFromDelta(core, prev) : null
   })
