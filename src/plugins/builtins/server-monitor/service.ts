@@ -344,6 +344,15 @@ export async function probeService(
 ): Promise<void> {
   const generation = ++session.probeGeneration
   setStatus(ctx, session, { state: 'probing', streamConnected: false })
+  if (ctx.isLocalSession() && process.platform === 'win32') {
+    clearHistory(session, hooks)
+    setStatus(ctx, session, {
+      state: 'error',
+      streamConnected: false,
+      message: 'WaSSH Service requires Linux with systemd'
+    })
+    return
+  }
   if (!ctx.isSshSession() && !ctx.isLocalSession()) {
     clearHistory(session, hooks)
     setStatus(ctx, session, {

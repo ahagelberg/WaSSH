@@ -52,6 +52,7 @@ import {
 } from './service'
 import { isMonitorRendererMessage, type MonitorMainMessage } from './serviceProtocol'
 import { parseKeyValueBlock, parseLimits, parseParentLine } from './processDetails'
+import { buildLocalWindowsSample } from './localWindowsSample'
 
 /** `ps --sort=` field for each UI column */
 const PS_SORT_FIELD: Record<ServerMonitorProcessSort, string> = {
@@ -108,6 +109,9 @@ const KILL_EXIT_MARKER = '__EC:'
 
 /** Fixed sampling cadence shared by the poller and the daemon (ms) */
 const SAMPLE_INTERVAL_MS = SERVER_MONITOR_DEFAULT_INTERVAL_MS
+
+/** Slower Windows fields are refreshed separately from the live OS counters. */
+const WINDOWS_DETAILS_SAMPLE_INTERVAL_MS = 5000
 
 /** Processes tracked for CPU history (the top-N list, so all visible rows) */
 const PROC_HISTORY_MAX = SERVER_MONITOR_TOP_PROCESS_COUNT
@@ -169,6 +173,8 @@ interface MonitorSessionState {
   shortSamples: number
   /** Per-process CPU history from past samples, keyed by pid */
   procHistory: Map<number, ProcCpuHistory>
+  windowsDetailsBusy: boolean
+  lastWindowsDetailsAt: number
   /** Most recent snapshot pushed to the renderer, for `get_snapshot` API calls */
   lastSnapshot: ServerMonitorSnapshot | null
   /** Remote daemon ("WaSSH Service") probe + stream state */
@@ -376,10 +382,10 @@ function buildWindowsCommand(sort: ServerMonitorProcessSort, descending: boolean
     '[math]::Round(((Get-Date) - $os.LastBootUpTime).TotalSeconds)', "'0 0 0 0/0 0'",
     '"Windows $($os.Version)"', '[Environment]::ProcessorCount',
     "Write-Output '===IP==='",
-    "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { $_.IPAddress }",
+    '$interfaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object { $_.NetworkInterfaceType -ne [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback }; $addresses = foreach ($interface in $interfaces) { foreach ($address in $interface.GetIPProperties().UnicastAddresses) { if ($address.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and $address.Address.ToString() -ne \'127.0.0.1\') { [pscustomobject]@{ Name = $interface.Name; Address = $address.Address.ToString() } } } }; $addresses | ForEach-Object { $_.Address }',
     "Write-Output '===OS==='", '"PRETTY_NAME=$($os.Caption)"',
     "Write-Output '===CPU==='",
-    '$counter = Get-Counter \'\\Processor(*)\\% Processor Time\'; "percent $([math]::Round(($counter.CounterSamples | Where-Object { $_.InstanceName -eq \'_Total\' }).CookedValue, 1))"; $counter.CounterSamples | Where-Object { $_.InstanceName -ne \'_Total\' } | ForEach-Object { "core$($_.InstanceName) $([math]::Round($_.CookedValue, 1))" }',
+    '$cpuCounters = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor; "percent $([math]::Round(($cpuCounters | Where-Object { $_.Name -eq \'_Total\' }).PercentProcessorTime, 1))"; $cpuCounters | Where-Object { $_.Name -ne \'_Total\' } | Sort-Object { [int]$_.Name } | ForEach-Object { "core$($_.Name) $([math]::Round($_.PercentProcessorTime, 1))" }',
     "Write-Output '===MEM==='", '"MemTotal: $($os.TotalVisibleMemorySize) kB"',
     '"MemAvailable: $($os.FreePhysicalMemory) kB"', '"MemFree: $($os.FreePhysicalMemory) kB"',
     '"SwapTotal: $($os.TotalVirtualMemorySize - $os.TotalVisibleMemorySize) kB"',
@@ -387,11 +393,11 @@ function buildWindowsCommand(sort: ServerMonitorProcessSort, descending: boolean
     "Write-Output '===DISK==='",
     "Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\" | ForEach-Object { \"$($_.DeviceID) $($_.Size) $($_.Size - $_.FreeSpace) 0\" }",
     "Write-Output '===DISKIO==='", "Write-Output '===NET==='",
-    'Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name): $($_.ReceivedBytes) 0 0 0 0 0 0 0 $($_.SentBytes)" }',
+    '$interfaces | ForEach-Object { $statistics = $_.GetIPv4Statistics(); "$($_.Name): $($statistics.BytesReceived) 0 0 0 0 0 0 0 $($statistics.BytesSent)" }',
     "Write-Output '===IPMAP==='",
-    "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { \"$($_.InterfaceAlias) $($_.IPAddress)\" }",
+    '$addresses | ForEach-Object { "$($_.Name) $($_.Address)" }',
     "Write-Output '===NETSPEED==='",
-    'Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.LinkSpeed } | ForEach-Object { "$($_.Name) $([math]::Round(([double]$_.LinkSpeed / 1MB * 8)))" }',
+    '$interfaces | Where-Object { $_.Speed -gt 0 } | ForEach-Object { "$($_.Name) $([math]::Round($_.Speed / 1000000))" }',
     "Write-Output '===TEMP==='", "Write-Output '===PROCS==='",
     `$processes = Get-Process | Sort-Object -Property ${sortProperty[sort]}${direction} | Select-Object -First ${SERVER_MONITOR_TOP_PROCESS_COUNT}; $processes | ForEach-Object { $threads = if ($_.Threads) { $_.Threads.Count } else { 0 }; $cpu = if ($_.CPU) { [math]::Round($_.CPU, 1) } else { 0 }; $rss = [math]::Round($_.WorkingSet64 / 1KB); \"$($_.Id) $($_.ProcessName) R 0 $threads $cpu 0 $rss $($_.ProcessName)\" }`
   ].join('; ')
@@ -647,15 +653,15 @@ function parseNetDev(block: string): Record<string, { rx: number; tx: number }> 
 function parseNetSpeeds(block: string): Record<string, number> {
   const speeds: Record<string, number> = {}
   for (const line of block.split(/\n/)) {
-    const m = /^(\S+)\s+(-?\d+)$/.exec(line.trim())
-    if (!m) {
+    const parts = line.trim().split(/\s+/)
+    if (parts.length < 2) {
       continue
     }
-    const name = m[1]
+    const mbps = Number(parts.pop())
+    const name = parts.join(' ')
     if (name === SERVER_MONITOR_LOOPBACK_IFACE) {
       continue
     }
-    const mbps = Number(m[2])
     if (!Number.isFinite(mbps) || mbps <= 0) {
       continue
     }
@@ -672,7 +678,8 @@ function parseIfaceIps(block: string): Record<string, string[]> {
     if (parts.length < 2) {
       continue
     }
-    const [name, ip] = parts
+    const ip = parts.pop() || ''
+    const name = parts.join(' ')
     if (!name || !/^[0-9a-fA-F:.]+$/.test(ip)) {
       continue
     }
@@ -1397,6 +1404,38 @@ async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): 
   }
   state.busy = true
   try {
+    if (ctx.isLocalSession() && process.platform === 'win32') {
+      const raw = buildLocalWindowsSample()
+      const parsed = parseSample(raw, state.prevCpu, state.prevCores, null, null, 'linux')
+      state.prevCpu = parsed.cpu
+      state.prevCores = parsed.cores
+      const previous = state.lastSnapshot
+      const interfaceIps = parseIfaceIps(section(raw, 'IPMAP'))
+      parsed.snapshot.swapTotalBytes = previous?.swapTotalBytes ?? 0
+      parsed.snapshot.swapUsedBytes = previous?.swapUsedBytes ?? 0
+      parsed.snapshot.diskReadBytes = previous?.diskReadBytes ?? 0
+      parsed.snapshot.diskWriteBytes = previous?.diskWriteBytes ?? 0
+      parsed.snapshot.diskReadRate = previous?.diskReadRate ?? null
+      parsed.snapshot.diskWriteRate = previous?.diskWriteRate ?? null
+      parsed.snapshot.processes = state.lastProcesses
+      parsed.snapshot.network = (previous?.network ?? []).map((iface) => ({
+        ...iface,
+        ips: interfaceIps[iface.name] ?? []
+      }))
+      recordProcessHistory(state, parsed.snapshot.processes, parsed.snapshot.updatedAt)
+      pushStats(ctx, state, parsed.snapshot)
+      pushLocalHistory(ctx, state, parsed.snapshot)
+
+      if (
+        !state.windowsDetailsBusy &&
+        Date.now() - state.lastWindowsDetailsAt >= WINDOWS_DETAILS_SAMPLE_INTERVAL_MS
+      ) {
+        state.lastWindowsDetailsAt = Date.now()
+        void pollWindowsDetails(ctx, state)
+      }
+      return
+    }
+
     const buf = await runExecSample(
       ctx,
       buildSampleCommand(state.family, state.processSort, state.processSortDesc)
@@ -1434,6 +1473,44 @@ async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): 
     pushStats(ctx, state, emptySnapshot({ error: message }))
   } finally {
     state.busy = false
+  }
+}
+
+/** Refresh process, swap, and adapter counters without blocking live Windows stats. */
+async function pollWindowsDetails(ctx: PluginMainContext, state: MonitorSessionState): Promise<void> {
+  state.windowsDetailsBusy = true
+  try {
+    const raw = await runHostCommand(
+      ctx,
+      buildSampleCommand('windows', state.processSort, state.processSortDesc)
+    )
+    if (state.stopped) {
+      return
+    }
+    const parsed = parseSample(raw, null, [], state.prevNet, state.prevDiskIo, 'windows')
+    state.prevNet = parsed.net
+    state.prevDiskIo = parsed.diskIo
+    const current = state.lastSnapshot
+    if (!current) {
+      return
+    }
+    const processes = stabilizeProcessList(state, parsed.snapshot.processes)
+    pushStats(ctx, state, {
+      ...current,
+      updatedAt: Date.now(),
+      swapTotalBytes: parsed.snapshot.swapTotalBytes,
+      swapUsedBytes: parsed.snapshot.swapUsedBytes,
+      diskReadBytes: parsed.snapshot.diskReadBytes,
+      diskWriteBytes: parsed.snapshot.diskWriteBytes,
+      diskReadRate: parsed.snapshot.diskReadRate,
+      diskWriteRate: parsed.snapshot.diskWriteRate,
+      processes,
+      network: parsed.snapshot.network
+    })
+  } catch {
+    // The in-process Windows sample remains live when extended fields fail.
+  } finally {
+    state.windowsDetailsBusy = false
   }
 }
 
@@ -1550,6 +1627,8 @@ export const serverMonitorMain: PluginMainModule = {
       lastProcesses: [],
       shortSamples: 0,
       procHistory: new Map(),
+      windowsDetailsBusy: false,
+      lastWindowsDetailsAt: 0,
       lastSnapshot: null,
       timer: null,
       poll: async () => undefined,
@@ -1567,9 +1646,15 @@ export const serverMonitorMain: PluginMainModule = {
       sessionStates.delete(instanceKey(ctx))
     })
 
-    await probeService(ctx, state.service, serviceHooks(ctx, state))
+    const localWindows = ctx.isLocalSession() && process.platform === 'win32'
+    if (!localWindows) {
+      await probeService(ctx, state.service, serviceHooks(ctx, state))
+    }
     void state.poll()
     armTimer(ctx, state)
+    if (localWindows) {
+      void probeService(ctx, state.service, serviceHooks(ctx, state))
+    }
   },
 
   async onMessage(ctx, payload): Promise<ServerMonitorActionResult | undefined> {
