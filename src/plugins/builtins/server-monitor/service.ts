@@ -134,13 +134,14 @@ export function runHostCommand(
   stdin?: string
 ): Promise<string> {
   if (ctx.isLocalSession()) {
-    if (process.platform !== 'linux' && process.platform !== 'darwin' && process.platform !== 'freebsd') {
-      return Promise.reject(new Error('Local monitor commands require Linux, macOS, or FreeBSD'))
-    }
+    const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
+    const args = process.platform === 'win32'
+      ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command]
+      : ['-c', command]
     return new Promise((resolve, reject) => {
       const child = execFile(
-        '/bin/sh',
-        ['-c', command],
+        shell,
+        args,
         {
           timeout: SERVICE_COMMAND_TIMEOUT_MS,
           maxBuffer: SERVICE_COMMAND_MAX_BUFFER_BYTES

@@ -148,7 +148,7 @@ interface DiskIoCounters {
 }
 
 /** OS families the monitor can sample (Linux stays the primary path) */
-type MonitorFamily = 'linux' | 'macos' | 'freebsd'
+type MonitorFamily = 'linux' | 'macos' | 'freebsd' | 'windows'
 
 interface MonitorSessionState {
   stopped: boolean
@@ -363,6 +363,40 @@ function buildBsdProcCommand(isMac: boolean, byMem: boolean): string {
   return `(rows=$(ps -A ${orderFlag} -o pid=,user=,${psState}=,nice=,%cpu=,%mem=,rss=,${psField}= 2>/dev/null); if [ -n "$rows" ]; then printf '%s\n' "$rows" | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT}; else ps -A ${orderFlag} -o pid=,user=,%cpu=,%mem=,rss=,${psField}= 2>/dev/null | awk '{ cmd=$6; for (j = 7; j <= NF; j++) cmd = cmd " " $j; print $1, $2, "?", 0, $3, $4, $5, cmd }' | head -n ${SERVER_MONITOR_TOP_PROCESS_COUNT}; fi)`
 }
 
+/** Windows PowerShell sample command, shaped like the Unix sample sections. */
+function buildWindowsCommand(sort: ServerMonitorProcessSort, descending: boolean): string {
+  const sortProperty: Record<ServerMonitorProcessSort, string> = {
+    pid: 'Id', user: 'ProcessName', state: 'Id', nice: 'Id', threads: 'Threads.Count',
+    cpu: 'CPU', mem: 'WorkingSet64', command: 'ProcessName'
+  }
+  const direction = descending ? ' -Descending' : ''
+  return [
+    '$os = Get-CimInstance Win32_OperatingSystem',
+    "Write-Output '===META==='", '$env:COMPUTERNAME',
+    '[math]::Round(((Get-Date) - $os.LastBootUpTime).TotalSeconds)', "'0 0 0 0/0 0'",
+    '"Windows $($os.Version)"', '[Environment]::ProcessorCount',
+    "Write-Output '===IP==='",
+    "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { $_.IPAddress }",
+    "Write-Output '===OS==='", '"PRETTY_NAME=$($os.Caption)"',
+    "Write-Output '===CPU==='",
+    '"percent $([math]::Round((Get-Counter \'\\Processor(_Total)\\% Processor Time\').CounterSamples[0].CookedValue, 1))"',
+    "Write-Output '===MEM==='", '"MemTotal: $($os.TotalVisibleMemorySize) kB"',
+    '"MemAvailable: $($os.FreePhysicalMemory) kB"', '"MemFree: $($os.FreePhysicalMemory) kB"',
+    '"SwapTotal: $($os.TotalVirtualMemorySize - $os.TotalVisibleMemorySize) kB"',
+    '"SwapFree: $($os.FreeVirtualMemory - $os.FreePhysicalMemory) kB"',
+    "Write-Output '===DISK==='",
+    "Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\" | ForEach-Object { \"$($_.DeviceID) $($_.Size) $($_.Size - $_.FreeSpace) 0\" }",
+    "Write-Output '===DISKIO==='", "Write-Output '===NET==='",
+    'Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name): $($_.ReceivedBytes) 0 0 0 0 0 0 0 $($_.SentBytes)" }',
+    "Write-Output '===IPMAP==='",
+    "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { \"$($_.InterfaceAlias) $($_.IPAddress)\" }",
+    "Write-Output '===NETSPEED==='",
+    'Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.LinkSpeed } | ForEach-Object { "$($_.Name) $([math]::Round(([double]$_.LinkSpeed / 1MB * 8)))" }',
+    "Write-Output '===TEMP==='", "Write-Output '===PROCS==='",
+    `$processes = Get-Process | Sort-Object -Property ${sortProperty[sort]}${direction} | Select-Object -First ${SERVER_MONITOR_TOP_PROCESS_COUNT}; $processes | ForEach-Object { $threads = if ($_.Threads) { $_.Threads.Count } else { 0 }; $cpu = if ($_.CPU) { [math]::Round($_.CPU, 1) } else { 0 }; $rss = [math]::Round($_.WorkingSet64 / 1KB); \"$($_.Id) $($_.ProcessName) R 0 $threads $cpu 0 $rss $($_.ProcessName)\" }`
+  ].join('; ')
+}
+
 /**
  * Wrap a command so it runs under a POSIX `/bin/sh`, whatever the remote login
  * shell is (e.g. FreeBSD defaults to csh).
@@ -380,8 +414,10 @@ function buildSampleCommand(
   const payload =
     family === 'linux'
       ? buildMonitorCommand(sort, descending)
-      : buildUnixCommand(family, sort)
-  return family === 'linux' ? payload : shWrap(payload)
+      : family === 'windows'
+        ? buildWindowsCommand(sort, descending)
+        : buildUnixCommand(family, sort)
+  return family === 'linux' || family === 'windows' ? payload : shWrap(payload)
 }
 
 /** Detect the OS family from a sample's META kernel line (`uname -srm`). */
@@ -396,6 +432,9 @@ function detectFamilyFromSample(raw: string): MonitorFamily {
   }
   if (first === 'FreeBSD' || first === 'OpenBSD' || first === 'NetBSD' || first === 'DragonFly') {
     return 'freebsd'
+  }
+  if (first === 'Windows') {
+    return 'windows'
   }
   return 'linux'
 }
@@ -761,6 +800,16 @@ function parseMacCpuPercent(block: string): number | null {
   return Math.max(0, Math.min(100, 100 - idle))
 }
 
+/** Windows PowerShell reports aggregate CPU as a ready-made percentage. */
+function parseWindowsCpuPercent(block: string): number | null {
+  const match = /(?:^|\n)percent\s+([\d.,]+)/i.exec(block)
+  if (!match) {
+    return null
+  }
+  const percent = Number(match[1].replace(',', '.'))
+  return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null
+}
+
 /** BSD `ps -A -r -o …` rows (thread count not available on all BSD flavors). */
 function parseBsdProcesses(block: string): ServerMonitorProcess[] {
   const rows: ServerMonitorProcess[] = []
@@ -861,6 +910,8 @@ function parseUnixSample(
   const cores: CpuJiffies[] = []
   if (family === 'macos') {
     cpuPercent = parseMacCpuPercent(section(raw, 'CPU'))
+  } else if (family === 'windows') {
+    cpuPercent = parseWindowsCpuPercent(section(raw, 'CPU'))
   } else {
     cpu = parseCpuBlock(section(raw, 'CPU')).aggregate ?? null
     if (cpu && prevCpu) {
@@ -971,15 +1022,16 @@ function parseSample(
   prevCpu: CpuJiffies | null,
   prevCores: CpuJiffies[],
   prevNet: NetCounters | null,
-  prevDiskIo: DiskIoCounters | null
+  prevDiskIo: DiskIoCounters | null,
+  family: MonitorFamily = 'linux'
 ): SampleParseResult {
   const now = Date.now()
   const { hostname, uptimeSec, load1, load5, load15, procsRunning, procsTotal, distro, kernel, cpuCount, ips } =
     parseCommonMeta(raw)
 
   const { aggregate: cpu, cores } = parseCpuBlock(section(raw, 'CPU'))
-  let cpuPercent: number | null = null
-  if (cpu && prevCpu) {
+  let cpuPercent: number | null = family === 'windows' ? parseWindowsCpuPercent(section(raw, 'CPU')) : null
+  if (family !== 'windows' && cpu && prevCpu) {
     cpuPercent = cpuPercentFromDelta(cpu, prevCpu)
   }
   const cpuCores: Array<number | null> = cores.map((core, i) => {
@@ -1341,8 +1393,8 @@ async function pollSession(ctx: PluginMainContext, state: MonitorSessionState): 
     }
 
     const parsed =
-      family === 'linux'
-        ? parseSample(buf, state.prevCpu, state.prevCores, state.prevNet, state.prevDiskIo)
+      family === 'linux' || family === 'windows'
+        ? parseSample(buf, state.prevCpu, state.prevCores, state.prevNet, state.prevDiskIo, family)
         : parseUnixSample(buf, family, state.prevCpu, state.prevNet)
     if (parsed.cpu) {
       state.prevCpu = parsed.cpu
@@ -1462,7 +1514,14 @@ export const serverMonitorMain: PluginMainModule = {
       busy: false,
       processSort: SERVER_MONITOR_PROCESS_SORT_DEFAULT,
       processSortDesc: SERVER_MONITOR_PROCESS_SORT_DESC_DEFAULT,
-      family: process.platform === 'darwin' ? 'macos' : process.platform === 'freebsd' ? 'freebsd' : 'linux',
+      family:
+        process.platform === 'win32'
+          ? 'windows'
+          : process.platform === 'darwin'
+            ? 'macos'
+            : process.platform === 'freebsd'
+              ? 'freebsd'
+              : 'linux',
       prevCpu: null,
       prevCores: [],
       prevNet: null,
