@@ -1,0 +1,12 @@
+[package]
+name = "wassh-serial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Serial-port transport for WaSSH"
+
+[dependencies]
+anyhow.workspace = true
+serial2 = "0.2"
+wassh-core = { path = "../wassh-core" }

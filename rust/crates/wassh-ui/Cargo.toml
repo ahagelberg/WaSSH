@@ -1,0 +1,14 @@
+[package]
+name = "wassh-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WaSSH egui shell, widget kit and screens"
+
+[dependencies]
+egui = { workspace = true }
+wassh-core = { path = "../wassh-core" }
+wassh-term = { path = "../wassh-term" }
+wassh-term-render = { path = "../wassh-term-render" }

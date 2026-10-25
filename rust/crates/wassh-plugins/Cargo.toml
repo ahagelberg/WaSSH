@@ -1,0 +1,19 @@
+[package]
+name = "wassh-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WaSSH built-in plugins and their internal registration API"
+
+[dependencies]
+egui = { workspace = true }
+regex = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+wassh-core = { path = "../wassh-core" }
+wassh-mqtt = { path = "../wassh-mqtt" }
+wassh-ui = { path = "../wassh-ui" }

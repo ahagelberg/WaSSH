@@ -1,0 +1,12 @@
+[package]
+name = "wassh-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WaSSH domain model: constants, theme, session lifecycle, dock layout"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

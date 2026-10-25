@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WaSSH
+GenericName=SSH client
+Comment=SSH, Telnet and serial terminal
+Exec=wassh %U
+Icon=wassh
+Terminal=false
+Categories=Network;RemoteAccess;TerminalEmulator;
+Keywords=ssh;sftp;telnet;serial;terminal;
+StartupNotify=true
+StartupWMClass=wassh

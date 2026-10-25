@@ -1,0 +1,11 @@
+[package]
+name = "wassh-term-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WaSSH terminal renderer: glyph atlas and per-cell mesh generation"
+
+[dependencies]
+wassh-term = { path = "../wassh-term" }

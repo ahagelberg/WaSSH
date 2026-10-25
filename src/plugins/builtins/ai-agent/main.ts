@@ -11,9 +11,11 @@ import {
 } from './defaults'
 import { PLUGIN_ID_AI_AGENT, aiAgentVaultId } from './id'
 import {
+  AI_AGENT_ALL_PERMISSION_BUNDLES,
   AI_AGENT_GROUP_KNOWLEDGE_BASE,
   AI_AGENT_GROUP_LOCAL_FS,
   AI_AGENT_GROUP_REMOTE_FS,
+  AI_AGENT_GROUP_SYSTEM,
   AI_AGENT_GROUP_TERMINAL,
   AI_AGENT_GROUP_WEB_ACCESS,
   AI_AGENT_DATETIME_METHOD,
@@ -22,6 +24,8 @@ import {
   AI_AGENT_LOCAL_FS_METHODS,
   AI_AGENT_REMOTE_FILESYSTEM_METHODS,
   AI_AGENT_REMOTE_FS_BUNDLES,
+  AI_AGENT_SYSTEM_BUNDLES,
+  AI_AGENT_SYSTEM_METHODS,
   AI_AGENT_TERMINAL_METHODS,
   AI_AGENT_WEB_ACCESS_ALL_METHODS,
   TOOL_DEF_ASK_USER,
@@ -74,6 +78,10 @@ import {
   AI_AGENT_TOOL_REMOTE_FS_READ,
   AI_AGENT_TOOL_REMOTE_FS_WRITE,
   AI_AGENT_TOOL_RUN_COMMAND,
+  AI_AGENT_TOOL_SYSTEM_DISK_USAGE,
+  AI_AGENT_TOOL_SYSTEM_MEMORY_REPORT,
+  AI_AGENT_TOOL_SYSTEM_OVERVIEW,
+  AI_AGENT_TOOL_SYSTEM_PROCESS_LIST,
   AI_AGENT_TOOL_TERMINAL_KEYS,
   AI_AGENT_TOOL_TERMINAL_READ,
   AI_AGENT_TOOL_TERMINAL_WAIT,
@@ -136,8 +144,13 @@ import {
   executeRemoteFsList,
   executeRemoteFsRead,
   executeRemoteFsWrite,
+  executeSystemDiskUsage,
+  executeSystemMemoryReport,
+  executeSystemOverview,
+  executeSystemProcessList,
   executeWebFetch,
-  executeWebSearch
+  executeWebSearch,
+  type SystemProcessSort
 } from './tools'
 
 /** Cap on a plugin-API tool result before it's fed back to the model (generous - not a token limit). */
@@ -951,6 +964,7 @@ function systemPrompt(
   const cwd = conv?.cwd || '/'
   const hasDevTools = activeTools.some((t) => t.name.startsWith('dev_'))
   const hasTerminalTools = activeTools.some((t) => t.name.startsWith('terminal_'))
+  const hasSystemTools = activeTools.some((t) => t.name.startsWith('system_'))
   const toolDescriptions = activeTools.map((t) => `- ${t.name}: ${t.description}`)
   const base = [
     `You are an AI development agent connected to the active WaSSH session "${host.hostLabel}".`,
@@ -985,6 +999,13 @@ function systemPrompt(
           '- When editing files with dev_edit_file, ensure oldText is exact and unique within the file.',
           '- Use dev_diff_file to verify a file\u2019s actual content against what you expect before editing it, or to confirm an edit took effect.',
           '- dev_diff_file also accepts a unified diff via its patch parameter to check or apply multi-hunk and partial-hunk patches; prefer it over hand-rolling shell patch commands.'
+        ]
+      : []),
+    ...(hasSystemTools
+      ? [
+          '- For questions about CPU, memory, disk, or process usage, call the system_* tools instead of assembling df, free, vmstat, ps, or top pipelines; they return structured, bounded data.',
+          '- system_overview is the one-call baseline; drill down with system_process_list, system_disk_usage, and system_memory_report.',
+          '- system_disk_usage also reports inode usage, so use it when a filesystem is full but bytes look available.'
         ]
       : []),
     '- After each command or tool call you see its actual result. Never invent output.',
@@ -1232,6 +1253,25 @@ function isToolEnabled(activeTools: PluginApiMethod[], toolName: string): boolea
   return activeTools.some((tool) => tool.name === toolName)
 }
 
+/**
+ * Trinary permission for a tool, honouring bundle leader keys. Bundled methods
+ * share one settings field, so a plain per-method lookup would miss the value
+ * the settings UI actually writes.
+ */
+function resolveToolPermission(
+  settings: Record<string, unknown>,
+  pluginId: string,
+  method: string
+): 'allow' | 'deny' | 'ask' {
+  if (pluginId === PLUGIN_ID_AI_AGENT) {
+    const bundled = settings[permissionSettingKeyFor(pluginId, method, AI_AGENT_ALL_PERMISSION_BUNDLES)]
+    if (bundled === 'allow' || bundled === 'deny' || bundled === 'ask') {
+      return bundled
+    }
+  }
+  return resolvePermission(settings, pluginId, method)
+}
+
 function applyApprovalDecision(
   host: HostState,
   subject: string,
@@ -1364,6 +1404,24 @@ function extractToolDisplayCommand(name: string, argsJson: string): string {
   if (name === AI_AGENT_TOOL_DEV_FIND_FILES) {
     return `dev_find "${String(args.pattern || '')}" ${String(args.path || '.')}`
   }
+  if (name === AI_AGENT_TOOL_SYSTEM_OVERVIEW) {
+    return 'system_overview'
+  }
+  if (name === AI_AGENT_TOOL_SYSTEM_PROCESS_LIST) {
+    const sort = typeof args.sort === 'string' ? args.sort : 'cpu'
+    const user = typeof args.user === 'string' && args.user ? ` user=${args.user}` : ''
+    const pattern =
+      typeof args.namePattern === 'string' && args.namePattern
+        ? ` "${args.namePattern}"`
+        : ''
+    return `system_ps ${sort}${user}${pattern}`
+  }
+  if (name === AI_AGENT_TOOL_SYSTEM_DISK_USAGE) {
+    return `system_df ${String(args.path || 'all filesystems')}`
+  }
+  if (name === AI_AGENT_TOOL_SYSTEM_MEMORY_REPORT) {
+    return `system_memory top=${String(args.topConsumers || 5)}`
+  }
   if (name === AI_AGENT_TOOL_GET_CURRENT_TIME) {
     return 'get_current_time'
   }
@@ -1477,6 +1535,15 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
       AI_AGENT_WEB_ACCESS_ALL_METHODS,
       settings
     ),
+    ...(sshSession
+      ? allowedGroupMethodsWithBundles(
+          PLUGIN_ID_AI_AGENT,
+          AI_AGENT_GROUP_SYSTEM,
+          AI_AGENT_SYSTEM_METHODS,
+          AI_AGENT_SYSTEM_BUNDLES,
+          settings
+        )
+      : []),
     ...(sshSession
       ? allowedGroupMethodsWithBundles(
           PLUGIN_ID_AI_AGENT,
@@ -1774,7 +1841,7 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
         }
 
         const target = resolveToolTarget(toolName)
-        const permission = resolvePermission(settings, target.pluginId, target.method)
+        const permission = resolveToolPermission(settings, target.pluginId, target.method)
         if (permission === 'deny') {
           conv.messages.push(
             toolResultMessage(tc.id, toolName, displayCommand, 'This action is not permitted.', 'denied', false)
@@ -1791,10 +1858,11 @@ async function runLoop(host: HostState, tab: TabRuntime): Promise<void> {
           }
           if (decision === 'allowAlways') {
             ctx.setSettingValue(
-              permissionSettingKeyFor(target.pluginId, target.method, [
-                ...AI_AGENT_REMOTE_FS_BUNDLES,
-                ...AI_AGENT_LOCAL_FS_BUNDLES
-              ]),
+              permissionSettingKeyFor(
+                target.pluginId,
+                target.method,
+                AI_AGENT_ALL_PERMISSION_BUNDLES
+              ),
               'allow'
             )
           }
@@ -2890,6 +2958,30 @@ async function handleApiCall(
       typeof args.contextLines === 'number' ? args.contextLines : undefined,
       typeof args.patch === 'string' ? args.patch : undefined
     )
+  }
+  if (method === AI_AGENT_TOOL_SYSTEM_OVERVIEW) {
+    return executeSystemOverview(ctx)
+  }
+  if (method === AI_AGENT_TOOL_SYSTEM_PROCESS_LIST) {
+    const rawSort = typeof args.sort === 'string' ? args.sort : 'cpu'
+    const sort: SystemProcessSort =
+      rawSort === 'mem' || rawSort === 'pid' || rawSort === 'time' ? rawSort : 'cpu'
+    const limit = typeof args.limit === 'number' ? args.limit : undefined
+    const user = typeof args.user === 'string' ? args.user : undefined
+    const namePattern = typeof args.namePattern === 'string' ? args.namePattern : undefined
+    return executeSystemProcessList(ctx, sort, limit, user, namePattern)
+  }
+  if (method === AI_AGENT_TOOL_SYSTEM_DISK_USAGE) {
+    const host = hostForCtx(ctx)
+    const cwd = host?.conversation?.cwd || '/'
+    const target = typeof args.path === 'string' ? args.path : undefined
+    const includeInodes = args.includeInodes !== false
+    const includeAllFilesystems = args.includeAllFilesystems === true
+    return executeSystemDiskUsage(ctx, cwd, target, includeInodes, includeAllFilesystems)
+  }
+  if (method === AI_AGENT_TOOL_SYSTEM_MEMORY_REPORT) {
+    const topConsumers = typeof args.topConsumers === 'number' ? args.topConsumers : undefined
+    return executeSystemMemoryReport(ctx, topConsumers)
   }
   if (method === AI_AGENT_TOOL_GET_CURRENT_TIME) {
     return executeDateTime()

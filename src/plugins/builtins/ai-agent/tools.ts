@@ -1428,4 +1428,809 @@ export async function executeDevDiffFile(
   }`
 }
 
+/* ------------------------------------------------------------------------- *
+ * System inspection tools (CPU, memory, disk, processes)
+ *
+ * These are read-only and remote-only: they parse /proc and POSIX tooling on
+ * the SSH host, returning structured JSON instead of locale-dependent text so
+ * the model never has to assemble or interpret df/free/ps output itself.
+ * ------------------------------------------------------------------------- */
+
+/** Default and maximum rows returned by `system_process_list`. */
+export const MAX_SYSTEM_PROCESS_ROWS_DEFAULT = 15
+export const MAX_SYSTEM_PROCESS_ROWS_LIMIT = 50
+/** Default and maximum top consumers included in `system_memory_report`. */
+export const MAX_MEMORY_CONSUMERS_DEFAULT = 5
+export const MAX_MEMORY_CONSUMERS_LIMIT = 15
+/** Command text kept per process row. */
+const MAX_PROCESS_COMMAND_CHARS = 200
+/** Filesystems listed in the overview; the rest are summarised in a count. */
+const MAX_OVERVIEW_FILESYSTEMS = 10
+/** Window used for the two-sample CPU reading in the overview (seconds). */
+const CPU_SAMPLE_SECONDS = 0.4
+
+export type SystemProcessSort = 'cpu' | 'mem' | 'pid' | 'time'
+
+/** Filesystem types that never represent user data worth reporting. */
+const PSEUDO_FS_TYPES = new Set([
+  'autofs',
+  'binfmt_misc',
+  'bpf',
+  'cgroup',
+  'cgroup2',
+  'configfs',
+  'debugfs',
+  'devpts',
+  'devtmpfs',
+  'efivarfs',
+  'fusectl',
+  'hugetlbfs',
+  'mqueue',
+  'nsfs',
+  'proc',
+  'pstore',
+  'ramfs',
+  'rpc_pipefs',
+  'securityfs',
+  'sysfs',
+  'tmpfs',
+  'tracefs'
+])
+
+/** Fallback pseudo-mount detection when `df -T` is unavailable. */
+const PSEUDO_MOUNT_PREFIXES = ['/proc', '/sys', '/dev', '/run']
+
+interface CpuTotals {
+  total: number
+  idle: number
+}
+
+interface DiskEntry {
+  filesystem: string
+  type: string | null
+  mount: string
+  sizeBytes: number
+  usedBytes: number
+  availableBytes: number
+  usedPercent: number
+  inodes: { total: number; used: number; free: number; usedPercent: number } | null
+}
+
+interface ProcessRow {
+  pid: number
+  user: string
+  state: string | null
+  nice: number | null
+  threads: number | null
+  cpuPercent: number | null
+  memPercent: number | null
+  rssBytes: number
+  elapsed: string | null
+  cpuTimeSeconds: number | null
+  command: string
+}
+
+/** Run a read-only stats script on the connected SSH host. */
+async function execStats(ctx: PluginMainContext, script: string): Promise<string> {
+  if (!ctx.isSshSession()) {
+    throw new Error('System inspection requires an active SSH session')
+  }
+  return ctx.execCapture(script)
+}
+
+/** Split `@@SECTION@@`-delimited script output into named blocks. */
+function statSections(output: string): Record<string, string> {
+  const sections: Record<string, string> = {}
+  let current: string | null = null
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.replace(/\r$/, '')
+    const marker = /^@@([A-Z0-9_]+)@@$/.exec(line.trim())
+    if (marker) {
+      current = marker[1]
+      sections[current] = ''
+      continue
+    }
+    if (current !== null) {
+      sections[current] += `${line}\n`
+    }
+  }
+  return sections
+}
+
+/**
+ * Split a whitespace-aligned table row into `prefixCount` single-token
+ * columns plus one remainder column (the command or mount point).
+ */
+function splitColumns(line: string, prefixCount: number): string[] | null {
+  const parts: string[] = []
+  let rest = line.trim()
+  for (let i = 0; i < prefixCount; i += 1) {
+    const match = /^(\S+)\s+(.*)$/.exec(rest)
+    if (!match) {
+      return null
+    }
+    parts.push(match[1])
+    rest = match[2]
+  }
+  parts.push(rest)
+  return parts
+}
+
+function toNumber(value: string | undefined): number | null {
+  if (value === undefined) {
+    return null
+  }
+  const parsed = Number(value.replace(/,/g, ''))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function toPercent(value: string | undefined): number | null {
+  if (!value) {
+    return null
+  }
+  const parsed = Number(value.replace('%', ''))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function round1(value: number): number {
+  return Math.round(value * 10) / 10
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
+
+function parseCpuLine(line: string | undefined): CpuTotals | null {
+  if (!line) {
+    return null
+  }
+  const parts = line.trim().split(/\s+/)
+  if (parts[0] !== 'cpu') {
+    return null
+  }
+  // Only the first eight counters count real time: guest time is already
+  // included in user/nice, so adding it would inflate the total.
+  const counters = parts.slice(1, 9).map(Number)
+  if (counters.length < 4 || counters.some((n) => !Number.isFinite(n))) {
+    return null
+  }
+  // idle + iowait are the only non-busy counters
+  const idle = (counters[3] ?? 0) + (counters[4] ?? 0)
+  const total = counters.reduce((sum, n) => sum + n, 0)
+  return { total, idle }
+}
+
+function cpuUsedPercent(first: CpuTotals | null, second: CpuTotals | null): number | null {
+  if (!first || !second) {
+    return null
+  }
+  const totalDelta = second.total - first.total
+  const idleDelta = second.idle - first.idle
+  if (totalDelta <= 0) {
+    return null
+  }
+  return round1(clamp((1 - idleDelta / totalDelta) * 100, 0, 100))
+}
+
+function parseLoadavg(section: string | undefined): {
+  load1: number
+  load5: number
+  load15: number
+  runnable: number | null
+  totalThreads: number | null
+} | null {
+  const parts = (section ?? '').trim().split(/\s+/)
+  if (parts.length < 3) {
+    return null
+  }
+  const [load1, load5, load15] = parts.slice(0, 3).map(Number)
+  if (![load1, load5, load15].every((n) => Number.isFinite(n))) {
+    return null
+  }
+  let runnable: number | null = null
+  let totalThreads: number | null = null
+  const counts = parts[3]?.split('/')
+  if (counts && counts.length === 2) {
+    runnable = toNumber(counts[0])
+    totalThreads = toNumber(counts[1])
+  }
+  return { load1, load5, load15, runnable, totalThreads }
+}
+
+function meminfoValues(section: string | undefined): Map<string, number> {
+  const values = new Map<string, number>()
+  for (const line of (section ?? '').split('\n')) {
+    const match = /^([A-Za-z_()0-9]+):\s+(\d+)/.exec(line.trim())
+    if (match) {
+      values.set(match[1], Number(match[2]))
+    }
+  }
+  return values
+}
+
+/**
+ * Parse one `df` layout. `columns` is the number of data columns, not header
+ * tokens: the header ends with "Mounted on", which is two tokens for one
+ * column, so counting header words overestimates by one.
+ */
+function parseDfSpaceLayout(lines: string[], columns: number): DiskEntry[] {
+  const hasType = columns === 7
+  const sizeIndex = hasType ? 2 : 1
+  const mountIndex = columns - 1
+  const entries: DiskEntry[] = []
+  for (const line of lines.slice(1)) {
+    const cols = splitColumns(line, columns - 1)
+    if (!cols) {
+      continue
+    }
+    const sizeKb = toNumber(cols[sizeIndex])
+    const usedKb = toNumber(cols[sizeIndex + 1])
+    const availableKb = toNumber(cols[sizeIndex + 2])
+    if (sizeKb === null || usedKb === null || availableKb === null) {
+      continue
+    }
+    entries.push({
+      filesystem: cols[0],
+      type: hasType ? cols[1] : null,
+      mount: cols[mountIndex],
+      sizeBytes: sizeKb * 1024,
+      usedBytes: usedKb * 1024,
+      availableBytes: availableKb * 1024,
+      usedPercent:
+        toPercent(cols[sizeIndex + 3]) ?? (sizeKb > 0 ? round1((usedKb / sizeKb) * 100) : 0),
+      inodes: null
+    })
+  }
+  return entries
+}
+
+function parseDfSpace(section: string | undefined): DiskEntry[] {
+  const lines = (section ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+  if (lines.length < 2) {
+    return []
+  }
+  const header = lines[0].split(/\s+/)
+  const withType = header[1]?.toLowerCase() === 'type'
+  // Try the header's layout first, then the other: `df -T` is not guaranteed
+  // to be supported, so the header and rows can disagree after a fallback.
+  for (const columns of withType ? [7, 6] : [6, 7]) {
+    const entries = parseDfSpaceLayout(lines, columns)
+    if (entries.length > 0) {
+      return entries
+    }
+  }
+  return []
+}
+
+function parseDfInodes(
+  section: string | undefined
+): Map<string, { total: number; used: number; free: number; usedPercent: number }> {
+  const out = new Map<string, { total: number; used: number; free: number; usedPercent: number }>()
+  const lines = (section ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+  if (lines.length < 2) {
+    return out
+  }
+  // Filesystem, Inodes, IUsed, IFree, IUse%, Mounted on
+  const columns = 6
+  for (const line of lines.slice(1)) {
+    const cols = splitColumns(line, columns - 1)
+    if (!cols) {
+      continue
+    }
+    const total = toNumber(cols[1])
+    const used = toNumber(cols[2])
+    const free = toNumber(cols[3])
+    if (total === null || used === null || free === null) {
+      continue
+    }
+    out.set(cols[columns - 1], {
+      total,
+      used,
+      free,
+      usedPercent: toPercent(cols[4]) ?? (total > 0 ? round1((used / total) * 100) : 0)
+    })
+  }
+  return out
+}
+
+function isPseudoMount(entry: DiskEntry): boolean {
+  const type = (entry.type ?? '').toLowerCase()
+  if (type && PSEUDO_FS_TYPES.has(type)) {
+    return true
+  }
+  if (!type) {
+    return PSEUDO_MOUNT_PREFIXES.some(
+      (prefix) => entry.mount === prefix || entry.mount.startsWith(`${prefix}/`)
+    )
+  }
+  return false
+}
+
+/** Deduplicate by mount point and apply the default pseudo-filesystem filter. */
+function normalizeDisks(
+  entries: DiskEntry[],
+  inodes: Map<string, { total: number; used: number; free: number; usedPercent: number }> | null,
+  includeAllFilesystems: boolean
+): DiskEntry[] {
+  const byMount = new Map<string, DiskEntry>()
+  for (const entry of entries) {
+    byMount.set(entry.mount, entry)
+  }
+  const rows = [...byMount.values()].filter(
+    (entry) => includeAllFilesystems || !isPseudoMount(entry)
+  )
+  if (inodes) {
+    for (const row of rows) {
+      row.inodes = inodes.get(row.mount) ?? null
+    }
+  }
+  rows.sort((a, b) => b.usedPercent - a.usedPercent)
+  return rows
+}
+
+function parseProcessTable(section: string | undefined): ProcessRow[] {
+  const lines = (section ?? '')
+    .split('\n')
+    .map((line) => line.replace(/\s+$/, ''))
+    .filter((line) => line.trim().length > 0)
+  if (lines.length < 2) {
+    return []
+  }
+  const header = lines[0].trim().split(/\s+/)
+  const names = header.map((name) => name.toLowerCase().replace(/%/g, ''))
+  const indexOf = (...candidates: string[]): number =>
+    names.findIndex((name) => candidates.includes(name))
+  const pidIndex = indexOf('pid')
+  if (pidIndex === -1) {
+    return []
+  }
+  const rssIndex = indexOf('rss')
+  const cpuIndex = indexOf('cpu')
+  const memIndex = indexOf('mem')
+  const userIndex = indexOf('user', 'uid')
+  const statIndex = indexOf('stat', 's')
+  const niceIndex = indexOf('ni', 'nice')
+  const threadsIndex = indexOf('nlwp', 'thr', 'threads')
+  const elapsedIndex = indexOf('etime', 'elapsed')
+  const timeIndex = indexOf('time', 'cputime')
+  const commandIndex = header.length - 1
+
+  const rows: ProcessRow[] = []
+  for (const line of lines.slice(1)) {
+    const cols = splitColumns(line, header.length - 1)
+    if (!cols || cols.length <= commandIndex) {
+      continue
+    }
+    const pid = toNumber(cols[pidIndex])
+    if (pid === null) {
+      continue
+    }
+    const rssKb = rssIndex >= 0 ? toNumber(cols[rssIndex]) : null
+    rows.push({
+      pid,
+      user: userIndex >= 0 ? cols[userIndex] : '',
+      state: statIndex >= 0 ? cols[statIndex] : null,
+      nice: niceIndex >= 0 ? toNumber(cols[niceIndex]) : null,
+      threads: threadsIndex >= 0 ? toNumber(cols[threadsIndex]) : null,
+      cpuPercent: cpuIndex >= 0 ? toNumber(cols[cpuIndex]) : null,
+      memPercent: memIndex >= 0 ? toNumber(cols[memIndex]) : null,
+      rssBytes: Math.max(0, rssKb ?? 0) * 1024,
+      elapsed: elapsedIndex >= 0 ? cols[elapsedIndex] : null,
+      cpuTimeSeconds: timeIndex >= 0 ? parseCpuTime(cols[timeIndex]) : null,
+      command: cols[commandIndex].slice(0, MAX_PROCESS_COMMAND_CHARS)
+    })
+  }
+  return rows
+}
+
+function parseCpuTime(value: string): number | null {
+  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(value.trim())
+  if (!match) {
+    return null
+  }
+  const days = Number(match[1] ?? 0)
+  const hours = Number(match[2] ?? 0)
+  const minutes = Number(match[3])
+  const seconds = Number(match[4])
+  return days * 86400 + hours * 3600 + minutes * 60 + seconds
+}
+
+/** Shape a process table the same way for `system_process_list` and memory consumers. */
+function selectProcesses(
+  rows: ProcessRow[],
+  sort: SystemProcessSort,
+  limit: number,
+  user?: string,
+  namePattern?: string
+): ProcessRow[] {
+  const needle = namePattern?.trim().toLowerCase()
+  const filtered = rows.filter((row) => {
+    if (user && row.user !== user) {
+      return false
+    }
+    if (needle && !row.command.toLowerCase().includes(needle)) {
+      return false
+    }
+    return true
+  })
+  filtered.sort((a, b) => {
+    if (sort === 'pid') {
+      return a.pid - b.pid
+    }
+    if (sort === 'mem') {
+      return b.rssBytes - a.rssBytes
+    }
+    if (sort === 'time') {
+      return (b.cpuTimeSeconds ?? 0) - (a.cpuTimeSeconds ?? 0)
+    }
+    return (b.cpuPercent ?? 0) - (a.cpuPercent ?? 0)
+  })
+  return filtered.slice(0, limit)
+}
+
+/** JSON error helper shared by the system tools. */
+function systemError(tool: string, err: unknown): string {
+  return `Error running ${tool}: ${err instanceof Error ? err.message : String(err)}`
+}
+
+/** Execute System Tool: one-call CPU / memory / disk / load baseline. */
+export async function executeSystemOverview(ctx: PluginMainContext): Promise<string> {
+  const script = [
+    'COLUMNS=4096; export COLUMNS',
+    "echo '@@UNAME@@'",
+    'uname -srm 2>/dev/null || true',
+    "echo '@@HOSTNAME@@'",
+    'uname -n 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || true',
+    "echo '@@OSRELEASE@@'",
+    "(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null || true)",
+    "echo '@@UPTIME@@'",
+    'cat /proc/uptime 2>/dev/null || true',
+    "echo '@@LOADAVG@@'",
+    'cat /proc/loadavg 2>/dev/null || true',
+    "echo '@@NPROC@@'",
+    "(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)",
+    "echo '@@CPU1@@'",
+    "(grep -m1 '^cpu ' /proc/stat 2>/dev/null || true)",
+    `sleep ${CPU_SAMPLE_SECONDS} 2>/dev/null || sleep 1`,
+    "echo '@@CPU2@@'",
+    "(grep -m1 '^cpu ' /proc/stat 2>/dev/null || true)",
+    "echo '@@MEM@@'",
+    "(grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SReclaimable|SwapTotal|SwapFree):' /proc/meminfo 2>/dev/null || true)",
+    "echo '@@DF@@'",
+    '((command -v timeout >/dev/null 2>&1 && timeout 5 df -kPT 2>/dev/null) || df -kPT 2>/dev/null || df -kP 2>/dev/null || true)',
+    "echo '@@END@@'",
+    'true'
+  ].join('\n')
+
+  let output: string
+  try {
+    output = await execStats(ctx, script)
+  } catch (err) {
+    return systemError('system_overview', err)
+  }
+  const sections = statSections(output)
+  const cpu1 = parseCpuLine(sections.CPU1)
+  if (!cpu1) {
+    return 'Error: system_overview requires a Linux host (/proc/stat is unavailable).'
+  }
+
+  const unameParts = (sections.UNAME ?? '').trim().split(/\s+/).filter(Boolean)
+  const os = unameParts[0] ?? null
+  const arch = unameParts.length > 1 ? unameParts[unameParts.length - 1] : null
+  const kernel = unameParts.length > 2 ? unameParts.slice(1, -1).join(' ') : null
+  const release = (sections.OSRELEASE ?? '').trim()
+  const prettyName = /^PRETTY_NAME="?([^"]*)"?$/.exec(release)?.[1] ?? release
+  const uptimeSeconds = Number((sections.UPTIME ?? '').trim().split(/\s+/)[0] || 0)
+  const logicalCores = toNumber((sections.NPROC ?? '').trim()) ?? 0
+  const load = parseLoadavg(sections.LOADAVG)
+  const mem = meminfoValues(sections.MEM)
+  const memTotal = (mem.get('MemTotal') ?? 0) * 1024
+  const memFree = (mem.get('MemFree') ?? 0) * 1024
+  const memAvailable =
+    (mem.get('MemAvailable') ??
+      (mem.get('MemFree') ?? 0) +
+        (mem.get('Buffers') ?? 0) +
+        (mem.get('Cached') ?? 0) +
+        (mem.get('SReclaimable') ?? 0)) * 1024
+  const disks = normalizeDisks(parseDfSpace(sections.DF), null, false)
+
+  const uniqueDevices = new Map<string, DiskEntry>()
+  for (const disk of disks) {
+    if (!uniqueDevices.has(disk.filesystem)) {
+      uniqueDevices.set(disk.filesystem, disk)
+    }
+  }
+  const diskTotal = [...uniqueDevices.values()].reduce((sum, d) => sum + d.sizeBytes, 0)
+  const diskUsed = [...uniqueDevices.values()].reduce((sum, d) => sum + d.usedBytes, 0)
+
+  const overview = {
+    host: {
+      hostname: (sections.HOSTNAME ?? '').trim() || null,
+      os,
+      distro: prettyName || null,
+      kernel,
+      arch
+    },
+    uptimeSeconds: Number.isFinite(uptimeSeconds) ? Math.round(uptimeSeconds) : null,
+    load,
+    cpu: {
+      logicalCores,
+      usedPercent: cpuUsedPercent(cpu1, parseCpuLine(sections.CPU2))
+    },
+    memory: {
+      totalBytes: memTotal,
+      availableBytes: memAvailable,
+      usedBytes: Math.max(0, memTotal - memAvailable),
+      freeBytes: memFree,
+      buffersBytes: (mem.get('Buffers') ?? 0) * 1024,
+      cachedBytes: ((mem.get('Cached') ?? 0) + (mem.get('SReclaimable') ?? 0)) * 1024,
+      swapTotalBytes: (mem.get('SwapTotal') ?? 0) * 1024,
+      swapUsedBytes: ((mem.get('SwapTotal') ?? 0) - (mem.get('SwapFree') ?? 0)) * 1024
+    },
+    disk: {
+      totalBytes: diskTotal,
+      usedBytes: diskUsed,
+      usedPercent: diskTotal > 0 ? round1((diskUsed / diskTotal) * 100) : 0,
+      filesystems: disks.slice(0, MAX_OVERVIEW_FILESYSTEMS),
+      hiddenFilesystemCount: Math.max(0, disks.length - MAX_OVERVIEW_FILESYSTEMS)
+    }
+  }
+  return JSON.stringify(overview, null, 2)
+}
+
+/** Execute System Tool: process list sorted by CPU, memory, PID, or CPU time. */
+export async function executeSystemProcessList(
+  ctx: PluginMainContext,
+  sort: SystemProcessSort = 'cpu',
+  limit?: number,
+  user?: string,
+  namePattern?: string
+): Promise<string> {
+  const rowLimit = clamp(Math.trunc(Number(limit) || MAX_SYSTEM_PROCESS_ROWS_DEFAULT), 1, MAX_SYSTEM_PROCESS_ROWS_LIMIT)
+  const script = [
+    'COLUMNS=4096; export COLUMNS',
+    "echo '@@PS@@'",
+    '(ps -ww -eo pid,user:32,stat,nice,nlwp,pcpu,pmem,rss,etime,time,args 2>/dev/null || ps -ww -eo pid,user:32,stat,pcpu,pmem,rss,etime,time,args 2>/dev/null || ps aux 2>/dev/null || true)',
+    "echo '@@NPROC@@'",
+    "(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)",
+    "echo '@@LOADAVG@@'",
+    'cat /proc/loadavg 2>/dev/null || true',
+    "echo '@@END@@'",
+    'true'
+  ].join('\n')
+
+  let output: string
+  try {
+    output = await execStats(ctx, script)
+  } catch (err) {
+    return systemError('system_process_list', err)
+  }
+  const sections = statSections(output)
+  const rows = parseProcessTable(sections.PS)
+  if (rows.length === 0) {
+    return 'Error: could not parse process list output from the remote host.'
+  }
+  const selected = selectProcesses(rows, sort, rowLimit, user?.trim() || undefined, namePattern)
+  return JSON.stringify(
+    {
+      sort,
+      totalProcesses: rows.length,
+      matchedProcesses: selected.length,
+      logicalCores: toNumber((sections.NPROC ?? '').trim()) ?? 0,
+      load: parseLoadavg(sections.LOADAVG),
+      processes: selected,
+      note:
+        rows.length > selected.length
+          ? `Showing ${selected.length} of ${rows.length} processes sorted by ${sort}.`
+          : undefined
+    },
+    null,
+    2
+  )
+}
+
+/** Execute System Tool: per-filesystem space and inode usage. */
+export async function executeSystemDiskUsage(
+  ctx: PluginMainContext,
+  cwd: string,
+  path?: string,
+  includeInodes = true,
+  includeAllFilesystems = false
+): Promise<string> {
+  const target = path && path.trim() ? resolveRemotePath(cwd, path.trim()) : null
+  const operand = target ? ` -- ${shellQuote(target)}` : ''
+  const script = [
+    'COLUMNS=4096; export COLUMNS',
+    "echo '@@DFSPACE@@'",
+    `((command -v timeout >/dev/null 2>&1 && timeout 5 df -kPT${operand} 2>/dev/null) || df -kPT${operand} 2>/dev/null || df -kP${operand} 2>/dev/null || true)`,
+    "echo '@@DFINODE@@'",
+    includeInodes
+      ? `((command -v timeout >/dev/null 2>&1 && timeout 5 df -iP${operand} 2>/dev/null) || df -iP${operand} 2>/dev/null || true)`
+      : '',
+    "echo '@@END@@'",
+    'true'
+  ]
+    .filter((line) => line.length > 0)
+    .join('\n')
+
+  let output: string
+  try {
+    output = await execStats(ctx, script)
+  } catch (err) {
+    return systemError('system_disk_usage', err)
+  }
+  const sections = statSections(output)
+  const entries = parseDfSpace(sections.DFSPACE)
+  if (entries.length === 0) {
+    return target
+      ? `No filesystem usage found for "${target}".`
+      : 'Error: could not parse df output from the remote host.'
+  }
+  // An explicit path means the user asked for that filesystem specifically,
+  // so keep pseudo filesystems rather than hiding the answer.
+  const includeAll = includeAllFilesystems || target !== null
+  const inodes = includeInodes ? parseDfInodes(sections.DFINODE) : null
+  const disks = normalizeDisks(entries, inodes, includeAll)
+  const totalBytes = disks.reduce((sum, d) => sum + d.sizeBytes, 0)
+  const usedBytes = disks.reduce((sum, d) => sum + d.usedBytes, 0)
+  const fullInodes = disks.filter((d) => (d.inodes?.usedPercent ?? 0) >= 90).map((d) => d.mount)
+  return JSON.stringify(
+    {
+      path: target,
+      includeAllFilesystems: includeAll,
+      totalBytes,
+      usedBytes,
+      usedPercent: totalBytes > 0 ? round1((usedBytes / totalBytes) * 100) : 0,
+      filesystems: disks,
+      inodesNearlyFull: fullInodes
+    },
+    null,
+    2
+  )
+}
+
+/** Execute System Tool: memory breakdown, pressure, swap, OOM kills, top consumers. */
+export async function executeSystemMemoryReport(
+  ctx: PluginMainContext,
+  topConsumers?: number
+): Promise<string> {
+  const consumerCount = clamp(
+    Math.trunc(Number(topConsumers) || MAX_MEMORY_CONSUMERS_DEFAULT),
+    1,
+    MAX_MEMORY_CONSUMERS_LIMIT
+  )
+  const script = [
+    'COLUMNS=4096; export COLUMNS',
+    "echo '@@MEMINFO@@'",
+    'cat /proc/meminfo 2>/dev/null || true',
+    "echo '@@PRESSURE@@'",
+    'cat /proc/pressure/memory 2>/dev/null || true',
+    "echo '@@VMSTAT@@'",
+    "grep -E '^(oom_kill|pgscan_direct|pgsteal_direct|pswpin|pswpout) ' /proc/vmstat 2>/dev/null || true",
+    "echo '@@SWAP@@'",
+    'cat /proc/swaps 2>/dev/null || true',
+    "echo '@@PS@@'",
+    '(ps -ww -eo pid,user:32,pcpu,pmem,rss,args 2>/dev/null || ps aux 2>/dev/null || true)',
+    "echo '@@END@@'",
+    'true'
+  ].join('\n')
+
+  let output: string
+  try {
+    output = await execStats(ctx, script)
+  } catch (err) {
+    return systemError('system_memory_report', err)
+  }
+  const sections = statSections(output)
+  const mem = meminfoValues(sections.MEMINFO)
+  if (mem.size === 0) {
+    return 'Error: /proc/meminfo is unavailable on the remote host.'
+  }
+  const kib = (key: string): number => (mem.get(key) ?? 0) * 1024
+  const total = kib('MemTotal')
+  const free = kib('MemFree')
+  const available = mem.has('MemAvailable')
+    ? kib('MemAvailable')
+    : free + kib('Buffers') + kib('Cached') + kib('SReclaimable')
+  const used = Math.max(0, total - available)
+
+  const pressure: Record<string, { avg10: number; avg60: number; avg300: number; totalMicroseconds: number }> = {}
+  for (const line of (sections.PRESSURE ?? '').split('\n')) {
+    const match = /^(some|full)\s+(.*)$/.exec(line.trim())
+    if (!match) {
+      continue
+    }
+    const values: Record<string, number> = {}
+    for (const pair of match[2].split(/\s+/)) {
+      const [key, raw] = pair.split('=')
+      const number = Number(raw)
+      if (key && Number.isFinite(number)) {
+        values[key] = number
+      }
+    }
+    pressure[match[1]] = {
+      avg10: values.avg10 ?? 0,
+      avg60: values.avg60 ?? 0,
+      avg300: values.avg300 ?? 0,
+      totalMicroseconds: values.total ?? 0
+    }
+  }
+
+  const vmstat: Record<string, number> = {}
+  for (const line of (sections.VMSTAT ?? '').split('\n')) {
+    const [key, raw] = line.trim().split(/\s+/)
+    const number = Number(raw)
+    if (key && Number.isFinite(number)) {
+      vmstat[key] = number
+    }
+  }
+
+  const swapDevices: Array<{ filename: string; type: string; sizeBytes: number; usedBytes: number }> = []
+  for (const line of (sections.SWAP ?? '').split('\n').slice(1)) {
+    const cols = splitColumns(line, 4)
+    if (!cols) {
+      continue
+    }
+    const sizeKb = toNumber(cols[2])
+    const usedKb = toNumber(cols[3])
+    if (sizeKb === null || usedKb === null) {
+      continue
+    }
+    swapDevices.push({
+      filename: cols[0],
+      type: cols[1],
+      sizeBytes: sizeKb * 1024,
+      usedBytes: usedKb * 1024
+    })
+  }
+
+  const consumers = selectProcesses(parseProcessTable(sections.PS), 'mem', consumerCount).map(
+    (row) => ({
+      pid: row.pid,
+      user: row.user,
+      rssBytes: row.rssBytes,
+      memPercent: row.memPercent,
+      command: row.command
+    })
+  )
+
+  return JSON.stringify(
+    {
+      totalBytes: total,
+      availableBytes: available,
+      usedBytes: used,
+      freeBytes: free,
+      usedPercent: total > 0 ? round1((used / total) * 100) : 0,
+      buffersBytes: kib('Buffers'),
+      cachedBytes: kib('Cached'),
+      reclaimableBytes: kib('SReclaimable'),
+      sharedBytes: kib('Shmem'),
+      dirtyBytes: kib('Dirty'),
+      swap: {
+        totalBytes: kib('SwapTotal'),
+        freeBytes: kib('SwapFree'),
+        usedBytes: Math.max(0, kib('SwapTotal') - kib('SwapFree')),
+        devices: swapDevices
+      },
+      pressure: Object.keys(pressure).length > 0 ? pressure : null,
+      oom: {
+        killsSinceBoot: vmstat.oom_kill ?? 0,
+        pagesReclaimedDirectly: vmstat.pgsteal_direct ?? 0,
+        pagesScannedDirectly: vmstat.pgscan_direct ?? 0,
+        swapInPages: vmstat.pswpin ?? 0,
+        swapOutPages: vmstat.pswpout ?? 0
+      },
+      topConsumers: consumers
+    },
+    null,
+    2
+  )
+}
+
 

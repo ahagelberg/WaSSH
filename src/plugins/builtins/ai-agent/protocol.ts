@@ -41,6 +41,10 @@ export const AI_AGENT_TOOL_TERMINAL_READ = 'terminal_read'
 export const AI_AGENT_TOOL_TERMINAL_WRITE = 'terminal_write'
 export const AI_AGENT_TOOL_TERMINAL_KEYS = 'terminal_send_keys'
 export const AI_AGENT_TOOL_TERMINAL_WAIT = 'terminal_wait'
+export const AI_AGENT_TOOL_SYSTEM_OVERVIEW = 'system_overview'
+export const AI_AGENT_TOOL_SYSTEM_PROCESS_LIST = 'system_process_list'
+export const AI_AGENT_TOOL_SYSTEM_DISK_USAGE = 'system_disk_usage'
+export const AI_AGENT_TOOL_SYSTEM_MEMORY_REPORT = 'system_memory_report'
 
 export const AI_AGENT_RULE_REGEX_PREFIX = 'regex:'
 

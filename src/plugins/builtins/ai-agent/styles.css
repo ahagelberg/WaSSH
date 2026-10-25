@@ -895,6 +895,11 @@
   color: #f472b6;
 }
 
+.ai-agent-tool-badge.tool-badge-system {
+  background: color-mix(in srgb, #2dd4bf 25%, transparent);
+  color: #2dd4bf;
+}
+
 .ai-agent-tool-badge.tool-badge-generic {
   background: color-mix(in srgb, var(--text-muted) 25%, transparent);
   color: var(--text-muted);

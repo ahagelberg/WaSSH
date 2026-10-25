@@ -1,0 +1,10 @@
+[package]
+name = "wassh-mqtt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WaSSH MQTT client: a small MQTT 3.1.1 subscriber for the message analyser"
+
+[dependencies]

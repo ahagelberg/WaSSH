@@ -1,0 +1,12 @@
+[package]
+name = "wassh-telnet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Telnet transport with IAC option negotiation"
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true }
+wassh-core = { path = "../wassh-core" }

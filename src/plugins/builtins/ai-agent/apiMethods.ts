@@ -30,6 +30,10 @@ import {
   AI_AGENT_TOOL_TERMINAL_READ,
   AI_AGENT_TOOL_TERMINAL_WAIT,
   AI_AGENT_TOOL_TERMINAL_WRITE,
+  AI_AGENT_TOOL_SYSTEM_DISK_USAGE,
+  AI_AGENT_TOOL_SYSTEM_MEMORY_REPORT,
+  AI_AGENT_TOOL_SYSTEM_OVERVIEW,
+  AI_AGENT_TOOL_SYSTEM_PROCESS_LIST,
   AI_AGENT_TOOL_WEB_FETCH,
   AI_AGENT_TOOL_WEB_SEARCH
 } from './protocol'
@@ -613,11 +617,95 @@ export const TOOL_DEF_TERMINAL_WAIT: PluginApiMethod = {
   }
 }
 
+export const TOOL_DEF_SYSTEM_OVERVIEW: PluginApiMethod = {
+  name: AI_AGENT_TOOL_SYSTEM_OVERVIEW,
+  description:
+    'Get a one-call health baseline for the REMOTE host: OS, kernel, uptime, load averages, CPU usage, ' +
+    'memory/swap totals, and per-filesystem disk usage. Prefer this before drilling into processes or disks.',
+  parameters: {
+    type: 'object',
+    properties: {}
+  }
+}
+
+export const TOOL_DEF_SYSTEM_PROCESS_LIST: PluginApiMethod = {
+  name: AI_AGENT_TOOL_SYSTEM_PROCESS_LIST,
+  description:
+    'List processes on the REMOTE host sorted by CPU, memory, PID, or accumulated CPU time. ' +
+    'Returns pid, user, state, threads, CPU%, MEM%, RSS bytes, elapsed time, and command. ' +
+    'Use this instead of assembling ps / ps aux / top pipelines. Avoid interactive tools like top.',
+  parameters: {
+    type: 'object',
+    properties: {
+      sort: {
+        type: 'string',
+        enum: ['cpu', 'mem', 'pid', 'time'],
+        description: 'Sort order: cpu (default, highest first), mem, pid, or time (accumulated CPU time)'
+      },
+      limit: {
+        type: 'number',
+        description: 'Maximum rows to return (default 15, max 50)'
+      },
+      user: {
+        type: 'string',
+        description: 'Optional exact user name to filter by'
+      },
+      namePattern: {
+        type: 'string',
+        description: 'Optional case-insensitive text to match anywhere in the command line'
+      }
+    }
+  }
+}
+
+export const TOOL_DEF_SYSTEM_DISK_USAGE: PluginApiMethod = {
+  name: AI_AGENT_TOOL_SYSTEM_DISK_USAGE,
+  description:
+    'Report per-filesystem disk usage on the REMOTE host, including inode usage so filesystems that are ' +
+    'full on inodes (not bytes) are visible. Use this instead of df / df -h / df -i.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'Optional path or mount point to report on (default: all filesystems)'
+      },
+      includeInodes: {
+        type: 'boolean',
+        description: 'Include inode counts and usage (default: true)'
+      },
+      includeAllFilesystems: {
+        type: 'boolean',
+        description:
+          'Include pseudo filesystems such as tmpfs, proc, sysfs, and cgroups (default: false)'
+      }
+    }
+  }
+}
+
+export const TOOL_DEF_SYSTEM_MEMORY_REPORT: PluginApiMethod = {
+  name: AI_AGENT_TOOL_SYSTEM_MEMORY_REPORT,
+  description:
+    'Detailed memory report for the REMOTE host: /proc/meminfo breakdown (available, free, buffers, cache), ' +
+    'swap usage, memory pressure (PSI), OOM kills since boot, and the top RSS consumers. ' +
+    'Use this instead of free, vmstat, or ps sorted by RSS.',
+  parameters: {
+    type: 'object',
+    properties: {
+      topConsumers: {
+        type: 'number',
+        description: 'How many top RSS processes to include (default 5, max 15)'
+      }
+    }
+  }
+}
+
 export const AI_AGENT_GROUP_WEB_ACCESS = 'web-access'
 export const AI_AGENT_GROUP_REMOTE_FS = 'remote-fs'
 export const AI_AGENT_GROUP_LOCAL_FS = 'local-fs'
 export const AI_AGENT_GROUP_KNOWLEDGE_BASE = 'knowledge-base'
 export const AI_AGENT_GROUP_TERMINAL = 'terminal'
+export const AI_AGENT_GROUP_SYSTEM = 'system'
 
 export const AI_AGENT_DEV_TOOLS_METHODS = [
   TOOL_DEF_DEV_VIEW_FILE,
@@ -728,7 +816,34 @@ export const AI_AGENT_TERMINAL_METHODS = [
   TOOL_DEF_TERMINAL_WRITE,
   TOOL_DEF_TERMINAL_KEYS
 ]
+export const AI_AGENT_SYSTEM_METHODS = [
+  TOOL_DEF_SYSTEM_OVERVIEW,
+  TOOL_DEF_SYSTEM_PROCESS_LIST,
+  TOOL_DEF_SYSTEM_DISK_USAGE,
+  TOOL_DEF_SYSTEM_MEMORY_REPORT
+]
+
+/**
+ * The system inspection tools are read-only and closely related, so they share
+ * one permission field instead of one toggle per tool.
+ */
+export const AI_AGENT_SYSTEM_BUNDLES: PermissionBundle[] = [
+  {
+    methods: AI_AGENT_SYSTEM_METHODS,
+    label: 'Read system stats',
+    description:
+      'Allow the agent to inspect CPU, memory, disk, and process usage on the remote host.'
+  }
+]
+
 export const AI_AGENT_DATETIME_METHOD = TOOL_DEF_GET_CURRENT_TIME
+
+/** Every permission bundle, for resolving a bundled method to its shared setting key. */
+export const AI_AGENT_ALL_PERMISSION_BUNDLES: PermissionBundle[] = [
+  ...AI_AGENT_REMOTE_FS_BUNDLES,
+  ...AI_AGENT_LOCAL_FS_BUNDLES,
+  ...AI_AGENT_SYSTEM_BUNDLES
+]
 
 /**
  * Every method AI Agent exposes via `contributes.api` / `onApiCall`, dispatched
@@ -745,6 +860,7 @@ export const AI_AGENT_API_METHODS = [
   ...AI_AGENT_LOCAL_FS_METHODS,
   ...AI_AGENT_KNOWLEDGE_BASE_METHODS,
   ...AI_AGENT_TERMINAL_METHODS,
+  ...AI_AGENT_SYSTEM_METHODS,
   AI_AGENT_DATETIME_METHOD
 ]
 
@@ -769,6 +885,17 @@ export function buildAiAgentBuiltinApiFields(webSearchExtraChildren: PluginSetti
       {
         description:
           'Allow the agent to read and type into your live terminal session. This shares your shell and prompt, so the agent acts as if it were you typing.'
+      }
+    ),
+    buildApiPermissionGroup(
+      PLUGIN_ID_AI_AGENT,
+      AI_AGENT_GROUP_SYSTEM,
+      'System inspection',
+      AI_AGENT_SYSTEM_METHODS,
+      {
+        description:
+          'Allow the agent to read CPU, memory, disk, and process statistics from the remote host.',
+        bundles: AI_AGENT_SYSTEM_BUNDLES
       }
     ),
     buildApiPermissionGroup(
