@@ -29,6 +29,8 @@ pub struct Button<'a> {
     kind: ButtonKind,
     compact: bool,
     enabled: bool,
+    /// Drawn as toggled on: accent border and label, no extra fill.
+    active: bool,
     min_width: Option<f32>,
 }
 
@@ -39,8 +41,15 @@ impl<'a> Button<'a> {
             kind: ButtonKind::Secondary,
             compact: false,
             enabled: true,
+            active: false,
             min_width: None,
         }
+    }
+
+    /// Draw the button as toggled on (a toggle such as "attach the terminal").
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
     }
 
     pub fn kind(mut self, kind: ButtonKind) -> Self {
@@ -137,6 +146,20 @@ impl<'a> Button<'a> {
                 ButtonKind::Danger | ButtonKind::Ghost => (transparent, transparent),
             };
             return (fill, border, muted.gamma_multiply(0.6));
+        }
+
+        // A toggle keeps its surface and takes the accent for its border and label, so it is
+        // the same shape as its neighbours whether it is on or off.
+        if self.active && self.kind == ButtonKind::Secondary {
+            return (
+                if hovered {
+                    to_color32(palette.bg_panel_2).gamma_multiply(1.15)
+                } else {
+                    to_color32(palette.bg_panel_2)
+                },
+                if hovered { accent } else { to_color32(palette.accent) },
+                if hovered { to_color32(palette.accent_hover) } else { accent },
+            );
         }
 
         match self.kind {
@@ -284,5 +307,37 @@ mod tests {
     fn disabled_buttons_are_not_clickable() {
         let button = Button::new("x").enabled(false);
         assert!(!button.enabled);
+    }
+
+    #[test]
+    fn a_toggle_is_the_same_button_whether_it_is_on_or_off() {
+        // A toggle (an "attach the terminal" button next to a paperclip) must keep the
+        // shape of its neighbours; only its border and label take the accent colour.
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let measure = |active: bool| {
+            let mut size = Vec2::ZERO;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(200.0, 100.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                size = Button::new(">_")
+                    .compact()
+                    .active(active)
+                    .show(ui, &palette)
+                    .rect
+                    .size();
+            });
+            output.drop_without_applying_deltas();
+            size
+        };
+        let off = measure(false);
+        let on = measure(true);
+        assert_eq!(on, off, "the toggle changed size when it was turned on");
+        assert_eq!(off.y, 20.0, "a compact button is 20 pt tall: {off:?}");
     }
 }
