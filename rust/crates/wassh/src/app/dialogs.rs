@@ -108,6 +108,15 @@ pub enum DialogAction {
     SaveSettings(AppSettings, PluginSecretDrafts),
     /// Persist this host (new or edited), with the credentials typed into the dialog.
     SaveHost(Box<HostSave>),
+    /// Apply these settings to one open session only.
+    ///
+    /// The saved host and the host's other sessions keep their own settings.
+    SaveSession {
+        /// Id of the session the dialog was opened from.
+        session: String,
+        /// Settings and credentials to apply.
+        save: Box<HostSave>,
+    },
     /// Rename a group and set (or clear) its colour.
     SaveGroup {
         group_id: String,
@@ -228,12 +237,14 @@ pub enum Command {
     NewLocalTab,
     NewHost,
     EditHost,
+    SaveAsHost,
     OpenOptions,
     OpenTunnels,
     ToggleSidebar,
     Reconnect,
     ReconnectAll,
     CloseTab,
+    ReopenTab,
     NextTab,
     PreviousTab,
     Find,
@@ -243,16 +254,18 @@ pub enum Command {
 
 impl Command {
     /// Every command with its palette label.
-    pub const ALL: [(Command, &'static str); 14] = [
+    pub const ALL: [(Command, &'static str); 16] = [
         (Command::NewLocalTab, "New local terminal tab"),
         (Command::NewHost, "New host…"),
         (Command::EditHost, "Edit current session settings…"),
+        (Command::SaveAsHost, "Save session as host…"),
         (Command::OpenOptions, "Options…"),
         (Command::OpenTunnels, "Tunnels…"),
         (Command::ToggleSidebar, "Toggle sidebar"),
         (Command::Reconnect, "Reconnect current session"),
         (Command::ReconnectAll, "Reconnect all sessions"),
         (Command::CloseTab, "Close current tab"),
+        (Command::ReopenTab, "Reopen closed tab"),
         (Command::NextTab, "Next tab"),
         (Command::PreviousTab, "Previous tab"),
         (Command::Find, "Find in terminal"),
@@ -353,10 +366,22 @@ impl OptionsState {
     }
 }
 
+/// Whether a settings dialog edits the stored host or one live session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostTarget {
+    /// The host in `hosts.json`: Save persists it; "Apply to sessions" also pushes the
+    /// change to the sessions already open for it.
+    Host,
+    /// One open session, by id: Save changes that tab and nothing else.
+    Session(String),
+}
+
 /// Host/Session settings state.
 pub struct HostState {
     /// Section rail state.
     pub nav: SettingsNav,
+    /// What Save writes: the stored host or the session the dialog was opened from.
+    pub target: HostTarget,
     /// Draft copy of the host.
     pub draft: HostProfile,
     /// Whether the host is in the saved configuration.
@@ -399,6 +424,7 @@ impl HostState {
     pub fn draft(host: HostProfile, is_new: bool) -> Self {
         Self {
             nav: SettingsNav::default(),
+            target: HostTarget::Host,
             tab_color_draft: host
                 .connection
                 .style
@@ -456,19 +482,23 @@ impl HostState {
         self
     }
 
+    /// Point the dialog at the session it was opened from, so Save stays local to it.
+    pub fn with_target(mut self, target: HostTarget) -> Self {
+        self.target = target;
+        self
+    }
+
     /// Note which plugin secrets the vault already holds for this host.
     ///
     /// Pass `(plugin, field)` pairs; the dialog shows "(stored)" instead of a
     /// value, because the secret never travels through the draft.
     pub fn with_plugin_secrets(
         mut self,
-        stored: impl IntoIterator<Item = (&'static str, &'static str)>,
+        stored: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         for (plugin, field) in stored {
-            self.plugin_secrets.insert(
-                secret_field_key(plugin, field),
-                SecretDraft::stored(),
-            );
+            self.plugin_secrets
+                .insert(secret_field_key(&plugin, &field), SecretDraft::stored());
         }
         self
     }
@@ -482,14 +512,15 @@ impl HostState {
 
     /// Whether "Apply to sessions" applies to this dialog.
     ///
-    /// The reference offers it only for a saved host with sessions open.
+    /// Only a saved host can push its settings to the sessions open for it; a session
+    /// dialog saves to that one tab.
     pub fn can_apply_to_sessions(&self) -> bool {
-        self.saved && self.has_sessions
+        self.target == HostTarget::Host && self.saved && self.has_sessions
     }
 
     /// Whether the dialog deletes a host rather than discarding a draft.
     pub fn can_delete(&self) -> bool {
-        self.saved
+        self.target == HostTarget::Host && self.saved
     }
 
     /// Record which secrets are already stored for this host.
@@ -1952,18 +1983,22 @@ fn host_dialog(
 ) -> Vec<DialogAction> {
     let mut actions = Vec::new();
     let mut sections = host_sections(state.draft.connection.kind);
-    // Enabled plugins with per-host fields add a section each, after Appearance.
+    let target = state.target.clone();
+    // Enabled plugins with per-host fields add a section each, after Appearance. A session
+    // dialog leaves them out: plugin settings are stored per host, and the session dialog
+    // must not write the host.
     let builtin_sections = sections.len();
-    let plugin_sections = host_plugin_sections(enabled_plugins);
-    sections.extend(plugin_sections.iter().map(|plug| plug.heading));
-    // The reference calls the unsaved dialog "Session settings".
-    let title = if state.saved {
-        "Host settings"
-    } else {
-        "Session settings"
+    let plugin_sections = match target {
+        HostTarget::Host => host_plugin_sections(enabled_plugins),
+        HostTarget::Session(_) => Vec::new(),
     };
-    // Footer actions follow the reference: only a saved host can be applied to
-    // its sessions or deleted.
+    sections.extend(plugin_sections.iter().map(|plug| plug.heading));
+    let title = match target {
+        HostTarget::Host => "Host settings",
+        HostTarget::Session(_) => "Session settings",
+    };
+    // Footer actions: a session dialog only saves to its tab, and only a saved host can
+    // be applied to its sessions or deleted.
     let can_apply = state.can_apply_to_sessions();
     let can_delete = state.can_delete();
     // Borrow the fields one by one so the content closure can touch the credential
@@ -2022,7 +2057,13 @@ fn host_dialog(
                     );
                 }
             }
-            "Connection" => host_connection(ui, palette, draft, tag_draft),
+            "Connection" => host_connection(
+                ui,
+                palette,
+                draft,
+                tag_draft,
+                target == HostTarget::Host,
+            ),
             "Authentication" => host_authentication(
                 ui,
                 palette,
@@ -2036,7 +2077,13 @@ fn host_dialog(
                     clear_passphrase,
                 },
             ),
-            "Advanced" => host_advanced(ui, palette, draft, hosts),
+            "Advanced" => host_advanced(
+                ui,
+                palette,
+                draft,
+                hosts,
+                target == HostTarget::Host,
+            ),
             "Tunnels" => host_tunnels(ui, palette, draft),
             _ => host_appearance(
                 ui,
@@ -2060,13 +2107,19 @@ fn host_dialog(
             passphrase: SecretEdit::from_field(passphrase, *clear_passphrase),
             plugin_secrets: plugin_secrets
                 .iter()
-                .filter(|(_, draft)| draft.edit() != SecretEdit::Unchanged)
+                .filter(|(_, draft)| draft_changes(draft))
                 .map(|(key, draft)| (key.clone(), draft.clone()))
                 .collect(),
         }
     };
     match outcome {
-        ShellOutcome::Save => actions.push(DialogAction::SaveHost(Box::new(save()))),
+        ShellOutcome::Save => match target {
+            HostTarget::Host => actions.push(DialogAction::SaveHost(Box::new(save()))),
+            HostTarget::Session(session) => actions.push(DialogAction::SaveSession {
+                session,
+                save: Box::new(save()),
+            }),
+        },
         ShellOutcome::Apply => actions.push(DialogAction::ApplyHost(Box::new(save()))),
         ShellOutcome::Delete => actions.push(DialogAction::DeleteHost(draft.id.clone())),
         ShellOutcome::Cancel | ShellOutcome::Dismissed => actions.push(DialogAction::Close),
@@ -3007,7 +3060,7 @@ pub fn tab_menu_command(index: usize) -> Option<Command> {
     match index {
         0 => Some(Command::Reconnect),
         1 => Some(Command::EditHost),
-        2 => None,
+        2 => Some(Command::SaveAsHost),
         4 => Some(Command::CloseTab),
         _ => None,
     }
@@ -3882,11 +3935,24 @@ mod tests {
         assert!(saved_idle.can_delete());
 
         // A saved host with sessions open offers both.
-        let saved_live = HostState::draft(host, false)
+        let saved_live = HostState::draft(host.clone(), false)
             .with_open_sessions(true)
             .with_saved(true);
         assert!(saved_live.can_apply_to_sessions());
         assert!(saved_live.can_delete());
+
+        // The session dialog for that same host offers neither: Save goes to its tab.
+        let session_dialog = HostState::draft(host, false)
+            .with_open_sessions(true)
+            .with_saved(true)
+            .with_target(HostTarget::Session("tab-1".to_owned()));
+        assert!(!session_dialog.can_apply_to_sessions());
+        assert!(!session_dialog.can_delete());
+    }
+
+    #[test]
+    fn the_tab_menu_can_save_a_session_as_a_host() {
+        assert_eq!(tab_menu_command(2), Some(Command::SaveAsHost));
     }
 
     #[test]

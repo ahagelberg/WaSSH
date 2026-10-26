@@ -878,6 +878,30 @@ impl Shell {
         applied
     }
 
+    /// Apply a session dialog's settings to the one tab it was opened from.
+    ///
+    /// Returns false when the tab is gone. Credentials stay in the tab: nothing is
+    /// written to `hosts.json` or to the vault, so the saved host and its other
+    /// sessions keep their own settings.
+    fn apply_to_session(&mut self, session_id: &str, save: &HostSave) -> bool {
+        let defaults = self.settings.session_style_defaults.clone();
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return false;
+        };
+        session.apply_connection(save.host.connection.clone(), &defaults);
+        if let Some(value) = secret_value(&save.password) {
+            session.secrets.password = value.unwrap_or_default().to_owned();
+        }
+        if let Some(value) = secret_value(&save.passphrase) {
+            session.secrets.key_passphrase = value.unwrap_or_default().to_owned();
+        }
+        true
+    }
+
     /// Password stored for a saved host, if any.
     fn stored_password(&self, host_id: Option<&str>) -> Option<String> {
         let host_id = host_id?;
@@ -1052,10 +1076,29 @@ impl Shell {
             }
             self.persist_hosts();
         }
+        if let Some(config) = self.config.as_ref() {
+            for (plugin, scope, data) in docs {
+                if let Err(error) = config.save_plugin_data(&plugin, scope.as_deref(), &data) {
+                    self.toasts.push(
+                        ToastKind::Error,
+                        format!("could not clear the {plugin} password from its data: {error}"),
+                    );
+                }
+            }
+        }
     }
 
     /// Build a host dialog state with the app defaults and any stored secrets.
     fn host_state(&self, host: HostProfile, is_new: bool) -> HostState {
+        self.dialog_state(host, is_new, HostTarget::Host)
+    }
+
+    /// Build the dialog for the session opened from a tab: Save stays on that tab.
+    fn session_state(&self, host: HostProfile, session: &str) -> HostState {
+        self.dialog_state(host, false, HostTarget::Session(session.to_owned()))
+    }
+
+    fn dialog_state(&self, host: HostProfile, is_new: bool, target: HostTarget) -> HostState {
         // Ask the configuration rather than trusting the caller's flag: a draft
         // for an id that is not in `hosts.json` must never offer "Apply to
         // sessions" or "Delete".
@@ -1072,6 +1115,7 @@ impl Shell {
             .with_saved(saved)
             .with_stored_secrets(password, passphrase)
             .with_plugin_secrets(stored_plugin_secrets)
+            .with_target(target)
     }
 
     /// Whether a password / passphrase is already stored for `host_id`.
@@ -1209,27 +1253,42 @@ impl Shell {
                 self.dialogs.host = Some(self.host_state(draft, true));
             }
             Command::EditHost => {
-                let saved = self
-                    .active()
-                    .and_then(|session| session.host_id.clone())
-                    .and_then(|id| self.hosts.host(&id).cloned());
-                let state = match saved {
-                    Some(host) => self.host_state(host, false),
-                    None => {
-                        let mut draft = self
-                            .active()
-                            .map(|session| HostProfile {
-                                id: format!("host-{}", self.next_id),
-                                name: session.title.clone(),
-                                connection: session.connection.clone(),
-                                ..HostProfile::default()
-                            })
-                            .unwrap_or_default();
-                        draft.connection = draft.connection.normalized();
-                        self.host_state(draft, true)
-                    }
+                // The dialog edits the live session: its Save must not touch the saved
+                // host or the host's other tabs.
+                let Some((session_id, host_id, title, connection)) = self.active().map(|session| {
+                    (
+                        session.id.clone(),
+                        session.host_id.clone(),
+                        session.title.clone(),
+                        session.connection.clone(),
+                    )
+                }) else {
+                    return;
                 };
-                self.dialogs.host = Some(state);
+                let mut draft = host_id
+                    .as_deref()
+                    .and_then(|id| self.hosts.host(id).cloned())
+                    .unwrap_or_else(|| HostProfile {
+                        id: format!("host-{}", self.next_id),
+                        name: title,
+                        ..HostProfile::default()
+                    });
+                draft.connection = connection;
+                self.dialogs.host = Some(self.session_state(draft, &session_id));
+            }
+            Command::SaveAsHost => {
+                // The tab menu's entry: a new host built from the active session.
+                let Some(session) = self.active() else {
+                    return;
+                };
+                let mut draft = HostProfile {
+                    id: format!("host-{}", self.next_id),
+                    name: session.title.clone(),
+                    connection: session.connection.clone(),
+                    ..HostProfile::default()
+                };
+                draft.connection = draft.connection.normalized();
+                self.dialogs.host = Some(self.host_state(draft, true));
             }
             Command::OpenOptions => {
                 let home = home_dir();
@@ -1679,6 +1738,17 @@ impl Shell {
                     self.save_host(save.host);
                     self.dialogs.host = None;
                     self.toasts.push(ToastKind::Info, "Host saved.");
+                }
+                DialogAction::SaveSession { session, save } => {
+                    let applied = self.apply_to_session(&session, &save);
+                    self.dialogs.host = None;
+                    if applied {
+                        self.toasts
+                            .push(ToastKind::Info, "Session settings applied.");
+                    } else {
+                        self.toasts
+                            .push(ToastKind::Error, "The session is no longer open.");
+                    }
                 }
                 DialogAction::ApplyHost(save) => {
                     self.apply_secret_edits(&save);
