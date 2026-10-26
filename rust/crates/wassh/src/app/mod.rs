@@ -16,7 +16,7 @@ use egui::{Key, Modifiers, Pos2, Vec2};
 
 use wassh_core::{
     APP_NAME, AppSettings, AuthMethod, ConnectionParams, ConnectionType, HostProfile,
-    HostsDocument, Palette, SessionStatus, colors,
+    HostsDocument, Palette, SessionStatus, WindowBounds, colors,
 };
 use wassh_plugins::PluginId;
 use wassh_ssh::KnownHosts;
@@ -26,10 +26,14 @@ use wassh_ui::widgets::{Button, MenuItem, MenuState, ToastKind, Toasts};
 
 use self::dialogs::{
     Command, DialogAction, Dialogs, FindCommand, FindState, GroupEditState, HostSave, HostState,
-    OptionsState, PaletteState, PluginSecretDrafts, SecretEdit, tab_menu_command, tab_menu_items,
+    HostTarget, OptionsState, PaletteState, PluginSecretDrafts, SecretEdit, tab_menu_command,
+    tab_menu_items,
 };
 use self::quick_connect::{QuickForm, quick_connect};
 use self::session::{PluginValues, Secrets, SessionEntry, SshOpen, jump_chain};
+
+/// How long the window must stay put before its geometry is written to `settings.json`.
+const WINDOW_BOUNDS_SETTLE: Duration = Duration::from_millis(700);
 
 /// Menus shown in the titlebar.
 /// Toolbar labels of the Plugins menu entries, in registry order.
@@ -133,6 +137,15 @@ pub struct Shell {
     perf_tabs: usize,
     /// Last desktop light/dark preference seen, so `ThemeMode::System` can follow it.
     system_dark: Option<bool>,
+    /// Palette egui's own visuals were last built from.
+    styled_palette: Option<Palette>,
+    /// Normal (non-maximized) window geometry from the last frame, kept while maximized so
+    /// unmaximizing and the next launch still land on the same rectangle.
+    last_bounds: Option<WindowBounds>,
+    /// Saved position to apply once the real window exists.
+    restore_bounds: Option<WindowBounds>,
+    /// When the window geometry last changed, so a drag is written once it settles.
+    bounds_changed_at: Option<std::time::Instant>,
 }
 
 /// Whether the desktop is currently in its dark variant.
@@ -182,13 +195,29 @@ pub fn run_perf(tabs: usize) -> eframe::Result<()> {
 }
 
 fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
+    let config = if perf {
+        None
+    } else {
+        Config::open_data_dir().ok()
+    };
+    let bounds = config
+        .as_ref()
+        .and_then(|config| config.settings.get().window_bounds);
+
     // The desktop draws the window: title bar, caption buttons, resize border, shadow and
     // rounded corners all come from the theme, so the app only puts its menu strip inside.
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 800.0])
+    let mut viewport = egui::ViewportBuilder::default()
         .with_min_inner_size([800.0, 500.0])
         .with_title(APP_NAME)
         .with_app_id("wassh");
+    viewport = match bounds {
+        // `width`/`height` are points, so the window keeps its apparent size on a monitor
+        // with different scaling. The position is applied on the first frame, in pixels.
+        Some(bounds) => viewport
+            .with_inner_size([bounds.width as f32, bounds.height as f32])
+            .with_maximized(bounds.maximized),
+        None => viewport.with_inner_size([1280.0, 800.0]),
+    };
 
     let options = eframe::NativeOptions {
         viewport,
@@ -197,7 +226,11 @@ fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
     eframe::run_native(
         "wassh",
         options,
-        Box::new(move |cc| Ok(Box::new(Shell::new_with_probe(cc, perf, perf_tabs)))),
+        Box::new(move |cc| {
+            Ok(Box::new(Shell::new_with_probe(
+                cc, config, perf, perf_tabs, bounds,
+            )))
+        }),
     )
 }
 
@@ -206,19 +239,24 @@ impl Shell {
     ///
     /// A `--perf` probe works on an empty, in-memory configuration: a measurement must never
     /// read or write the real hosts, settings or saved tabs.
-    fn new_with_probe(cc: &eframe::CreationContext<'_>, perf: bool, perf_tabs: usize) -> Self {
-        let config = if perf {
-            None
-        } else {
-            Config::open_data_dir().ok()
-        };
+    fn new_with_probe(
+        cc: &eframe::CreationContext<'_>,
+        config: Option<Config>,
+        perf: bool,
+        perf_tabs: usize,
+        bounds: Option<WindowBounds>,
+    ) -> Self {
         let mut shell = Self::new_for_test(config, perf, perf_tabs);
+        shell.last_bounds = bounds.map(|bounds| WindowBounds {
+            maximized: false,
+            ..bounds
+        });
+        shell.restore_bounds = bounds.filter(|bounds| !bounds.maximized);
         let system_dark = system_prefers_dark(&cc.egui_ctx);
         shell.system_dark = Some(system_dark);
         if shell.settings.theme == wassh_core::ThemeMode::System {
             shell.palette = Palette::for_mode(shell.settings.theme.resolve(system_dark));
         }
-        apply_visuals(&cc.egui_ctx, shell.palette);
         shell
     }
 
@@ -287,6 +325,10 @@ impl Shell {
             perf_probe: perf,
             restore_pending: true,
             system_dark: None,
+            styled_palette: None,
+            last_bounds: None,
+            restore_bounds: None,
+            bounds_changed_at: None,
             perf_tabs,
         };
         for problem in shell
@@ -671,13 +713,10 @@ impl Shell {
         }
     }
 
-    // --- persistence -------------------------------------------------------
+    // --- window geometry ---------------------------------------------------
 
-    fn save_settings(&mut self) {
-        self.settings.sidebar_collapsed = self.sidebar.collapsed;
-        // `System` resolves against the desktop preference seen this session.
-        let system_dark = self.system_dark.unwrap_or(true);
-        self.palette = Palette::for_mode(self.settings.theme.resolve(system_dark));
+    /// Write `settings.json` without re-applying defaults to the open tabs.
+    fn write_settings(&mut self) {
         if let Some(config) = self.config.as_mut() {
             if let Err(error) = config.settings.set(self.settings.clone()) {
                 self.toasts.push(
@@ -690,6 +729,87 @@ impl Shell {
                     .push(ToastKind::Error, format!("could not save settings: {error}"));
             }
         }
+    }
+
+    /// Put the window back where it was saved, in physical pixels.
+    ///
+    /// `OuterPosition` takes points, so the saved pixel position is divided by the window's
+    /// current scale: the conversion happens against the same scale it is multiplied by, and
+    /// the window lands on the monitor, and at the pixel, it was saved from. The size is
+    /// already applied in points when the window is created.
+    fn restore_window_position(&mut self, ctx: &egui::Context) -> bool {
+        let Some(bounds) = self.restore_bounds.take() else {
+            return false;
+        };
+        let pixels_per_point = ctx.pixels_per_point();
+        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
+            return false;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            bounds.x as f32 / pixels_per_point,
+            bounds.y as f32 / pixels_per_point,
+        )));
+        ctx.request_repaint();
+        true
+    }
+
+    /// Remember the window rectangle so the next launch can restore it.
+    fn track_window_bounds(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.input(|input| input.viewport().clone());
+        if viewport.fullscreen.unwrap_or(false) || viewport.minimized.unwrap_or(false) {
+            return;
+        }
+        let (Some(outer), Some(inner)) = (viewport.outer_rect, viewport.inner_rect) else {
+            return;
+        };
+        let pixels_per_point = ctx.pixels_per_point();
+        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
+            return;
+        }
+        let maximized = viewport.maximized.unwrap_or(false);
+        if !maximized {
+            self.last_bounds = Some(WindowBounds {
+                x: (outer.left() * pixels_per_point).round() as i32,
+                y: (outer.top() * pixels_per_point).round() as i32,
+                width: inner.width().round() as u32,
+                height: inner.height().round() as u32,
+                maximized: false,
+            });
+        }
+        // While maximized the normal rectangle is kept, so unmaximizing and the next launch
+        // still use it.
+        let Some(normal) = self.last_bounds else {
+            return;
+        };
+        let current = WindowBounds { maximized, ..normal };
+        if self.settings.window_bounds == Some(current) {
+            return;
+        }
+        self.settings.window_bounds = Some(current);
+        self.bounds_changed_at = Some(std::time::Instant::now());
+        ctx.request_repaint_after(WINDOW_BOUNDS_SETTLE);
+    }
+
+    /// Write the window rectangle once it has stopped changing, or at once when the app exits.
+    fn persist_window_bounds(&mut self, force: bool) {
+        let Some(changed_at) = self.bounds_changed_at else {
+            return;
+        };
+        if !force && changed_at.elapsed() < WINDOW_BOUNDS_SETTLE {
+            return;
+        }
+        self.bounds_changed_at = None;
+        self.write_settings();
+    }
+
+    // --- persistence -------------------------------------------------------
+
+    fn save_settings(&mut self) {
+        self.settings.sidebar_collapsed = self.sidebar.collapsed;
+        // `System` resolves against the desktop preference seen this session.
+        let system_dark = self.system_dark.unwrap_or(true);
+        self.palette = Palette::for_mode(self.settings.theme.resolve(system_dark));
+        self.write_settings();
         // New defaults and the (possibly new) theme apply to the sessions already open.
         let palette = self.palette;
         let defaults = self.settings.session_style_defaults.clone();
@@ -2350,6 +2470,10 @@ impl eframe::App for Shell {
             }
         }
     }
+
+    fn on_exit(&mut self) {
+        self.persist_window_bounds(true);
+    }
 }
 
 /// Resident memory of this process, in bytes, where the platform reports it.
@@ -2378,13 +2502,21 @@ impl Shell {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
         }
         if self.quit_requested {
+            self.persist_window_bounds(true);
             if let Some(config) = self.config.as_mut() {
                 let _ = config.flush();
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // The saved position is applied to the real window on the first frame; until then
+        // the reported geometry is not the user's.
+        let restoring = self.restore_window_position(&ctx);
         self.frame_body(ui);
+        if !restoring {
+            self.track_window_bounds(&ctx);
+        }
+        self.persist_window_bounds(false);
     }
 
     /// Everything inside the window frame.
@@ -2546,12 +2678,7 @@ impl wassh_ui::DockContent for SessionPanes<'_> {
 }
 
 fn apply_visuals(ctx: &egui::Context, palette: Palette) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = wassh_ui::terminal_view::to_color32(palette.bg_app);
-    visuals.window_fill = wassh_ui::terminal_view::to_color32(palette.bg_panel);
-    visuals.extreme_bg_color = wassh_ui::terminal_view::to_color32(palette.bg_input);
-    visuals.override_text_color = Some(wassh_ui::terminal_view::to_color32(palette.text));
-    ctx.set_visuals(visuals);
+    wassh_ui::apply_visuals(ctx, &palette);
 }
 
 #[cfg(test)]
@@ -2930,6 +3057,160 @@ mod tests {
 
         // A host with no open session is a no-op.
         assert_eq!(shell.apply_host_to_sessions(&HostProfile::default()), 0);
+    }
+
+    #[test]
+    fn the_window_rectangle_is_remembered_in_physical_pixels() {
+        let dir = std::env::temp_dir().join(format!(
+            "wassh-window-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = Config::open(&dir).expect("config");
+        let mut shell = Shell::new_with(Some(config), false);
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let normal = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(10.0, 20.0),
+                egui::vec2(800.0, 610.0),
+            )),
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(12.0, 50.0),
+                egui::vec2(796.0, 580.0),
+            )),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        input.viewports.insert(egui::ViewportId::ROOT, normal);
+        let output = ctx.run_ui(input.clone(), |ui| {
+            let ctx = ui.ctx().clone();
+            shell.track_window_bounds(&ctx);
+        });
+        output.drop_without_applying_deltas();
+
+        // The outer rect is physical, the inner size stays in points.
+        assert_eq!(
+            shell.settings.window_bounds,
+            Some(WindowBounds {
+                x: 10,
+                y: 20,
+                width: 796,
+                height: 580,
+                maximized: false,
+            })
+        );
+
+        // Maximizing keeps the normal rectangle next to the flag.
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(2560.0, 1440.0),
+                )),
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(2560.0, 1400.0),
+                )),
+                maximized: Some(true),
+                ..Default::default()
+            },
+        );
+        let output = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            shell.track_window_bounds(&ctx);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            shell.settings.window_bounds,
+            Some(WindowBounds {
+                x: 10,
+                y: 20,
+                width: 796,
+                height: 580,
+                maximized: true,
+            })
+        );
+
+        shell.persist_window_bounds(true);
+        let reopened = Config::open(&dir).expect("reopen");
+        assert_eq!(
+            reopened.settings.get().window_bounds,
+            shell.settings.window_bounds
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_dialog_save_stays_on_its_tab() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let mut host = HostProfile {
+            id: "h1".to_owned(),
+            name: "Dev".to_owned(),
+            ..HostProfile::default()
+        };
+        host.connection.kind = ConnectionType::Ssh;
+        host.connection.host = "192.0.2.1".to_owned();
+        shell.save_host(host.clone());
+
+        let open = |id: &str, shell: &mut Shell| {
+            let mut entry = crate::app::session::SessionEntry::new_local(
+                id,
+                &shell.palette,
+                &shell.settings.session_style_defaults,
+                "xterm-256color",
+                TerminalSize::new(80, 24),
+            );
+            entry.host_id = Some("h1".to_owned());
+            entry.connection = host.connection.clone();
+            shell.sessions.push(entry);
+        };
+        open("tab-1", &mut shell);
+        open("tab-2", &mut shell);
+        shell.active = Some(0);
+
+        // Only the host dialog of a saved host offers Apply to sessions.
+        assert!(shell.host_state(host.clone(), false).can_apply_to_sessions());
+        let session_dialog = shell.session_state(host.clone(), "tab-1");
+        assert!(!session_dialog.can_apply_to_sessions());
+        assert!(!session_dialog.can_delete());
+
+        let mut edited = host.connection.clone();
+        edited.host = "10.0.0.5".to_owned();
+        edited.style.font_size = Some(21);
+        let save = HostSave {
+            host: HostProfile {
+                id: "h1".to_owned(),
+                connection: edited,
+                ..HostProfile::default()
+            },
+            password: SecretEdit::Set("hunter2".to_owned()),
+            passphrase: SecretEdit::Unchanged,
+            plugin_secrets: PluginSecretDrafts::new(),
+        };
+        assert!(shell.apply_to_session("tab-1", &save));
+        assert!(!shell.apply_to_session("gone", &save));
+
+        assert_eq!(shell.sessions[0].connection.host, "10.0.0.5");
+        assert_eq!(shell.sessions[0].view.font_size, 21.0);
+        assert_eq!(shell.sessions[0].secrets.password, "hunter2");
+        // The host's other tab and the saved host keep their own settings, and the
+        // password never reaches the vault.
+        assert_eq!(shell.sessions[1].connection.host, "192.0.2.1");
+        assert_eq!(
+            shell.hosts.host("h1").expect("saved host").connection.host,
+            "192.0.2.1"
+        );
+        assert_eq!(shell.stored_password(Some("h1")), None);
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub fn plugin_setting_values<'a>(
 }
 
 /// Persisted window geometry.
+///
+/// `x`/`y` are the outer position in physical pixels, which are unambiguous across monitors
+/// with different scaling. `width`/`height` are the inner size in points, so the window keeps
+/// its apparent size wherever it is restored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowBounds {
