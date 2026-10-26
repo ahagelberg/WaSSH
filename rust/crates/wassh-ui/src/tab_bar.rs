@@ -18,6 +18,10 @@ pub const TAB_MAX_WIDTH: f32 = 220.0;
 pub const TAB_MIN_WIDTH: f32 = 96.0;
 /// Gap between tabs.
 pub const TAB_GAP: f32 = 2.0;
+/// Horizontal padding at both ends of the strip.
+const TAB_STRIP_PADDING: f32 = 8.0;
+/// Gap between the last tab and the "new tab" button.
+const NEW_TAB_GAP: f32 = 2.0;
 /// Horizontal padding inside a tab.
 pub const TAB_PADDING_X: f32 = 10.0;
 /// Gap between the dot, the title and the close button.
@@ -28,22 +32,24 @@ pub const TAB_ACCENT_BAR: f32 = 4.0;
 pub const STATUS_DOT: f32 = 8.0;
 /// Border width of the active tab.
 pub const ACTIVE_BORDER: f32 = 2.0;
+/// How far the active tab overlaps the edge below the strip so it reads as connected.
+const TAB_BOTTOM_OVERLAP: f32 = 1.0;
 /// Width of the drag insertion indicator.
 pub const DROP_INDICATOR: f32 = 2.0;
-/// Height of the "new tab" button.
+/// Width of the "new tab" button.
 pub const NEW_TAB_WIDTH: f32 = 28.0;
-
-/// One tab to draw.
-#[derive(Clone, Copy, Debug)]
-pub struct TabView<'a> {
-    /// Stable session id.
-    pub id: &'a str,
 /// Inset of the "new tab" button box inside its slot.
 const NEW_TAB_INSET: Vec2 = Vec2::new(3.0, 7.0);
 /// Font size of the "new tab" glyph.
 const NEW_TAB_GLYPH_SIZE: f32 = 14.0;
 /// Font size of the tab title.
 const TAB_TITLE_SIZE: f32 = 12.0;
+
+/// One tab to draw.
+#[derive(Clone, Copy, Debug)]
+pub struct TabView<'a> {
+    /// Stable session id.
+    pub id: &'a str,
     /// Title shown in the strip.
     pub title: &'a str,
     /// Session status, controlling the dot colour.
@@ -93,14 +99,50 @@ pub fn tab_width(count: usize, available: f32) -> f32 {
         return 0.0;
     }
     let gaps = TAB_GAP * (count.saturating_sub(1)) as f32;
-    let share = (available - gaps - NEW_TAB_WIDTH) / count as f32;
+    let share = (tabs_space(available) - gaps) / count as f32;
     share.clamp(TAB_MIN_WIDTH.min(TAB_MAX_WIDTH), TAB_MAX_WIDTH)
 }
 
-/// Cross-frame drag state for the strip.
+/// Space the tabs may use once the strip padding and the new tab button are reserved.
+fn tabs_space(available: f32) -> f32 {
+    available - TAB_STRIP_PADDING * 2.0 - NEW_TAB_WIDTH - NEW_TAB_GAP
+}
+
+/// How far the tabs can scroll sideways in `available` pixels.
+fn max_scroll(count: usize, available: f32) -> f32 {
+    let width = tab_width(count, available);
+    let content = count.saturating_sub(1) as f32 * (width + TAB_GAP) + width;
+    (content - tabs_space(available)).max(0.0)
+}
+
+/// Rect of the tab at `index` in a strip scrolled by `scroll`.
+fn tab_slot(bar: Rect, width: f32, scroll: f32, index: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            bar.left() + TAB_STRIP_PADDING - scroll + index as f32 * (width + TAB_GAP),
+            bar.top(),
+        ),
+        Vec2::new(width, TABBAR_HEIGHT),
+    )
+}
+
+/// Rect of the new tab button: after the last tab, at the right edge once they overflow.
+fn new_tab_slot(bar: Rect, width: f32, count: usize, scroll: f32) -> Rect {
+    let after_tabs = bar.left() + TAB_STRIP_PADDING - scroll + count as f32 * (width + TAB_GAP);
+    Rect::from_min_size(
+        Pos2::new(
+            (after_tabs + NEW_TAB_GAP).min(bar.right() - TAB_STRIP_PADDING - NEW_TAB_WIDTH),
+            bar.top(),
+        ),
+        Vec2::new(NEW_TAB_WIDTH, TABBAR_HEIGHT),
+    )
+}
+
+/// Cross-frame drag and scroll state for the strip.
 #[derive(Default)]
 pub struct TabBarState {
     drag: Option<DragState>,
+    scroll: f32,
 }
 
 #[derive(Default)]
@@ -141,40 +183,77 @@ pub fn tab_bar(
     );
 
     let width = tab_width(tabs.len(), bar.width());
+    let limit = max_scroll(tabs.len(), bar.width());
+
+    // The wheel scrolls the tabs sideways; a vertical wheel works like a horizontal one
+    // and the dominant axis wins, so trackpad tilt works too.
+    let over_strip = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pos| bar.contains(pos));
+    if over_strip && limit > 0.0 {
+        let delta = ui.ctx().input(|input| input.smooth_scroll_delta);
+        let shift = -(if delta.y.abs() >= delta.x.abs() { delta.y } else { delta.x });
+        state.scroll += shift;
+    }
+    state.scroll = state.scroll.clamp(0.0, limit);
+
+    let new_rect = new_tab_slot(bar, width, tabs.len(), state.scroll);
+
+    // Tabs stop short of the button and of the strip's ends, whatever the scroll offset.
+    let mut strip = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+    let clip = Rect::from_min_max(
+        bar.min,
+        Pos2::new(new_rect.left() - NEW_TAB_GAP, bar.bottom() + TAB_BOTTOM_OVERLAP),
+    );
+    strip.set_clip_rect(clip.intersect(ui.clip_rect()));
     let mut rects = Vec::with_capacity(tabs.len());
-    let mut x = bar.left() + 8.0;
     for (index, tab) in tabs.iter().enumerate() {
-        let rect = Rect::from_min_size(Pos2::new(x, bar.top()), Vec2::new(width, TABBAR_HEIGHT));
+        let rect = tab_slot(bar, width, state.scroll, index);
         rects.push(rect);
-        x += width + TAB_GAP;
-        draw_tab(ui, palette, tab, rect, index, &mut actions, state);
+        draw_tab(&mut strip, palette, tab, rect, index, &mut actions, state);
     }
 
-    // New tab button at the end of the strip.
-    let new_rect = Rect::from_min_size(
-        Pos2::new(x + 2.0, bar.top()),
-        Vec2::new(NEW_TAB_WIDTH, TABBAR_HEIGHT),
-    );
     let new_button = ui.interact(new_rect, Id::unique("wassh-tab-new"), Sense::click());
-    let colour = if new_button.hovered() {
-        to_color32(palette.text)
-    } else {
-        to_color32(palette.text_muted)
-    };
-    if new_button.hovered() {
-        ui.painter()
-            .rect_filled(new_rect.shrink2(Vec2::new(2.0, 6.0)), 4, to_color32(palette.bg_panel));
-    }
+    let hovered = new_button.hovered();
+    let button = new_rect.shrink2(NEW_TAB_INSET);
+    ui.painter().rect_filled(
+        button,
+        wassh_core::RADIUS,
+        to_color32(if hovered {
+            palette.bg_panel
+        } else {
+            palette.bg_input
+        }),
+    );
+    ui.painter().rect_stroke(
+        button,
+        wassh_core::RADIUS,
+        egui::Stroke::new(
+            1.0,
+            to_color32(if hovered {
+                palette.accent
+            } else {
+                palette.border
+            }),
+        ),
+        egui::StrokeKind::Inside,
+    );
     ui.painter().text(
-        new_rect.center(),
+        button.center(),
         Align2::CENTER_CENTER,
         "+",
-        FontId::proportional(16.0),
-        colour,
+        FontId::proportional(NEW_TAB_GLYPH_SIZE),
+        to_color32(if hovered {
+            palette.text
+        } else {
+            palette.text_muted
+        }),
     );
     if new_button.clicked() {
         actions.push(TabAction::NewTab);
     }
+    new_button.on_hover_text("New local terminal tab");
 
     // Finish or cancel a drag once the pointer is released.
     let released = ui.ctx().input(|input| input.pointer.any_released());
@@ -224,7 +303,7 @@ fn draw_tab(
     };
     let fill = colors::row_background(tab.accent, backdrop, tab.active, response.hovered());
     ui.painter().rect_filled(
-        Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() + 1.0)),
+        Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() + TAB_BOTTOM_OVERLAP)),
         egui::CornerRadius {
             nw: wassh_core::RADIUS as u8,
             ne: wassh_core::RADIUS as u8,
@@ -353,18 +432,194 @@ fn draw_tab(
             egui::StrokeKind::Inside,
         );
     }
+    response.on_hover_text(tab.title);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SCREEN: Rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1200.0, 600.0));
+    const TITLES: [&str; 20] = [
+        "t00", "t01", "t02", "t03", "t04", "t05", "t06", "t07", "t08", "t09", "t10", "t11", "t12",
+        "t13", "t14", "t15", "t16", "t17", "t18", "t19",
+    ];
+
+    fn tabs(count: usize) -> Vec<TabView<'static>> {
+        TITLES[..count]
+            .iter()
+            .map(|title| TabView {
+                id: title,
+                title,
+                status: SessionStatus::Connected,
+                active: false,
+                accent: None,
+            })
+            .collect()
+    }
+
+    /// One frame of the strip; returns the strip rect. `pointer` and `wheel` are the input.
+    fn frame(
+        ctx: &egui::Context,
+        tabs: &[TabView<'static>],
+        state: &mut TabBarState,
+        pointer: Option<Pos2>,
+        wheel: Vec2,
+    ) -> Rect {
+        let mut input = egui::RawInput {
+            screen_rect: Some(SCREEN),
+            ..Default::default()
+        };
+        if let Some(pos) = pointer {
+            input.events.push(egui::Event::PointerMoved(pos));
+        }
+        if wheel != Vec2::ZERO {
+            input.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: wheel,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let mut bar = Rect::NOTHING;
+        ctx.run_ui(input, |ui| {
+            tab_bar(ui, &Palette::dark(), tabs, state);
+            bar = ui.min_rect();
+        })
+        .drop_without_applying_deltas();
+        bar
+    }
+
+    /// Frames needed for egui's smoothed wheel delta to be fully delivered.
+    const WHEEL_FRAMES: usize = 20;
+
+    /// Turn the wheel at `pointer` and let egui finish delivering the delta.
+    fn wheel(
+        ctx: &egui::Context,
+        tabs: &[TabView<'static>],
+        state: &mut TabBarState,
+        pointer: Pos2,
+        delta: Vec2,
+    ) {
+        frame(ctx, tabs, state, Some(pointer), delta);
+        for _ in 0..WHEEL_FRAMES {
+            frame(ctx, tabs, state, Some(pointer), Vec2::ZERO);
+        }
+    }
+
+    fn assert_scrolled(state: &TabBarState, expected: f32) {
+        assert!(
+            (state.scroll - expected).abs() < 0.5,
+            "expected {expected}, got {}",
+            state.scroll
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_tabs_sideways() {
+        let ctx = egui::Context::default();
+        let tabs = tabs(TITLES.len());
+        let mut state = TabBarState::new();
+        let bar = frame(&ctx, &tabs, &mut state, None, Vec2::ZERO);
+        assert!(max_scroll(tabs.len(), bar.width()) > 0.0, "the tabs must overflow");
+        assert_eq!(state.scroll, 0.0);
+
+        // Wheel down reveals the tabs on the right.
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -40.0));
+        assert_scrolled(&state, 40.0);
+
+        // Wheel up scrolls back towards the first tab.
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, 15.0));
+        assert_scrolled(&state, 25.0);
+
+        // Horizontal wheels and trackpad tilt work the same way.
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(10.0, 0.0));
+        assert_scrolled(&state, 15.0);
+    }
+
+    #[test]
+    fn scrolling_stops_at_both_ends() {
+        let ctx = egui::Context::default();
+        let tabs = tabs(TITLES.len());
+        let mut state = TabBarState::new();
+        let bar = frame(&ctx, &tabs, &mut state, None, Vec2::ZERO);
+        let limit = max_scroll(tabs.len(), bar.width());
+
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -10_000.0));
+        assert_eq!(state.scroll, limit);
+
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, 10_000.0));
+        assert_eq!(state.scroll, 0.0);
+    }
+
+    #[test]
+    fn the_wheel_outside_the_strip_leaves_the_tabs_alone() {
+        let ctx = egui::Context::default();
+        let tabs = tabs(TITLES.len());
+        let mut state = TabBarState::new();
+        let bar = frame(&ctx, &tabs, &mut state, None, Vec2::ZERO);
+
+        let below = Pos2::new(bar.center().x, bar.bottom() + 200.0);
+        wheel(&ctx, &tabs, &mut state, below, Vec2::new(0.0, -40.0));
+        assert_eq!(state.scroll, 0.0);
+    }
+
+    #[test]
+    fn tabs_that_fit_never_scroll() {
+        let ctx = egui::Context::default();
+        let tabs = tabs(2);
+        let mut state = TabBarState::new();
+        let bar = frame(&ctx, &tabs, &mut state, None, Vec2::ZERO);
+        assert_eq!(max_scroll(tabs.len(), bar.width()), 0.0);
+
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -400.0));
+        assert_eq!(state.scroll, 0.0);
+    }
+
+    #[test]
+    fn closing_tabs_back_into_view_resets_the_scroll() {
+        let ctx = egui::Context::default();
+        let many = tabs(TITLES.len());
+        let mut state = TabBarState::new();
+        let bar = frame(&ctx, &many, &mut state, None, Vec2::ZERO);
+        wheel(&ctx, &many, &mut state, bar.center(), Vec2::new(0.0, -400.0));
+        assert!(state.scroll > 0.0);
+
+        frame(&ctx, &tabs(2), &mut state, None, Vec2::ZERO);
+        assert_eq!(state.scroll, 0.0);
+    }
+
     #[test]
     fn tab_width_is_capped_and_floored() {
         assert_eq!(tab_width(1, 1200.0), TAB_MAX_WIDTH);
         assert_eq!(tab_width(20, 400.0), TAB_MIN_WIDTH);
-        let natural = tab_width(4, 4.0 * 150.0 + 3.0 * TAB_GAP + NEW_TAB_WIDTH);
+        let available = 4.0 * 150.0
+            + 3.0 * TAB_GAP
+            + 2.0 * TAB_STRIP_PADDING
+            + NEW_TAB_WIDTH
+            + NEW_TAB_GAP;
+        let natural = tab_width(4, available);
         assert!((natural - 150.0).abs() < 0.01, "got {natural}");
+    }
+
+    #[test]
+    fn tabs_that_fit_end_before_the_new_tab_button() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, TABBAR_HEIGHT));
+        for count in 1..=40 {
+            let width = tab_width(count, bar.width());
+            if max_scroll(count, bar.width()) > 0.5 {
+                continue;
+            }
+            let last = tab_slot(bar, width, 0.0, count - 1);
+            let button = new_tab_slot(bar, width, count, 0.0);
+            assert!(
+                last.right() <= button.left(),
+                "{count} tabs: tab ends at {} but the button starts at {}",
+                last.right(),
+                button.left()
+            );
+        }
     }
 
     #[test]
@@ -390,4 +645,3 @@ mod tests {
         );
     }
 }
-    response.on_hover_text(tab.title);
