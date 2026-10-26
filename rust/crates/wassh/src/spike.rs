@@ -319,7 +319,7 @@ impl SpikeApp {
             return;
         }
         let modes = self.terminal.modes();
-        for input in wassh_ui::collect_terminal_input(ctx) {
+        for input in wassh_ui::collect_terminal_input(ctx, false) {
             let bytes = match input {
                 TerminalInput::Text(text) => text.into_bytes(),
                 TerminalInput::Key(stroke) => encode(&stroke, modes),

@@ -1620,7 +1620,9 @@ impl Shell {
 
     /// Ask the integration for the clipboard contents; the text arrives as a paste event and
     /// is typed into the terminal from there.
-    fn paste_clipboard(&self, ctx: &egui::Context) {
+    fn paste_clipboard(&mut self, ctx: &egui::Context) {
+        // A plain Ctrl+V produces the same event, so remember that this one is ours.
+        self.paste_deadline = Some(std::time::Instant::now() + PASTE_WAIT);
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
     }
 
@@ -1633,41 +1635,41 @@ impl Shell {
         let mut copy = false;
         let mut paste = false;
         ctx.input_mut(|input| {
-            if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::P)
-                || input.consume_key(Modifiers::NONE, Key::F1)
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::P)
+                || consume_chord(input, Modifiers::NONE, Key::F1)
             {
                 palette = true;
             }
-            if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::T) {
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::T) {
                 commands.push(Command::ReopenTab);
             }
-            // Ctrl+W is the tab convention everywhere; Ctrl+Shift+W and Ctrl+F4 keep working
-            // for people used to the older terminal bindings.
-            if input.consume_key(Modifiers::CTRL, Key::W)
-                || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::W)
-                || input.consume_key(Modifiers::CTRL, Key::F4)
+            // Ctrl+W belongs to the shell (Emacs and readline use it to delete a word),
+            // so only the shifted form and Ctrl+F4 close a tab.
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::W)
+                || consume_chord(input, Modifiers::CTRL, Key::F4)
             {
                 commands.push(Command::CloseTab);
             }
-            // Ctrl+Shift+C / Ctrl+Insert copy the selection, Ctrl+Shift+V / Shift+Insert paste,
-            // so the plain Ctrl+C / Ctrl+V still reach the shell as ^C / ^V.
-            if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::C)
-                || input.consume_key(Modifiers::CTRL, Key::Insert)
+            // Ctrl+Shift+C / Ctrl+Insert copy the selection, Ctrl+Shift+V / Shift+Insert
+            // paste. Every other Ctrl combination — Ctrl+C and Ctrl+Z above all — reaches
+            // the shell, so nothing else here may claim one.
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::C)
+                || consume_chord(input, Modifiers::CTRL, Key::Insert)
             {
                 copy = true;
             }
-            if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::V)
-                || input.consume_key(Modifiers::SHIFT, Key::Insert)
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::V)
+                || consume_chord(input, Modifiers::SHIFT, Key::Insert)
             {
                 paste = true;
             }
-            if input.consume_key(Modifiers::CTRL, Key::Tab) {
+            if consume_chord(input, Modifiers::CTRL, Key::Tab) {
                 commands.push(Command::NextTab);
             }
-            if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab) {
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::Tab) {
                 commands.push(Command::PreviousTab);
             }
-            if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F) {
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::F) {
                 commands.push(Command::Find);
             }
         });
@@ -1804,7 +1806,16 @@ impl Shell {
         let Some(index) = self.active else {
             return;
         };
-        let inputs = wassh_ui::collect_terminal_input(ctx);
+        let paste_pending = self
+            .paste_deadline
+            .is_some_and(|deadline| deadline > std::time::Instant::now());
+        let inputs = wassh_ui::collect_terminal_input(ctx, paste_pending);
+        if inputs
+            .iter()
+            .any(|input| matches!(input, wassh_ui::TerminalInput::Paste(_)))
+        {
+            self.paste_deadline = None;
+        }
         if inputs.is_empty() {
             return;
         }
@@ -3183,6 +3194,12 @@ mod tests {
     }
 
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        // egui-winit fills `command` from Ctrl (Cmd on macOS) on every real event, so a
+        // shortcut test that leaves it unset would not exercise what the app actually sees.
+        let modifiers = egui::Modifiers {
+            command: modifiers.ctrl || modifiers.mac_cmd,
+            ..modifiers
+        };
         egui::Event::Key {
             key,
             physical_key: None,
@@ -3192,15 +3209,231 @@ mod tests {
         }
     }
 
+    /// Whether the frame asked the integration for the clipboard contents.
+    fn requested_paste(output: &egui::FullOutput) -> bool {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| {
+                viewport
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::RequestPaste))
+            })
+    }
+
+    /// The delay one frame asked the platform to wait before painting again.
+    ///
+    /// Needs a context that outlives the call: a fresh context asks for an immediate
+    /// repaint to upload its fonts, which would mask the cadence.
+    fn repaint_delay(
+        ctx: &egui::Context,
+        shell: &mut Shell,
+        events: Vec<egui::Event>,
+    ) -> Duration {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| shell.frame(ui));
+        let delay = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::ZERO, |viewport| viewport.repaint_delay);
+        output.drop_without_applying_deltas();
+        delay
+    }
+
     #[test]
-    fn ctrl_w_closes_the_active_tab() {
+    fn a_quiet_window_repaints_slowly_and_activity_speeds_it_up() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        let ctx = egui::Context::default();
+        // Let fonts, textures and the restored tab settle first.
+        for _ in 0..3 {
+            repaint_delay(&ctx, &mut shell, Vec::new());
+        }
+
+        // A settled window is only polled: a static pane (the monitor, say) cannot
+        // burn the CPU by being redrawn sixty times a second.
+        shell.active_until = None;
+        assert_eq!(
+            repaint_delay(&ctx, &mut shell, Vec::new()),
+            IDLE_INTERVAL
+        );
+
+        // A keystroke opens the active window, so the echo is painted as soon as it
+        // lands instead of waiting for the idle poll. (The delay reported by the key
+        // frame itself is always zero: egui repaints immediately after input.)
+        repaint_delay(
+            &ctx,
+            &mut shell,
+            vec![key_event(egui::Key::A, egui::Modifiers::NONE)],
+        );
+        assert!(
+            shell
+                .active_until
+                .is_some_and(|until| until > std::time::Instant::now()),
+            "a keystroke must open the active repaint window"
+        );
+
+        // Output from the shell does the same.
+        shell.active_until = None;
+        shell.sessions[0].send(b"echo hello\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while shell.active_until.is_none() && std::time::Instant::now() < deadline {
+            repaint_delay(&ctx, &mut shell, Vec::new());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            shell.active_until.is_some(),
+            "the shell's answer never asked for a repaint"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_belongs_to_the_shell() {
         let mut shell = Shell::new_with(Some(scratch_config()), false);
         shell.open_local();
         shell.open_local();
         assert_eq!(shell.sessions.len(), 2);
 
+        // Emacs and readline delete a word with Ctrl+W, so the tab stays open.
         frame_with_events(&mut shell, vec![key_event(egui::Key::W, egui::Modifiers::CTRL)]);
-        assert_eq!(shell.sessions.len(), 1, "Ctrl+W closed one tab");
+        assert_eq!(shell.sessions.len(), 2, "Ctrl+W closed a tab");
+
+        // The shifted form and Ctrl+F4 still close it.
+        frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::W,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(shell.sessions.len(), 1, "Ctrl+Shift+W closes one tab");
+        frame_with_events(&mut shell, vec![key_event(egui::Key::F4, egui::Modifiers::CTRL)]);
+        assert!(shell.sessions.is_empty(), "Ctrl+F4 closes the last tab");
+    }
+
+    #[test]
+    fn a_shifted_key_is_not_swallowed_by_the_plain_binding() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        shell.open_local();
+        shell.open_local();
+        shell.active = Some(1);
+
+        frame_with_events(&mut shell, vec![key_event(egui::Key::Tab, egui::Modifiers::CTRL)]);
+        assert_eq!(shell.active, Some(2), "Ctrl+Tab cycles forward");
+
+        frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::Tab,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(
+            shell.active,
+            Some(1),
+            "Ctrl+Shift+Tab goes back instead of reusing the Ctrl+Tab binding"
+        );
+
+        // Ctrl+F1 is the program's, not the command palette's.
+        frame_with_events(&mut shell, vec![key_event(egui::Key::F1, egui::Modifiers::CTRL)]);
+        assert!(
+            shell.dialogs.palette.is_none(),
+            "Ctrl+F1 must reach the terminal"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_a_running_command() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        let ctx = egui::Context::default();
+        // Start something that will not finish on its own.
+        shell.sessions[0].send(b"sleep 60\r");
+        run_shell(&mut shell, &ctx, 3);
+
+        // Ctrl+C arrives from egui as a clipboard event.
+        frame_with_events(&mut shell, vec![egui::Event::Copy]);
+        run_shell(&mut shell, &ctx, 3);
+
+        // Only a shell that got `^C` reads the next line; `sleep` ignores its stdin, so
+        // without the interrupt the answer would not come for a minute.
+        shell.sessions[0].send(b"echo ready-$((1+1))\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut answered = false;
+        while !answered && std::time::Instant::now() < deadline {
+            run_shell(&mut shell, &ctx, 1);
+            answered = shell.sessions[0].visible_text().contains("ready-2");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(answered, "Ctrl+C never reached the shell");
+    }
+
+    #[test]
+    fn ctrl_z_suspends_a_running_command() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        let ctx = egui::Context::default();
+        shell.sessions[0].send(b"sleep 60\r");
+        run_shell(&mut shell, &ctx, 3);
+
+        // Ctrl+Z is an ordinary key event; it must not be claimed by any app shortcut.
+        frame_with_events(&mut shell, vec![key_event(egui::Key::Z, egui::Modifiers::CTRL)]);
+        run_shell(&mut shell, &ctx, 3);
+
+        shell.sessions[0].send(b"echo ready-$((2+2))\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut answered = false;
+        while !answered && std::time::Instant::now() < deadline {
+            run_shell(&mut shell, &ctx, 1);
+            answered = shell.sessions[0].visible_text().contains("ready-4");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(answered, "Ctrl+Z never reached the shell");
+    }
+
+    #[test]
+    fn ctrl_f4_closes_the_active_session() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        shell.open_local();
+        shell.open_local();
+        let ids: Vec<String> = shell.sessions.iter().map(|entry| entry.id.clone()).collect();
+        shell.active = Some(1);
+
+        frame_with_events(&mut shell, vec![key_event(egui::Key::F4, egui::Modifiers::CTRL)]);
+
+        let remaining: Vec<String> = shell.sessions.iter().map(|entry| entry.id.clone()).collect();
+        assert_eq!(
+            remaining,
+            vec![ids[0].clone(), ids[2].clone()],
+            "Ctrl+F4 closes the session in front of the user, not just the last tab"
+        );
+        assert_eq!(shell.active, Some(1), "the neighbour takes over");
+        assert_eq!(shell.closed.len(), 1, "and it can be reopened");
+    }
+
+    #[test]
+    fn ctrl_c_is_not_a_copy_shortcut() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+
+        // egui reports the platform's Ctrl+C as a clipboard event; the terminal must get
+        // `^C` (SIGINT) instead of the app copying an empty selection.
+        let output = frame_with_events(&mut shell, vec![egui::Event::Copy]);
+        let copied = output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(_))
+        });
+        assert!(!copied, "Ctrl+C was treated as copy");
+        assert!(shell.toasts.is_empty(), "Ctrl+C must not warn about a selection");
     }
 
     #[test]
@@ -3279,7 +3512,13 @@ mod tests {
         assert!(shell.sessions.is_empty(), "Ctrl+Shift+T opened a tab");
 
         shell.open_local();
-        frame_with_events(&mut shell, vec![key_event(egui::Key::W, egui::Modifiers::CTRL)]);
+        frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::W,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
         assert!(shell.sessions.is_empty());
         assert_eq!(shell.closed.len(), 1);
 
@@ -3338,16 +3577,23 @@ mod tests {
             &mut shell,
             vec![key_event(egui::Key::Insert, egui::Modifiers::SHIFT)],
         );
-        let requested = output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|viewport| {
-                viewport
-                    .commands
-                    .iter()
-                    .any(|command| matches!(command, egui::ViewportCommand::RequestPaste))
-            });
-        assert!(requested, "Shift+Insert requests a paste");
+        assert!(
+            requested_paste(&output),
+            "Shift+Insert requests a paste"
+        );
+
+        // Ctrl+Shift+V does the same, with the `command` flag a real Ctrl press carries.
+        let output = frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::V,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert!(
+            requested_paste(&output),
+            "Ctrl+Shift+V requests a paste"
+        );
     }
 
     #[test]

@@ -18,7 +18,11 @@ pub enum TerminalInput {
 }
 
 /// Collect terminal input from this frame's events.
-pub fn collect(ctx: &egui::Context) -> Vec<TerminalInput> {
+///
+/// `paste_pending` says whether a clipboard paste was asked for: the platform's paste
+/// shortcut produces the same [`egui::Event::Paste`], and there the key belongs to the
+/// shell (`^V` is readline's "literal next").
+pub fn collect(ctx: &egui::Context, paste_pending: bool) -> Vec<TerminalInput> {
     ctx.input(|input| {
         let mut out = Vec::new();
         for event in &input.events {
@@ -28,7 +32,18 @@ pub fn collect(ctx: &egui::Context) -> Vec<TerminalInput> {
                         out.push(TerminalInput::Text(text.clone()));
                     }
                 }
-                egui::Event::Paste(text) => out.push(TerminalInput::Paste(text.clone())),
+                // egui turns the platform's Ctrl+C / Ctrl+X / Ctrl+V into clipboard
+                // events before the terminal sees them. Put the control codes back: a
+                // shell needs `^C` to interrupt, and `^X` / `^V` are its own bindings.
+                egui::Event::Copy => out.push(TerminalInput::Key(ctrl_char('c'))),
+                egui::Event::Cut => out.push(TerminalInput::Key(ctrl_char('x'))),
+                egui::Event::Paste(text) => {
+                    if paste_pending {
+                        out.push(TerminalInput::Paste(text.clone()));
+                    } else {
+                        out.push(TerminalInput::Key(ctrl_char('v')));
+                    }
+                }
                 egui::Event::Key {
                     key,
                     pressed: true,
@@ -44,6 +59,16 @@ pub fn collect(ctx: &egui::Context) -> Vec<TerminalInput> {
         }
         out
     })
+}
+
+/// `Ctrl+<ch>` as a key stroke, which [`wassh_term::encode`] turns into a control code.
+fn ctrl_char(ch: char) -> KeyStroke {
+    KeyStroke {
+        key: Key::Char(ch),
+        ctrl: true,
+        alt: false,
+        shift: false,
+    }
 }
 
 fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyStroke> {
@@ -189,5 +214,58 @@ mod tests {
             map_key(egui::Key::F5, egui::Modifiers::NONE).unwrap().key,
             Key::Function(5)
         );
+    }
+
+    /// Collect from `events`, as one headless frame would.
+    fn inputs_for(events: Vec<egui::Event>, paste_pending: bool) -> Vec<TerminalInput> {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(640.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        raw.events = events;
+        let mut collected = Vec::new();
+        let output = ctx.run_ui(raw, |ui| {
+            collected = collect(ui.ctx(), paste_pending);
+        });
+        output.drop_without_applying_deltas();
+        collected
+    }
+
+    #[test]
+    fn the_platform_clipboard_shortcuts_still_reach_the_shell() {
+        // egui reports Ctrl+C / Ctrl+X / Ctrl+V as clipboard events, never as keys; a
+        // shell needs `^C` to interrupt a command, and `^X` / `^V` for its own bindings.
+        let inputs = inputs_for(vec![egui::Event::Copy, egui::Event::Cut], false);
+        assert_eq!(
+            inputs,
+            vec![
+                TerminalInput::Key(ctrl_char('c')),
+                TerminalInput::Key(ctrl_char('x')),
+            ]
+        );
+        assert_eq!(
+            inputs_for(vec![egui::Event::Paste("clip".to_owned())], false),
+            vec![TerminalInput::Key(ctrl_char('v'))]
+        );
+    }
+
+    #[test]
+    fn a_requested_paste_is_pasted_not_typed_as_ctrl_v() {
+        assert_eq!(
+            inputs_for(vec![egui::Event::Paste("clip".to_owned())], true),
+            vec![TerminalInput::Paste("clip".to_owned())]
+        );
+    }
+
+    #[test]
+    fn control_codes_encode_as_the_shell_expects() {
+        let modes = wassh_term::SnapshotModes::default();
+        assert_eq!(wassh_term::encode(&ctrl_char('c'), modes), vec![0x03]);
+        assert_eq!(wassh_term::encode(&ctrl_char('z'), modes), vec![0x1a]);
+        assert_eq!(wassh_term::encode(&ctrl_char('w'), modes), vec![0x17]);
     }
 }
