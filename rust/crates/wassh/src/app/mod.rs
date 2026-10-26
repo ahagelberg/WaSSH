@@ -51,24 +51,18 @@ const PLUGIN_MENU_LABELS: &[&str] = &[
 const MENUS: &[wassh_ui::titlebar::Menu] = &[
     (
         "File",
-        &[
-            "New tab",
-            "New host…",
-            "Reopen closed tab",
-            "",
-            "Options…",
-            "Quit",
-        ],
+        &["New tab", "New hostâ€¦", "", "Optionsâ€¦", "Quit"],
     ),
-    ("Edit", &["Copy", "Paste", "", "Find…"]),
+    ("Edit", &["Copy", "Paste", "", "Findâ€¦"]),
     (
         "Session",
         &[
             "Reconnect",
             "Reconnect all",
+            "Reopen closed tab",
             "",
-            "Session settings…",
-            "Tunnels…",
+            "Session settingsâ€¦",
+            "Tunnelsâ€¦",
         ],
     ),
     (
@@ -1331,6 +1325,7 @@ impl Shell {
                     self.close(index);
                 }
             }
+            Command::ReopenTab => self.reopen_closed(),
             Command::NextTab => self.cycle_tab(true),
             Command::PreviousTab => self.cycle_tab(false),
             Command::Find => {
@@ -1348,15 +1343,15 @@ impl Shell {
             "Copy" => self.copy_selection(ctx),
             "Paste" => self.paste_clipboard(ctx),
             "New tab" => self.handle_command(Command::NewLocalTab),
-            "New host…" => self.handle_command(Command::NewHost),
-            "Reopen closed tab" => self.reopen_closed(),
-            "Options…" => self.handle_command(Command::OpenOptions),
+            "New hostâ€¦" => self.handle_command(Command::NewHost),
+            "Reopen closed tab" => self.handle_command(Command::ReopenTab),
+            "Optionsâ€¦" => self.handle_command(Command::OpenOptions),
             "Quit" => self.handle_command(Command::Quit),
-            "Find…" => self.handle_command(Command::Find),
+            "Findâ€¦" => self.handle_command(Command::Find),
             "Reconnect" => self.handle_command(Command::Reconnect),
             "Reconnect all" => self.handle_command(Command::ReconnectAll),
-            "Session settings…" => self.handle_command(Command::EditHost),
-            "Tunnels…" => self.handle_command(Command::OpenTunnels),
+            "Session settingsâ€¦" => self.handle_command(Command::EditHost),
+            "Tunnelsâ€¦" => self.handle_command(Command::OpenTunnels),
             "Zoom In" => {
                 self.zoom = (self.zoom + 1.0).min(30.0);
                 self.apply_zoom();
@@ -1481,7 +1476,7 @@ impl Shell {
                 palette = true;
             }
             if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::T) {
-                commands.push(Command::NewLocalTab);
+                commands.push(Command::ReopenTab);
             }
             // Ctrl+W is the tab convention everywhere; Ctrl+Shift+W and Ctrl+F4 keep working
             // for people used to the older terminal bindings.
@@ -2826,6 +2821,91 @@ mod tests {
 
         frame_with_events(&mut shell, vec![key_event(egui::Key::W, egui::Modifiers::CTRL)]);
         assert_eq!(shell.sessions.len(), 1, "Ctrl+W closed one tab");
+    }
+
+    #[test]
+    fn a_tab_closes_when_its_shell_exits() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        shell.open_local();
+        assert_eq!(shell.sessions.len(), 1);
+
+        // Type `exit` until the shell has taken it, then let the shell pump.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut typed = 0;
+        while !shell.sessions.is_empty() && std::time::Instant::now() < deadline {
+            if typed < 5 {
+                shell.sessions[0].send(b"exit\r\n");
+                typed += 1;
+            }
+            run_shell(&mut shell, &ctx, 1);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            shell.sessions.is_empty(),
+            "a shell that exits must take its tab with it"
+        );
+        assert_eq!(shell.closed.len(), 1, "and stay reopenable");
+    }
+
+    #[test]
+    fn a_failed_connection_keeps_its_tab_and_retries() {
+        use wassh_core::ReconnectMode;
+
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        // Nothing listens on port 1, so the connect fails immediately.
+        let connection = ConnectionParams {
+            kind: ConnectionType::Ssh,
+            host: "127.0.0.1".to_owned(),
+            port: 1,
+            username: "nobody".to_owned(),
+            auth: AuthMethod::None,
+            reconnect: ReconnectMode::Always,
+            ..ConnectionParams::default()
+        };
+        shell.start_ssh(connection, None, Secrets::default());
+        assert_eq!(shell.sessions.len(), 1);
+
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while shell.sessions[0].status != SessionStatus::Reconnecting
+            && std::time::Instant::now() < deadline
+        {
+            run_shell(&mut shell, &ctx, 1);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert_eq!(shell.sessions.len(), 1, "a failed connection keeps its tab");
+        assert_eq!(
+            shell.sessions[0].status,
+            SessionStatus::Reconnecting,
+            "and the reconnect policy takes over"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_t_reopens_the_closed_tab() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let reopen = || {
+            vec![key_event(
+                egui::Key::T,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )]
+        };
+
+        // Nothing closed yet: the shortcut must not open a fresh local tab.
+        frame_with_events(&mut shell, reopen());
+        assert!(shell.sessions.is_empty(), "Ctrl+Shift+T opened a tab");
+
+        shell.open_local();
+        frame_with_events(&mut shell, vec![key_event(egui::Key::W, egui::Modifiers::CTRL)]);
+        assert!(shell.sessions.is_empty());
+        assert_eq!(shell.closed.len(), 1);
+
+        frame_with_events(&mut shell, reopen());
+        assert_eq!(shell.sessions.len(), 1, "Ctrl+Shift+T reopened the tab");
+        assert!(shell.closed.is_empty());
     }
 
     #[test]
