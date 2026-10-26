@@ -20,7 +20,7 @@ use super::agent::{
     Turn, SUMMARY_SYSTEM_PROMPT,
 };
 use super::protocol::{
-    default_providers, Protocol, ProviderConfig, CONVERSATIONS_PER_HOST_MAX, DATA_VERSION,
+    Protocol, ProviderConfig, CONVERSATIONS_PER_HOST_MAX, DATA_VERSION,
     DEFAULT_CHAT_TITLE, MAX_ATTACHMENTS,
     MAX_ATTACHMENT_CHARS, MAX_ATTACHMENT_BYTES, PROVIDER_OPENROUTER, SAFE_RULES,
     SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
@@ -225,17 +225,12 @@ pub struct AiAgent {
 
 impl Default for AiAgent {
     fn default() -> Self {
-        let providers = default_providers();
-        let model = providers
-            .first()
-            .and_then(|provider| provider.models.first().cloned())
-            .unwrap_or_default();
         Self {
             agent: Agent::new(),
             chats: Vec::new(),
-            providers,
+            providers: Vec::new(),
             provider: 0,
-            model,
+            model: String::new(),
             keys: std::collections::BTreeMap::new(),
             draft: String::new(),
             attachments: Vec::new(),
@@ -498,8 +493,7 @@ impl AiAgent {
         self.providers = settings
             .get(PROVIDERS_KEY)
             .and_then(|value| serde_json::from_value::<Vec<ProviderConfig>>(value.clone()).ok())
-            .filter(|providers| !providers.is_empty())
-            .unwrap_or_else(default_providers);
+            .unwrap_or_default();
         self.keys = self
             .providers
             .iter()
@@ -516,7 +510,8 @@ impl AiAgent {
             .min(self.providers.len().saturating_sub(1));
         // A conversation without a model starts on the provider's first one.
         if self.model.is_empty()
-            && let Some(model) = self.providers[self.provider].models.first()
+            && let Some(provider) = self.providers.get(self.provider)
+            && let Some(model) = provider.models.first()
         {
             self.model.clone_from(model);
         }
@@ -572,7 +567,8 @@ impl AiAgent {
                     provider.models = models;
                 }
                 if self.model.is_empty()
-                    && let Some(model) = self.providers[index].models.first()
+                    && let Some(provider) = self.providers.get(index)
+                    && let Some(model) = provider.models.first()
                 {
                     self.model.clone_from(model);
                 }
@@ -1270,13 +1266,25 @@ impl Plugin for AiAgent {
                 {
                     self.agent.stop();
                 }
-            } else if small_button_enabled(ui, palette, "Send", !self.draft.trim().is_empty()) {
+            } else if small_button_enabled(
+                ui,
+                palette,
+                "Send",
+                !self.providers.is_empty() && !self.draft.trim().is_empty(),
+            ) {
                 submit = true;
             }
         });
 
         // Provider and model under the composer, like the reference footer.
         let footer_room = ((ui.available_width() - FOOTER_GAP) / 2.0).max(FOOTER_SELECT_MIN_WIDTH);
+        if self.providers.is_empty() {
+            ui.label(
+                egui::RichText::new("No model providers configured — add one in Options.")
+                    .size(FOOTER_TEXT_SIZE)
+                    .color(muted),
+            );
+        }
         let (chosen_provider, chosen_model) = {
             let provider_options: Vec<(usize, &str)> = self
                 .providers
@@ -1294,26 +1302,31 @@ impl Plugin for AiAgent {
                         .collect()
                 })
                 .unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = FOOTER_GAP;
-                // The reference footer is set in the same small type as the rest.
-                ui.style_mut().text_styles.insert(
-                    egui::TextStyle::Button,
-                    egui::FontId::proportional(FOOTER_TEXT_SIZE),
-                );
-                let provider =
-                    select_width(ui, "ai-provider", &self.provider, &provider_options, footer_room);
-                let model = select_width(ui, "ai-model", &self.model, &model_options, footer_room);
-                (provider, model)
-            })
-            .inner
+            if self.providers.is_empty() {
+                (None, None)
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = FOOTER_GAP;
+                    // The reference footer is set in the same small type as the rest.
+                    ui.style_mut().text_styles.insert(
+                        egui::TextStyle::Button,
+                        egui::FontId::proportional(FOOTER_TEXT_SIZE),
+                    );
+                    let provider =
+                        select_width(ui, "ai-provider", &self.provider, &provider_options, footer_room);
+                    let model = select_width(ui, "ai-model", &self.model, &model_options, footer_room);
+                    (provider, model)
+                })
+                .inner
+            }
         };
         if let Some(index) = chosen_provider {
             self.provider = index;
             // A provider starts on its first model, like the reference.
-            self.model = self.providers[index]
-                .models
-                .first()
+            self.model = self
+                .providers
+                .get(index)
+                .and_then(|provider| provider.models.first())
                 .cloned()
                 .unwrap_or_default();
         }
@@ -1442,9 +1455,13 @@ mod tests {
     fn the_pane_opens_on_a_provider_with_a_hint() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
+        // Nothing is configured yet, so the pane says where to add a provider.
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
-        assert!(texts.contains(&"Ollama"), "provider picker missing: {texts:?}");
+        assert!(
+            texts.contains(&"No model providers configured — add one in Options."),
+            "the missing-provider hint is not shown: {texts:?}"
+        );
         assert!(
             texts.contains(&"Ask anything about this session."),
             "empty hint missing: {texts:?}"
@@ -1675,7 +1692,14 @@ mod tests {
     #[test]
     fn a_failed_model_fetch_keeps_the_configured_list() {
         let mut plugin = AiAgent::default();
-        plugin.providers[0].models = vec!["kept".to_owned()];
+        plugin.providers.push(ProviderConfig {
+            id: "one".to_owned(),
+            name: "First".to_owned(),
+            protocol: Protocol::Openai,
+            base_url: "https://one/v1".to_owned(),
+            models: vec!["kept".to_owned()],
+            embedding_model: None,
+        });
         let (sender, events) = std::sync::mpsc::channel();
         plugin.fetch = Some((0, events));
         sender.send(Err("no route".to_owned())).expect("send");

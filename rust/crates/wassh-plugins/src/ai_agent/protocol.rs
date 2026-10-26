@@ -141,6 +141,10 @@ pub const PROVIDER_ANTHROPIC: &str = "anthropic";
 pub const PROVIDER_DEEPSEEK: &str = "deepseek";
 /// Provider id of xAI.
 pub const PROVIDER_GROK: &str = "grok";
+/// Provider id of OpenAI.
+pub const PROVIDER_OPENAI: &str = "openai";
+/// Id prefix of a provider the user fills in themselves.
+pub const CUSTOM_PROVIDER_PREFIX: &str = "custom-";
 
 /// Which wire format a provider speaks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,51 +196,86 @@ pub struct ProviderConfig {
     pub embedding_model: Option<String>,
 }
 
-/// The providers the reference ships with.
-pub fn default_providers() -> Vec<ProviderConfig> {
-    let provider = |id: &str, name: &str, protocol, base_url: &str, models: &[&str]| ProviderConfig {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        protocol,
-        base_url: base_url.to_owned(),
-        models: models.iter().map(|model| (*model).to_owned()).collect(),
-        embedding_model: None,
-    };
-    vec![
-        provider(PROVIDER_OLLAMA, "Ollama", Protocol::Openai, "http://127.0.0.1:11434/v1", &[]),
-        provider(
-            PROVIDER_OPENROUTER,
-            "Open Router",
-            Protocol::Openai,
-            "https://openrouter.ai/api/v1",
-            &["anthropic/claude-sonnet-4-20250514"],
-        ),
-        provider(
-            PROVIDER_ANTHROPIC,
-            "Anthropic",
-            Protocol::Anthropic,
-            "https://api.anthropic.com",
-            &[
-                "claude-sonnet-4-20250514",
-                "claude-opus-4-20250514",
-                "claude-3-5-haiku-20241022",
-            ],
-        ),
-        provider(
-            PROVIDER_DEEPSEEK,
-            "DeepSeek",
-            Protocol::Openai,
-            "https://api.deepseek.com",
-            &["deepseek-chat", "deepseek-reasoner"],
-        ),
-        provider(
-            PROVIDER_GROK,
-            "Grok (xAI)",
-            Protocol::Openai,
-            "https://api.x.ai/v1",
-            &["grok-3", "grok-3-mini-beta"],
-        ),
-    ]
+/// A provider type the add dialog offers.
+///
+/// Picking one decides the endpoint and the wire format, so the dialog only asks for
+/// what that service needs: an API key, and for the services the user hosts himself,
+/// a name and an endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderType {
+    /// Stable id the provider is stored under; also the vault field of its key.
+    pub id: &'static str,
+    /// Name shown in the dropdown.
+    pub name: &'static str,
+    /// Wire format.
+    pub protocol: Protocol,
+    /// Endpoint, empty when the user supplies it.
+    pub base_url: &'static str,
+    /// Whether the service needs an API key (a local Ollama server does not).
+    pub needs_key: bool,
+}
+
+/// Id of the "somewhere else" entry: an endpoint the user describes himself.
+pub const PROVIDER_CUSTOM: &str = "custom";
+
+/// The provider types the add dialog lists, in the order it shows them.
+pub const PROVIDER_TYPES: &[ProviderType] = &[
+    ProviderType {
+        id: PROVIDER_OPENAI,
+        name: "OpenAI",
+        protocol: Protocol::Openai,
+        base_url: "https://api.openai.com/v1",
+        needs_key: true,
+    },
+    ProviderType {
+        id: PROVIDER_ANTHROPIC,
+        name: "Anthropic",
+        protocol: Protocol::Anthropic,
+        base_url: "https://api.anthropic.com",
+        needs_key: true,
+    },
+    ProviderType {
+        id: PROVIDER_DEEPSEEK,
+        name: "DeepSeek",
+        protocol: Protocol::Openai,
+        base_url: "https://api.deepseek.com",
+        needs_key: true,
+    },
+    ProviderType {
+        id: PROVIDER_GROK,
+        name: "Grok (xAI)",
+        protocol: Protocol::Openai,
+        base_url: "https://api.x.ai/v1",
+        needs_key: true,
+    },
+    ProviderType {
+        id: PROVIDER_OPENROUTER,
+        name: "Open Router",
+        protocol: Protocol::Openai,
+        base_url: "https://openrouter.ai/api/v1",
+        needs_key: true,
+    },
+    ProviderType {
+        id: PROVIDER_OLLAMA,
+        name: "Ollama (local)",
+        protocol: Protocol::Openai,
+        base_url: "http://127.0.0.1:11434/v1",
+        needs_key: false,
+    },
+    ProviderType {
+        id: PROVIDER_CUSTOM,
+        name: "Other (OpenAI or Anthropic compatible)",
+        protocol: Protocol::Openai,
+        base_url: "",
+        needs_key: true,
+    },
+];
+
+impl ProviderType {
+    /// Whether the endpoint is the user's to type, rather than the service's.
+    pub fn has_fixed_endpoint(self) -> bool {
+        !self.base_url.is_empty() && self.id != PROVIDER_OLLAMA
+    }
 }
 
 /// Command patterns that run without asking, as the reference ships them.
@@ -318,19 +357,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_shipped_providers_match_the_reference() {
-        let providers = default_providers();
-        let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+    fn the_add_dialog_offers_the_known_services() {
+        let names: Vec<&str> = PROVIDER_TYPES.iter().map(|kind| kind.name).collect();
         assert_eq!(
-            ids,
-            ["ollama", "openrouter", "anthropic", "deepseek", "grok"]
+            names,
+            [
+                "OpenAI",
+                "Anthropic",
+                "DeepSeek",
+                "Grok (xAI)",
+                "Open Router",
+                "Ollama (local)",
+                "Other (OpenAI or Anthropic compatible)",
+            ]
         );
-        assert_eq!(providers[2].protocol, Protocol::Anthropic);
-        assert_eq!(providers[0].base_url, "http://127.0.0.1:11434/v1");
-        assert_eq!(
-            providers[3].models,
-            ["deepseek-chat", "deepseek-reasoner"]
-        );
+        // Every type knows its endpoint and wire format, except the one the user describes.
+        let anthropic = PROVIDER_TYPES
+            .iter()
+            .find(|kind| kind.id == PROVIDER_ANTHROPIC)
+            .expect("anthropic");
+        assert_eq!(anthropic.protocol, Protocol::Anthropic);
+        assert_eq!(anthropic.base_url, "https://api.anthropic.com");
+        assert!(anthropic.needs_key);
+        // A local Ollama server has no key; its endpoint stays editable.
+        let ollama = PROVIDER_TYPES
+            .iter()
+            .find(|kind| kind.id == PROVIDER_OLLAMA)
+            .expect("ollama");
+        assert!(!ollama.needs_key);
+        assert!(!ollama.has_fixed_endpoint());
+        let custom = PROVIDER_TYPES
+            .iter()
+            .find(|kind| kind.id == PROVIDER_CUSTOM)
+            .expect("custom");
+        assert!(custom.base_url.is_empty());
+        // Ids are unique, or two types would share one vault field.
+        let mut ids: Vec<&str> = PROVIDER_TYPES.iter().map(|kind| kind.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
     }
 
     #[test]

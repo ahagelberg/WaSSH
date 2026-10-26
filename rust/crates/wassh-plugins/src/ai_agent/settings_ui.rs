@@ -10,9 +10,14 @@ use std::sync::mpsc::Receiver;
 use egui::Ui;
 use serde_json::{Map, Value};
 use wassh_core::Palette;
-use wassh_ui::widgets::{password_input, select, small_button, small_button_enabled, text_input};
+use wassh_ui::widgets::{
+    footer, modal, password_input, select, small_button, small_button_enabled, text_input,
+};
 
-use super::protocol::{ProviderConfig, Protocol, default_providers};
+use super::protocol::{
+    CUSTOM_PROVIDER_PREFIX, PROVIDER_CUSTOM, PROVIDER_TYPES, ProviderConfig, ProviderType,
+    Protocol,
+};
 use super::providers::provider_models;
 use crate::color::to_color32;
 use crate::settings::{PluginSecretDrafts, SecretDraft, secret_field_key};
@@ -38,9 +43,93 @@ const CARD_PADDING: i8 = 8;
 const BUTTONS_WIDTH: f32 = 170.0;
 /// Height reserved for one control; a zero height would clip its text.
 const CONTROL_HEIGHT: f32 = 22.0;
+/// Width of the "add a provider" dialog.
+const ADD_DIALOG_WIDTH: f32 = 460.0;
+/// Size of the hint that the list is still empty.
+const HINT_SIZE: f32 = 11.0;
 
 /// A model-list fetch running on its own thread.
 type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
+
+/// A provider the user is filling in before it is added.
+struct NewProvider {
+    /// Index into [`PROVIDER_TYPES`].
+    kind: usize,
+    /// Name, editable only for the type the user describes.
+    name: String,
+    /// Wire format, editable only for that type.
+    protocol: Protocol,
+    /// Endpoint, editable for a hosted-on-your-own-machine or unknown service.
+    base_url: String,
+    /// The API key as typed; it is sealed into the vault when the provider is added.
+    key: String,
+}
+
+impl NewProvider {
+    /// A draft for the first type in the list.
+    fn new() -> Self {
+        let kind = PROVIDER_TYPES[0];
+        Self {
+            kind: 0,
+            name: kind.name.to_owned(),
+            protocol: kind.protocol,
+            base_url: kind.base_url.to_owned(),
+            key: String::new(),
+        }
+    }
+
+    /// The type the dropdown shows.
+    fn selected(&self) -> ProviderType {
+        PROVIDER_TYPES[self.kind.min(PROVIDER_TYPES.len() - 1)]
+    }
+
+    /// Point the draft at another type, taking its endpoint and wire format.
+    fn select_type(&mut self, kind: usize) {
+        self.kind = kind;
+        let selected = self.selected();
+        self.name = selected.name.to_owned();
+        self.protocol = selected.protocol;
+        self.base_url = selected.base_url.to_owned();
+    }
+
+    /// Whether the draft can be added: a described provider needs a name and an endpoint.
+    fn is_complete(&self) -> bool {
+        let kind = self.selected();
+        if kind.id != PROVIDER_CUSTOM {
+            return true;
+        }
+        !self.name.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+
+    /// The provider this draft describes, and the key to seal for it.
+    fn into_provider(self, providers: &[ProviderConfig]) -> (ProviderConfig, String) {
+        let kind = self.selected();
+        let custom = kind.id == PROVIDER_CUSTOM;
+        let base = if custom {
+            CUSTOM_PROVIDER_PREFIX.trim_end_matches('-')
+        } else {
+            kind.id
+        };
+        let provider = ProviderConfig {
+            id: unique_id(base, providers),
+            name: if custom {
+                self.name.trim().to_owned()
+            } else {
+                kind.name.to_owned()
+            },
+            protocol: if custom { self.protocol } else { kind.protocol },
+            base_url: if kind.has_fixed_endpoint() {
+                kind.base_url.to_owned()
+            } else {
+                self.base_url.trim().to_owned()
+            },
+            // The model list is fetched from the provider once it is in use.
+            models: Vec::new(),
+            embedding_model: None,
+        };
+        (provider, self.key.trim().to_owned())
+    }
+}
 
 /// State the provider editor keeps between frames.
 #[derive(Default)]
@@ -48,9 +137,16 @@ pub struct ProviderEditor {
     fetch: Option<ModelFetch>,
     /// Result of the last fetch: the message, and whether it succeeded.
     message: Option<(bool, String)>,
+    /// The add dialog, while it is open.
+    new_provider: Option<NewProvider>,
 }
 
 impl ProviderEditor {
+    /// Whether the "add a provider" dialog is open on top of the editor.
+    pub fn is_adding(&self) -> bool {
+        self.new_provider.is_some()
+    }
+
     /// Draw the editor: the provider list goes into `values`, the API keys into `secrets`.
     pub fn show(
         &mut self,
@@ -59,9 +155,7 @@ impl ProviderEditor {
         values: &mut Map<String, Value>,
         secrets: &mut PluginSecretDrafts,
     ) {
-        let mut providers = read::<Vec<ProviderConfig>>(values, PROVIDERS_KEY)
-            .filter(|providers| !providers.is_empty())
-            .unwrap_or_else(default_providers);
+        let mut providers = read::<Vec<ProviderConfig>>(values, PROVIDERS_KEY).unwrap_or_default();
         // Keys for the model fetch, read from the vault drafts.
         let keys: BTreeMap<String, String> = providers
             .iter()
@@ -146,8 +240,23 @@ impl ProviderEditor {
             draft.clear = true;
             draft.draft.clear();
         }
-        if small_button(ui, palette, "+ Add provider") {
-            providers.push(custom_provider(&providers));
+        if providers.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No providers yet. Add the one you want to chat through; its API key \
+                     goes into the credential vault.",
+                )
+                .size(HINT_SIZE)
+                .color(muted),
+            );
+        }
+        if let Some((provider, key)) = self.add_controls(ui, palette, &providers) {
+            if !key.is_empty() {
+                let draft: &mut SecretDraft = secrets.entry(secret_key(&provider.id)).or_default();
+                draft.draft = key;
+                draft.clear = false;
+            }
+            providers.push(provider);
         }
         if let Some(index) = fetch {
             self.start_fetch(&providers, &keys, index);
@@ -167,6 +276,106 @@ impl ProviderEditor {
             PROVIDERS_KEY.to_owned(),
             serde_json::to_value(&providers).unwrap_or(Value::Null),
         );
+    }
+
+    /// The "+ Add provider" button and the dialog it opens.
+    ///
+    /// Nothing is configured out of the box, so the dialog starts with the type: OpenAI,
+    /// Anthropic, DeepSeek, Grok, Open Router, a local Ollama, or an endpoint of the
+    /// user's own. The type fixes the wire format and, for hosted services, the endpoint.
+    fn add_controls(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        providers: &[ProviderConfig],
+    ) -> Option<(ProviderConfig, String)> {
+        if self.new_provider.is_none() {
+            if small_button(ui, palette, "+ Add provider") {
+                self.new_provider = Some(NewProvider::new());
+            }
+            return None;
+        }
+        let mut draft = self.new_provider.take()?;
+        let mut add = false;
+        let mut cancel = false;
+        let response = modal(
+            ui.ctx(),
+            "ai-agent-add-provider",
+            palette,
+            "Add a provider",
+            ADD_DIALOG_WIDTH,
+            |ui| {
+                let muted = to_color32(palette.text_muted);
+                let options: Vec<(usize, &str)> = PROVIDER_TYPES
+                    .iter()
+                    .enumerate()
+                    .map(|(index, kind)| (index, kind.name))
+                    .collect();
+                caption(ui, muted, "Provider", |ui| {
+                    if let Some(kind) = select(ui, "ai-new-provider-type", &draft.kind, &options)
+                    {
+                        draft.select_type(kind);
+                    }
+                });
+                let kind = draft.selected();
+                // A hosted service knows its endpoint; a local or unknown one does not.
+                if kind.has_fixed_endpoint() {
+                    caption(ui, muted, "Endpoint", |ui| {
+                        ui.label(
+                            egui::RichText::new(kind.base_url)
+                                .size(LABEL_SIZE)
+                                .color(to_color32(palette.text)),
+                        );
+                    });
+                } else {
+                    caption(ui, muted, "Base URL", |ui| {
+                        text_input(ui, palette, &mut draft.base_url, "https://host/v1");
+                    });
+                }
+                if kind.id == PROVIDER_CUSTOM {
+                    caption(ui, muted, "Name", |ui| {
+                        text_input(ui, palette, &mut draft.name, "My provider");
+                    });
+                    caption(ui, muted, "Protocol", |ui| {
+                        let options = [
+                            (Protocol::Openai, "OpenAI compatible"),
+                            (Protocol::Anthropic, "Anthropic"),
+                        ];
+                        if let Some(protocol) =
+                            select(ui, "ai-new-provider-protocol", &draft.protocol, &options)
+                        {
+                            draft.protocol = protocol;
+                        }
+                    });
+                }
+                if kind.needs_key {
+                    caption(ui, muted, "API key", |ui| {
+                        password_input(ui, palette, &mut draft.key, "paste the provider key");
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new("This service runs without an API key.")
+                            .size(HINT_SIZE)
+                            .color(muted),
+                    );
+                }
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, "Add", draft.is_complete()) {
+                        add = true;
+                    }
+                    if small_button(ui, palette, "Cancel") {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if add {
+            return Some(draft.into_provider(providers));
+        }
+        if !(response.dismissed || cancel) {
+            self.new_provider = Some(draft);
+        }
+        None
     }
 
     /// Ask a provider for its model list on a worker thread.
@@ -218,23 +427,19 @@ impl ProviderEditor {
     }
 }
 
-/// A new provider with an id no other provider uses.
-fn custom_provider(providers: &[ProviderConfig]) -> ProviderConfig {
-    let mut number = providers.len() + 1;
+/// An id no configured provider uses, so a second OpenAI is still its own entry.
+fn unique_id(base: &str, providers: &[ProviderConfig]) -> String {
+    if !providers.iter().any(|provider| provider.id == base) {
+        return base.to_owned();
+    }
+    let mut number = 2;
     while providers
         .iter()
-        .any(|provider| provider.id == format!("custom-{number}"))
+        .any(|provider| provider.id == format!("{base}-{number}"))
     {
         number += 1;
     }
-    ProviderConfig {
-        id: format!("custom-{number}"),
-        name: "Custom provider".to_owned(),
-        protocol: Protocol::Openai,
-        base_url: String::new(),
-        models: Vec::new(),
-        embedding_model: None,
-    }
+    format!("{base}-{number}")
 }
 
 /// Read one key of `values` as `T`.
@@ -250,8 +455,7 @@ pub fn provider_secret_field(provider_id: &str) -> String {
 /// Ids of the providers the app-wide settings list.
 pub fn provider_ids(values: &Map<String, Value>) -> Vec<String> {
     read::<Vec<ProviderConfig>>(values, PROVIDERS_KEY)
-        .filter(|providers| !providers.is_empty())
-        .unwrap_or_else(default_providers)
+        .unwrap_or_default()
         .into_iter()
         .map(|provider| provider.id)
         .collect()
@@ -332,12 +536,17 @@ mod tests {
     #[test]
     fn every_provider_lists_its_endpoint_models_and_key() {
         let mut values = Map::new();
+        values.insert(
+            PROVIDERS_KEY.to_owned(),
+            serde_json::json!([{ "id": "anthropic", "name": "Anthropic", "protocol": "anthropic",
+                                 "baseUrl": "https://api.anthropic.com", "models": [] }]),
+        );
         let mut secrets = PluginSecretDrafts::new();
         let texts = painted(&mut values, &mut secrets);
         for field in ["Protocol", "Base URL", "Models", "API key"] {
             assert!(texts.iter().any(|text| text == field), "{field} missing: {texts:?}");
         }
-        assert!(texts.iter().any(|text| text == "Ollama"), "provider missing: {texts:?}");
+        assert!(texts.iter().any(|text| text == "Anthropic"), "provider missing: {texts:?}");
         assert!(
             texts.iter().any(|text| text == "https://api.anthropic.com"),
             "base URL missing: {texts:?}"
@@ -380,6 +589,87 @@ mod tests {
     #[test]
     fn provider_keys_use_the_vault_field_name() {
         assert_eq!(secret_key("deepseek"), "ai-agent|provider.deepseek");
+    }
+
+    #[test]
+    fn nothing_is_configured_out_of_the_box() {
+        let mut values = Map::new();
+        let mut secrets = PluginSecretDrafts::new();
+        let texts = painted(&mut values, &mut secrets);
+        assert!(
+            texts.iter().any(|text| text.contains("No providers yet")),
+            "the empty list needs a hint: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "+ Add provider"),
+            "the add button is missing: {texts:?}"
+        );
+        assert_eq!(
+            values[PROVIDERS_KEY],
+            serde_json::json!([]),
+            "an empty list is stored, not a list of defaults"
+        );
+        assert!(provider_ids(&values).is_empty());
+    }
+
+    #[test]
+    fn the_dialog_starts_on_a_known_service_and_asks_for_its_key() {
+        let draft = NewProvider::new();
+        let kind = draft.selected();
+        assert_eq!(kind.id, "openai");
+        assert_eq!(draft.base_url, "https://api.openai.com/v1");
+        assert_eq!(draft.protocol, Protocol::Openai);
+        assert!(kind.needs_key);
+        assert!(draft.is_complete(), "a hosted service only needs the key");
+
+        // The endpoint is the service's, so adding keeps it whatever was typed.
+        let (provider, _) = draft.into_provider(&[]);
+        assert_eq!(provider.id, "openai");
+        assert_eq!(provider.name, "OpenAI");
+        assert_eq!(provider.base_url, "https://api.openai.com/v1");
+        assert_eq!(provider.models, Vec::<String>::new(), "fetched on first use");
+    }
+
+    #[test]
+    fn the_selected_type_decides_which_fields_matter() {
+        let custom = PROVIDER_TYPES
+            .iter()
+            .position(|kind| kind.id == PROVIDER_CUSTOM)
+            .expect("custom");
+        let mut draft = NewProvider::new();
+        draft.select_type(custom);
+        assert!(draft.base_url.is_empty(), "a described provider has no endpoint yet");
+        assert!(!draft.is_complete(), "the endpoint is still missing");
+        draft.base_url = "https://models.internal/v1".to_owned();
+        draft.name = "  In-house  ".to_owned();
+        draft.protocol = Protocol::Anthropic;
+        assert!(draft.is_complete());
+        let (provider, _) = draft.into_provider(&[]);
+        assert_eq!(provider.id, "custom");
+        assert_eq!(provider.name, "In-house");
+        assert_eq!(provider.protocol, Protocol::Anthropic);
+        assert_eq!(provider.base_url, "https://models.internal/v1");
+
+        // A local Ollama server needs no key and its port is editable.
+        let ollama = PROVIDER_TYPES
+            .iter()
+            .position(|kind| kind.id == "ollama")
+            .expect("ollama");
+        let mut draft = NewProvider::new();
+        draft.select_type(ollama);
+        assert!(!draft.selected().needs_key);
+        assert!(!draft.selected().has_fixed_endpoint());
+        draft.base_url = "http://127.0.0.1:11500/v1".to_owned();
+        assert_eq!(draft.into_provider(&[]).0.base_url, "http://127.0.0.1:11500/v1");
+    }
+
+    #[test]
+    fn adding_the_same_service_twice_keeps_the_keys_apart() {
+        let (first, _) = NewProvider::new().into_provider(&[]);
+        let (second, _) = NewProvider::new().into_provider(std::slice::from_ref(&first));
+        assert_eq!(first.id, "openai");
+        assert_eq!(second.id, "openai-2", "the id is also the vault field");
+        assert_eq!(unique_id("openai", &[first, second.clone()]), "openai-3");
     }
 }
 

@@ -1434,6 +1434,8 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
         .unwrap_or_default();
     let mut close = false;
     let room = editor_room(ctx.content_rect().height());
+    // The editor may open its own dialog on top; Escape belongs to that one then.
+    let nested = id == PluginId::AiAgent && state.ai_providers.is_adding();
     let response = modal(
         ctx,
         ("plugin-settings-editor", id.as_str()),
@@ -1481,7 +1483,7 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
             .plugin_settings
             .insert(id.as_str().to_owned(), values);
     }
-    if response.dismissed || close {
+    if (response.dismissed && !nested) || close {
         state.editor = None;
     }
 }

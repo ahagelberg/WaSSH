@@ -16,9 +16,10 @@ mod web;
 mod view;
 
 pub use protocol::{
-    ApiMessage, ApiToolCall, Completion, Protocol, ProviderConfig, default_providers, join_url,
-    DATA_VERSION, DEFAULT_CHAT_TITLE, SAFE_RULES, SETTING_DEFAULT_ALLOW_RULES,
-    SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT, SETTING_HOST_ALLOW_RULES,
+    ApiMessage, ApiToolCall, Completion, PROVIDER_CUSTOM, PROVIDER_TYPES, Protocol, ProviderConfig,
+    ProviderType, join_url, DATA_VERSION, DEFAULT_CHAT_TITLE, SAFE_RULES,
+    SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
+    SETTING_HOST_ALLOW_RULES,
     SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, TITLE_MAX_CHARS,
 };
 pub use providers::{provider_models, CompletionRequest, EmbedConfig, StreamEvent};
