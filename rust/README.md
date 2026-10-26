@@ -29,3 +29,6 @@ cargo run -p wassh
 - Long-running builds: `CARGO_BUILD_JOBS=8 taskset -c 0-9 cargo build` (this machine is
   limited to 10 cores and must not run parallel builds).
 - `wassh --spike` runs the terminal/SSH spike harness; `--widgets` shows the widget gallery.
+- `vendor/winit` is winit 0.30.13 with the Windows 11 mixed-DPI fix backported (see
+  `vendor/winit/PATCHED.md`). Drop the directory and the `[patch.crates-io]` entry once
+  eframe moves to a winit release that contains it.
