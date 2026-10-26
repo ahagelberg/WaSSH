@@ -21,7 +21,11 @@ use wassh_core::SessionStatus;
 
 use crate::hostkey::HostKeyFingerprint;
 use crate::known_hosts::KnownHosts;
-use crate::x11::{self, X11Config};
+use crate::x11::X11Config;
+
+/// OpenSSH for Windows exposes its agent on this named pipe.
+#[cfg(windows)]
+const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 /// How to authenticate.
 #[derive(Clone, Debug)]
@@ -195,6 +199,7 @@ pub enum SshEvent {
     },
     Closed {
         reason: Option<String>,
+        end: SessionEnd,
     },
     /// The credentials were rejected. The caller may ask for another password and
     /// reconnect; a `Closed` event still follows so transports are always released.
@@ -202,6 +207,27 @@ pub enum SshEvent {
         detail: String,
     },
     Error(String),
+}
+
+/// How an SSH session ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The remote shell exited by itself, e.g. after `exit` or `logout`.
+    Exited {
+        /// The exit status the server reported.
+        status: u32,
+    },
+    /// The transport failed or went away without the shell exiting.
+    Failed,
+    /// The app tore the session down.
+    Requested,
+}
+
+impl SessionEnd {
+    /// True when the remote side ended the session on purpose.
+    pub fn by_shell(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
 }
 
 /// Marker error distinguishing rejected credentials from transport failures, so a caller
@@ -512,10 +538,9 @@ impl client::Handler for ClientHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
-        if let Some(config) = &self.x11 {
-            let display = config.display_number;
+        if let Some(config) = self.x11.clone() {
             tokio::spawn(async move {
-                if let Err(error) = x11::bridge(channel, display).await {
+                if let Err(error) = crate::x11::bridge(channel, &config).await {
                     eprintln!("X11 forwarding stopped: {error:#}");
                 }
             });
@@ -569,8 +594,12 @@ async fn run(
     match connect_and_shell(&options, &mut commands, &events, &status, decision, auth_response)
         .await
     {
-        Ok(()) => {
-            let _ = events.send(SshEvent::Closed { reason: None });
+        Ok(end) => {
+            let reason = match end {
+                SessionEnd::Exited { status } => Some(format!("remote exit status {status}")),
+                _ => None,
+            };
+            let _ = events.send(SshEvent::Closed { reason, end });
         }
         Err(error) => {
             if error.downcast_ref::<AuthFailure>().is_some() {
@@ -582,6 +611,7 @@ async fn run(
             }
             let _ = events.send(SshEvent::Closed {
                 reason: Some(format!("{error:#}")),
+                end: SessionEnd::Failed,
             });
         }
     }
@@ -594,7 +624,7 @@ async fn connect_and_shell(
     status: &impl Fn(SessionStatus, Option<String>),
     decision: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     auth_response: Arc<Mutex<Option<oneshot::Sender<Vec<String>>>>>,
-) -> Result<()> {
+) -> Result<SessionEnd> {
     let forwards = crate::tunnels::remote_forwards();
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
@@ -667,6 +697,8 @@ async fn connect_and_shell(
 
     let (mut reader, writer) = channel.split();
     let mut writer = Some(writer);
+    // Assumed a drop until the session ends in a way that names itself.
+    let mut end = SessionEnd::Failed;
 
     loop {
         tokio::select! {
@@ -718,7 +750,10 @@ async fn connect_and_shell(
                             let _ = reply.send(answer);
                         });
                     }
-                    Some(SshCommand::Disconnect) | None => break,
+                    Some(SshCommand::Disconnect) | None => {
+                        end = SessionEnd::Requested;
+                        break;
+                    }
                 }
             }
             message = reader.wait() => {
@@ -730,11 +765,10 @@ async fn connect_and_shell(
                         let _ = events.send(SshEvent::Data(data.to_vec()));
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
-                        let _ = events.send(SshEvent::Closed {
-                            reason: Some(format!("remote exit status {exit_status}")),
-                        });
+                        end = SessionEnd::Exited { status: exit_status };
                         break;
                     }
+                    // The channel ended without an exit status: the connection dropped.
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
                     _ => {}
                 }
@@ -746,7 +780,7 @@ async fn connect_and_shell(
     let _ = handle
         .disconnect(Disconnect::ByApplication, "", "en")
         .await;
-    Ok(())
+    Ok(end)
 }
 
 async fn authenticate(
@@ -966,9 +1000,14 @@ async fn authenticate_agent(
     handle: &mut client::Handle<ClientHandler>,
     username: &str,
 ) -> Result<bool> {
+    #[cfg(unix)]
     let mut agent = AgentClient::connect_env()
         .await
         .context("connecting to the SSH agent (is SSH_AUTH_SOCK set?)")?;
+    #[cfg(windows)]
+    let mut agent = AgentClient::connect_named_pipe(WINDOWS_AGENT_PIPE)
+        .await
+        .context("connecting to the OpenSSH agent named pipe")?;
     let identities = agent
         .request_identities()
         .await

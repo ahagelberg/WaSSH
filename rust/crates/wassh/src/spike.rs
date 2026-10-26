@@ -279,8 +279,10 @@ impl SpikeApp {
                     self.error = Some(detail);
                     self.status = SessionStatus::Failed;
                 }
-                SshEvent::Closed { reason } => {
-                    self.status = SessionStatus::Closed;
+                SshEvent::Closed { reason, end } => {
+                    if end.by_shell() {
+                        self.status = SessionStatus::Closed;
+                    }
                     self.host_key_prompt = None;
                     self.auth_prompt = None;
                     if let Some(reason) = reason {

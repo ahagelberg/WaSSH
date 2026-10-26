@@ -78,7 +78,65 @@ impl server::Handler for EchoServer {
 /// Throwaway ed25519 host key used only by these tests.
 const TEST_HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACC3YJilmtTL1Yzxj1k9A91pbvonkDdGrD49/iE9WfkUBAAAAJAA4kMiAOJD\nIgAAAAtzc2gtZWQyNTUxOQAAACC3YJilmtTL1Yzxj1k9A91pbvonkDdGrD49/iE9WfkUBA\nAAAECoQUbFK7LflE6UdHX/68zm8oBEXxSmq7niKCwA/yVCNLdgmKWa1MvVjPGPWT0D3Wlu\n+ieQN0asPj3+IT1Z+RQEAAAACndhc3NoLXRlc3QBAgM=\n-----END OPENSSH PRIVATE KEY-----\n";
 
+/// A server that logs out as soon as the shell opens, like a user typing `exit`.
+#[derive(Clone)]
+struct ExitingServer;
+
+impl server::Handler for ExitingServer {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        Ok(if password == "secret" {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        session.data(channel, b"bye\r\n".to_vec())?;
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+}
+
 async fn spawn_server() -> (String, u16) {
+    spawn_server_with(EchoServer).await
+}
+
+async fn spawn_server_with(handler: impl server::Handler + Clone + Send + Sync + 'static) -> (String, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -89,7 +147,18 @@ async fn spawn_server() -> (String, u16) {
             ],
             ..Default::default()
         });
-        let _ = server::run_stream(config, stream, EchoServer).await;
+        let _ = server::run_stream(config, stream, handler).await;
+    });
+    (address.ip().to_string(), address.port())
+}
+
+/// A server that hangs up as soon as a client connects.
+async fn spawn_dropping_server() -> (String, u16) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
     });
     (address.ip().to_string(), address.port())
 }
@@ -277,6 +346,7 @@ async fn sends_x11_request_with_display_details() {
         SshAuth::Password("secret".to_owned()),
     );
     options.x11 = Some(X11Config {
+        host: String::new(),
         display_number: 0,
         screen: 2,
         protocol: "MIT-MAGIC-COOKIE-1".to_owned(),
@@ -530,4 +600,50 @@ async fn rejects_a_changed_host_key_without_overwriting_it() {
     }
     assert!(failed, "rejecting the key must abort the connection");
     assert_eq!(known.get(&host, port).as_deref(), Some(WRONG));
+}
+
+/// Collect the `Closed` event's reason for how the session ended.
+async fn wait_for_end(session: &mut SshSession) -> Option<wassh_ssh::SessionEnd> {
+    let start = Instant::now();
+    let mut end = None;
+    while start.elapsed() < Duration::from_secs(10) {
+        for event in session.events() {
+            if let SshEvent::Closed { end: kind, .. } = event {
+                end = Some(kind);
+            }
+        }
+        if end.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    end
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exit_status_means_the_shell_ended() {
+    let (host, port) = spawn_server_with(ExitingServer).await;
+    let mut session =
+        SshSession::connect(options(host, port, SshAuth::Password("secret".to_owned())))
+            .expect("spawn session");
+
+    assert_eq!(
+        wait_for_end(&mut session).await,
+        Some(wassh_ssh::SessionEnd::Exited { status: 0 }),
+        "a shell that logs out must be reported as exited, not as a dropped connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_connection_is_a_failure() {
+    let (host, port) = spawn_dropping_server().await;
+    let mut session =
+        SshSession::connect(options(host, port, SshAuth::Password("secret".to_owned())))
+            .expect("spawn session");
+
+    assert_eq!(
+        wait_for_end(&mut session).await,
+        Some(wassh_ssh::SessionEnd::Failed),
+        "a hang-up must be reported as a failure, so the tab reconnects"
+    );
 }

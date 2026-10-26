@@ -23,8 +23,8 @@ pub use hostkey::{HostKeyFingerprint, fingerprint_sha256};
 pub use known_hosts::KnownHosts;
 pub use remote_session::{Presence, RemotePlan, plan as plan_remote_session};
 pub use session::{
-    AuthPromptField, ExecOutput, HostKeyPolicy, JumpHop, SftpJob, SshAuth, SshEvent, SshOptions,
-    SshSession, capture as capture_command,
+    AuthPromptField, ExecOutput, HostKeyPolicy, JumpHop, SessionEnd, SftpJob, SshAuth, SshEvent,
+    SshOptions, SshSession, capture as capture_command,
 };
 pub use sftp::{SftpEntry, SftpOutcome, SftpProgress, SftpRequest, format_size};
 pub use tunnels::{RemoteForwards, TunnelRequest, remote_forwards};

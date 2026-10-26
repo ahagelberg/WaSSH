@@ -120,6 +120,17 @@ pub struct AuthPrompt {
     pub answers: Vec<String>,
 }
 
+/// Why a session's transport ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Exit {
+    /// Text to show as the tab's error, if any.
+    pub reason: Option<String>,
+    /// True when the shell exited by itself (`exit`, `logout`) rather than the
+    /// transport failing. A tab whose shell exited is closed; a failed one stays and
+    /// reconnects.
+    pub from_shell: bool,
+}
+
 /// Something the shell should react to after pumping a session.
 #[derive(Clone, Debug, Default)]
 pub struct Pumped {
@@ -127,8 +138,8 @@ pub struct Pumped {
     pub title: Option<String>,
     /// The bell rang.
     pub bell: bool,
-    /// The transport closed.
-    pub closed: Option<Option<String>>,
+    /// The transport closed, and why.
+    pub closed: Option<Exit>,
 }
 
 /// Everything needed to open an SSH session.
@@ -682,17 +693,29 @@ impl SessionEntry {
                             if !self.retry_login() {
                                 self.error = Some(detail);
                                 self.status = SessionStatus::Failed;
-                                pumped.closed = Some(None);
+                                pumped.closed = Some(Exit {
+                                    reason: None,
+                                    from_shell: false,
+                                });
                             }
                         }
-                        SshEvent::Closed { reason } => {
+                        SshEvent::Closed { reason, end } => {
                             if self.suppress_close {
                                 self.suppress_close = false;
                             } else {
-                                self.status = SessionStatus::Closed;
+                                // A failed transport keeps its status, so the shell's
+                                // reconnect policy applies; an `exit` closes the tab.
+                                if end.by_shell() {
+                                    self.status = SessionStatus::Closed;
+                                } else if self.status == SessionStatus::Connected {
+                                    self.status = SessionStatus::Disconnected;
+                                }
                                 self.host_key_prompt = None;
                                 self.auth_prompt = None;
-                                pumped.closed = Some(reason);
+                                pumped.closed = Some(Exit {
+                                    reason,
+                                    from_shell: end.by_shell(),
+                                });
                             }
                         }
                         SshEvent::Error(error) => {
@@ -701,7 +724,10 @@ impl SessionEntry {
                             self.suppress_close = false;
                             self.error = Some(error);
                             self.status = SessionStatus::Failed;
-                            pumped.closed = Some(None);
+                            pumped.closed = Some(Exit {
+                                reason: None,
+                                from_shell: false,
+                            });
                         }
                     }
                 }
@@ -713,12 +739,18 @@ impl SessionEntry {
                         wassh_telnet::TelnetEvent::Status(status) => self.status = status,
                         wassh_telnet::TelnetEvent::Closed { reason } => {
                             self.status = SessionStatus::Closed;
-                            pumped.closed = Some(reason);
+                            pumped.closed = Some(Exit {
+                                reason,
+                                from_shell: false,
+                            });
                         }
                         wassh_telnet::TelnetEvent::Error(error) => {
                             self.error = Some(error);
                             self.status = SessionStatus::Failed;
-                            pumped.closed = Some(None);
+                            pumped.closed = Some(Exit {
+                                reason: None,
+                                from_shell: false,
+                            });
                         }
                     }
                 }
@@ -731,9 +763,13 @@ impl SessionEntry {
             Backend::Closed => {}
         }
 
+        // A local shell that exits was told to: no reconnect, the tab goes away.
         if local_exited && self.status == SessionStatus::Connected {
             self.status = SessionStatus::Closed;
-            pumped.closed = Some(None);
+            pumped.closed = Some(Exit {
+                reason: None,
+                from_shell: true,
+            });
         }
 
         if self.status == SessionStatus::Connected {
@@ -2384,6 +2420,48 @@ mod tests {
     use wassh_core::SessionStyleDefaults;
 
     #[test]
+    fn a_local_shell_that_exits_ends_the_session_on_purpose() {
+        // The shell is replaced with one that logs out immediately, like typing `exit`.
+        #[cfg(windows)]
+        let (shell, args) = ("cmd.exe".to_owned(), vec!["/c".to_owned(), "exit".to_owned()]);
+        #[cfg(not(windows))]
+        let (shell, args) = ("/bin/sh".to_owned(), vec!["-c".to_owned(), "exit".to_owned()]);
+
+        let size = TerminalSize::new(80, 24);
+        let mut entry = SessionEntry::prepare(
+            "t-local",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            size,
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                ..ConnectionParams::default()
+            },
+            None,
+        );
+        entry.backend = Backend::Local(
+            PtySession::spawn(&shell, &args, size, "xterm-256color").expect("pty"),
+        );
+        entry.status = SessionStatus::Connected;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut closed = None;
+        while closed.is_none() && std::time::Instant::now() < deadline {
+            closed = entry.pump("xterm-256color").closed;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            closed,
+            Some(Exit {
+                reason: None,
+                from_shell: true,
+            }),
+            "a shell that exits must be reported as ended on purpose"
+        );
+        assert_eq!(entry.status, SessionStatus::Closed);
+    }
+
+    #[test]
     fn the_transfer_queue_lists_what_runs_and_what_waits() {
         let mut files = RemoteFiles::default();
         assert!(files.rows().is_empty());
@@ -2482,6 +2560,48 @@ mod tests {
             "xterm-256color",
             TerminalSize::new(80, 24),
             SshOpen {
+    #[test]
+    fn a_local_shell_that_exits_ends_the_session_on_purpose() {
+        // The shell is replaced with one that logs out immediately, like typing `exit`.
+        #[cfg(windows)]
+        let (shell, args) = ("cmd.exe".to_owned(), vec!["/c".to_owned(), "exit".to_owned()]);
+        #[cfg(not(windows))]
+        let (shell, args) = ("/bin/sh".to_owned(), vec!["-c".to_owned(), "exit".to_owned()]);
+
+        let size = TerminalSize::new(80, 24);
+        let mut entry = SessionEntry::prepare(
+            "t-local",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            size,
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                ..ConnectionParams::default()
+            },
+            None,
+        );
+        entry.backend = Backend::Local(
+            PtySession::spawn(&shell, &args, size, "xterm-256color").expect("pty"),
+        );
+        entry.status = SessionStatus::Connected;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut closed = None;
+        while closed.is_none() && std::time::Instant::now() < deadline {
+            closed = entry.pump("xterm-256color").closed;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            closed,
+            Some(Exit {
+                reason: None,
+                from_shell: true,
+            }),
+            "a shell that exits must be reported as ended on purpose"
+        );
+        assert_eq!(entry.status, SessionStatus::Closed);
+    }
+
                 params,
                 host_id: None,
                 secrets: Secrets::default(),

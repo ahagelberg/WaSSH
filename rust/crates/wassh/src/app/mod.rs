@@ -1473,6 +1473,7 @@ impl Shell {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
+        let mut exited = Vec::new();
         for (index, pumped) in results {
             if let Some(title) = pumped.title
                 && self.active == Some(index)
@@ -1486,15 +1487,23 @@ impl Shell {
                     egui::UserAttentionType::Informational,
                 ));
             }
-            if let Some(reason) = pumped.closed
-                && let Some(session) = self.sessions.get_mut(index)
-                && !session.exit_reported
-            {
-                session.exit_reported = true;
-                if let Some(reason) = reason {
-                    session.error = Some(reason);
+            if let Some(exit) = pumped.closed {
+                // The shell was told to exit (`exit`, `logout`), so the tab is done. A
+                // failed transport keeps its tab: the reconnect policy takes over below.
+                if exit.from_shell {
+                    exited.push(index);
+                } else if let Some(session) = self.sessions.get_mut(index)
+                    && !session.exit_reported
+                {
+                    session.exit_reported = true;
+                    if let Some(reason) = exit.reason {
+                        session.error = Some(reason);
+                    }
                 }
             }
+        }
+        for index in exited.into_iter().rev() {
+            self.close(index);
         }
 
         self.schedule_reconnects(ctx);
