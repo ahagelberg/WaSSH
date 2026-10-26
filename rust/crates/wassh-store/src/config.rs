@@ -110,6 +110,39 @@ impl Config {
         let path = paths::plugin_data_file(&self.dir, plugin_id, scope);
         crate::write_json(&path, data)
     }
+
+    /// Every stored document of one plugin, as the scope each belongs to.
+    ///
+    /// Scopes are read back from the directory, so documents left behind by
+    /// sessions that are no longer open are found too. `None` is the
+    /// plugin-wide file. The scope is the sanitised one the file name carries,
+    /// which is what [`Self::plugin_data`] expects when reading it back.
+    pub fn plugin_data_scopes(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<Option<String>>, StoreError> {
+        let prefix = paths::plugin_data_prefix(plugin_id);
+        let mut scopes = Vec::new();
+        for entry in std::fs::read_dir(&self.dir).map_err(|error| StoreError::io(&self.dir, error))? {
+            let entry = entry.map_err(|error| StoreError::io(&self.dir, error))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_suffix(".json") else {
+                continue;
+            };
+            match rest.strip_prefix('.') {
+                Some(scope) => scopes.push(Some(scope.to_owned())),
+                None if rest.is_empty() => scopes.push(None),
+                None => {}
+            }
+        }
+        Ok(scopes)
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +206,34 @@ mod tests {
         // The file uses the camelCase key the Electron app writes.
         let text = fs::read_to_string(dir.join("hosts.json")).unwrap();
         assert!(text.contains("\"pluginSettings\""), "got {text}");
+    }
+
+    #[test]
+    fn plugin_documents_are_listed_with_their_scope() {
+        let dir = scratch();
+        let config = Config::open(&dir).unwrap();
+        for scope in [None, Some("host-1"), Some("tab:a1")] {
+            config
+                .save_plugin_data("ai-agent", scope, &serde_json::json!({}))
+                .unwrap();
+        }
+        // Another plugin whose id starts the same must not be listed.
+        config
+            .save_plugin_data("ai-agent-extra", Some("host-1"), &serde_json::json!({}))
+            .unwrap();
+
+        let mut scopes = config.plugin_data_scopes("ai-agent").unwrap();
+        scopes.sort();
+        assert_eq!(
+            scopes,
+            [
+                None,
+                Some("host-1".to_owned()),
+                // The scope comes back sanitised, which is what the file name holds.
+                Some("tab_a1".to_owned()),
+            ]
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

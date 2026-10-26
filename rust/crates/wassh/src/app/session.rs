@@ -46,6 +46,8 @@ struct PluginPane {
     loaded: bool,
     /// Plugin secrets the pane sealed or cleared this frame, keyed by field.
     secret_writes: Vec<(String, Option<String>)>,
+    /// App-wide settings the pane changed while drawing.
+    app_writes: Vec<(String, serde_json::Value)>,
 }
 
 /// App- and host-level plugin settings for one session: what Options stores for
@@ -1154,6 +1156,7 @@ impl SessionEntry {
             seeded: serde_json::Map::new(),
             loaded: false,
             secret_writes: Vec::new(),
+            app_writes: Vec::new(),
         });
         self.panes.len() - 1
     }
@@ -1232,6 +1235,17 @@ impl SessionEntry {
         for pane in &mut self.panes {
             for (field, value) in std::mem::take(&mut pane.secret_writes) {
                 writes.push((pane.id, field, value));
+            }
+        }
+        writes
+    }
+
+    /// App-wide plugin settings the panes changed since the last call.
+    pub fn take_dirty_app_settings(&mut self) -> Vec<(PluginId, String, serde_json::Value)> {
+        let mut writes = Vec::new();
+        for pane in &mut self.panes {
+            for (key, value) in std::mem::take(&mut pane.app_writes) {
+                writes.push((pane.id, key, value));
             }
         }
         writes
@@ -1318,6 +1332,10 @@ impl SessionEntry {
                 pane.secret_writes.extend(writes);
             }
         }
+        let app_writes = pane.plugin.take_app_settings();
+        if !app_writes.is_empty() {
+            pane.app_writes.extend(app_writes);
+        }
         self.panes.push(pane);
         // A macro or plugin action types into the shell as if the user had.
         if !typed.is_empty() {
@@ -1341,6 +1359,19 @@ impl SessionEntry {
         if let Some(path) = self.files.poll() {
             // A transfer landed: show the directory as it is now.
             self.start_file_request(&path);
+        }
+    }
+
+    /// Take an app-wide value a pane refreshed into the pane's own copy.
+    ///
+    /// The pane reads its settings from a copy loaded once, so a value it just
+    /// refreshed in Options would otherwise be overwritten on the next frame.
+    /// It counts as supplied by the dialogs, so it stays out of the pane's file.
+    pub fn adopt_app_setting(&mut self, id: PluginId, key: &str, value: serde_json::Value) {
+        for pane in self.panes.iter_mut().filter(|pane| pane.id == id) {
+            pane.settings.insert(key.to_owned(), value.clone());
+            pane.saved.insert(key.to_owned(), value.clone());
+            pane.seeded.insert(key.to_owned(), value.clone());
         }
     }
 
@@ -2980,6 +3011,22 @@ mod tests {
         assert_eq!(settings["maxEntries"], serde_json::json!(25));
         // Those values belong to the dialog, so loading them is not an edit.
         assert!(entry.take_dirty_plugins().is_empty());
+    }
+
+    #[test]
+    fn an_adopted_app_setting_is_not_pane_data() {
+        let mut entry = password_entry();
+        let slot = entry.ensure_pane(wassh_plugins::PluginId::AiAgent);
+        entry.load_pane_data(slot, None, &PluginValues::default());
+
+        // A refreshed provider list comes back from the host as an app value.
+        let providers = serde_json::json!([{ "id": "one", "models": ["a"] }]);
+        entry.adopt_app_setting(wassh_plugins::PluginId::AiAgent, "providers", providers.clone());
+        assert_eq!(entry.panes[slot].settings["providers"], providers);
+        assert!(
+            entry.take_dirty_plugins().is_empty(),
+            "adopting an app value is not an edit of the pane's own data"
+        );
     }
 
     #[test]

@@ -42,13 +42,18 @@ pub fn plugin_data_file(
     plugin_id: &str,
     scope: Option<&str>,
 ) -> PathBuf {
-    let mut name = format!("plugin-{}", sanitize(plugin_id));
+    let mut name = plugin_data_prefix(plugin_id);
     if let Some(scope) = scope {
         name.push('.');
         name.push_str(&sanitize(scope));
     }
     name.push_str(".json");
     data_dir.as_ref().join(name)
+}
+
+/// Start of every document file name of one plugin, without the scope and suffix.
+pub fn plugin_data_prefix(plugin_id: &str) -> String {
+    format!("plugin-{}", sanitize(plugin_id))
 }
 
 fn sanitize(value: &str) -> String {

@@ -32,7 +32,7 @@ pub use field::{field, password_input, search_input, text_area, text_input};
 pub use menu::{MenuItem, MenuState, context_menu};
 pub use modal::{ModalResponse, footer, modal};
 pub use number::{clamp_value, number_input};
-pub use select::{select, select_str};
+pub use select::{select, select_str, select_width};
 pub use slider::{SLIDER_HEIGHT, SLIDER_WIDTH, slider_field, step_slider};
 pub use splitter::{SplitAxis, drop_index, drop_indicator, splitter};
 pub use surface::{

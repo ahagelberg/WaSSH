@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use wassh_core::SessionStatus;
 use wassh_ui::dock::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, select_str, small_button_enabled, text_area, text_input,
+    Button, ButtonKind, chip, select_str, select_width, small_button_enabled, text_area, text_input,
 };
 
 use super::agent::{
@@ -22,13 +22,14 @@ use super::agent::{
 use super::protocol::{
     default_providers, Protocol, ProviderConfig, CONVERSATIONS_PER_HOST_MAX, DATA_VERSION,
     DEFAULT_CHAT_TITLE, MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENT_BYTES, PROVIDER_OLLAMA, PROVIDER_OPENROUTER, SAFE_RULES,
+    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENT_BYTES, PROVIDER_OPENROUTER, SAFE_RULES,
     SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
     SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, SETTING_HOST_RAG_FOLDER,
     SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY,
     SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS,
 };
-use super::providers::{complete_blocking, CompletionRequest, EmbedConfig};
+use super::providers::{complete_blocking, provider_models, CompletionRequest, EmbedConfig};
+use super::settings_ui::{PROVIDERS_KEY, provider_secret_field};
 use super::tools;
 use crate::color::to_color32;
 use crate::plugin::{Plugin, PluginContext};
@@ -36,12 +37,36 @@ use crate::{PluginId, PluginManifest};
 
 /// Key the conversation is stored under.
 const CONVERSATION_KEY: &str = "conversation";
-/// Key the provider list is stored under.
-const PROVIDERS_KEY: &str = "providers";
-/// Key the typed API keys are stored under.
-const API_KEYS_KEY: &str = "apiKeys";
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
+/// Gap between the provider and model dropdowns under the composer.
+const FOOTER_GAP: f32 = 6.0;
+/// Narrowest a footer dropdown gets before it stops shrinking.
+const FOOTER_SELECT_MIN_WIDTH: f32 = 80.0;
+/// Room the provider and model row takes under the composer.
+const FOOTER_HEIGHT: f32 = 26.0;
+/// Type size of the two dropdowns.
+const FOOTER_TEXT_SIZE: f32 = 11.0;
+/// Room the composer and the two buttons under it keep free.
+const COMPOSER_HEIGHT: f32 = 116.0;
+/// The same while the agent waits for an answer to its question.
+const COMPOSER_HEIGHT_ASKING: f32 = 150.0;
+/// Shortest the transcript gets, whatever the pane height.
+const MIN_TRANSCRIPT_HEIGHT: f32 = 80.0;
+/// Room kept for the Send / Stop button next to the composer.
+const SEND_BUTTON_WIDTH: f32 = 96.0;
+/// Narrowest the composer text area gets.
+const MIN_COMPOSER_WIDTH: f32 = 80.0;
+/// Caption of the file-attach button.
+const ATTACH_GLYPH: &str = "📎";
+/// Caption of the terminal-context toggle.
+const TERMINAL_ATTACH_GLYPH: &str = "⌁";
+/// Characters of terminal output attached to a message as context.
+const TERMINAL_CONTEXT_CHARS: usize = 6_000;
+/// Heading of that block in the outgoing message.
+const TERMINAL_CONTEXT_MARKER: &str = "[Recent terminal output]";
+/// Text used when the terminal has shown nothing yet.
+const TERMINAL_CONTEXT_EMPTY: &str = "[No terminal output captured yet.]";
 /// A slash command the composer understands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
@@ -127,9 +152,6 @@ impl Attachment {
     }
 }
 
-/// A model-list fetch: the provider it belongs to and its answer.
-type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
-
 /// What a summary worker is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SummaryMode {
@@ -138,6 +160,9 @@ enum SummaryMode {
     /// Show it, then start a new chat carrying it.
     Transfer,
 }
+
+/// A model-list fetch running on its own thread: the provider index and the worker.
+type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
 
 /// A previous conversation, kept so the user can go back to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,18 +199,22 @@ pub struct AiAgent {
     draft: String,
     /// Files attached to the next message.
     attachments: Vec<Attachment>,
+    /// Whether the next message carries the recent terminal output.
+    attach_terminal: bool,
     /// A file picker running on its own thread.
     picking: Option<Receiver<Vec<String>>>,
-    /// A model-list fetch running on its own thread.
-    fetching: Option<ModelFetch>,
+    /// A provider's model list being fetched: its index and the worker.
+    fetch: Option<ModelFetch>,
+    /// Providers whose model list was already refreshed in this pane.
+    refreshed: std::collections::BTreeSet<String>,
+    /// App-wide settings this pane changed, handed to the host after drawing.
+    app_writes: Vec<(String, Value)>,
     /// A summary running on its own thread.
     summary: Option<(SummaryMode, Receiver<Result<String, String>>)>,
     /// The question composer, while `ask_user` waits.
     answer: String,
     /// The sudo password field, after a refused command.
     sudo: String,
-    /// Whether the provider editor is open.
-    editing: bool,
     /// Whether the stored conversation has been read back.
     loaded: bool,
     /// Caption and health for the pane header.
@@ -210,12 +239,14 @@ impl Default for AiAgent {
             keys: std::collections::BTreeMap::new(),
             draft: String::new(),
             attachments: Vec::new(),
+            attach_terminal: false,
             picking: None,
-            fetching: None,
+            fetch: None,
+            refreshed: std::collections::BTreeSet::new(),
+            app_writes: Vec::new(),
             summary: None,
             answer: String::new(),
             sudo: String::new(),
-            editing: false,
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
             error: None,
@@ -256,6 +287,17 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// The last `max_chars` characters of `text`.
+fn tail_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    match text.char_indices().rev().nth(max_chars - 1) {
+        Some((index, _)) => &text[index..],
+        None => text,
+    }
 }
 
 impl AiAgent {
@@ -442,24 +484,120 @@ impl AiAgent {
         })
     }
 
-    /// Read the stored conversation and providers back in.
+    /// Take the provider list and API keys from the app-wide settings and the vault.
+    ///
+    /// Options owns both, so they are re-read every frame and never written back here;
+    /// the current provider and model stay per conversation. Keys arrive decrypted
+    /// from the host, because a pane cannot reach the credential vault itself.
+    fn sync_providers(
+        &mut self,
+        settings: &serde_json::Map<String, Value>,
+        secrets: &std::collections::BTreeMap<String, String>,
+    ) {
+        let selected = self.active().map(|provider| provider.id.clone());
+        self.providers = settings
+            .get(PROVIDERS_KEY)
+            .and_then(|value| serde_json::from_value::<Vec<ProviderConfig>>(value.clone()).ok())
+            .filter(|providers| !providers.is_empty())
+            .unwrap_or_else(default_providers);
+        self.keys = self
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                let field = super::settings_ui::provider_secret_field(&provider.id);
+                secrets
+                    .get(&field)
+                    .map(|key| (provider.id.clone(), key.clone()))
+            })
+            .collect();
+        self.provider = selected
+            .and_then(|id| self.providers.iter().position(|provider| provider.id == id))
+            .unwrap_or(0)
+            .min(self.providers.len().saturating_sub(1));
+        // A conversation without a model starts on the provider's first one.
+        if self.model.is_empty()
+            && let Some(model) = self.providers[self.provider].models.first()
+        {
+            self.model.clone_from(model);
+        }
+    }
+
+    /// Fetch a provider's model list the first time it is used.
+    ///
+    /// The reference refreshes the list from the provider itself instead of
+    /// trusting what Options last saved, so a new Ollama model shows up without
+    /// anyone pressing a button.
+    fn refresh_models(&mut self, context: &PluginContext<'_>) {
+        if self.fetch.is_some() {
+            return;
+        }
+        let Some(provider) = self.active() else {
+            return;
+        };
+        if self.refreshed.contains(&provider.id) {
+            return;
+        }
+        let key = context
+            .secrets
+            .get(&provider_secret_field(&provider.id))
+            .cloned()
+            .unwrap_or_default();
+        // Anthropic lists its models only for a key; without one the list stays
+        // as configured, like the reference.
+        if key.is_empty() && provider.protocol == Protocol::Anthropic {
+            return;
+        }
+        let index = self.provider;
+        let provider = provider.clone();
+        self.refreshed.insert(provider.id.clone());
+        let (sender, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(provider_models(&provider, &key));
+        });
+        self.fetch = Some((index, events));
+    }
+
+    /// Collect a finished model list. Returns whether the list changed.
+    fn poll_models(&mut self) -> bool {
+        let Some((index, events)) = &self.fetch else {
+            return false;
+        };
+        match events.try_recv() {
+            Ok(Ok(mut models)) if !models.is_empty() => {
+                let index = *index;
+                // Same order as the reference: case-insensitive alphabetical.
+                models.sort_by_key(|model| model.to_lowercase());
+                self.fetch = None;
+                if let Some(provider) = self.providers.get_mut(index) {
+                    provider.models = models;
+                }
+                if self.model.is_empty()
+                    && let Some(model) = self.providers[index].models.first()
+                {
+                    self.model.clone_from(model);
+                }
+                // Options owns the provider list; the host files the fresh models there.
+                self.app_writes.push((
+                    PROVIDERS_KEY.to_owned(),
+                    serde_json::to_value(&self.providers).unwrap_or(Value::Null),
+                ));
+                true
+            }
+            // An error or an empty list leaves the configured models alone.
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.fetch = None;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+        }
+    }
+
+    /// Read the stored conversation back in.
     fn load(&mut self, settings: &serde_json::Map<String, Value>) {
         if self.loaded {
             return;
         }
         self.loaded = true;
-        if let Some(providers) = settings.get(PROVIDERS_KEY)
-            && let Ok(parsed) = serde_json::from_value::<Vec<ProviderConfig>>(providers.clone())
-            && !parsed.is_empty()
-        {
-            self.providers = parsed;
-        }
-        if let Some(keys) = settings.get(API_KEYS_KEY)
-            && let Ok(parsed) =
-                serde_json::from_value::<std::collections::BTreeMap<String, String>>(keys.clone())
-        {
-            self.keys = parsed;
-        }
         let Some(stored) = settings.get(CONVERSATION_KEY) else {
             return;
         };
@@ -603,47 +741,6 @@ impl AiAgent {
         }
     }
 
-    /// Ask a provider for its model list on a worker thread.
-    fn fetch_models(&mut self, index: usize) {
-        if self.fetching.is_some() {
-            return;
-        }
-        let Some(provider) = self.providers.get(index).cloned() else {
-            return;
-        };
-        let key = self.keys.get(&provider.id).cloned().unwrap_or_default();
-        let (sender, events) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(super::providers::provider_models(&provider, &key));
-        });
-        self.fetching = Some((index, events));
-    }
-
-    /// Collect a finished model list.
-    fn poll_models(&mut self) {
-        let Some((index, events)) = &self.fetching else {
-            return;
-        };
-        match events.try_recv() {
-            Ok(result) => {
-                let index = *index;
-                self.fetching = None;
-                match result {
-                    Ok(models) if !models.is_empty() => {
-                        if let Some(provider) = self.providers.get_mut(index) {
-                            provider.models = models;
-                        }
-                        self.error = None;
-                    }
-                    Ok(_) => self.error = Some("The provider listed no models.".to_owned()),
-                    Err(error) => self.error = Some(error),
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.fetching = None,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-    }
-
     /// Open the native file picker for attachments.
     fn pick_attachments(&mut self) {
         if self.picking.is_some() || self.attachments.len() >= MAX_ATTACHMENTS {
@@ -718,11 +815,8 @@ impl AiAgent {
         }
     }
 
-    /// The user message with attachments folded in.
-    fn message_with_attachments(&self, text: &str) -> String {
-        if self.attachments.is_empty() {
-            return text.to_owned();
-        }
+    /// The user message with attachments and the terminal tail folded in.
+    fn message_with_attachments(&self, text: &str, terminal: Option<&str>) -> String {
         let mut message = String::new();
         for attachment in &self.attachments {
             message.push_str(&format!(
@@ -732,6 +826,15 @@ impl AiAgent {
             ));
         }
         message.push_str(text);
+        if let Some(tail) = terminal {
+            let tail = tail_chars(tail, TERMINAL_CONTEXT_CHARS);
+            message.push_str(&format!("\n\n{TERMINAL_CONTEXT_MARKER}\n"));
+            message.push_str(if tail.trim().is_empty() {
+                TERMINAL_CONTEXT_EMPTY
+            } else {
+                tail
+            });
+        }
         message
     }
 
@@ -861,90 +964,6 @@ impl AiAgent {
             ui.add_space(6.0);
         }
     }
-
-    /// Paint the provider editor.
-    fn provider_editor(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
-        egui::ScrollArea::vertical()
-            .id_salt("ai-providers")
-            .max_height(180.0)
-            .show(ui, |ui| {
-                let mut remove = None;
-                let mut started = None;
-                let count = self.providers.len();
-                for (index, provider) in self.providers.iter_mut().enumerate() {
-                    let mut fetch = false;
-                    ui.horizontal(|ui| {
-                        let room = (ui.available_width() - 150.0).max(90.0);
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(room, 0.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.set_width(room);
-                                text_input(ui, palette, &mut provider.name, "name");
-                            },
-                        );
-                        if small_button_enabled(ui, palette, "Fetch", true) {
-                            fetch = true;
-                        }
-                        if small_button_enabled(ui, palette, "Remove", count > 1) {
-                            remove = Some(index);
-                        }
-                    });
-                    if fetch {
-                        started = Some(index);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("URL").size(10.5).color(muted));
-                        let room = (ui.available_width() - 8.0).max(80.0);
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(room, 0.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.set_width(room);
-                                text_input(ui, palette, &mut provider.base_url, "https://host/v1");
-                            },
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Models").size(10.5).color(muted));
-                        let mut models = provider.models.join(", ");
-                        let room = (ui.available_width() - 8.0).max(80.0);
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(room, 0.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.set_width(room);
-                                if text_input(ui, palette, &mut models, "model-a, model-b").changed() {
-                                    provider.models = models
-                                        .split(',')
-                                        .map(|model| model.trim().to_owned())
-                                        .filter(|model| !model.is_empty())
-                                        .collect();
-                                }
-                            },
-                        );
-                    });
-                    ui.add_space(4.0);
-                }
-                if let Some(index) = remove {
-                    self.providers.remove(index);
-                    self.provider = self.provider.min(self.providers.len().saturating_sub(1));
-                }
-                if let Some(index) = started {
-                    self.fetch_models(index);
-                }
-                if small_button_enabled(ui, palette, "Add provider", true) {
-                    self.providers.push(ProviderConfig {
-                        id: format!("custom-{}", self.providers.len() + 1),
-                        name: "Custom provider".to_owned(),
-                        protocol: Protocol::Openai,
-                        base_url: "https://api.example.com/v1".to_owned(),
-                        models: Vec::new(),
-                        embedding_model: None,
-                    });
-                }
-            });
-    }
 }
 
 impl Plugin for AiAgent {
@@ -956,17 +975,23 @@ impl Plugin for AiAgent {
         (!self.caption.0.is_empty()).then(|| self.caption.clone())
     }
 
+    fn take_app_settings(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.app_writes)
+    }
+
     fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
         let palette = &context.palette;
         let muted = to_color32(palette.text_muted);
         // Taken out so the borrow of one field does not block the rest.
         let mut session = context.session.take();
+        self.sync_providers(context.settings, context.secrets);
         self.load(context.settings);
         self.apply_settings(context.settings, context.secret(SETTING_WEB_SEARCH_KEY));
+        self.poll_models();
+        self.refresh_models(context);
         self.agent.now_ms = now_ms();
         self.poll_summary();
         self.poll_picker();
-        self.poll_models();
 
         // Drain workers, then answer any tool result it produced.
         self.agent.poll(&mut session);
@@ -976,7 +1001,7 @@ impl Plugin for AiAgent {
                 self.agent.start(request);
             }
         }
-        if self.agent.busy() || self.summary.is_some() || self.picking.is_some() {
+        if self.agent.busy() || self.summary.is_some() || self.picking.is_some() || self.fetch.is_some() {
             ui.ctx().request_repaint();
         }
 
@@ -991,34 +1016,8 @@ impl Plugin for AiAgent {
         let busy = self.agent.busy();
         let mut sudo_retry = false;
 
-        // Provider, model and the pane controls.
+        // The pane controls; provider and model live under the composer.
         ui.horizontal(|ui| {
-            let labels: Vec<&'static str> = self
-                .providers
-                .iter()
-                .map(|provider| &*Box::leak(provider.name.clone().into_boxed_str()))
-                .collect();
-            let current = self
-                .active()
-                .map(|provider| provider.name.clone())
-                .unwrap_or_default();
-            if let Some(chosen) = select_str(ui, "ai-provider", &current, &labels)
-                && let Some(index) = self.providers.iter().position(|item| item.name == chosen)
-            {
-                self.provider = index;
-                if let Some(model) = self.providers[index].models.first() {
-                    self.model.clone_from(model);
-                }
-            }
-            let room = (ui.available_width() - 96.0).max(120.0);
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(room, 0.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.set_width(room);
-                    text_input(ui, palette, &mut self.model, "model");
-                },
-            );
             if small_button_enabled(ui, palette, "New chat", !busy && !self.agent.turns.is_empty()) {
                 self.begin_new_chat();
             }
@@ -1026,48 +1025,23 @@ impl Plugin for AiAgent {
 
         // Previous conversations.
         if !self.chats.is_empty() {
-            ui.horizontal(|ui| {
-                let labels: Vec<&'static str> = self
-                    .chats
-                    .iter()
-                    .map(|chat| &*Box::leak(chat.title.clone().into_boxed_str()))
-                    .collect();
-                ui.label(egui::RichText::new("Chats").size(11.0).color(muted));
-                if let Some(chosen) = select_str(ui, "ai-chats", "", &labels)
-                    && let Some(index) = self.chats.iter().position(|chat| chat.title == chosen)
-                {
-                    self.open_chat(index);
-                }
-            });
+            let chosen = {
+                let titles: Vec<&str> = self.chats.iter().map(|chat| chat.title.as_str()).collect();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Chats").size(11.0).color(muted));
+                    select_str(ui, "ai-chats", "", &titles)
+                })
+                .inner
+            };
+            if let Some(chosen) = chosen
+                && let Some(index) = self.chats.iter().position(|chat| chat.title == chosen)
+            {
+                self.open_chat(index);
+            }
         }
 
-        // The provider's key, when it needs one.
-        let provider_id = self.active().map(|provider| provider.id.clone());
-        if let Some(provider_id) = provider_id.filter(|id| id != PROVIDER_OLLAMA) {
-            let mut key = self.keys.get(&provider_id).cloned().unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("API key").size(11.0).color(muted));
-                let room = (ui.available_width() - 100.0).max(80.0);
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(room, 0.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(room);
-                        if text_input(ui, palette, &mut key, "paste the provider key").changed() {
-                            self.keys.insert(provider_id.clone(), key.clone());
-                        }
-                    },
-                );
-                if small_button_enabled(ui, palette, "Providers", true) {
-                    self.editing = !self.editing;
-                }
-            });
-        } else if small_button_enabled(ui, palette, "Providers", true) {
-            self.editing = !self.editing;
-        }
-        if self.editing {
-            self.provider_editor(ui, palette, muted);
-        }
+        // The provider, model and keys are configured in Options → AI agent; the pane
+        // only picks which of them this conversation uses.
 
         // A refused sudo password is asked for here, like the reference.
         if self.agent.sudo_waiting {
@@ -1090,8 +1064,12 @@ impl Plugin for AiAgent {
         ui.separator();
 
         // Transcript.
-        let composer_height = if self.agent.asking() { 150.0 } else { 116.0 };
-        let height = (ui.available_height() - composer_height).max(80.0);
+        let composer_height = if self.agent.asking() {
+            COMPOSER_HEIGHT_ASKING
+        } else {
+            COMPOSER_HEIGHT
+        } + FOOTER_HEIGHT;
+        let height = (ui.available_height() - composer_height).max(MIN_TRANSCRIPT_HEIGHT);
         let mut approval: Option<(bool, Option<usize>, bool)> = None;
         let mut answer: Option<String> = None;
         egui::ScrollArea::vertical()
@@ -1254,27 +1232,21 @@ impl Plugin for AiAgent {
         let mut submit = false;
         let mut command: Option<SlashCommand> = None;
         ui.horizontal(|ui| {
-            if busy {
-                if Button::new("Stop")
-                    .compact()
-                    .kind(ButtonKind::Danger)
-                    .show(ui, palette)
-                    .clicked()
-                {
-                    self.agent.stop();
+            // The attach buttons stack on the left, like the reference composer.
+            ui.vertical(|ui| {
+                if small_button_enabled(
+                    ui,
+                    palette,
+                    ATTACH_GLYPH,
+                    self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS,
+                ) {
+                    self.pick_attachments();
                 }
-            } else if small_button_enabled(ui, palette, "Send", !self.draft.trim().is_empty()) {
-                submit = true;
-            }
-            if small_button_enabled(
-                ui,
-                palette,
-                &format!("Attach ({})", self.attachments.len()),
-                self.attachments.len() < MAX_ATTACHMENTS,
-            ) {
-                self.pick_attachments();
-            }
-            let room = (ui.available_width() - 8.0).max(80.0);
+                if chip(ui, palette, TERMINAL_ATTACH_GLYPH, self.attach_terminal) {
+                    self.attach_terminal = !self.attach_terminal;
+                }
+            });
+            let room = (ui.available_width() - SEND_BUTTON_WIDTH).max(MIN_COMPOSER_WIDTH);
             ui.allocate_ui_with_layout(
                 egui::Vec2::new(room, 0.0),
                 egui::Layout::top_down(egui::Align::Min),
@@ -1289,17 +1261,86 @@ impl Plugin for AiAgent {
                     }
                 },
             );
+            if busy {
+                if Button::new("Stop")
+                    .compact()
+                    .kind(ButtonKind::Danger)
+                    .show(ui, palette)
+                    .clicked()
+                {
+                    self.agent.stop();
+                }
+            } else if small_button_enabled(ui, palette, "Send", !self.draft.trim().is_empty()) {
+                submit = true;
+            }
         });
+
+        // Provider and model under the composer, like the reference footer.
+        let footer_room = ((ui.available_width() - FOOTER_GAP) / 2.0).max(FOOTER_SELECT_MIN_WIDTH);
+        let (chosen_provider, chosen_model) = {
+            let provider_options: Vec<(usize, &str)> = self
+                .providers
+                .iter()
+                .enumerate()
+                .map(|(index, provider)| (index, provider.name.as_str()))
+                .collect();
+            let model_options: Vec<(String, &str)> = self
+                .active()
+                .map(|provider| {
+                    provider
+                        .models
+                        .iter()
+                        .map(|model| (model.clone(), model.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = FOOTER_GAP;
+                // The reference footer is set in the same small type as the rest.
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Button,
+                    egui::FontId::proportional(FOOTER_TEXT_SIZE),
+                );
+                let provider =
+                    select_width(ui, "ai-provider", &self.provider, &provider_options, footer_room);
+                let model = select_width(ui, "ai-model", &self.model, &model_options, footer_room);
+                (provider, model)
+            })
+            .inner
+        };
+        if let Some(index) = chosen_provider {
+            self.provider = index;
+            // A provider starts on its first model, like the reference.
+            self.model = self.providers[index]
+                .models
+                .first()
+                .cloned()
+                .unwrap_or_default();
+        }
+        if let Some(model) = chosen_model {
+            self.model = model;
+        }
+
         if submit && !busy && let Some(slash) = &slash && let Some(exact) = slash.exact {
             command = Some(exact);
         }
         if let Some(command) = command {
             self.run_command(command, context.settings, &context.host_label);
         } else if submit && !busy && !self.draft.trim().is_empty() {
-            let message = self.message_with_attachments(self.draft.trim());
+            // The toggle attaches the live terminal screen to this one message.
+            let terminal = self
+                .attach_terminal
+                .then(|| {
+                    session
+                        .as_ref()
+                        .map(|access| access.screen_text())
+                        .unwrap_or_default()
+                });
+            let message = self.message_with_attachments(self.draft.trim(), terminal.as_deref());
             if self.agent.push_user(&message) {
                 self.draft.clear();
                 self.attachments.clear();
+                self.attach_terminal = false;
                 let request = self.request(context.settings, &context.host_label);
                 if let Some(request) = request {
                     self.agent.start(request);
@@ -1335,14 +1376,6 @@ impl Plugin for AiAgent {
                 "chats": chats
             }),
         );
-        context.set_value(
-            PROVIDERS_KEY,
-            serde_json::to_value(&self.providers).unwrap_or(Value::Null),
-        );
-        context.set_value(
-            API_KEYS_KEY,
-            serde_json::to_value(&self.keys).unwrap_or(Value::Null),
-        );
         context.session = session;
         let _ = PROVIDER_OPENROUTER;
     }
@@ -1354,6 +1387,7 @@ mod tests {
     static EMPTY_SECRETS: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
 
+    use super::super::settings_ui::{API_KEYS_KEY, provider_secret_field};
     use super::*;
     use wassh_core::Palette;
 
@@ -1416,7 +1450,14 @@ mod tests {
             "empty hint missing: {texts:?}"
         );
         assert!(texts.contains(&"Send"), "composer missing: {texts:?}");
-        assert!(texts.contains(&"Attach (0)"), "attach button missing: {texts:?}");
+        assert!(
+            texts.contains(&ATTACH_GLYPH),
+            "attach button missing: {texts:?}"
+        );
+        assert!(
+            texts.contains(&TERMINAL_ATTACH_GLYPH),
+            "terminal-context toggle missing: {texts:?}"
+        );
         assert_eq!(
             plugin.header_status(),
             Some((DEFAULT_CHAT_TITLE.to_owned(), HeaderHealth::Ok))
@@ -1426,6 +1467,11 @@ mod tests {
     #[test]
     fn a_stored_conversation_comes_back_and_the_title_follows_it() {
         let mut settings = serde_json::Map::new();
+        settings.insert(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "ollama", "name": "Ollama", "protocol": "openai",
+                     "baseUrl": "http://127.0.0.1:11434/v1", "models": ["llama3.1", "qwen3"] }]),
+        );
         settings.insert(
             CONVERSATION_KEY.to_owned(),
             json!({
@@ -1446,17 +1492,43 @@ mod tests {
         let mut plugin = AiAgent::default();
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
-        assert!(texts.contains(&"llama3.1"), "stored model missing: {texts:?}");
+        assert!(
+            texts.contains(&"llama3.1"),
+            "the model dropdown does not show the stored model: {texts:?}"
+        );
         assert!(
             texts.contains(&"how much disk is left"),
             "stored question missing: {texts:?}"
         );
+        assert_eq!(plugin.model, "llama3.1");
         assert_eq!(plugin.agent.cwd, "/srv/app");
         assert_eq!(plugin.agent.history.len(), 2);
         assert_eq!(
             plugin.header_status(),
             Some(("how much disk is left".to_owned(), HeaderHealth::Ok))
         );
+    }
+
+    #[test]
+    fn the_footer_picks_the_provider_and_one_of_its_models() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            PROVIDERS_KEY.to_owned(),
+            json!([
+                { "id": "one", "name": "First", "protocol": "openai",
+                  "baseUrl": "https://one/v1", "models": ["a", "b"] },
+                { "id": "two", "name": "Second", "protocol": "anthropic",
+                  "baseUrl": "https://two", "models": ["c"] }
+            ]),
+        );
+        let mut plugin = AiAgent::default();
+        let painted = draw(&mut plugin, &mut settings);
+        let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
+        // First provider and its first model are what a new conversation starts on.
+        assert!(texts.contains(&"First"), "provider dropdown missing: {texts:?}");
+        assert!(texts.contains(&"a"), "model dropdown missing: {texts:?}");
+        assert_eq!(plugin.provider, 0);
+        assert_eq!(plugin.model, "a");
     }
 
     #[test]
@@ -1541,16 +1613,76 @@ mod tests {
     }
 
     #[test]
-    fn attachments_are_folded_into_the_message() {
+    fn attachments_and_the_terminal_tail_are_folded_into_the_message() {
         let mut plugin = AiAgent::default();
         plugin.attachments.push(Attachment {
             path: "/tmp/notes.txt".to_owned(),
             text: "line one".to_owned(),
         });
-        let message = plugin.message_with_attachments("summarise this");
+        let message = plugin.message_with_attachments("summarise this", Some("$ uptime\nup 3 days"));
         assert!(message.starts_with("[Attached file notes.txt]\nline one"), "{message}");
-        assert!(message.ends_with("summarise this"), "{message}");
-        assert!(plugin.message_with_attachments("plain").contains("Attached"));
+        assert!(message.contains("summarise this"), "{message}");
+        assert!(
+            message.ends_with("[Recent terminal output]\n$ uptime\nup 3 days"),
+            "terminal context missing: {message}"
+        );
+        assert!(plugin.message_with_attachments("plain", None).contains("Attached"));
+
+        // A blank terminal still says so, like the reference.
+        let empty = plugin.message_with_attachments("plain", Some("  "));
+        assert!(empty.ends_with("[Recent terminal output]\n[No terminal output captured yet.]"));
+    }
+
+    #[test]
+    fn the_terminal_tail_keeps_the_last_characters() {
+        assert_eq!(tail_chars("abcdef", 2), "ef");
+        assert_eq!(tail_chars("abc", 10), "abc");
+        assert_eq!(tail_chars("abc", 0), "");
+        // Multi-byte characters are cut on their boundary.
+        assert_eq!(tail_chars("hällo", 2), "lo");
+    }
+
+    #[test]
+    fn a_fetched_model_list_reaches_the_app_settings() {
+        let mut plugin = AiAgent {
+            providers: vec![ProviderConfig {
+                id: "one".to_owned(),
+                name: "First".to_owned(),
+                protocol: Protocol::Openai,
+                base_url: "https://one/v1".to_owned(),
+                models: vec!["old".to_owned()],
+                embedding_model: None,
+            }],
+            model: "old".to_owned(),
+            ..AiAgent::default()
+        };
+        let (sender, events) = std::sync::mpsc::channel();
+        plugin.fetch = Some((0, events));
+        sender
+            .send(Ok(vec!["c".to_owned(), "A".to_owned()]))
+            .expect("send");
+
+        assert!(plugin.poll_models(), "the list should count as changed");
+        assert_eq!(plugin.providers[0].models, ["A", "c"], "sorted, case-insensitive");
+        assert_eq!(plugin.model, "old", "the chosen model is left alone");
+
+        let writes = plugin.take_app_settings();
+        assert_eq!(writes.len(), 1, "one app-wide write");
+        assert_eq!(writes[0].0, PROVIDERS_KEY);
+        assert_eq!(writes[0].1[0]["models"], json!(["A", "c"]));
+    }
+
+    #[test]
+    fn a_failed_model_fetch_keeps_the_configured_list() {
+        let mut plugin = AiAgent::default();
+        plugin.providers[0].models = vec!["kept".to_owned()];
+        let (sender, events) = std::sync::mpsc::channel();
+        plugin.fetch = Some((0, events));
+        sender.send(Err("no route".to_owned())).expect("send");
+
+        assert!(!plugin.poll_models());
+        assert_eq!(plugin.providers[0].models, ["kept"]);
+        assert!(plugin.take_app_settings().is_empty());
     }
 
     #[test]
@@ -1591,7 +1723,36 @@ mod tests {
         assert_eq!(stored["turns"].as_array().map(Vec::len), Some(2));
         assert_eq!(stored["history"].as_array().map(Vec::len), Some(3));
         assert_eq!(stored["turns"][1]["label"], "$ uptime");
-        assert!(settings.contains_key(PROVIDERS_KEY));
+        // Providers belong to Options, so the pane never writes them back.
+        assert!(!settings.contains_key(PROVIDERS_KEY));
+        assert!(!settings.contains_key(API_KEYS_KEY));
+    }
+
+    #[test]
+    fn providers_come_from_the_app_wide_settings_and_keys_from_the_vault() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            PROVIDERS_KEY.to_owned(),
+            json!([
+                { "id": "one", "name": "First", "protocol": "openai",
+                  "baseUrl": "https://one/v1", "models": ["m1"] },
+                { "id": "two", "name": "Second", "protocol": "anthropic",
+                  "baseUrl": "https://two", "models": ["m2"] }
+            ]),
+        );
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(provider_secret_field("two"), "secret".to_owned());
+        let mut plugin = AiAgent::default();
+        draw_with_secrets(&mut plugin, &mut settings, &secrets);
+
+        let names: Vec<&str> = plugin
+            .providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        assert_eq!(names, ["First", "Second"]);
+        assert_eq!(plugin.keys.get("two").map(String::as_str), Some("secret"));
+        assert_eq!(plugin.keys.get("one"), None, "no key stored for one");
     }
 
     #[test]

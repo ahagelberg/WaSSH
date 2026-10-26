@@ -299,10 +299,10 @@ const AI_AGENT_KNOWLEDGE_CHILDREN: &[SettingsField] = &[
     ),
     SettingsField {
         key: "ragProviderId",
-        label: "Embedding provider",
-        kind: FieldKind::Select,
+        label: "Embedding provider id",
+        kind: FieldKind::String,
         default: FieldDefault::Text(""),
-        description: "Optional. Select an OpenAI-compatible provider to enable semantic knowledge-base search.",
+        description: "Optional. Id of one of the providers above (for example \u{201c}openai\u{201d}), to enable semantic knowledge-base search.",
         secret: false,
         options: &[],
         children: &[],
@@ -312,9 +312,9 @@ const AI_AGENT_KNOWLEDGE_CHILDREN: &[SettingsField] = &[
     SettingsField {
         key: "ragEmbeddingModel",
         label: "Embedding model",
-        kind: FieldKind::Select,
+        kind: FieldKind::String,
         default: FieldDefault::Text(""),
-        description: "Optional. Embedding model used with the provider above; without it, text matching is used.",
+        description: "Optional. Embedding model that provider offers; without it, text matching is used.",
         secret: false,
         options: &[],
         children: &[],
@@ -783,6 +783,38 @@ pub fn resolve(
     apply_to(id, app_values, host_values, &mut values);
     values
 }
+
+/// Key one plugin secret field is filed under in [`PluginSecretDrafts`].
+pub fn secret_field_key(plugin: &str, field: &str) -> String {
+    format!("{plugin}|{field}")
+}
+
+/// A plugin secret field while a settings dialog is open.
+///
+/// The value never goes into the settings map: the host seals it into the
+/// credential vault when the dialog is saved, exactly like a host password.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecretDraft {
+    /// Text typed in this dialog, empty to keep whatever is stored.
+    pub draft: String,
+    /// Whether the vault already holds a value.
+    pub stored: bool,
+    /// The user asked to forget the stored value.
+    pub clear: bool,
+}
+
+impl SecretDraft {
+    /// A draft for a field the vault already holds.
+    pub fn stored() -> Self {
+        Self {
+            stored: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Every plugin secret a dialog is editing, keyed by [`secret_field_key`].
+pub type PluginSecretDrafts = std::collections::BTreeMap<String, SecretDraft>;
 
 #[cfg(test)]
 mod tests {

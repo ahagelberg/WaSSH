@@ -10,6 +10,7 @@ mod rag;
 mod protocol;
 mod providers;
 mod rules;
+mod settings_ui;
 mod tools;
 mod web;
 mod view;
@@ -23,4 +24,8 @@ pub use protocol::{
 pub use providers::{provider_models, CompletionRequest, EmbedConfig, StreamEvent};
 pub use agent::{Agent, Phase, ToolSettings, Turn, Waiting};
 pub use rules::{approval_scopes, decide_command, ApprovalScope, RuleDecision};
+pub use settings_ui::{
+    API_KEYS_KEY, PROVIDERS_KEY, ProviderEditor, is_provider_key_field, provider_ids,
+    provider_secret_field,
+};
 pub use view::AiAgent;

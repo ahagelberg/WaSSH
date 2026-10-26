@@ -171,48 +171,25 @@ impl SecretEdit {
     }
 }
 
-/// Key one plugin secret field is filed under in [`PluginSecretDrafts`].
-pub fn secret_field_key(plugin: &str, field: &str) -> String {
-    format!("{plugin}|{field}")
+/// Plugin secret drafts and their keys live in `wassh_plugins`, so a plugin's own
+/// settings editor can edit its secrets without going through the app.
+pub use wassh_plugins::settings::{PluginSecretDrafts, SecretDraft, secret_field_key};
+
+/// Whether saving this draft would change the vault.
+pub fn draft_changes(draft: &SecretDraft) -> bool {
+    draft.clear || !draft.draft.is_empty()
 }
 
-/// A plugin `secret: true` field while the dialog is open.
-///
-/// The value is never put into the settings map: the host seals it into the
-/// credential vault when the dialog is saved, exactly like a host password.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SecretDraft {
-    /// Text typed in this dialog, empty to keep whatever is stored.
-    pub draft: String,
-    /// Whether the vault already holds a value.
-    pub stored: bool,
-    /// The user asked to forget the stored value.
-    pub clear: bool,
-}
-
-impl SecretDraft {
-    /// What to write when the dialog is saved.
-    pub fn edit(&self) -> SecretEdit {
-        if self.clear {
-            SecretEdit::Clear
-        } else if self.draft.is_empty() {
-            SecretEdit::Unchanged
-        } else {
-            SecretEdit::Set(self.draft.clone())
-        }
-    }
-
-    /// A draft for a field the vault already holds.
-    pub fn stored() -> Self {
-        Self {
-            stored: true,
-            ..Self::default()
-        }
+/// The value a plugin secret draft stands for: `None` keeps what is stored.
+pub fn plugin_secret_value(draft: &SecretDraft) -> Option<Option<&str>> {
+    if draft.clear {
+        Some(None)
+    } else if draft.draft.is_empty() {
+        None
+    } else {
+        Some(Some(draft.draft.as_str()))
     }
 }
-
-/// Every plugin secret a dialog is editing, keyed by [`secret_field_key`].
-pub type PluginSecretDrafts = std::collections::BTreeMap<String, SecretDraft>;
 
 /// Which plugin a settings section belongs to, and where its secrets go.
 pub struct SecretEditing<'a> {
@@ -331,6 +308,8 @@ pub struct OptionsState {
     pub editor: Option<PluginId>,
     /// Secrets of app-wide plugin settings (`secret: true` fields).
     pub plugin_secrets: PluginSecretDrafts,
+    /// State of the AI agent's provider editor (a model fetch in flight).
+    pub ai_providers: wassh_plugins::ai_agent::ProviderEditor,
 }
 
 impl OptionsState {
@@ -345,6 +324,7 @@ impl OptionsState {
             backup_path: String::new(),
             editor: None,
             plugin_secrets: PluginSecretDrafts::new(),
+            ai_providers: wassh_plugins::ai_agent::ProviderEditor::default(),
         }
     }
 
@@ -1111,6 +1091,7 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         backup_path,
         editor,
         plugin_secrets,
+        ..
     } = state;
     // Set while the section closure runs; applied once the shell returns.
     let mut open_editor = None;
@@ -1451,6 +1432,17 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
                 .max_height(EDITOR_HEIGHT)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // The AI agent's provider list is app-wide too, and comes first: it is
+                    // what the rest of the chat settings refer to.
+                    if id == PluginId::AiAgent {
+                        provider_section(
+                            ui,
+                            palette,
+                            &mut state.ai_providers,
+                            &mut values,
+                            &mut state.plugin_secrets,
+                        );
+                    }
                     plugin_settings_rows(
                         ui,
                         palette,
@@ -1478,6 +1470,30 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
     if response.dismissed || close {
         state.editor = None;
     }
+}
+
+/// The AI agent's provider list, which lives in the app-wide dialog like its fields.
+fn provider_section(
+    ui: &mut Ui,
+    palette: &Palette,
+    editor: &mut wassh_plugins::ai_agent::ProviderEditor,
+    values: &mut serde_json::Map<String, serde_json::Value>,
+    secrets: &mut PluginSecretDrafts,
+) {
+    let muted = to_color32(palette.text_muted);
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("PROVIDERS").size(12.0).color(muted));
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Endpoints the AI agent can chat through. API keys are sealed in the \
+             credential vault.",
+        )
+        .size(11.0)
+        .color(muted),
+    );
+    ui.add_space(6.0);
+    editor.show(ui, palette, values, secrets);
 }
 
 /// One plugin-owned section of a settings dialog.
@@ -2054,6 +2070,7 @@ fn host_dialog(
         defaults: state_defaults,
         has_sessions: _,
         saved: _,
+        target: _,
     } = state;
 
     let outcome = settings_shell(
@@ -2162,19 +2179,28 @@ fn host_dialog(
     actions
 }
 
-fn host_connection(ui: &mut Ui, palette: &Palette, draft: &mut HostProfile, tag_draft: &mut String) {
-    row(ui, palette, "Name", Some("Shown in the sessions panel"), |ui| {
-        text_input(ui, palette, &mut draft.name, "My server");
-    });
-    row(
-        ui,
-        palette,
-        "Tags",
-        Some("Labels for this host. Type a tag and press Enter or comma to add it."),
-        |ui| {
-            tag_input(ui, palette, "host-tags", &mut draft.tags, tag_draft, "Add tag…");
-        },
-    );
+fn host_connection(
+    ui: &mut Ui,
+    palette: &Palette,
+    draft: &mut HostProfile,
+    tag_draft: &mut String,
+    host_fields: bool,
+) {
+    // Name and tags describe the saved host; a session has neither.
+    if host_fields {
+        row(ui, palette, "Name", Some("Shown in the sessions panel"), |ui| {
+            text_input(ui, palette, &mut draft.name, "My server");
+        });
+        row(
+            ui,
+            palette,
+            "Tags",
+            Some("Labels for this host. Type a tag and press Enter or comma to add it."),
+            |ui| {
+                tag_input(ui, palette, "host-tags", &mut draft.tags, tag_draft, "Add tag…");
+            },
+        );
+    }
     row(ui, palette, "Type", None, |ui| {
         let options = [
             (ConnectionType::Ssh, "SSH"),
@@ -2382,6 +2408,7 @@ fn host_advanced(
     palette: &Palette,
     draft: &mut HostProfile,
     hosts: &[HostProfile],
+    host_fields: bool,
 ) {
     row(ui, palette, "Jump host", Some("Reached with a direct-tcpip tunnel"), |ui| {
         let current = draft.connection.jump_host_id.clone();
@@ -2412,21 +2439,25 @@ fn host_advanced(
                 }
             });
     });
-    row(
-        ui,
-        palette,
-        "Open in remote session",
-        Some("Attach to tmux or screen"),
-        |ui| {
-            checkbox(
-                ui,
-                palette,
-                &mut draft.connection.remote_session.enabled,
-                "Enabled",
-            );
-        },
-    );
-    if draft.connection.remote_session.enabled {
+    // Attaching to tmux/screen is set up when a host opens a session, so a session
+    // dialog leaves it out.
+    if host_fields {
+        row(
+            ui,
+            palette,
+            "Open in remote session",
+            Some("Attach to tmux or screen"),
+            |ui| {
+                checkbox(
+                    ui,
+                    palette,
+                    &mut draft.connection.remote_session.enabled,
+                    "Enabled",
+                );
+            },
+        );
+    }
+    if host_fields && draft.connection.remote_session.enabled {
         row(ui, palette, "Session type", None, |ui| {
             let options = [(Multiplexer::Tmux, "tmux"), (Multiplexer::Screen, "screen")];
             if let Some(kind) = select(
@@ -2497,6 +2528,14 @@ fn host_tunnels(ui: &mut Ui, palette: &Palette, draft: &mut HostProfile) {
                         {
                             remove = Some(index);
                         }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            checkbox(ui, palette, &mut tunnel.enabled, "");
+                            ui.label(
+                                egui::RichText::new(tunnel.summary())
+                                    .size(12.0)
+                                    .color(to_color32(palette.text)),
+                            );
+                        });
                     });
                 });
                 ui.add_space(6.0);
@@ -3462,6 +3501,33 @@ mod tests {
     }
 
     #[test]
+    fn the_ai_agent_editor_holds_the_provider_list() {
+        let ctx = Context::default();
+        let palette = Palette::dark();
+        let mut state = OptionsState::new(&AppSettings {
+            enabled_plugins: vec!["ai-agent".to_owned()],
+            ..AppSettings::default()
+        });
+        state.editor = Some(PluginId::AiAgent);
+        let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
+            options_plugin_editor(ctx, &palette, &mut state);
+        });
+        let texts: Vec<_> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(texts.contains(&"AI agent settings"));
+        // The provider list is configured here, not in the pane.
+        assert!(texts.contains(&"PROVIDERS"));
+        assert!(texts.contains(&"Fetch models"));
+        assert!(texts.contains(&"+ Add provider"));
+
+        // What the editor shows is what gets stored.
+        let stored = &state.draft.plugin_settings["ai-agent"];
+        let providers = stored[wassh_plugins::ai_agent::PROVIDERS_KEY]
+            .as_array()
+            .expect("the provider list is written back");
+        assert!(providers.iter().any(|provider| provider["id"] == "ollama"));
+    }
+
+    #[test]
     fn a_plugin_section_shows_the_stored_value() {
         let ctx = Context::default();
         let palette = Palette::dark();
@@ -4133,3 +4199,4 @@ mod layout_probe {
         }
     }
 }
+

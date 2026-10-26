@@ -170,6 +170,14 @@ pub trait Plugin {
 
     /// The header button was clicked.
     fn header_action_clicked(&mut self) {}
+
+    /// App-wide settings the pane changed while drawing, keyed by settings key.
+    ///
+    /// Options owns those settings, but a pane can hold fresher data, such as a
+    /// provider's model list it just fetched. The host saves them.
+    fn take_app_settings(&mut self) -> Vec<(String, serde_json::Value)> {
+        Vec::new()
+    }
 }
 
 /// A button a plugin asks the host to paint in its pane header.

@@ -51,9 +51,9 @@ const PLUGIN_MENU_LABELS: &[&str] = &[
 const MENUS: &[wassh_ui::titlebar::Menu] = &[
     (
         "File",
-        &["New tab", "New hostâ€¦", "", "Optionsâ€¦", "Quit"],
+        &["New tab", "New host…", "", "Options…", "Quit"],
     ),
-    ("Edit", &["Copy", "Paste", "", "Findâ€¦"]),
+    ("Edit", &["Copy", "Paste", "", "Find…"]),
     (
         "Session",
         &[
@@ -61,8 +61,8 @@ const MENUS: &[wassh_ui::titlebar::Menu] = &[
             "Reconnect all",
             "Reopen closed tab",
             "",
-            "Session settingsâ€¦",
-            "Tunnelsâ€¦",
+            "Session settings…",
+            "Tunnels…",
         ],
     ),
     (
@@ -903,7 +903,7 @@ impl Shell {
     }
 
     /// Plugin `secret: true` fields the vault holds for `scope`.
-    fn stored_plugin_secrets(&self, scope: &str) -> Vec<(&'static str, &'static str)> {
+    fn stored_plugin_secrets(&self, scope: &str) -> Vec<(String, String)> {
         let Some(store) = self.secrets.as_ref() else {
             return Vec::new();
         };
@@ -911,11 +911,28 @@ impl Shell {
         for id in PluginId::ALL {
             for (key, _) in wassh_plugins::settings::secret_fields(id) {
                 if store.has_plugin_secret(scope, id.as_str(), key) {
-                    stored.push((id.as_str(), key));
+                    stored.push((id.as_str().to_owned(), key.to_owned()));
                 }
             }
         }
+        for field in self.ai_agent_secret_fields() {
+            if store.has_plugin_secret(scope, PluginId::AiAgent.as_str(), &field) {
+                stored.push((PluginId::AiAgent.as_str().to_owned(), field));
+            }
+        }
         stored
+    }
+
+    /// Vault fields the AI agent's provider keys are filed under.
+    fn ai_agent_secret_fields(&self) -> Vec<String> {
+        self.settings
+            .plugin_settings
+            .get(PluginId::AiAgent.as_str())
+            .map(wassh_plugins::ai_agent::provider_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|provider| wassh_plugins::ai_agent::provider_secret_field(&provider))
+            .collect()
     }
 
     /// Decrypted plugin secrets for one host, per plugin id and field key.
@@ -948,6 +965,19 @@ impl Shell {
                 }
             }
         }
+        // The AI agent's provider keys are named after the configured providers, so
+        // they are not part of its static schema.
+        for field in self.ai_agent_secret_fields() {
+            if let Some(value) = store.plugin_secret(
+                wassh_store::secrets::APP_SCOPE,
+                PluginId::AiAgent.as_str(),
+                &field,
+            ) {
+                out.entry(PluginId::AiAgent.as_str().to_owned())
+                    .or_default()
+                    .insert(field, value);
+            }
+        }
         out
     }
 
@@ -967,13 +997,10 @@ impl Shell {
             let Some((plugin, field)) = key.split_once('|') else {
                 continue;
             };
-            let result = match draft.edit() {
-                SecretEdit::Unchanged => continue,
-                SecretEdit::Set(value) => {
-                    store.set_plugin_secret(scope, plugin, field, Some(&value))
-                }
-                SecretEdit::Clear => store.set_plugin_secret(scope, plugin, field, None),
+            let Some(value) = dialogs::plugin_secret_value(draft) else {
+                continue;
             };
+            let result = store.set_plugin_secret(scope, plugin, field, value);
             if let Err(error) = result {
                 self.toasts.push(
                     ToastKind::Error,
@@ -992,6 +1019,11 @@ impl Shell {
         let mut pending: Vec<(String, String, String, String)> = Vec::new();
         for (plugin, values) in &self.settings.plugin_settings {
             let Some(id) = PluginId::parse(plugin) else {
+                pending.extend(unknown_plugin_secrets(
+                    wassh_store::secrets::APP_SCOPE,
+                    plugin,
+                    values,
+                ));
                 continue;
             };
             for (key, app_wide) in wassh_plugins::settings::secret_fields(id) {
@@ -1011,10 +1043,14 @@ impl Shell {
                     ));
                 }
             }
+            if id == PluginId::AiAgent {
+                pending.extend(legacy_provider_keys(plugin, values));
+            }
         }
         for host in &self.hosts.hosts {
             for (plugin, values) in &host.plugin_settings {
                 let Some(id) = PluginId::parse(plugin) else {
+                    pending.extend(unknown_plugin_secrets(&host.id, plugin, values));
                     continue;
                 };
                 for (key, app_wide) in wassh_plugins::settings::secret_fields(id) {
@@ -1033,6 +1069,23 @@ impl Shell {
                             text.to_owned(),
                         ));
                     }
+                }
+            }
+        }
+        let mut docs: Vec<(String, Option<String>, serde_json::Value)> = Vec::new();
+        if let Some(config) = self.config.as_ref() {
+            for id in PluginId::ALL {
+                let scopes = config.plugin_data_scopes(id.as_str()).unwrap_or_default();
+                for scope in scopes {
+                    let Ok(Some(mut data)) = config.plugin_data(id.as_str(), scope.as_deref()) else {
+                        continue;
+                    };
+                    let found = take_document_secrets(id, scope.as_deref(), &mut data);
+                    if found.is_empty() {
+                        continue;
+                    }
+                    pending.extend(found);
+                    docs.push((id.as_str().to_owned(), scope, data));
                 }
             }
         }
@@ -1128,7 +1181,7 @@ impl Shell {
             .into_iter()
             .map(|(plugin, field)| {
                 (
-                    self::dialogs::secret_field_key(plugin, field),
+                    self::dialogs::secret_field_key(&plugin, &field),
                     self::dialogs::SecretDraft::stored(),
                 )
             })
@@ -1188,15 +1241,10 @@ impl Shell {
     fn save_host(&mut self, mut host: HostProfile) {
         // A plugin password belongs in the vault, never in `hosts.json`.
         strip_plugin_secrets(&mut host.plugin_settings);
-        let host_id = host.id.clone();
         self.hosts.upsert(host.clone());
         self.hosts = std::mem::take(&mut self.hosts).normalized();
-        // Panes of this host pick up its plugin settings on the next draw.
-        for session in &mut self.sessions {
-            if session.host_id.as_deref() == Some(host_id.as_str()) {
-                session.reload_pane_settings();
-            }
-        }
+        // Open sessions keep the values they started with; only "Apply to sessions"
+        // pushes the change to them.
         if let Some(config) = self.config.as_mut()
             && let Err(error) = config.save_host(host)
         {
@@ -1343,15 +1391,15 @@ impl Shell {
             "Copy" => self.copy_selection(ctx),
             "Paste" => self.paste_clipboard(ctx),
             "New tab" => self.handle_command(Command::NewLocalTab),
-            "New hostâ€¦" => self.handle_command(Command::NewHost),
+            "New host…" => self.handle_command(Command::NewHost),
             "Reopen closed tab" => self.handle_command(Command::ReopenTab),
-            "Optionsâ€¦" => self.handle_command(Command::OpenOptions),
+            "Options…" => self.handle_command(Command::OpenOptions),
             "Quit" => self.handle_command(Command::Quit),
-            "Findâ€¦" => self.handle_command(Command::Find),
+            "Find…" => self.handle_command(Command::Find),
             "Reconnect" => self.handle_command(Command::Reconnect),
             "Reconnect all" => self.handle_command(Command::ReconnectAll),
-            "Session settingsâ€¦" => self.handle_command(Command::EditHost),
-            "Tunnelsâ€¦" => self.handle_command(Command::OpenTunnels),
+            "Session settings…" => self.handle_command(Command::EditHost),
+            "Tunnels…" => self.handle_command(Command::OpenTunnels),
             "Zoom In" => {
                 self.zoom = (self.zoom + 1.0).min(30.0);
                 self.apply_zoom();
@@ -1821,10 +1869,23 @@ impl Shell {
         let host_id = session.host_id.clone();
         let dirty = session.take_dirty_plugins();
         let secret_writes = session.take_dirty_plugin_secrets();
+        let app_writes = session.take_dirty_app_settings();
+        if !app_writes.is_empty() {
+            for (id, key, value) in app_writes {
+                self.settings
+                    .plugin_settings
+                    .entry(id.as_str().to_owned())
+                    .or_default()
+                    .insert(key.clone(), value.clone());
+                // The pane reads settings from a copy, so it takes the value back.
+                if let Some(session) = self.sessions.get_mut(index) {
+                    session.adopt_app_setting(id, &key, value);
+                }
+            }
+            self.save_settings();
+        }
         for (id, field, value) in secret_writes {
-            let scope = host_id.clone().unwrap_or_else(|| {
-                wassh_store::secrets::APP_SCOPE.to_owned()
-            });
+            let scope = plugin_secret_scope(id, &field, host_id.as_deref());
             let Some(store) = self.secrets.as_mut() else {
                 self.toasts.push(
                     ToastKind::Error,
@@ -2697,19 +2758,149 @@ impl Shell {
     }
 }
 
+/// Vault scope a plugin secret field belongs to.
+///
+/// App-wide fields are stored under the app scope even when the write comes
+/// from a host's pane, so a provider key is never filed per host.
+fn plugin_secret_scope(id: PluginId, field: &str, host_id: Option<&str>) -> String {
+    let app_wide = wassh_plugins::settings::secret_scope(id, field) == Some(true)
+        || (id == PluginId::AiAgent && wassh_plugins::ai_agent::is_provider_key_field(field));
+    match (app_wide, host_id) {
+        (true, _) | (false, None) => wassh_store::secrets::APP_SCOPE.to_owned(),
+        (false, Some(host_id)) => host_id.to_owned(),
+    }
+}
+
 /// Drop plain-text copies of a plugin's `secret: true` fields.
 ///
 /// Those fields live in the credential vault; a settings map must never carry
 /// one, or `settings.json` and `hosts.json` would hold a readable password.
 fn strip_plugin_secrets(settings: &mut wassh_core::PluginSettings) {
     settings.retain(|plugin, values| {
-        if let Some(id) = PluginId::parse(plugin) {
-            for (key, _) in wassh_plugins::settings::secret_fields(id) {
-                values.remove(key);
+        match PluginId::parse(plugin) {
+            Some(id) => {
+                for (key, _) in wassh_plugins::settings::secret_fields(id) {
+                    values.remove(key);
+                }
+                if id == PluginId::AiAgent {
+                    values.remove(wassh_plugins::ai_agent::API_KEYS_KEY);
+                }
             }
+            None => values.retain(|key, _| !names_a_secret(key)),
         }
         !values.is_empty()
     });
+}
+
+/// Plain-text secrets a plugin's own stored document still holds.
+///
+/// A pane used to write `secret: true` fields — and the AI agent its provider
+/// API keys — into its own data file. They are taken out here, with the vault
+/// scope each one belongs to, so the caller can seal them.
+fn take_document_secrets(
+    id: PluginId,
+    scope: Option<&str>,
+    data: &mut serde_json::Value,
+) -> Vec<(String, String, String, String)> {
+    let Some(values) = data.as_object_mut() else {
+        return Vec::new();
+    };
+    let host_scope = scope.unwrap_or(wassh_store::secrets::APP_SCOPE);
+    let mut found = Vec::new();
+    for (key, app_wide) in wassh_plugins::settings::secret_fields(id) {
+        let Some(text) = values
+            .remove(key)
+            .and_then(|value| value.as_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        let vault_scope = if app_wide {
+            wassh_store::secrets::APP_SCOPE
+        } else {
+            host_scope
+        };
+        found.push((
+            vault_scope.to_owned(),
+            id.as_str().to_owned(),
+            key.to_owned(),
+            text,
+        ));
+    }
+    if id == PluginId::AiAgent
+        && let Some(keys) = values
+            .remove(wassh_plugins::ai_agent::API_KEYS_KEY)
+            .and_then(|value| value.as_object().cloned())
+    {
+        for (provider, key) in keys {
+            let Some(text) = key.as_str().filter(|text| !text.is_empty()) else {
+                continue;
+            };
+            found.push((
+                wassh_store::secrets::APP_SCOPE.to_owned(),
+                id.as_str().to_owned(),
+                wassh_plugins::ai_agent::provider_secret_field(&provider),
+                text.to_owned(),
+            ));
+        }
+    }
+    found
+}
+
+/// Secret-named fields of a plugin id this build does not know.
+///
+/// The reference app could load external plugins, so `hosts.json` can carry
+/// settings of a plugin that no longer exists here. Its schema is unknown, so
+/// a field is taken as a credential when its name says so.
+fn unknown_plugin_secrets(
+    scope: &str,
+    plugin: &str,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String, String, String)> {
+    values
+        .iter()
+        .filter_map(|(key, value)| {
+            let text = value.as_str().filter(|text| !text.is_empty())?;
+            names_a_secret(key).then(|| {
+                (
+                    scope.to_owned(),
+                    plugin.to_owned(),
+                    key.to_owned(),
+                    text.to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Whether a field name holds a credential whatever plugin wrote it.
+fn names_a_secret(key: &str) -> bool {
+    const SUFFIXES: [&str; 5] = ["password", "passphrase", "apikey", "token", "secret"];
+    let lower = key.to_ascii_lowercase();
+    SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+}
+
+/// Provider API keys an earlier build kept as plain text in the settings.
+fn legacy_provider_keys(
+    plugin: &str,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String, String, String)> {
+    let Some(keys) = values
+        .get(wassh_plugins::ai_agent::API_KEYS_KEY)
+        .and_then(|value| value.as_object())
+    else {
+        return Vec::new();
+    };
+    keys.iter()
+        .filter_map(|(provider, key)| {
+            let key = key.as_str().filter(|key| !key.is_empty())?;
+            Some((
+                wassh_store::secrets::APP_SCOPE.to_owned(),
+                plugin.to_owned(),
+                wassh_plugins::ai_agent::provider_secret_field(provider),
+                key.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 /// The value a [`SecretEdit`] stands for: `None` keeps what is stored.
@@ -3183,6 +3374,121 @@ mod tests {
         assert_eq!(shell.sessions.len(), 1);
         assert!(!shell.sessions[0].awaiting_login());
         assert_eq!(shell.sessions[0].secrets.password, "hunter2");
+    }
+
+    #[test]
+    fn a_plain_text_provider_key_is_sealed_on_startup() {
+        let mut config = scratch_config();
+        let mut values = serde_json::Map::new();
+        values.insert(
+            wassh_plugins::ai_agent::API_KEYS_KEY.to_owned(),
+            serde_json::json!({ "deepseek": "sk-secret" }),
+        );
+        config
+            .settings
+            .get_mut()
+            .plugin_settings
+            .insert(PluginId::AiAgent.as_str().to_owned(), values);
+
+        let shell = Shell::new_with(Some(config), false);
+        assert!(
+            !shell
+                .settings
+                .plugin_settings
+                .get(PluginId::AiAgent.as_str())
+                .is_some_and(|values| values.contains_key(wassh_plugins::ai_agent::API_KEYS_KEY)),
+            "settings must not keep a readable provider key"
+        );
+        let dir = shell.config.as_ref().expect("config").dir.clone();
+        let store = wassh_store::SecretsStore::open(&dir).expect("vault");
+        let field = wassh_plugins::ai_agent::provider_secret_field("deepseek");
+        assert_eq!(
+            store
+                .plugin_secret(
+                    wassh_store::secrets::APP_SCOPE,
+                    PluginId::AiAgent.as_str(),
+                    &field
+                )
+                .as_deref(),
+            Some("sk-secret")
+        );
+    }
+
+    #[test]
+    fn a_provider_key_in_a_pane_document_is_sealed_on_startup() {
+        let config = scratch_config();
+        config
+            .save_plugin_data(
+                PluginId::AiAgent.as_str(),
+                Some("tab-abc"),
+                &serde_json::json!({
+                    "apiKeys": { "deepseek": "sk-doc" },
+                    "providers": [],
+                }),
+            )
+            .expect("pane document");
+
+        let shell = Shell::new_with(Some(config), false);
+        let config = shell.config.as_ref().expect("config");
+        let store = wassh_store::SecretsStore::open(&config.dir).expect("vault");
+        let field = wassh_plugins::ai_agent::provider_secret_field("deepseek");
+        assert_eq!(
+            store
+                .plugin_secret(
+                    wassh_store::secrets::APP_SCOPE,
+                    PluginId::AiAgent.as_str(),
+                    &field
+                )
+                .as_deref(),
+            Some("sk-doc")
+        );
+        let document = config
+            .plugin_data(PluginId::AiAgent.as_str(), Some("tab-abc"))
+            .expect("read back")
+            .expect("document");
+        assert!(
+            document.get(wassh_plugins::ai_agent::API_KEYS_KEY).is_none(),
+            "the pane document still holds keys: {document:?}"
+        );
+        assert!(document.get("providers").is_some(), "providers stay");
+    }
+
+    #[test]
+    fn a_password_of_a_plugin_this_build_lacks_is_still_sealed() {
+        let mut config = scratch_config();
+        let mut values = serde_json::Map::new();
+        values.insert("password".to_owned(), serde_json::json!("broker-pw"));
+        values.insert("host".to_owned(), serde_json::json!("broker.local"));
+        let mut host = HostProfile {
+            id: "h1".to_owned(),
+            name: "Dev".to_owned(),
+            ..HostProfile::default()
+        };
+        host.plugin_settings.insert("mqtt-explorer".to_owned(), values);
+        config.save_host(host).expect("host");
+
+        let shell = Shell::new_with(Some(config), false);
+        let config = shell.config.as_ref().expect("config");
+        let store = wassh_store::SecretsStore::open(&config.dir).expect("vault");
+        assert_eq!(
+            store
+                .plugin_secret("h1", "mqtt-explorer", "password")
+                .as_deref(),
+            Some("broker-pw")
+        );
+        let saved = shell.hosts.host("h1").expect("host");
+        assert!(
+            !saved.plugin_settings["mqtt-explorer"].contains_key("password"),
+            "hosts.json still holds the password: {:?}",
+            saved.plugin_settings
+        );
+        assert_eq!(
+            saved.plugin_settings["mqtt-explorer"]["host"],
+            serde_json::json!("broker.local"),
+            "other fields stay"
+        );
+        let text = std::fs::read_to_string(config.dir.join("hosts.json")).expect("read");
+        assert!(!text.contains("broker-pw"), "the file kept the password");
     }
 
     #[test]
@@ -3675,4 +3981,8 @@ mod tests {
         assert!(shell.dialogs.options.is_some());
     }
 }
+
+
+
+
 
