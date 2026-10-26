@@ -37,6 +37,33 @@ use self::session::{PluginValues, Secrets, SessionEntry, SshOpen, jump_chain};
 /// How long the window must stay put before its geometry is written to `settings.json`.
 const WINDOW_BOUNDS_SETTLE: Duration = Duration::from_millis(700);
 
+/// How long after the last terminal activity the app keeps repainting at the active rate.
+///
+/// Typing and a command's output both fit inside one window: the keystroke extends it, the
+/// echo arrives a few milliseconds later and extends it again.
+const ACTIVE_LINGER: Duration = Duration::from_millis(400);
+
+/// Repaint interval while output arrives or the user is typing (about 60 fps).
+const ACTIVE_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Largest window-frame offset (borders plus title bar, in points) that is believed.
+///
+/// A window manager that ignored the restore request reports the distance from the old
+/// position instead, which is far larger than a decoration; that is not learned.
+const MAX_FRAME_OFFSET: f32 = 200.0;
+
+/// How long a requested clipboard paste may take to arrive.
+///
+/// A `Paste` event after this belongs to the platform's Ctrl+V and goes to the shell.
+const PASTE_WAIT: Duration = Duration::from_secs(1);
+
+/// Repaint interval when nothing is happening.
+///
+/// The transports are polled rather than waking the window, so a slow poll keeps
+/// unsolicited output (a build log, a `tail -f`, a prompt after a long command) prompt
+/// without redrawing a static window sixty times a second.
+const IDLE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Menus shown in the titlebar.
 /// Toolbar labels of the Plugins menu entries, in registry order.
 const PLUGIN_MENU_LABELS: &[&str] = &[
@@ -138,6 +165,24 @@ pub struct Shell {
     /// Normal (non-maximized) window geometry from the last frame, kept while maximized so
     /// unmaximizing and the next launch still land on the same rectangle.
     last_bounds: Option<WindowBounds>,
+    /// Position the window was asked to take on relaunch, in points, until it has landed.
+    restore_request: Option<egui::Pos2>,
+    /// Frames to wait before looking at where the window actually landed.
+    restore_wait: u8,
+    /// When a clipboard paste was asked for, until which a `Paste` event is ours.
+    ///
+    /// The platform's Ctrl+V produces the same event, and that key belongs to the shell.
+    paste_deadline: Option<std::time::Instant>,
+    /// Measured difference between a requested position and the client position the
+    /// platform reports for it — the frame's borders and title bar.
+    ///
+    /// X11 lets the window manager add the decoration to the requested position but reports
+    /// the *client* position back, so saving that report verbatim would walk the window a
+    /// decoration's width further across the screen on every launch. It is measured once
+    /// from the restore move and subtracted again when saving.
+    frame_offset: Option<egui::Vec2>,
+    /// When the fast repaint window ends; `None` (or a past instant) means the app is idle.
+    active_until: Option<std::time::Instant>,
     /// Saved position to apply once the real window exists.
     restore_bounds: Option<WindowBounds>,
     /// When the window geometry last changed, so a drag is written once it settles.
@@ -325,6 +370,11 @@ impl Shell {
             last_bounds: None,
             restore_bounds: None,
             bounds_changed_at: None,
+            restore_request: None,
+            restore_wait: 0,
+            paste_deadline: None,
+            frame_offset: None,
+            active_until: None,
             perf_tabs,
         };
         for problem in shell
@@ -1592,6 +1642,11 @@ impl Shell {
         }
         let mut exited = Vec::new();
         for (index, pumped) in results {
+            // New output or a state change: keep repainting at the active rate until the
+            // session settles, so the echo and the rest of a burst arrive without a wait.
+            if pumped.wake {
+                self.active_until = Some(std::time::Instant::now() + ACTIVE_LINGER);
+            }
             if let Some(title) = pumped.title
                 && self.active == Some(index)
             {
@@ -2279,7 +2334,22 @@ impl Shell {
         }
 
         self.forward_input(ctx);
-        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// Ask for another frame: soon while the window is busy, later when it is idle.
+    ///
+    /// egui only repaints when it is asked to, and the transports are polled from the frame
+    /// loop rather than waking it, so a slow idle cadence is what keeps a static window from
+    /// redrawing sixty times a second. Typing and fresh output switch to the active rate.
+    fn schedule_repaint(&mut self, ctx: &egui::Context) {
+        // Working with the window means the echo is about to arrive.
+        if ctx.input(|input| input_started_work(&input.events)) {
+            self.active_until = Some(std::time::Instant::now() + ACTIVE_LINGER);
+        }
+        let active = self
+            .active_until
+            .is_some_and(|until| until > std::time::Instant::now());
+        ctx.request_repaint_after(if active { ACTIVE_INTERVAL } else { IDLE_INTERVAL });
     }
 
     fn show_session_banners(&mut self, ui: &mut egui::Ui, index: usize) {
@@ -2606,6 +2676,8 @@ impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
         if self.perf_probe {
+            // The probe measures frames, not idle time: keep them coming.
+            ui.ctx().request_repaint();
             self.frames += 1;
             // Give the renderer a moment to settle so the memory figure is representative.
             if self.frames == 30 {
@@ -2721,6 +2793,7 @@ impl Shell {
             self.finish_startup();
             ctx.request_repaint();
         }
+        self.schedule_repaint(&ctx);
     }
 
     /// Re-colour everything when the desktop switches between light and dark.
@@ -2962,11 +3035,59 @@ impl wassh_ui::DockContent for SessionPanes<'_> {
     }
 }
 
+/// Whether this frame's input means the user is working with the window.
+///
+/// Pointer *movement* deliberately does not count: the desktop keeps sending motion while
+/// the cursor rests over the window, and treating that as activity would pin the window at
+/// the active repaint rate for as long as the pointer is on it.
+fn input_started_work(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key { pressed: true, .. }
+                | egui::Event::Text(_)
+                | egui::Event::PointerButton { pressed: true, .. }
+                | egui::Event::MouseWheel { .. }
+                | egui::Event::Touch { .. }
+                | egui::Event::Paste(_)
+                | egui::Event::PasteImage(_)
+                | egui::Event::MiddleClickPaste { .. }
+                | egui::Event::Copy
+                | egui::Event::Cut
+                | egui::Event::Zoom(_)
+        )
+    })
+}
+
 fn apply_visuals(ctx: &egui::Context, palette: Palette) {
     wassh_ui::apply_visuals(ctx, &palette);
 }
 
-#[cfg(test)]
+/// Consume a key press whose modifiers match `pattern` exactly.
+///
+/// `InputState::consume_key` matches *logically*, i.e. it ignores extra Shift and Alt, so a
+/// plain-Ctrl binding would also swallow Ctrl+Shift+<key>. The terminal wants every one of
+/// those (`^C`, `^Z`, `^W` … and their shifted variants), so only an exact chord is claimed.
+///
+/// `Modifiers::matches_exact` still treats Ctrl and Cmd as the same modifier, which is what
+/// a real event needs: egui-winit sets `command` from Ctrl on this platform.
+fn consume_chord(
+    input: &mut egui::InputState,
+    pattern: egui::Modifiers,
+    key: egui::Key,
+) -> bool {
+    let mut consumed = false;
+    input.events.retain(|event| {
+        let claimed = matches!(
+            event,
+            egui::Event::Key { key: pressed, pressed: true, modifiers, .. }
+                if *pressed == key && modifiers.matches_exact(pattern)
+        );
+        consumed |= claimed;
+        !claimed
+    });
+    consumed
+}#[cfg(test)]
 mod tests {
     /// Run one frame with `events` as input and return what the platform was asked to do.
     fn frame_with_events(

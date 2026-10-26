@@ -143,6 +143,10 @@ pub struct Pumped {
     pub bell: bool,
     /// The transport closed, and why.
     pub closed: Option<Exit>,
+    /// The session produced something worth showing: output, a status change, a
+    /// prompt or an exit. The window repaints promptly while this is being set
+    /// and idles slowly when it is not.
+    pub wake: bool,
 }
 
 /// Everything needed to open an SSH session.
@@ -672,21 +676,33 @@ impl SessionEntry {
         match &mut self.backend {
             Backend::Local(pty) => {
                 for chunk in pty.read_pending() {
-                    self.terminal.feed(&chunk);
+                    if !chunk.is_empty() {
+                        pumped.wake = true;
+                        self.terminal.feed(&chunk);
+                    }
                 }
                 local_exited = pty.has_exited();
             }
             Backend::Ssh(session) => {
                 for event in session.events() {
                     match event {
-                        SshEvent::Data(bytes) => self.terminal.feed(&bytes),
-                        SshEvent::Status { status, .. } => self.status = status,
+                        SshEvent::Data(bytes) => {
+                            if !bytes.is_empty() {
+                                pumped.wake = true;
+                                self.terminal.feed(&bytes);
+                            }
+                        }
+                        SshEvent::Status { status, .. } => {
+                            pumped.wake |= self.status != status;
+                            self.status = status;
+                        }
                         SshEvent::HostKeyPrompt {
                             host,
                             port,
                             fingerprint,
                             mismatch,
                         } => {
+                            pumped.wake = true;
                             self.host_key_prompt = Some(HostKeyPrompt {
                                 host,
                                 port,
@@ -699,6 +715,7 @@ impl SessionEntry {
                             instructions,
                             prompts,
                         } => {
+                            pumped.wake = true;
                             self.auth_prompt = Some(AuthPrompt {
                                 name,
                                 instructions,
@@ -707,6 +724,7 @@ impl SessionEntry {
                             });
                         }
                         SshEvent::AuthFailed { detail } => {
+                            pumped.wake = true;
                             // A rejected password re-prompts instead of ending the tab.
                             if !self.retry_login() {
                                 self.error = Some(detail);
@@ -718,6 +736,7 @@ impl SessionEntry {
                             }
                         }
                         SshEvent::Closed { reason, end } => {
+                            pumped.wake = true;
                             if self.suppress_close {
                                 self.suppress_close = false;
                             } else {
@@ -737,6 +756,7 @@ impl SessionEntry {
                             }
                         }
                         SshEvent::Error(error) => {
+                            pumped.wake = true;
                             // A transport failure ends the prompt flow for good.
                             self.login = None;
                             self.suppress_close = false;
@@ -753,9 +773,18 @@ impl SessionEntry {
             Backend::Telnet(session) => {
                 for event in session.events() {
                     match event {
-                        wassh_telnet::TelnetEvent::Data(bytes) => self.terminal.feed(&bytes),
-                        wassh_telnet::TelnetEvent::Status(status) => self.status = status,
+                        wassh_telnet::TelnetEvent::Data(bytes) => {
+                            if !bytes.is_empty() {
+                                pumped.wake = true;
+                                self.terminal.feed(&bytes);
+                            }
+                        }
+                        wassh_telnet::TelnetEvent::Status(status) => {
+                            pumped.wake |= self.status != status;
+                            self.status = status;
+                        }
                         wassh_telnet::TelnetEvent::Closed { reason } => {
+                            pumped.wake = true;
                             self.status = SessionStatus::Closed;
                             pumped.closed = Some(Exit {
                                 reason,
@@ -763,6 +792,7 @@ impl SessionEntry {
                             });
                         }
                         wassh_telnet::TelnetEvent::Error(error) => {
+                            pumped.wake = true;
                             self.error = Some(error);
                             self.status = SessionStatus::Failed;
                             pumped.closed = Some(Exit {
@@ -775,7 +805,10 @@ impl SessionEntry {
             }
             Backend::Serial(session) => {
                 for chunk in session.read_pending() {
-                    self.terminal.feed(&chunk);
+                    if !chunk.is_empty() {
+                        pumped.wake = true;
+                        self.terminal.feed(&chunk);
+                    }
                 }
             }
             Backend::Closed => {}
@@ -783,6 +816,7 @@ impl SessionEntry {
 
         // A local shell that exits was told to: no reconnect, the tab goes away.
         if local_exited && self.status == SessionStatus::Connected {
+            pumped.wake = true;
             self.status = SessionStatus::Closed;
             pumped.closed = Some(Exit {
                 reason: None,
@@ -802,15 +836,23 @@ impl SessionEntry {
         for event in self.events.try_iter() {
             match event {
                 TerminalEvent::Title(title) => {
+                    pumped.wake = true;
                     if !title.trim().is_empty() {
                         self.title = title.clone();
                         pumped.title = Some(title);
                     }
                 }
-                TerminalEvent::Bell => pumped.bell = true,
+                TerminalEvent::Bell => {
+                    pumped.wake = true;
+                    pumped.bell = true;
+                }
                 // The shell is waiting for this answer, e.g. ConPTY blocks on `CSI 6 n`.
-                TerminalEvent::PtyWrite(text) => replies.push(text),
-                TerminalEvent::Wakeup => {}
+                TerminalEvent::PtyWrite(text) => {
+                    pumped.wake = true;
+                    replies.push(text);
+                }
+                // The grid changed under us (a redraw request from the application).
+                TerminalEvent::Wakeup => pumped.wake = true,
             }
         }
         for reply in replies {
