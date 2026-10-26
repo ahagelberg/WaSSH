@@ -9,6 +9,7 @@ pub mod dock;
 pub mod input;
 pub mod plugin_toolbar;
 pub mod sidebar;
+pub mod style;
 pub mod tab_bar;
 pub mod terminal_view;
 pub mod titlebar;
@@ -20,6 +21,7 @@ pub use dock::{
 pub use input::{TerminalInput, collect as collect_terminal_input};
 pub use plugin_toolbar::{ToolbarButton, plugin_toolbar};
 pub use sidebar::{SidebarAction, SidebarState, sidebar};
+pub use style::apply_visuals;
 pub use tab_bar::{TabAction, TabBarState, TabView, tab_bar};
 pub use terminal_view::TerminalView;
 pub use titlebar::{

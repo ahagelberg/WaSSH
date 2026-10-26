@@ -566,11 +566,7 @@ impl eframe::App for SpikeApp {
 }
 
 fn apply_visuals(ctx: &egui::Context, palette: Palette) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = to_color32(palette.bg_app);
-    visuals.window_fill = to_color32(palette.bg_panel);
-    visuals.extreme_bg_color = to_color32(palette.bg_input);
-    ctx.set_visuals(visuals);
+    wassh_ui::apply_visuals(ctx, &palette);
 }
 
 #[cfg(test)]

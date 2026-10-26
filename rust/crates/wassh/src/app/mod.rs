@@ -2495,6 +2495,12 @@ impl Shell {
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.follow_system_theme(&ctx);
+        // egui's own widgets (combo boxes, scrollbars) draw from its visuals, so they are
+        // rebuilt whenever the palette changes, including a theme switch in Options.
+        if self.styled_palette != Some(self.palette) {
+            self.styled_palette = Some(self.palette);
+            apply_visuals(&ctx, self.palette);
+        }
         if self.first_frame_ms.is_none() {
             self.first_frame_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
         }
@@ -2581,7 +2587,6 @@ impl Shell {
             return;
         }
         self.palette = Palette::for_mode(self.settings.theme.resolve(system_dark));
-        apply_visuals(ctx, self.palette);
         let palette = self.palette;
         let defaults = self.settings.session_style_defaults.clone();
         for session in &mut self.sessions {
