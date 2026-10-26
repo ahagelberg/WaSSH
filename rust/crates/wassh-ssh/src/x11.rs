@@ -17,10 +17,13 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 
 /// Display `n` listens on TCP port `6000 + n`.
+#[cfg(windows)]
 const X11_TCP_PORT_BASE: u16 = 6000;
 /// Host used when `DISPLAY` names none.
+#[cfg(windows)]
 const DEFAULT_X11_HOST: &str = "127.0.0.1";
 /// Display assumed on Windows when `DISPLAY` is unset.
+#[cfg(windows)]
 const DEFAULT_DISPLAY_NUMBER: u32 = 0;
 
 /// Everything the `x11-req` packet needs.
