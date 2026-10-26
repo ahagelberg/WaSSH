@@ -439,7 +439,16 @@ impl Shell {
                 self.active = Some(self.sessions.len() - 1);
             }
             ConnectionType::Ssh => {
-                let jumps = jump_chain(&self.hosts, &connection).unwrap_or_default();
+                let (jumps, jump_error) = match jump_chain(
+                    &self.hosts,
+                    &connection,
+                    self.secrets.as_ref(),
+                ) {
+                    Ok(jumps) => (jumps, None),
+                    // Keep the tab, but report why it cannot connect instead of
+                    // falling back to a direct connection to the host.
+                    Err(error) => (Vec::new(), Some(error)),
+                };
                 let mut secrets = Secrets::default();
                 if connection.auth == AuthMethod::Password {
                     secrets.password = self
@@ -452,9 +461,11 @@ impl Shell {
                     secrets,
                     known_hosts: self.known_hosts.clone(),
                     jumps,
+                    jump_error,
                 };
                 // With no stored password the tab reopens and asks in the terminal.
-                let entry = if open.params.auth == AuthMethod::Password
+                let entry = if open.jump_error.is_none()
+                    && open.params.auth == AuthMethod::Password
                     && open.secrets.password.is_empty()
                 {
                     SessionEntry::new_ssh_prompt(
@@ -598,7 +609,7 @@ impl Shell {
     /// The tab appears immediately with the `user@host's password:` prompt, matching the
     /// terminal itself, like PuTTY; a rejected password re-prompts in place.
     fn open_ssh_prompt(&mut self, connection: ConnectionParams, host_id: Option<String>) {
-        let jumps = match jump_chain(&self.hosts, &connection) {
+        let jumps = match jump_chain(&self.hosts, &connection, self.secrets.as_ref()) {
             Ok(jumps) => jumps,
             Err(error) => {
                 self.toasts.push(ToastKind::Error, error);
@@ -617,6 +628,7 @@ impl Shell {
                 secrets: Secrets::default(),
                 known_hosts: self.known_hosts.clone(),
                 jumps,
+                jump_error: None,
             },
         );
         self.push_session(entry);
@@ -628,7 +640,7 @@ impl Shell {
         host_id: Option<String>,
         secrets: Secrets,
     ) {
-        let jumps = match jump_chain(&self.hosts, &connection) {
+        let jumps = match jump_chain(&self.hosts, &connection, self.secrets.as_ref()) {
             Ok(jumps) => jumps,
             Err(error) => {
                 self.toasts.push(ToastKind::Error, error);
@@ -648,6 +660,7 @@ impl Shell {
                 secrets,
                 known_hosts: self.known_hosts.clone(),
                 jumps,
+                jump_error: None,
             },
         );
         self.push_session(entry);

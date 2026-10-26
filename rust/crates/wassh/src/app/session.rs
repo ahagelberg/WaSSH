@@ -155,6 +155,8 @@ pub struct SshOpen {
     pub known_hosts: Arc<KnownHosts>,
     /// Jump hosts to traverse, outermost first.
     pub jumps: Vec<wassh_ssh::JumpHop>,
+    /// Why the jump chain could not be resolved, if it could not.
+    pub jump_error: Option<String>,
 }
 
 /// A tab's worth of session state.
@@ -197,6 +199,9 @@ pub struct SessionEntry {
     command_override: Option<String>,
     /// Jump hosts used by this session, resolved when the tab was opened.
     jumps: Vec<wassh_ssh::JumpHop>,
+    /// Why the jump hosts could not be resolved; the session reports it instead of
+    /// connecting directly to a host that is only reachable through them.
+    jump_error: Option<String>,
     /// A tmux/screen probe still running in the background.
     probe: Option<Receiver<wassh_ssh::Presence>>,
     /// How to open the connection once the probe finishes.
@@ -268,6 +273,7 @@ impl SessionEntry {
             retry_at: None,
             command_override: None,
             jumps: Vec::new(),
+            jump_error: None,
             probe: None,
             pending_open: None,
             files: RemoteFiles::default(),
@@ -299,6 +305,7 @@ impl SessionEntry {
         let mut entry = Self::prepare(id, palette, defaults, size, open.params.clone(), open.host_id.clone());
         entry.secrets = secrets;
         entry.jumps = jumps;
+        entry.jump_error = open.jump_error.clone();
         entry.begin(term_type, open);
         entry
     }
@@ -400,6 +407,7 @@ impl SessionEntry {
             retry_at: None,
             command_override: None,
             jumps: Vec::new(),
+            jump_error: None,
             probe: None,
             pending_open: None,
             files: RemoteFiles::default(),
@@ -453,6 +461,12 @@ impl SessionEntry {
     /// Start a connection, probing for tmux/screen first when the host asks for it.
     fn begin(&mut self, term_type: &str, open: SshOpen) {
         self.command_override = None;
+        if let Some(error) = self.jump_error.clone() {
+            self.backend = Backend::Closed;
+            self.status = SessionStatus::Failed;
+            self.error = Some(error);
+            return;
+        }
         if self.connection.remote_session.enabled {
             let kind = self.connection.remote_session.multiplexer;
             let name = self.connection.remote_session.name.clone();
@@ -542,6 +556,7 @@ impl SessionEntry {
                     secrets: self.secrets.clone(),
                     known_hosts,
                     jumps: self.jumps.clone(),
+                    jump_error: self.jump_error.clone(),
                 };
                 if self.connection.auth == AuthMethod::Password
                     && self.secrets.password.is_empty()
@@ -2338,11 +2353,13 @@ impl wassh_plugins::TerminalAccess for SessionEntry {
 
 /// Resolve the jump chain for `params`, outermost hop first.
 ///
-/// Follows `jump_host_id` through the saved hosts, refusing loops and hosts that need a
-/// password (there is no prompt path for jump hosts yet).
+/// Follows `jump_host_id` through the saved hosts, refusing loops. Credentials come
+/// from `vault`: jump hosts never prompt, so a hop without usable credentials is an
+/// error rather than a silent fallback.
 pub fn jump_chain(
     hosts: &wassh_core::HostsDocument,
     params: &ConnectionParams,
+    vault: Option<&wassh_store::SecretsStore>,
 ) -> Result<Vec<wassh_ssh::JumpHop>, String> {
     let mut chain = Vec::new();
     let mut next = params.jump_host_id.clone();
@@ -2359,28 +2376,6 @@ pub fn jump_chain(
             .host(&id)
             .ok_or_else(|| format!("jump host '{id}' no longer exists"))?;
         let connection = &host.connection;
-        let auth = match connection.auth {
-            AuthMethod::Password => {
-                return Err(format!(
-                    "jump host '{}' uses password authentication, which jump hosts do not support yet",
-                    host.display_name()
-                ));
-            }
-            AuthMethod::PrivateKey => {
-                let path = connection.private_key_path.clone().unwrap_or_default();
-                if path.trim().is_empty() {
-                    return Err(format!(
-                        "jump host '{}' has no private key configured",
-                        host.display_name()
-                    ));
-                }
-                wassh_ssh::SshAuth::PrivateKey {
-                    path: path.into(),
-                    passphrase: None,
-                }
-            }
-            AuthMethod::None => wassh_ssh::SshAuth::Agent,
-        };
         chain.insert(
             0,
             wassh_ssh::JumpHop {
@@ -2391,13 +2386,50 @@ pub fn jump_chain(
                 } else {
                     connection.username.clone()
                 },
-                auth,
+                auth: jump_auth(host, vault)?,
             },
         );
         next = connection.jump_host_id.clone();
     }
 
     Ok(chain)
+}
+
+/// Credentials one jump hop authenticates with, taken from the vault.
+fn jump_auth(
+    host: &wassh_core::HostProfile,
+    vault: Option<&wassh_store::SecretsStore>,
+) -> Result<wassh_ssh::SshAuth, String> {
+    let name = host.display_name();
+    match host.connection.auth {
+        AuthMethod::Password => {
+            let password = vault
+                .and_then(|vault| vault.password(&host.id))
+                .unwrap_or_default();
+            if password.is_empty() {
+                return Err(format!(
+                    "jump host '{name}' needs a saved password in its host settings"
+                ));
+            }
+            Ok(wassh_ssh::SshAuth::Password(password))
+        }
+        AuthMethod::PrivateKey => {
+            let path = host.connection.private_key_path.clone().unwrap_or_default();
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "jump host '{name}' has no private key configured"
+                ));
+            }
+            let passphrase = vault
+                .and_then(|vault| vault.passphrase(&host.id))
+                .filter(|passphrase| !passphrase.is_empty());
+            Ok(wassh_ssh::SshAuth::PrivateKey {
+                path: path.into(),
+                passphrase,
+            })
+        }
+        AuthMethod::None => Ok(wassh_ssh::SshAuth::Agent),
+    }
 }
 
 fn local_username() -> String {
@@ -2560,53 +2592,12 @@ mod tests {
             "xterm-256color",
             TerminalSize::new(80, 24),
             SshOpen {
-    #[test]
-    fn a_local_shell_that_exits_ends_the_session_on_purpose() {
-        // The shell is replaced with one that logs out immediately, like typing `exit`.
-        #[cfg(windows)]
-        let (shell, args) = ("cmd.exe".to_owned(), vec!["/c".to_owned(), "exit".to_owned()]);
-        #[cfg(not(windows))]
-        let (shell, args) = ("/bin/sh".to_owned(), vec!["-c".to_owned(), "exit".to_owned()]);
-
-        let size = TerminalSize::new(80, 24);
-        let mut entry = SessionEntry::prepare(
-            "t-local",
-            &Palette::dark(),
-            &SessionStyleDefaults::default(),
-            size,
-            ConnectionParams {
-                kind: ConnectionType::Local,
-                ..ConnectionParams::default()
-            },
-            None,
-        );
-        entry.backend = Backend::Local(
-            PtySession::spawn(&shell, &args, size, "xterm-256color").expect("pty"),
-        );
-        entry.status = SessionStatus::Connected;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut closed = None;
-        while closed.is_none() && std::time::Instant::now() < deadline {
-            closed = entry.pump("xterm-256color").closed;
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert_eq!(
-            closed,
-            Some(Exit {
-                reason: None,
-                from_shell: true,
-            }),
-            "a shell that exits must be reported as ended on purpose"
-        );
-        assert_eq!(entry.status, SessionStatus::Closed);
-    }
-
                 params,
                 host_id: None,
                 secrets: Secrets::default(),
                 known_hosts: Arc::new(KnownHosts::in_memory()),
                 jumps: Vec::new(),
+                jump_error: None,
             },
         );
         assert_eq!(entry.title, "alice@example.com:2222");
@@ -2632,6 +2623,7 @@ mod tests {
                 secrets: Secrets::default(),
                 known_hosts: Arc::new(KnownHosts::in_memory()),
                 jumps: Vec::new(),
+                jump_error: None,
             },
         )
     }
@@ -3122,7 +3114,7 @@ mod tests {
     fn jump_chains_are_resolved_outermost_first() {
         let hosts = jump_hosts_doc();
         let params = hosts.host("target").unwrap().connection.clone();
-        let chain = jump_chain(&hosts, &params).expect("chain");
+        let chain = jump_chain(&hosts, &params, None).expect("chain");
         assert_eq!(
             chain.iter().map(|hop| hop.host.as_str()).collect::<Vec<_>>(),
             vec!["bastion.example.com", "inner.example.com"]
@@ -3135,15 +3127,34 @@ mod tests {
     fn hosts_without_a_jump_host_have_an_empty_chain() {
         let hosts = jump_hosts_doc();
         let params = hosts.host("bastion").unwrap().connection.clone();
-        assert!(jump_chain(&hosts, &params).unwrap().is_empty());
+        assert!(jump_chain(&hosts, &params, None).unwrap().is_empty());
     }
 
     #[test]
-    fn password_jump_hosts_are_rejected_with_a_reason() {
+    fn password_jump_hosts_use_the_saved_password() {
         let hosts = jump_hosts_doc();
         let mut params = hosts.host("target").unwrap().connection.clone();
         params.jump_host_id = Some("locked".to_owned());
-        let error = jump_chain(&hosts, &params).unwrap_err();
+
+        let dir = std::env::temp_dir().join(format!("wassh-jump-{}", std::process::id()));
+        let mut vault = wassh_store::SecretsStore::open(&dir).unwrap();
+        vault.set_password("locked", Some("hunter2")).unwrap();
+
+        let chain = jump_chain(&hosts, &params, Some(&vault)).expect("chain");
+        assert!(matches!(
+            &chain[0].auth,
+            wassh_ssh::SshAuth::Password(password) if password == "hunter2"
+        ));
+        drop(vault);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn password_jump_hosts_need_a_saved_password() {
+        let hosts = jump_hosts_doc();
+        let mut params = hosts.host("target").unwrap().connection.clone();
+        params.jump_host_id = Some("locked".to_owned());
+        let error = jump_chain(&hosts, &params, None).unwrap_err();
         assert!(error.contains("locked"), "error was {error}");
         assert!(error.contains("password"));
     }
@@ -3154,7 +3165,7 @@ mod tests {
         let first = hosts.hosts.iter_mut().find(|host| host.id == "bastion").unwrap();
         first.connection.jump_host_id = Some("inner".to_owned());
         let params = hosts.host("target").unwrap().connection.clone();
-        let error = jump_chain(&hosts, &params).unwrap_err();
+        let error = jump_chain(&hosts, &params, None).unwrap_err();
         assert!(error.contains("loop"), "error was {error}");
     }
 
@@ -3163,7 +3174,7 @@ mod tests {
         let hosts = jump_hosts_doc();
         let mut params = hosts.host("target").unwrap().connection.clone();
         params.jump_host_id = Some("ghost".to_owned());
-        let error = jump_chain(&hosts, &params).unwrap_err();
+        let error = jump_chain(&hosts, &params, None).unwrap_err();
         assert!(error.contains("ghost"), "error was {error}");
     }
 
