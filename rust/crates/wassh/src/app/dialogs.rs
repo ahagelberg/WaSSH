@@ -54,10 +54,10 @@ const SECTION_GAP: f32 = 28.0;
 const BACKDROP_ALPHA: u8 = 140;
 /// Width of a plugin's dedicated settings editor.
 const EDITOR_WIDTH: f32 = 620.0;
-/// Tallest a plugin's dedicated settings editor gets.
-const EDITOR_MAX_HEIGHT: f32 = 820.0;
 /// Shortest a plugin's dedicated settings editor gets, whatever the window.
 const EDITOR_MIN_HEIGHT: f32 = 240.0;
+/// Share of the window height the editor may take: a dialog, not a second window.
+const EDITOR_HEIGHT_SHARE: f32 = 0.5;
 /// Height the modal header, footer and padding take from the window.
 const EDITOR_CHROME: f32 = 132.0;
 /// Width of a tunnel's port box, which sits next to its host field.
@@ -1095,10 +1095,14 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         backup_path,
         editor,
         plugin_secrets,
+        ai_providers,
         ..
     } = state;
     // Set while the section closure runs; applied once the shell returns.
     let mut open_editor = None;
+    // The AI agent's "add a provider" dialog is drawn inside this one, so while it is open
+    // Escape closes that dialog and not Options.
+    let adding_provider = ai_providers.dialog_open();
     // Plugins add one section each after the built-in ones, in plugin order, the
     // same way the original app appends them to its section list.
     let plugin_sections = app_plugin_sections(draft);
@@ -1162,15 +1166,13 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
                             open_editor = Some(section.id);
                         }
                     } else {
-                        plugin_settings_rows(
+                        plugin_section_rows(
                             ui,
                             palette,
-                            section.schema,
+                            section,
                             values,
-                            &mut SecretEditing {
-                                id: section.id,
-                                secrets: plugin_secrets,
-                            },
+                            ai_providers,
+                            plugin_secrets,
                         );
                     }
                 }
@@ -1192,6 +1194,8 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         ShellOutcome::Dismissed if editor.is_some() => {
             *editor = None;
         }
+        // Likewise for the provider dialog a plugin section draws on top.
+        ShellOutcome::Dismissed if adding_provider => {}
         ShellOutcome::Cancel | ShellOutcome::Dismissed => actions.push(DialogAction::Close),
         ShellOutcome::Delete | ShellOutcome::Apply | ShellOutcome::Pending => {}
     }
@@ -1408,14 +1412,16 @@ fn options_backup(ui: &mut Ui, palette: &Palette, path: &mut String, actions: &m
 
 /// Height a plugin editor's body gets in a window `screen_height` tall.
 ///
-/// The editor takes the room the window has, so its settings and provider cards do not
-/// have to be scrolled inside a short box; a small window still leaves the title and the
-/// footer visible.
+/// Half the window, so the settings and provider cards get a real box to scroll in while
+/// the dialog still reads as a dialog; a small window clamps to the minimum instead.
 fn editor_room(screen_height: f32) -> f32 {
-    (screen_height - EDITOR_CHROME).clamp(EDITOR_MIN_HEIGHT, EDITOR_MAX_HEIGHT)
+    (screen_height * EDITOR_HEIGHT_SHARE - EDITOR_CHROME).max(EDITOR_MIN_HEIGHT)
 }
 
-/// The plugin's own settings editor, opened by a "Configure…" row.
+/// A plugin's own settings dialog, opened by a "Configure…" row.
+///
+/// Only plugins whose settings are one big record list use one (the MQTT analyser's saved
+/// messages); everything else is drawn inline in its Options section.
 fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsState) {
     let Some(id) = state.editor else {
         return;
@@ -1434,8 +1440,6 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
         .unwrap_or_default();
     let mut close = false;
     let room = editor_room(ctx.content_rect().height());
-    // The editor may open its own dialog on top; Escape belongs to that one then.
-    let nested = id == PluginId::AiAgent && state.ai_providers.is_adding();
     let response = modal(
         ctx,
         ("plugin-settings-editor", id.as_str()),
@@ -1443,33 +1447,33 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
         &format!("{} settings", manifest.name),
         EDITOR_WIDTH,
         |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt(("plugin-editor-scroll", id.as_str()))
-                .max_height(room)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    // The AI agent's provider list is app-wide too, and comes first: it is
-                    // what the rest of the chat settings refer to.
-                    if id == PluginId::AiAgent {
-                        provider_section(
-                            ui,
-                            palette,
-                            &mut state.ai_providers,
-                            &mut values,
-                            &mut state.plugin_secrets,
-                        );
-                    }
-                    plugin_settings_rows(
-                        ui,
-                        palette,
-                        schema,
-                        &mut values,
-                        &mut SecretEditing {
-                            id,
-                            secrets: &mut state.plugin_secrets,
-                        },
-                    );
-                });
+            // The modal measures itself from its content, so the tall body has to be
+            // claimed explicitly. A scroll area only gets `min(content, available)` and
+            // `available` collapses to nothing on egui's sizing pass, which used to leave
+            // the AI agent's editor ~180 px tall however tall the window was.
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::Vec2::new(width, room),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("plugin-editor-scroll", id.as_str()))
+                        .max_height(room)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            plugin_settings_rows(
+                                ui,
+                                palette,
+                                schema,
+                                &mut values,
+                                &mut SecretEditing {
+                                    id,
+                                    secrets: &mut state.plugin_secrets,
+                                },
+                            );
+                        });
+                },
+            );
             wassh_ui::widgets::footer(ui, |ui| {
                 if small_button(ui, palette, "Close") {
                     close = true;
@@ -1483,33 +1487,47 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
             .plugin_settings
             .insert(id.as_str().to_owned(), values);
     }
-    if (response.dismissed && !nested) || close {
+    if response.dismissed || close {
         state.editor = None;
     }
 }
 
-/// The AI agent's provider list, which lives in the app-wide dialog like its fields.
-fn provider_section(
+/// One plugin section's content: its provider list (when it has one) and its settings.
+///
+/// Everything is drawn inline in the global dialog — the only dialog a plugin section opens
+/// is the one its own editor draws for a single item (adding a provider).
+fn plugin_section_rows(
     ui: &mut Ui,
     palette: &Palette,
-    editor: &mut wassh_plugins::ai_agent::ProviderEditor,
+    section: &PluginSection,
     values: &mut serde_json::Map<String, serde_json::Value>,
+    editor: &mut wassh_plugins::ai_agent::ProviderEditor,
     secrets: &mut PluginSecretDrafts,
 ) {
-    let muted = to_color32(palette.text_muted);
-    ui.add_space(12.0);
-    ui.label(egui::RichText::new("PROVIDERS").size(12.0).color(muted));
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(
-            "Endpoints the AI agent can chat through. API keys are sealed in the \
-             credential vault.",
-        )
-        .size(11.0)
-        .color(muted),
+    if plugin_settings::draws_provider_list(section.id) {
+        row_block(ui, palette, "Providers", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Endpoints the AI agent can chat through. API keys are sealed in the \
+                     credential vault.",
+                )
+                .size(11.0)
+                .color(to_color32(palette.text_muted)),
+            );
+            ui.add_space(6.0);
+            editor.show(ui, palette, values, secrets);
+        });
+    }
+    plugin_settings_rows(
+        ui,
+        palette,
+        section.schema,
+        values,
+        &mut SecretEditing {
+            id: section.id,
+            secrets,
+        },
     );
-    ui.add_space(6.0);
-    editor.show(ui, palette, values, secrets);
 }
 
 /// One plugin-owned section of a settings dialog.
@@ -3357,7 +3375,7 @@ mod tests {
                 "Docker"
             ]
         );
-        // And only the plugins with a dedicated editor show a "Configure…" row.
+        // And only the plugin that owns a settings editor shows a "Configure…" row.
         let editors: Vec<_> = sections
             .iter()
             .filter(|section| {
@@ -3365,7 +3383,14 @@ mod tests {
             })
             .map(|section| section.heading)
             .collect();
-        assert_eq!(editors, ["MQTT Analyser", "AI agent"]);
+        assert_eq!(editors, ["MQTT Analyser"]);
+        // The AI agent draws its settings inline; only its providers get a button.
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.id == PluginId::AiAgent
+                    && section.presentation == plugin_settings::Presentation::Fields)
+        );
     }
 
     #[test]
@@ -3516,55 +3541,309 @@ mod tests {
         assert_eq!(state.editor, Some(PluginId::MqttAnalyser));
     }
 
-    #[test]
-    fn the_editor_uses_the_height_of_the_window() {
-        // A normal window leaves far more room than the old fixed 420 px box.
-        assert!(editor_room(900.0) > 700.0);
-        assert!(editor_room(1400.0) > editor_room(900.0));
-        // A short window keeps the minimum instead of collapsing.
-        assert_eq!(editor_room(300.0), EDITOR_MIN_HEIGHT);
-        // The tallest screen still gets a bounded dialog.
-        assert_eq!(editor_room(4000.0), EDITOR_MAX_HEIGHT);
+    /// The plugin editor's panel rect (the widest dialog-sized rounded rect painted).
+    fn editor_panel(
+        ctx: &Context,
+        size: Vec2,
+        mut draw: impl FnMut(&Context),
+    ) -> Rect {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let mut panel = Rect::NOTHING;
+        for _ in 0..3 {
+            let mut output = ctx.run_pass(input.clone(), |ctx| draw(ctx));
+            let shapes = std::mem::take(&mut output.shapes);
+            for clipped in shapes {
+                if let egui::Shape::Rect(rect) = clipped.shape
+                    && (rect.rect.width() - EDITOR_WIDTH - 2.0).abs() < 2.0
+                {
+                    panel = rect.rect;
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+        panel
     }
 
-    #[test]
-    fn the_ai_agent_editor_holds_the_provider_list() {
-        let ctx = Context::default();
-        let palette = Palette::dark();
+    /// Settings with an AI agent section enabled, holding `count` providers.
+    fn ai_agent_settings(count: usize) -> AppSettings {
+        let providers: Vec<_> = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("p{index}"),
+                    "name": format!("Provider {index}"),
+                    "protocol": "openai",
+                    "baseUrl": format!("http://127.0.0.1:1143{index}/v1"),
+                    "models": ["llama3.1"],
+                })
+            })
+            .collect();
         let mut settings = AppSettings {
             enabled_plugins: vec!["ai-agent".to_owned()],
             ..AppSettings::default()
         };
-        // One configured provider, as most setups have.
         settings.plugin_settings.insert(
             "ai-agent".to_owned(),
             [(
                 wassh_plugins::ai_agent::PROVIDERS_KEY.to_owned(),
-                serde_json::json!([{ "id": "ollama", "name": "Ollama", "protocol": "openai",
-                                     "baseUrl": "http://127.0.0.1:11434/v1",
-                                     "models": ["llama3.1"] }]),
+                serde_json::Value::Array(providers),
             )]
             .into_iter()
             .collect(),
         );
+        settings
+    }
+
+    #[test]
+    fn a_short_editor_stays_compact() {
+        // A plugin with little to show keeps a small dialog instead of a mostly empty one.
+        let ctx = Context::default();
+        let palette = Palette::dark();
+        let settings = AppSettings {
+            enabled_plugins: vec!["mqtt-analyser".to_owned()],
+            ..AppSettings::default()
+        };
         let mut state = OptionsState::new(&settings);
-        state.editor = Some(PluginId::AiAgent);
-        let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
+        state.editor = Some(PluginId::MqttAnalyser);
+        let panel = editor_panel(&ctx, Vec2::new(1280.0, 1300.0), |ctx| {
             options_plugin_editor(ctx, &palette, &mut state);
         });
+        assert!(
+            panel.height() < 700.0,
+            "the MQTT editor stretched to {} px",
+            panel.height()
+        );
+        assert!(panel.height() > EDITOR_MIN_HEIGHT, "and it is not collapsed");
+    }
+
+    #[test]
+    fn the_editor_takes_half_the_window() {
+        // Half the window, less the header and footer, on a normal screen.
+        assert!((editor_room(1300.0) - (650.0 - EDITOR_CHROME)).abs() < 0.01);
+        assert!(editor_room(1400.0) > editor_room(900.0));
+        // A short window keeps the minimum instead of collapsing.
+        assert_eq!(editor_room(300.0), EDITOR_MIN_HEIGHT);
+        // Never more than half the window, however tall it is.
+        assert!(editor_room(2400.0) < 1200.0);
+    }
+
+    /// The AI agent's section, without the Options shell around it.
+    ///
+    /// `passes` exists because an `Area`'s first frame is a sizing pass that paints
+    /// nothing: read with 2, send input in a single pass once the area is warm.
+    fn draw_ai_agent_section(
+        ctx: &Context,
+        size: Vec2,
+        state: &mut OptionsState,
+        events: Vec<egui::Event>,
+        passes: usize,
+    ) -> Vec<(i32, i32, String)> {
+        let mut rows = Vec::new();
+        for pass in 0..passes.max(1) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                // Input belongs to the last pass, when the area is laid out.
+                events: if pass + 1 == passes { events.clone() } else { Vec::new() },
+                ..Default::default()
+            };
+            rows = run_section_pass(ctx, state, input);
+        }
+        rows
+    }
+
+    fn run_section_pass(
+        ctx: &Context,
+        state: &mut OptionsState,
+        input: egui::RawInput,
+    ) -> Vec<(i32, i32, String)> {
+        let palette = Palette::dark();
+        let section = PluginSection {
+            id: PluginId::AiAgent,
+            heading: "AI agent",
+            schema: plugin_settings::app_schema(PluginId::AiAgent),
+            presentation: plugin_settings::Presentation::Fields,
+        };
+        let mut output = ctx.run_pass(input, |ctx| {
+            egui::Area::new(Id::unique("ai-agent-section-probe"))
+                .fixed_pos(Pos2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_width(700.0);
+                    let mut values = state
+                        .draft
+                        .plugin_settings
+                        .remove(PluginId::AiAgent.as_str())
+                        .unwrap_or_default();
+                    plugin_section_rows(
+                        ui,
+                        &palette,
+                        &section,
+                        &mut values,
+                        &mut state.ai_providers,
+                        &mut state.plugin_secrets,
+                    );
+                    state
+                        .draft
+                        .plugin_settings
+                        .insert(PluginId::AiAgent.as_str().to_owned(), values);
+                });
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        let mut rows: Vec<_> = shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    text.pos.y as i32,
+                    text.pos.x as i32,
+                    text.galley.text().to_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn the_ai_agent_section_holds_its_providers_and_settings() {
+        // Both live in the global dialog: the provider list and every agent setting are
+        // rows of the section, so nothing needs a "Configure…" step.
+        let ctx = Context::default();
+        let size = Vec2::new(1000.0, 2000.0);
+        let mut state = OptionsState::new(&ai_agent_settings(1));
+        let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
         let texts: Vec<_> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
-        assert!(texts.contains(&"AI agent settings"));
-        // The provider list is configured here, not in the pane.
-        assert!(texts.contains(&"PROVIDERS"));
+        // The provider list.
+        assert!(texts.contains(&"Providers"));
         assert!(texts.contains(&"Fetch models"));
         assert!(texts.contains(&"+ Add provider"));
+        assert!(texts.contains(&"Provider 0"), "the configured provider's name");
+        // And every setting of the plugin.
+        for label in [
+            "Global prompt text",
+            "Global knowledge",
+            "Default allow rules",
+            "Default deny rules",
+            "Web search",
+        ] {
+            assert!(texts.contains(&label), "{label:?} should be in the section");
+        }
+        // Nothing points at a separate editor any more.
+        assert!(!texts.contains(&"Configure…"));
+    }
 
-        // What the editor shows is what gets stored.
-        let stored = &state.draft.plugin_settings["ai-agent"];
-        let providers = stored[wassh_plugins::ai_agent::PROVIDERS_KEY]
-            .as_array()
-            .expect("the provider list is written back");
-        assert!(providers.iter().any(|provider| provider["id"] == "ollama"));
+    #[test]
+    fn adding_a_provider_opens_its_dialog() {
+        // The one dialog a plugin section still opens is the single-item editor: adding a
+        // provider. It must appear on top of the section without disturbing it.
+        let ctx = Context::default();
+        let size = Vec2::new(1000.0, 2000.0);
+        let mut state = OptionsState::new(&ai_agent_settings(0));
+        let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
+        let (y, x) = rows
+            .iter()
+            .find(|(_, _, text)| text == "+ Add provider")
+            .map(|(y, x, _)| (*y, *x))
+            .expect("the provider list offers an add button");
+        let pos = Pos2::new(x as f32 + 4.0, y as f32 + 4.0);
+        draw_ai_agent_section(
+            &ctx,
+            size,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            1,
+        );
+        assert!(state.ai_providers.dialog_open(), "the add dialog should be open");
+        // The next frame draws the section and the dialog together.
+        let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
+        let texts: Vec<_> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(texts.contains(&"Add a provider"), "the add dialog is drawn");
+        assert!(texts.contains(&"Providers"), "and the list stays put");
+    }
+
+    /// One Options dialog frame with a clock (the settings scroll area animates its
+    /// offset, so a frozen clock never settles) and optional input events.
+    fn run_options(
+        ctx: &Context,
+        dialogs: &mut Dialogs,
+        size: Vec2,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> Vec<(i32, i32, String)> {
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_pass(input, |ctx| {
+            let _ = dialogs.show(ctx, &palette, &[], 0);
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        let mut rows: Vec<_> = shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    text.pos.y as i32,
+                    text.pos.x as i32,
+                    text.galley.text().to_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn the_ai_agent_providers_are_inside_the_options_dialog() {
+        // The list used to sit behind a "Configure…" row; it is part of the section now, so
+        // there is no step between the Options dialog and the providers.
+        let ctx = Context::default();
+        let size = Vec2::new(1280.0, 1300.0);
+        let mut dialogs = Dialogs {
+            options: Some(OptionsState::new(&ai_agent_settings(1))),
+            ..Dialogs::default()
+        };
+        // Bring the section to the top of the viewport and let the animated scroll settle.
+        let mut rows = Vec::new();
+        for step in 0..12 {
+            if let Some(state) = dialogs.options.as_mut() {
+                state.nav.scroll_to = Some(OPTION_SECTIONS.len());
+            }
+            rows = run_options(&ctx, &mut dialogs, size, f64::from(step) * 0.05, Vec::new());
+        }
+        let texts: Vec<_> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(texts.contains(&"Providers"), "the provider list is inline");
+        assert!(texts.contains(&"Fetch models"));
+        assert!(texts.contains(&"+ Add provider"));
+        assert!(
+            !texts.contains(&"Configure…"),
+            "nothing has to be opened to see the providers"
+        );
+        assert_eq!(
+            dialogs.options.as_ref().and_then(|state| state.editor),
+            None,
+            "no plugin editor is involved"
+        );
     }
 
     #[test]

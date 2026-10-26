@@ -3291,6 +3291,34 @@ mod tests {
     }
 
     #[test]
+    fn the_ai_agent_pane_sees_the_providers_configured_in_options() {
+        // The provider list is edited in Options — with its own widget, so it has no
+        // settings row — and used to be filtered out on the way to the pane, which then
+        // kept saying no provider was configured.
+        let mut entry = password_entry();
+        let slot = entry.ensure_pane(wassh_plugins::PluginId::AiAgent);
+        let mut values = PluginValues::default();
+        values.app.insert(
+            "ai-agent".to_owned(),
+            plugin_map(&[(
+                wassh_plugins::ai_agent::PROVIDERS_KEY,
+                serde_json::json!([{ "id": "ollama", "name": "Ollama", "protocol": "openai",
+                                     "baseUrl": "http://127.0.0.1:11434/v1",
+                                     "models": ["llama3.1"] }]),
+            )]),
+        );
+        entry.load_pane_data(slot, None, &values);
+        let providers = entry.panes[slot].settings
+            [wassh_plugins::ai_agent::PROVIDERS_KEY]
+            .as_array()
+            .expect("the pane got the configured providers");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["id"], serde_json::json!("ollama"));
+        // Loading what the dialog owns is not a pane edit.
+        assert!(entry.take_dirty_plugins().is_empty());
+    }
+
+    #[test]
     fn an_adopted_app_setting_is_not_pane_data() {
         let mut entry = password_entry();
         let slot = entry.ensure_pane(wassh_plugins::PluginId::AiAgent);

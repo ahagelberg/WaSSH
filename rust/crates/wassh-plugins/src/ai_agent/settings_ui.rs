@@ -39,8 +39,10 @@ const LABEL_WIDTH: f32 = 70.0;
 const CARD_RADIUS: u8 = 6;
 /// Padding inside a provider card.
 const CARD_PADDING: i8 = 8;
-/// Width kept free for the two buttons next to a provider name.
-const BUTTONS_WIDTH: f32 = 170.0;
+/// Width kept free for the buttons next to a provider name.
+const BUTTONS_WIDTH: f32 = 230.0;
+/// Size of a provider's name in the list.
+const NAME_SIZE: f32 = 12.5;
 /// Height reserved for one control; a zero height would clip its text.
 const CONTROL_HEIGHT: f32 = 22.0;
 /// Width of the "add a provider" dialog.
@@ -51,8 +53,27 @@ const HINT_SIZE: f32 = 11.0;
 /// A model-list fetch running on its own thread.
 type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
 
-/// A provider the user is filling in before it is added.
+/// What the provider dialog produced when it was saved.
+enum ProviderSave {
+    /// A new provider, with the key typed for it (empty when it needs none).
+    Add(ProviderConfig, String),
+    /// An existing provider changed in place.
+    Edit {
+        index: usize,
+        provider: ProviderConfig,
+        /// A key typed to replace the stored one; empty keeps it.
+        key: String,
+        /// Drop the stored key instead of keeping it.
+        forget_key: bool,
+    },
+}
+
+/// The provider the dialog is filling in: a new one, or an existing one being edited.
 struct NewProvider {
+    /// Index of the provider being edited; `None` while adding a new one.
+    editing: Option<usize>,
+    /// Drop the stored API key when saving an edit.
+    forget_key: bool,
     /// Index into [`PROVIDER_TYPES`].
     kind: usize,
     /// Name, editable only for the type the user describes.
@@ -61,7 +82,7 @@ struct NewProvider {
     protocol: Protocol,
     /// Endpoint, editable for a hosted-on-your-own-machine or unknown service.
     base_url: String,
-    /// The API key as typed; it is sealed into the vault when the provider is added.
+    /// The API key as typed; it is sealed into the vault when the provider is saved.
     key: String,
 }
 
@@ -70,12 +91,40 @@ impl NewProvider {
     fn new() -> Self {
         let kind = PROVIDER_TYPES[0];
         Self {
+            editing: None,
+            forget_key: false,
             kind: 0,
             name: kind.name.to_owned(),
             protocol: kind.protocol,
             base_url: kind.base_url.to_owned(),
             key: String::new(),
         }
+    }
+
+    /// A draft prefilled from an existing provider.
+    ///
+    /// The type is matched by endpoint so a hosted service shows its own name; anything
+    /// else starts on the free-form type, with every field already filled in.
+    fn edit(index: usize, provider: &ProviderConfig) -> Self {
+        let kind = PROVIDER_TYPES
+            .iter()
+            .position(|kind| kind.id != PROVIDER_CUSTOM && kind.base_url == provider.base_url)
+            .or_else(|| PROVIDER_TYPES.iter().position(|kind| kind.id == PROVIDER_CUSTOM))
+            .unwrap_or(0);
+        Self {
+            editing: Some(index),
+            forget_key: false,
+            kind,
+            name: provider.name.clone(),
+            protocol: provider.protocol,
+            base_url: provider.base_url.clone(),
+            key: String::new(),
+        }
+    }
+
+    /// Whether the dialog is changing a provider rather than adding one.
+    fn is_editing(&self) -> bool {
+        self.editing.is_some()
     }
 
     /// The type the dropdown shows.
@@ -92,13 +141,34 @@ impl NewProvider {
         self.base_url = selected.base_url.to_owned();
     }
 
-    /// Whether the draft can be added: a described provider needs a name and an endpoint.
+    /// Whether the draft can be saved: every provider needs a name and an endpoint.
     fn is_complete(&self) -> bool {
         let kind = self.selected();
-        if kind.id != PROVIDER_CUSTOM {
+        if !self.is_editing() && kind.id != PROVIDER_CUSTOM {
             return true;
         }
         !self.name.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+
+    /// The edited provider, the key typed for it, and whether to drop the stored key.
+    ///
+    /// The id is kept, so the API key already sealed in the vault stays bound to it.
+    fn into_edit(self, existing: &ProviderConfig) -> (ProviderConfig, String, bool) {
+        let base_url = self.base_url.trim().to_owned();
+        let provider = ProviderConfig {
+            id: existing.id.clone(),
+            name: self.name.trim().to_owned(),
+            protocol: self.protocol,
+            // A new endpoint means the old model list belongs to another service.
+            models: if base_url == existing.base_url {
+                existing.models.clone()
+            } else {
+                Vec::new()
+            },
+            embedding_model: existing.embedding_model.clone(),
+            base_url,
+        };
+        (provider, self.key.trim().to_owned(), self.forget_key)
     }
 
     /// The provider this draft describes, and the key to seal for it.
@@ -142,8 +212,8 @@ pub struct ProviderEditor {
 }
 
 impl ProviderEditor {
-    /// Whether the "add a provider" dialog is open on top of the editor.
-    pub fn is_adding(&self) -> bool {
+    /// Whether the "add or edit a provider" dialog is open on top of the list.
+    pub fn dialog_open(&self) -> bool {
         self.new_provider.is_some()
     }
 
@@ -170,6 +240,7 @@ impl ProviderEditor {
         let muted = to_color32(palette.text_muted);
         let mut remove = None;
         let mut fetch = None;
+        let mut edit = None;
         let count = providers.len();
         for (index, provider) in providers.iter_mut().enumerate() {
             let card = egui::Frame::new()
@@ -179,10 +250,21 @@ impl ProviderEditor {
                 .inner_margin(egui::Margin::same(CARD_PADDING));
             card.show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let room = (ui.available_width() - BUTTONS_WIDTH).max(120.0);
+                    let room = (ui.available_width() - BUTTONS_WIDTH).max(80.0);
                     slot(ui, room, |ui| {
-                        text_input(ui, palette, &mut provider.name, "name");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&provider.name)
+                                    .size(NAME_SIZE)
+                                    .strong()
+                                    .color(to_color32(palette.text)),
+                            )
+                            .truncate(),
+                        );
                     });
+                    if small_button(ui, palette, "Edit") {
+                        edit = Some(index);
+                    }
                     if small_button_enabled(ui, palette, "Fetch models", self.fetch.is_none()) {
                         fetch = Some(index);
                     }
@@ -190,45 +272,15 @@ impl ProviderEditor {
                         remove = Some(index);
                     }
                 });
-                caption(ui, muted, "Protocol", |ui| {
-                    let options = [
-                        (Protocol::Openai, "OpenAI compatible"),
-                        (Protocol::Anthropic, "Anthropic"),
-                    ];
-                    if let Some(protocol) =
-                        select(ui, ("ai-provider-protocol", index), &provider.protocol, &options)
-                    {
-                        provider.protocol = protocol;
-                    }
-                });
-                caption(ui, muted, "Base URL", |ui| {
-                    text_input(ui, palette, &mut provider.base_url, "https://host/v1");
-                });
-                caption(ui, muted, "Models", |ui| {
-                    let mut models = provider.models.join(", ");
-                    if text_input(ui, palette, &mut models, "model-a, model-b").changed() {
-                        provider.models = models
-                            .split(',')
-                            .map(|model| model.trim().to_owned())
-                            .filter(|model| !model.is_empty())
-                            .collect();
-                    }
-                });
-                caption(ui, muted, "API key", |ui| {
-                    let draft = secrets.entry(secret_key(&provider.id)).or_default();
-                    let hint = if draft.stored && draft.draft.is_empty() {
-                        STORED_PLACEHOLDER
-                    } else {
-                        "paste the provider key"
-                    };
-                    if password_input(ui, palette, &mut draft.draft, hint).changed() {
-                        draft.clear = false;
-                    }
-                    if draft.stored && !draft.clear && small_button(ui, palette, "Clear") {
-                        draft.clear = true;
-                        draft.draft.clear();
-                    }
-                });
+                // Just the models: everything else is read in the Edit dialog.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(models_text(&provider.models))
+                            .size(LABEL_SIZE + 1.0)
+                            .color(to_color32(palette.text_muted)),
+                    )
+                    .truncate(),
+                );
             });
             ui.add_space(4.0);
         }
@@ -250,13 +302,42 @@ impl ProviderEditor {
                 .color(muted),
             );
         }
-        if let Some((provider, key)) = self.add_controls(ui, palette, &providers) {
-            if !key.is_empty() {
-                let draft: &mut SecretDraft = secrets.entry(secret_key(&provider.id)).or_default();
-                draft.draft = key;
-                draft.clear = false;
+        match self.provider_dialog(ui, palette, &providers, secrets) {
+            Some(ProviderSave::Add(provider, key)) => {
+                if !key.is_empty() {
+                    let draft: &mut SecretDraft =
+                        secrets.entry(secret_key(&provider.id)).or_default();
+                    draft.draft = key;
+                    draft.clear = false;
+                }
+                providers.push(provider);
             }
-            providers.push(provider);
+            Some(ProviderSave::Edit {
+                index,
+                provider,
+                key,
+                forget_key,
+            }) => {
+                let draft: &mut SecretDraft =
+                    secrets.entry(secret_key(&provider.id)).or_default();
+                if !key.is_empty() {
+                    draft.draft = key;
+                    draft.clear = false;
+                } else if forget_key {
+                    draft.clear = true;
+                    draft.draft.clear();
+                }
+                if let Some(slot) = providers.get_mut(index) {
+                    *slot = provider;
+                }
+            }
+            None => {}
+        }
+        if let Some(index) = edit
+            && self.new_provider.is_none()
+            && let Some(provider) = providers.get(index)
+        {
+            self.new_provider = Some(NewProvider::edit(index, provider));
         }
         if let Some(index) = fetch {
             self.start_fetch(&providers, &keys, index);
@@ -280,15 +361,19 @@ impl ProviderEditor {
 
     /// The "+ Add provider" button and the dialog it opens.
     ///
+    /// The same dialog edits a provider when the card's Edit button opens it: the
+    /// provider list itself is read-only, so every change goes through here.
+    ///
     /// Nothing is configured out of the box, so the dialog starts with the type: OpenAI,
     /// Anthropic, DeepSeek, Grok, Open Router, a local Ollama, or an endpoint of the
     /// user's own. The type fixes the wire format and, for hosted services, the endpoint.
-    fn add_controls(
+    fn provider_dialog(
         &mut self,
         ui: &mut Ui,
         palette: &Palette,
         providers: &[ProviderConfig],
-    ) -> Option<(ProviderConfig, String)> {
+        secrets: &PluginSecretDrafts,
+    ) -> Option<ProviderSave> {
         if self.new_provider.is_none() {
             if small_button(ui, palette, "+ Add provider") {
                 self.new_provider = Some(NewProvider::new());
@@ -296,13 +381,23 @@ impl ProviderEditor {
             return None;
         }
         let mut draft = self.new_provider.take()?;
-        let mut add = false;
+        // Whether the provider being edited already has a key in the vault.
+        let stored_key = draft
+            .editing
+            .and_then(|index| providers.get(index))
+            .is_some_and(|provider| {
+                secrets
+                    .get(&secret_key(&provider.id))
+                    .is_some_and(|draft| draft.stored)
+            });
+        let editing = draft.is_editing();
+        let mut save = false;
         let mut cancel = false;
         let response = modal(
             ui.ctx(),
             "ai-agent-add-provider",
             palette,
-            "Add a provider",
+            if editing { "Edit provider" } else { "Add a provider" },
             ADD_DIALOG_WIDTH,
             |ui| {
                 let muted = to_color32(palette.text_muted);
@@ -319,7 +414,8 @@ impl ProviderEditor {
                 });
                 let kind = draft.selected();
                 // A hosted service knows its endpoint; a local or unknown one does not.
-                if kind.has_fixed_endpoint() {
+                // An existing provider shows every field, whatever its type was.
+                if kind.has_fixed_endpoint() && !editing {
                     caption(ui, muted, "Endpoint", |ui| {
                         ui.label(
                             egui::RichText::new(kind.base_url)
@@ -332,7 +428,7 @@ impl ProviderEditor {
                         text_input(ui, palette, &mut draft.base_url, "https://host/v1");
                     });
                 }
-                if kind.id == PROVIDER_CUSTOM {
+                if kind.id == PROVIDER_CUSTOM || editing {
                     caption(ui, muted, "Name", |ui| {
                         text_input(ui, palette, &mut draft.name, "My provider");
                     });
@@ -350,8 +446,24 @@ impl ProviderEditor {
                 }
                 if kind.needs_key {
                     caption(ui, muted, "API key", |ui| {
-                        password_input(ui, palette, &mut draft.key, "paste the provider key");
+                        let hint = if stored_key && draft.key.is_empty() {
+                            STORED_PLACEHOLDER
+                        } else {
+                            "paste the provider key"
+                        };
+                        password_input(ui, palette, &mut draft.key, hint);
                     });
+                    if stored_key && draft.key.is_empty() {
+                        ui.add_space(2.0);
+                        // The drafts are not `SecretDraft`s here, so a plain flag will do:
+                        // saving reads it, and the dialog is dropped afterwards.
+                        wassh_ui::widgets::checkbox(
+                            ui,
+                            palette,
+                            &mut draft.forget_key,
+                            "Forget the stored key",
+                        );
+                    }
                 } else {
                     ui.label(
                         egui::RichText::new("This service runs without an API key.")
@@ -360,8 +472,9 @@ impl ProviderEditor {
                     );
                 }
                 footer(ui, |ui| {
-                    if small_button_enabled(ui, palette, "Add", draft.is_complete()) {
-                        add = true;
+                    let label = if editing { "Save" } else { "Add" };
+                    if small_button_enabled(ui, palette, label, draft.is_complete()) {
+                        save = true;
                     }
                     if small_button(ui, palette, "Cancel") {
                         cancel = true;
@@ -369,8 +482,23 @@ impl ProviderEditor {
                 });
             },
         );
-        if add {
-            return Some(draft.into_provider(providers));
+        if save {
+            return Some(match draft.editing {
+                Some(index) => {
+                    let existing = providers.get(index)?.clone();
+                    let (provider, key, forget_key) = draft.into_edit(&existing);
+                    ProviderSave::Edit {
+                        index,
+                        provider,
+                        key,
+                        forget_key,
+                    }
+                }
+                None => {
+                    let (provider, key) = draft.into_provider(providers);
+                    ProviderSave::Add(provider, key)
+                }
+            });
         }
         if !(response.dismissed || cancel) {
             self.new_provider = Some(draft);
@@ -473,6 +601,15 @@ fn secret_key(provider_id: &str) -> String {
     secret_field_key(PluginId::AiAgent.as_str(), &provider_secret_field(provider_id))
 }
 
+/// A provider's models, or a hint when it has none yet.
+fn models_text(models: &[String]) -> String {
+    if models.is_empty() {
+        "none listed yet".to_owned()
+    } else {
+        models.join(", ")
+    }
+}
+
 /// A muted caption followed by a control that fills the rest of the card.
 fn caption(ui: &mut Ui, muted: egui::Color32, label: &str, add: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
@@ -534,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_lists_its_endpoint_models_and_key() {
+    fn a_provider_card_shows_its_name_and_models_only() {
         let mut values = Map::new();
         values.insert(
             PROVIDERS_KEY.to_owned(),
@@ -543,20 +680,196 @@ mod tests {
         );
         let mut secrets = PluginSecretDrafts::new();
         let texts = painted(&mut values, &mut secrets);
-        for field in ["Protocol", "Base URL", "Models", "API key"] {
-            assert!(texts.iter().any(|text| text == field), "{field} missing: {texts:?}");
-        }
         assert!(texts.iter().any(|text| text == "Anthropic"), "provider missing: {texts:?}");
         assert!(
-            texts.iter().any(|text| text == "https://api.anthropic.com"),
-            "base URL missing: {texts:?}"
+            texts.iter().any(|text| text == "none listed yet"),
+            "an empty model list still says so: {texts:?}"
         );
+        // Everything else is only in the Edit dialog, not on the card.
+        for hidden in ["Protocol", "Base URL", "API key", "https://api.anthropic.com"] {
+            assert!(
+                !texts.iter().any(|text| text == hidden),
+                "{hidden:?} belongs in the Edit dialog: {texts:?}"
+            );
+        }
         // The provider list is a setting; the keys never are.
         assert!(values.contains_key(PROVIDERS_KEY));
         assert!(
             !values.contains_key(API_KEYS_KEY),
             "a key must never be written to the settings map"
         );
+    }
+
+    /// One provider, the way the list stores it.
+    fn ollama() -> Value {
+        serde_json::json!([{ "id": "ollama", "name": "Ollama", "protocol": "openai",
+                             "baseUrl": "http://127.0.0.1:11434/v1",
+                             "models": ["llama3.1"] }])
+    }
+
+    /// Paint the editor and collect every text with its position.
+    ///
+    /// `events` go to the last of `passes` frames: an `Area`'s (and so a modal's) first
+    /// frame is a sizing pass that paints nothing, so click in one call and read in the
+    /// next.
+    fn painted_at(
+        values: &mut Map<String, Value>,
+        secrets: &mut PluginSecretDrafts,
+        editor: &mut ProviderEditor,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        passes: usize,
+    ) -> Vec<(i32, i32, String)> {
+        let mut rows = Vec::new();
+        for pass in 0..passes.max(1) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(800.0, 900.0),
+                )),
+                events: if pass + 1 == passes {
+                    events.clone()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(800.0)
+                    .show(ui, |ui| editor.show(ui, &Palette::dark(), values, secrets));
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            rows = shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.pos.y as i32,
+                        text.pos.x as i32,
+                        text.galley.text().to_owned(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            rows.sort();
+        }
+        rows
+    }
+
+    /// A press and release in the middle of a painted text.
+    fn click_at(row: (i32, i32, String)) -> Vec<egui::Event> {
+        let pos = egui::pos2(row.1 as f32 + 4.0, row.0 as f32 + 4.0);
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_provider_card_is_a_read_only_summary_with_an_edit_button() {
+        let mut values = Map::new();
+        values.insert(PROVIDERS_KEY.to_owned(), ollama());
+        let mut secrets = PluginSecretDrafts::new();
+        let mut editor = ProviderEditor::default();
+        let ctx = egui::Context::default();
+        let rows = painted_at(&mut values, &mut secrets, &mut editor, &ctx, Vec::new(), 2);
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        // The title, its models, and the buttons — nothing else.
+        for text in ["Ollama", "llama3.1"] {
+            assert!(texts.contains(&text), "{text:?} missing from the card: {texts:?}");
+        }
+        for hidden in [
+            "Protocol",
+            "Base URL",
+            "API key",
+            "OpenAI compatible",
+            "http://127.0.0.1:11434/v1",
+            "not set",
+        ] {
+            assert!(
+                !texts.contains(&hidden),
+                "{hidden:?} belongs in the Edit dialog: {texts:?}"
+            );
+        }
+        // The card is read-only: its button is the way in.
+        assert!(texts.contains(&"Edit"), "no Edit button: {texts:?}");
+        assert!(!editor.dialog_open(), "drawing the list opens no dialog");
+        assert_eq!(values[PROVIDERS_KEY], ollama(), "nothing was written back");
+    }
+
+    #[test]
+    fn the_edit_button_opens_the_dialog_in_edit_mode() {
+        let mut values = Map::new();
+        values.insert(PROVIDERS_KEY.to_owned(), ollama());
+        let mut secrets = PluginSecretDrafts::new();
+        let mut editor = ProviderEditor::default();
+        let ctx = egui::Context::default();
+        let rows = painted_at(&mut values, &mut secrets, &mut editor, &ctx, Vec::new(), 2);
+        let edit = rows
+            .iter()
+            .find(|(_, _, text)| text == "Edit")
+            .cloned()
+            .expect("the card has an Edit button");
+        painted_at(&mut values, &mut secrets, &mut editor, &ctx, click_at(edit), 2);
+        assert!(editor.dialog_open(), "Edit opens the provider dialog");
+        // The dialog paints on its next frame, since it was created after the click.
+        let rows = painted_at(&mut values, &mut secrets, &mut editor, &ctx, Vec::new(), 2);
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts.contains(&"Edit provider"),
+            "it opens in edit mode: {texts:?}"
+        );
+        assert!(texts.contains(&"Save"), "and offers Save: {texts:?}");
+        assert!(!texts.contains(&"Add a provider"), "not the add dialog");
+        // Its fields start on the provider's own values.
+        assert!(texts.contains(&"Ollama"), "the name is prefilled: {texts:?}");
+        assert!(
+            texts.contains(&"http://127.0.0.1:11434/v1"),
+            "the endpoint is prefilled: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn saving_an_edit_keeps_the_id_and_models_and_leaves_an_untouched_key() {
+        let existing = ProviderConfig {
+            id: "ollama".to_owned(),
+            name: "Ollama".to_owned(),
+            protocol: Protocol::Openai,
+            base_url: "http://127.0.0.1:11434/v1".to_owned(),
+            models: vec!["llama3.1".to_owned()],
+            embedding_model: None,
+        };
+        let draft = NewProvider::edit(0, &existing);
+        assert!(draft.is_editing());
+        assert_eq!(draft.name, "Ollama");
+        assert_eq!(draft.base_url, existing.base_url);
+        // The type is matched by endpoint, so the card edits as the service it is.
+        assert!(PROVIDER_TYPES[draft.kind].name.starts_with("Ollama"));
+        let (provider, key, forget) = draft.into_edit(&existing);
+        assert_eq!(provider.id, "ollama", "the vault key stays bound to it");
+        assert_eq!(provider.models, ["llama3.1"]);
+        assert!(key.is_empty() && !forget, "an untouched key is left alone");
+
+        // A new endpoint drops the old model list, and the typed key replaces the stored one.
+        let mut draft = NewProvider::edit(0, &existing);
+        draft.base_url = "https://other.example/v1".to_owned();
+        draft.key = "  sk-new  ".to_owned();
+        let (provider, key, _) = draft.into_edit(&existing);
+        assert!(provider.models.is_empty());
+        assert_eq!(provider.base_url, "https://other.example/v1");
+        assert_eq!(key, "sk-new", "trimmed");
     }
 
     #[test]

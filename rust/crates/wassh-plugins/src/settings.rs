@@ -620,11 +620,23 @@ pub enum Presentation {
 }
 
 /// Presentation of a plugin's Options section.
+///
+/// Only the MQTT analyser keeps its whole schema in a dialog (its saved messages are a
+/// record list that needs the room); every other plugin's settings are ordinary rows.
 pub fn app_presentation(id: PluginId) -> Presentation {
     match id {
-        PluginId::AiAgent | PluginId::MqttAnalyser => Presentation::Editor,
+        PluginId::MqttAnalyser => Presentation::Editor,
         _ => Presentation::Fields,
     }
+}
+
+/// Whether a plugin's Options section draws a provider list above its settings.
+///
+/// The AI agent's provider list is app-wide state edited in a list view, so it cannot be
+/// a label/control row. It is still part of the section — only adding a single provider
+/// opens a dialog, and the plugin's own editor draws that.
+pub fn draws_provider_list(id: PluginId) -> bool {
+    matches!(id, PluginId::AiAgent)
 }
 
 /// Fields Options shows for a plugin, app-wide.
@@ -746,6 +758,25 @@ pub fn apply_to(
         if let Some(value) = host_values.and_then(|values| values.get(field.key)) {
             target.insert(field.key.to_owned(), value.clone());
         }
+    }
+    // Keys a plugin draws with its own widget have no row, so no field above copies them.
+    for key in list_owned_app_keys(id) {
+        if let Some(value) = app_values.and_then(|values| values.get(*key)) {
+            target.insert((*key).to_owned(), value.clone());
+        }
+    }
+}
+
+/// App-wide keys a plugin edits with its own widget instead of a settings row.
+///
+/// They are not schema fields — there is no label, so no row — but they are still
+/// app-wide settings that Options owns and the pane reads, so [`apply_to`] has to carry
+/// them: without this the AI agent never saw the providers configured in Options and kept
+/// claiming none were set up.
+fn list_owned_app_keys(id: PluginId) -> &'static [&'static str] {
+    match id {
+        PluginId::AiAgent => &[crate::ai_agent::PROVIDERS_KEY],
+        _ => &[],
     }
 }
 
@@ -913,7 +944,53 @@ mod tests {
             .filter(|id| app_presentation(*id) == Presentation::Editor)
             .map(|id| id.as_str())
             .collect();
-        assert_eq!(editors, ["ai-agent", "mqtt-analyser"]);
+        assert_eq!(editors, ["mqtt-analyser"]);
+    }
+
+    #[test]
+    fn the_provider_list_reaches_the_pane_from_the_app_settings() {
+        // The provider list has no schema row (the AI agent draws it itself), so it used to
+        // be dropped on the way from Options to a pane: the pane kept saying no provider was
+        // configured however many were added.
+        let app: Map<String, Value> = [(
+            crate::ai_agent::PROVIDERS_KEY.to_owned(),
+            serde_json::json!([{ "id": "ollama", "name": "Ollama", "protocol": "openai",
+                                 "baseUrl": "http://127.0.0.1:11434/v1",
+                                 "models": ["llama3.1"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut pane = Map::new();
+        pane.insert("globalPrompt".to_owned(), "keep me".to_owned().into());
+        apply_to(PluginId::AiAgent, Some(&app), None, &mut pane);
+        assert!(
+            pane.get(crate::ai_agent::PROVIDERS_KEY)
+                .and_then(Value::as_array)
+                .is_some_and(|providers| providers.len() == 1),
+            "the configured providers must reach the pane: {pane:?}"
+        );
+        // Its ordinary rows still resolve as before.
+        assert_eq!(pane["globalPrompt"], Value::from("keep me"));
+        // Nothing was invented for plugins that have no such key.
+        let mut docker = Map::new();
+        apply_to(PluginId::DockerManager, Some(&app), None, &mut docker);
+        assert!(!docker.contains_key(crate::ai_agent::PROVIDERS_KEY));
+    }
+
+    #[test]
+    fn only_the_ai_agent_draws_a_provider_list() {
+        // Its settings are ordinary label/control rows now, so the section lists them.
+        assert_eq!(app_presentation(PluginId::AiAgent), Presentation::Fields);
+        assert!(!app_schema(PluginId::AiAgent).is_empty());
+        // Its provider list is a list view, drawn inside the same section.
+        assert!(draws_provider_list(PluginId::AiAgent));
+        // Nothing else has one.
+        let with_list: Vec<_> = PluginId::ALL
+            .into_iter()
+            .filter(|id| draws_provider_list(*id))
+            .map(|id| id.as_str())
+            .collect();
+        assert_eq!(with_list, ["ai-agent"]);
     }
 
     #[test]

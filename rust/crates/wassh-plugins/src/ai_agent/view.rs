@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use wassh_core::SessionStatus;
 use wassh_ui::dock::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, chip, select_str, select_width, small_button_enabled, text_area, text_input,
+    Button, ButtonKind, select_str, select_width, small_button_enabled, text_area, text_input,
 };
 
 use super::agent::{
@@ -60,7 +60,10 @@ const MIN_COMPOSER_WIDTH: f32 = 80.0;
 /// Caption of the file-attach button.
 const ATTACH_GLYPH: &str = "📎";
 /// Caption of the terminal-context toggle.
-const TERMINAL_ATTACH_GLYPH: &str = "⌁";
+///
+/// ASCII on purpose: the bundled fonts have no glyph for a symbol like "⌁", so it drew as
+/// an empty box next to the paperclip.
+const TERMINAL_ATTACH_GLYPH: &str = ">_";
 /// Characters of terminal output attached to a message as context.
 const TERMINAL_CONTEXT_CHARS: usize = 6_000;
 /// Heading of that block in the outgoing message.
@@ -1228,20 +1231,22 @@ impl Plugin for AiAgent {
         let mut submit = false;
         let mut command: Option<SlashCommand> = None;
         ui.horizontal(|ui| {
-            // The attach buttons stack on the left, like the reference composer.
-            ui.vertical(|ui| {
-                if small_button_enabled(
-                    ui,
-                    palette,
-                    ATTACH_GLYPH,
-                    self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS,
-                ) {
-                    self.pick_attachments();
-                }
-                if chip(ui, palette, TERMINAL_ATTACH_GLYPH, self.attach_terminal) {
-                    self.attach_terminal = !self.attach_terminal;
-                }
-            });
+            // Both composer tools sit side by side on the left and share one shape, like the
+            // reference's input-bar buttons; only the toggle's accent shows its state.
+            let attach = Button::new(ATTACH_GLYPH)
+                .compact()
+                .enabled(self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS)
+                .show(ui, palette);
+            if attach.clicked() {
+                self.pick_attachments();
+            }
+            let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
+                .compact()
+                .active(self.attach_terminal)
+                .show(ui, palette);
+            if terminal.clicked() {
+                self.attach_terminal = !self.attach_terminal;
+            }
             let room = (ui.available_width() - SEND_BUTTON_WIDTH).max(MIN_COMPOSER_WIDTH);
             ui.allocate_ui_with_layout(
                 egui::Vec2::new(room, 0.0),
@@ -1449,6 +1454,85 @@ mod tests {
             output.drop_without_applying_deltas();
         }
         painted
+    }
+
+    /// Draw the pane and keep every text with the position it was painted at.
+    fn painted_rows(
+        plugin: &mut AiAgent,
+        settings: &mut serde_json::Map<String, Value>,
+    ) -> Vec<(i32, i32, String)> {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(560.0, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut rows = Vec::new();
+        for _ in 0..2 {
+            let mut context = PluginContext {
+                palette,
+                host_label: "dev".to_owned(),
+                status: SessionStatus::Connected,
+                settings,
+                scope: "host-1".to_owned(),
+                session: None,
+                events: &[],
+                pending_input: Vec::new(),
+                secrets: &EMPTY_SECRETS,
+                secret_writes: Vec::new(),
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
+            let shapes = std::mem::take(&mut output.shapes);
+            rows.clear();
+            for clipped in shapes {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    rows.push((
+                        text.pos.y as i32,
+                        text.pos.x as i32,
+                        text.galley.text().to_owned(),
+                    ));
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn both_composer_tools_are_the_same_button_on_one_row() {
+        // The terminal toggle used to be a chip of its own between the paperclip and the
+        // prompt, and its glyph had no font, so it read as a broken box.
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        let rows = painted_rows(&mut plugin, &mut settings);
+        let attach = rows
+            .iter()
+            .find(|(_, _, text)| text == ATTACH_GLYPH)
+            .cloned()
+            .expect("the paperclip button is missing");
+        let terminal = rows
+            .iter()
+            .find(|(_, _, text)| text == TERMINAL_ATTACH_GLYPH)
+            .cloned()
+            .expect("the terminal toggle is missing");
+        assert_eq!(
+            attach.0, terminal.0,
+            "both tools sit on one row: {attach:?} vs {terminal:?}"
+        );
+        assert!(
+            terminal.1 > attach.1,
+            "the terminal toggle follows the paperclip: {attach:?} vs {terminal:?}"
+        );
+        assert!(
+            terminal.1 - attach.1 < 60,
+            "and sits right next to it, not across the row: {attach:?} vs {terminal:?}"
+        );
+        // ASCII, so the bundled fonts can draw it.
+        assert!(TERMINAL_ATTACH_GLYPH.is_ascii());
     }
 
     #[test]
