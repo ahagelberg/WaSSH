@@ -36,7 +36,12 @@ ureq = { version = "3", default-features = false, features = ["rustls", "json"] 
 # Native open/save dialogs. The XDG portal backend talks to the desktop over
 # D-Bus (and falls back to zenity), so there is no GTK3 build requirement.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
-russh = { version = "0.64", features = ["ring"] }
+# ring instead of the default aws-lc-rs: aws-lc-sys needs NASM/CMake to build.
+russh = { version = "0.64", default-features = false, features = [
+    "ring",
+    "rsa",
+    "flate2",
+] }
 russh-sftp = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
