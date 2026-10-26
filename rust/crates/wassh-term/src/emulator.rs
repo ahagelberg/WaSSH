@@ -22,7 +22,9 @@ use crate::grid::TerminalSize;
 pub enum TerminalEvent {
     Bell,
     Title(String),
-    ClipboardStore(String),
+    /// Bytes the shell asked the terminal for and must be written back, e.g. a
+    /// cursor-position report in reply to `CSI 6 n`.
+    PtyWrite(String),
     Wakeup,
 }
 
@@ -56,10 +58,10 @@ impl EventListener for EventProxy {
         let mapped = match event {
             Event::Bell => Some(TerminalEvent::Bell),
             Event::Title(title) => Some(TerminalEvent::Title(title)),
-            Event::PtyWrite(text) => Some(TerminalEvent::ClipboardStore(text)),
+            Event::PtyWrite(text) => Some(TerminalEvent::PtyWrite(text)),
             Event::Wakeup => Some(TerminalEvent::Wakeup),
-            // Colour queries, clipboard requests and cursor-change notifications are wired
-            // up in Phase 2 when the terminal owns a real clipboard.
+            // Colour queries and clipboard requests are wired up in Phase 2 when the
+            // terminal owns a real clipboard.
             _ => None,
         };
         if let Some(event) = mapped {
@@ -683,6 +685,21 @@ mod tests {
         let events: Vec<_> = rx.try_iter().collect();
         assert!(events.contains(&TerminalEvent::Bell));
         assert!(events.contains(&TerminalEvent::Title("my title".to_owned())));
+    }
+
+    #[test]
+    fn a_cursor_position_report_is_answered() {
+        // ConPTY withholds all output until the terminal replies to `CSI 6 n`.
+        let (mut term, rx) = terminal(10, 2);
+        term.feed(b"ab\x1b[6n");
+        let written: String = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                TerminalEvent::PtyWrite(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(written, "\x1b[1;3R");
     }
 
     #[test]

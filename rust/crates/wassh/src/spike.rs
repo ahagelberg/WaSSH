@@ -294,6 +294,7 @@ impl SpikeApp {
             }
         }
 
+        let mut replies = Vec::new();
         for event in self.events.try_iter() {
             match event {
                 TerminalEvent::Title(title) => {
@@ -302,8 +303,12 @@ impl SpikeApp {
                     )));
                 }
                 TerminalEvent::Bell => {}
-                TerminalEvent::ClipboardStore(_) | TerminalEvent::Wakeup => {}
+                TerminalEvent::PtyWrite(text) => replies.push(text),
+                TerminalEvent::Wakeup => {}
             }
+        }
+        for reply in replies {
+            self.write_backend(reply.as_bytes());
         }
     }
 
@@ -331,11 +336,16 @@ impl SpikeApp {
             if bytes.is_empty() {
                 continue;
             }
-            if let Some(ssh) = &mut self.ssh {
-                ssh.write(&bytes);
-            } else if let Some(local) = &mut self.local {
-                let _ = local.write(&bytes);
-            }
+            self.write_backend(&bytes);
+        }
+    }
+
+    /// Write raw bytes to whichever transport is connected.
+    fn write_backend(&mut self, bytes: &[u8]) {
+        if let Some(ssh) = &mut self.ssh {
+            ssh.write(bytes);
+        } else if let Some(local) = &mut self.local {
+            let _ = local.write(bytes);
         }
     }
 

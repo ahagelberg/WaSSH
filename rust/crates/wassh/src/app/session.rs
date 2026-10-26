@@ -744,6 +744,7 @@ impl SessionEntry {
             self.error = None;
         }
 
+        let mut replies = Vec::new();
         for event in self.events.try_iter() {
             match event {
                 TerminalEvent::Title(title) => {
@@ -753,8 +754,13 @@ impl SessionEntry {
                     }
                 }
                 TerminalEvent::Bell => pumped.bell = true,
-                TerminalEvent::ClipboardStore(_) | TerminalEvent::Wakeup => {}
+                // The shell is waiting for this answer, e.g. ConPTY blocks on `CSI 6 n`.
+                TerminalEvent::PtyWrite(text) => replies.push(text),
+                TerminalEvent::Wakeup => {}
             }
+        }
+        for reply in replies {
+            self.send(reply.as_bytes());
         }
 
         self.record_status();
