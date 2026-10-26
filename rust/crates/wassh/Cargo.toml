@@ -23,3 +23,4 @@ wassh-ssh = { path = "../wassh-ssh" }
 wassh-telnet = { path = "../wassh-telnet" }
 wassh-term = { path = "../wassh-term" }
 wassh-ui = { path = "../wassh-ui" }
+winit = { workspace = true }

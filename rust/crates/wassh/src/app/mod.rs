@@ -260,10 +260,11 @@ fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
         None => viewport.with_inner_size([1280.0, 800.0]),
     };
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+    prefer_x11_backend(&mut options);
     eframe::run_native(
         "wassh",
         options,
@@ -273,6 +274,32 @@ fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+/// Run through XWayland when one is available.
+///
+/// Wayland gives a client no way to place its own window, so a saved position could never
+/// be restored there (and the compositor reports no outer position to save either).
+/// XWayland, which every Wayland desktop with X support provides, supports both. A session
+/// without XWayland keeps the Wayland backend and simply cannot restore a position;
+/// `WASSH_WAYLAND=1` asks for native Wayland even when XWayland exists.
+fn prefer_x11_backend(options: &mut eframe::NativeOptions) {
+    #[cfg(target_os = "linux")]
+    {
+        let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let has_x11 = std::env::var_os("DISPLAY").is_some();
+        let wants_native_wayland = std::env::var_os("WASSH_WAYLAND").is_some();
+        if has_wayland && has_x11 && !wants_native_wayland {
+            options.event_loop_builder = Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                builder.with_x11();
+            }));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = options;
+    }
 }
 
 impl Shell {
@@ -804,12 +831,41 @@ impl Shell {
         if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
             return false;
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+        let target = egui::pos2(
             bounds.x as f32 / pixels_per_point,
             bounds.y as f32 / pixels_per_point,
-        )));
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+        // Where the window lands tells us the decoration offset; see `learn_frame_offset`.
+        self.restore_request = Some(target);
+        self.restore_wait = 2;
         ctx.request_repaint();
         true
+    }
+
+    /// Measure the window frame's offset from the position asked for, once per session.
+    ///
+    /// The move is applied asynchronously, so this runs a couple of frames after the
+    /// request. A window manager that ignored the request would report a large difference;
+    /// that is discarded rather than baked into every later save.
+    fn learn_frame_offset(&mut self, ctx: &egui::Context) {
+        let Some(requested) = self.restore_request else {
+            return;
+        };
+        if self.restore_wait > 0 {
+            self.restore_wait -= 1;
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            return;
+        }
+        self.restore_request = None;
+        let Some(inner) = ctx.input(|input| input.viewport().inner_rect) else {
+            return;
+        };
+        let offset = inner.min - requested;
+        if offset.length() <= MAX_FRAME_OFFSET {
+            self.frame_offset = Some(offset);
+        }
+        ctx.request_repaint();
     }
 
     /// Remember the window rectangle so the next launch can restore it.
@@ -818,7 +874,7 @@ impl Shell {
         if viewport.fullscreen.unwrap_or(false) || viewport.minimized.unwrap_or(false) {
             return;
         }
-        let (Some(outer), Some(inner)) = (viewport.outer_rect, viewport.inner_rect) else {
+        let Some(inner) = viewport.inner_rect else {
             return;
         };
         let pixels_per_point = ctx.pixels_per_point();
@@ -827,9 +883,16 @@ impl Shell {
         }
         let maximized = viewport.maximized.unwrap_or(false);
         if !maximized {
+            // The frame position is what gets restored, so the measured decoration offset
+            // is removed from the client position the platform reports. Wayland reports no
+            // outer position at all, and there a known offset lets the position survive.
+            let position = match self.frame_offset {
+                Some(offset) => inner.min - offset,
+                None => viewport.outer_rect.map_or(inner.min, |outer| outer.min),
+            };
             self.last_bounds = Some(WindowBounds {
-                x: (outer.left() * pixels_per_point).round() as i32,
-                y: (outer.top() * pixels_per_point).round() as i32,
+                x: (position.x * pixels_per_point).round() as i32,
+                y: (position.y * pixels_per_point).round() as i32,
                 width: inner.width().round() as u32,
                 height: inner.height().round() as u32,
                 maximized: false,
@@ -2741,7 +2804,10 @@ impl Shell {
         // the reported geometry is not the user's.
         let restoring = self.restore_window_position(&ctx);
         self.frame_body(ui);
-        if !restoring {
+        self.learn_frame_offset(&ctx);
+        // Until a restore has landed, the position is not the user's choice yet, so it is
+        // not saved over the one being restored.
+        if !restoring && self.restore_request.is_none() {
             self.track_window_bounds(&ctx);
         }
         self.persist_window_bounds(false);
@@ -3754,6 +3820,97 @@ mod tests {
             shell.settings.window_bounds
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_window_remembers_the_frame_offset() {
+        // The compositor places the window frame where it is asked to and reports the
+        // client position back. Saving that report verbatim would walk the window down and
+        // right by the decoration on every launch; the measured offset cancels it.
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // The restore asked for frame (500,300); the client landed at (504,332).
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(504.0, 332.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(504.0, 332.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                maximized: Some(false),
+                ..Default::default()
+            },
+        );
+        shell.restore_request = Some(egui::pos2(500.0, 300.0));
+        shell.restore_wait = 0;
+        let output = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            shell.learn_frame_offset(&ctx);
+            shell.track_window_bounds(&ctx);
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(shell.frame_offset, Some(egui::vec2(4.0, 32.0)));
+        assert_eq!(
+            shell.settings.window_bounds,
+            Some(WindowBounds {
+                x: 500,
+                y: 300,
+                width: 900,
+                height: 700,
+                maximized: false,
+            }),
+            "the saved value is the frame position the restore asked for"
+        );
+        assert!(shell.restore_request.is_none(), "the offset is learnt once");
+    }
+
+    #[test]
+    fn a_window_that_ignored_the_restore_does_not_learn_a_bogus_offset() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        // Asked for (500,300), the window stayed at (1200,700): the request was refused.
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(1200.0, 700.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                outer_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(1200.0, 700.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                maximized: Some(false),
+                ..Default::default()
+            },
+        );
+        shell.restore_request = Some(egui::pos2(500.0, 300.0));
+        shell.restore_wait = 0;
+        let output = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            shell.learn_frame_offset(&ctx);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(shell.frame_offset, None, "a refused move teaches nothing");
     }
 
     #[test]

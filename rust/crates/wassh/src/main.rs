@@ -84,6 +84,10 @@ fn print_help() {
     println!("Usage: wassh [--version] [--diagnostics]");
     println!("       wassh --perf [--tabs N]     (cold start and memory figures)");
     println!("       wassh --spike [--widgets]   (Phase 0 terminal harness)");
+    println!();
+    println!("Environment:");
+    println!("  WASSH_WAYLAND=1   use native Wayland even when XWayland is available");
+    println!("                    (Wayland cannot restore the window position)");
 }
 
 fn print_environment() {
