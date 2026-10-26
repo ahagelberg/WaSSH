@@ -19,6 +19,7 @@ pub mod splitter;
 pub mod surface;
 pub mod table;
 pub mod tag_input;
+pub mod text;
 pub mod toast;
 pub mod tree;
 
@@ -42,5 +43,6 @@ pub use table::{TableColumn, column_widths, table_header, table_row};
 pub use tag_input::{
     TagInputResponse, commit_all, commit_draft, commit_tag, remove_last, tag_input,
 };
+pub use text::truncating_galley;
 pub use toast::{Toast, ToastKind, Toasts};
 pub use tree::{TreeRow, TreeRowResponse, tree_row};

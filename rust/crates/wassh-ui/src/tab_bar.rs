@@ -8,6 +8,7 @@ use egui::{Align2, Color32, FontId, Id, Pos2, Rect, Sense, Ui, Vec2};
 use wassh_core::{Palette, Rgba, SessionStatus, colors};
 
 use crate::terminal_view::to_color32;
+use crate::widgets::truncating_galley;
 
 /// Height of the strip.
 pub const TABBAR_HEIGHT: f32 = 36.0;
@@ -37,6 +38,12 @@ pub const NEW_TAB_WIDTH: f32 = 28.0;
 pub struct TabView<'a> {
     /// Stable session id.
     pub id: &'a str,
+/// Inset of the "new tab" button box inside its slot.
+const NEW_TAB_INSET: Vec2 = Vec2::new(3.0, 7.0);
+/// Font size of the "new tab" glyph.
+const NEW_TAB_GLYPH_SIZE: f32 = 14.0;
+/// Font size of the tab title.
+const TAB_TITLE_SIZE: f32 = 12.0;
     /// Title shown in the strip.
     pub title: &'a str,
     /// Session status, controlling the dot colour.
@@ -291,29 +298,22 @@ fn draw_tab(
         close_colour,
     );
 
-    // Title.
+    // Title: one line, truncated rather than wrapped; hovering shows the full text.
     let title_rect = Rect::from_min_max(
         Pos2::new(left, rect.top()),
         Pos2::new(close_rect.left() - 4.0, rect.bottom()),
     );
-    if title_rect.width() > 8.0 {
-        let colour = if tab.active {
-            to_color32(palette.text)
-        } else {
-            to_color32(palette.text_muted)
-        };
-        let galley = ui.painter().layout(
-            tab.title.to_owned(),
-            FontId::proportional(12.0),
-            colour,
-            title_rect.width(),
-        );
-        ui.painter().with_clip_rect(title_rect).galley(
-            Pos2::new(title_rect.left(), rect.center().y - galley.size().y / 2.0),
-            galley,
-            colour,
-        );
-    }
+    let colour = if tab.active {
+        to_color32(palette.text)
+    } else {
+        to_color32(palette.text_muted)
+    };
+    let galley = truncating_galley(ui, tab.title, TAB_TITLE_SIZE, colour, title_rect.width());
+    ui.painter().with_clip_rect(title_rect).galley(
+        Pos2::new(title_rect.left(), rect.center().y - galley.size().y / 2.0),
+        galley,
+        colour,
+    );
 
     // Interaction.
     if close.clicked() {
@@ -390,3 +390,4 @@ mod tests {
         );
     }
 }
+    response.on_hover_text(tab.title);

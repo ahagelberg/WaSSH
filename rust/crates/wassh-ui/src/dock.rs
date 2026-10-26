@@ -13,6 +13,7 @@ use wassh_core::{
 
 use crate::terminal_view::to_color32;
 use crate::widgets::splitter::SplitAxis;
+use crate::widgets::truncating_galley;
 
 /// Height of a plugin pane's title bar.
 pub const PANE_HEADER_HEIGHT: f32 = 28.0;
@@ -587,23 +588,6 @@ fn draw_node(
 }
 
 /// Frame a single plugin pane and draw its contents.
-/// One line of header text, ellipsised rather than wrapped.
-fn header_galley(
-    ui: &Ui,
-    text: String,
-    size: f32,
-    colour: egui::Color32,
-    max_width: f32,
-) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        text,
-        FontId::proportional(size),
-        colour,
-    );
-    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(8.0));
-    ui.painter().layout_job(job)
-}
-
 fn draw_pane(
     ui: &mut Ui,
     palette: &Palette,
@@ -641,7 +625,7 @@ fn draw_pane(
     let mut status_right = close_rect.left() - 10.0;
     let mut action_left = None;
     if let Some(action) = content.pane_header_action(plugin_id) {
-        let galley = header_galley(
+        let galley = truncating_galley(
             ui,
             action.label.to_owned(),
             11.0,
@@ -699,7 +683,7 @@ fn draw_pane(
     let title_left = header.left() + PANE_PADDING;
     let mut title_room = status_right + 8.0 - title_left;
     if let Some((text, health)) = content.pane_status(plugin_id) {
-        let galley = header_galley(
+        let galley = truncating_galley(
             ui,
             text,
             10.5,
@@ -724,7 +708,7 @@ fn draw_pane(
         );
         title_room = (left - DOT_GAP - 6.0 - title_left).max(24.0);
     }
-    let title = header_galley(
+    let title = truncating_galley(
         ui,
         title,
         12.0,
