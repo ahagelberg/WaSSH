@@ -54,8 +54,12 @@ const SECTION_GAP: f32 = 28.0;
 const BACKDROP_ALPHA: u8 = 140;
 /// Width of a plugin's dedicated settings editor.
 const EDITOR_WIDTH: f32 = 620.0;
-/// Scroll height of a plugin's dedicated settings editor.
-const EDITOR_HEIGHT: f32 = 420.0;
+/// Tallest a plugin's dedicated settings editor gets.
+const EDITOR_MAX_HEIGHT: f32 = 820.0;
+/// Shortest a plugin's dedicated settings editor gets, whatever the window.
+const EDITOR_MIN_HEIGHT: f32 = 240.0;
+/// Height the modal header, footer and padding take from the window.
+const EDITOR_CHROME: f32 = 132.0;
 /// Width of a tunnel's port box, which sits next to its host field.
 const TUNNEL_PORT_WIDTH: f32 = 64.0;
 /// Smallest width a tunnel's host field keeps when the port box takes its share.
@@ -1402,6 +1406,15 @@ fn options_backup(ui: &mut Ui, palette: &Palette, path: &mut String, actions: &m
     });
 }
 
+/// Height a plugin editor's body gets in a window `screen_height` tall.
+///
+/// The editor takes the room the window has, so its settings and provider cards do not
+/// have to be scrolled inside a short box; a small window still leaves the title and the
+/// footer visible.
+fn editor_room(screen_height: f32) -> f32 {
+    (screen_height - EDITOR_CHROME).clamp(EDITOR_MIN_HEIGHT, EDITOR_MAX_HEIGHT)
+}
+
 /// The plugin's own settings editor, opened by a "Configure…" row.
 fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsState) {
     let Some(id) = state.editor else {
@@ -1420,6 +1433,7 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
         .remove(id.as_str())
         .unwrap_or_default();
     let mut close = false;
+    let room = editor_room(ctx.content_rect().height());
     let response = modal(
         ctx,
         ("plugin-settings-editor", id.as_str()),
@@ -1429,8 +1443,8 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
         |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("plugin-editor-scroll", id.as_str()))
-                .max_height(EDITOR_HEIGHT)
-                .auto_shrink([false, false])
+                .max_height(room)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     // The AI agent's provider list is app-wide too, and comes first: it is
                     // what the rest of the chat settings refer to.
@@ -3501,13 +3515,37 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_uses_the_height_of_the_window() {
+        // A normal window leaves far more room than the old fixed 420 px box.
+        assert!(editor_room(900.0) > 700.0);
+        assert!(editor_room(1400.0) > editor_room(900.0));
+        // A short window keeps the minimum instead of collapsing.
+        assert_eq!(editor_room(300.0), EDITOR_MIN_HEIGHT);
+        // The tallest screen still gets a bounded dialog.
+        assert_eq!(editor_room(4000.0), EDITOR_MAX_HEIGHT);
+    }
+
+    #[test]
     fn the_ai_agent_editor_holds_the_provider_list() {
         let ctx = Context::default();
         let palette = Palette::dark();
-        let mut state = OptionsState::new(&AppSettings {
+        let mut settings = AppSettings {
             enabled_plugins: vec!["ai-agent".to_owned()],
             ..AppSettings::default()
-        });
+        };
+        // One configured provider, as most setups have.
+        settings.plugin_settings.insert(
+            "ai-agent".to_owned(),
+            [(
+                wassh_plugins::ai_agent::PROVIDERS_KEY.to_owned(),
+                serde_json::json!([{ "id": "ollama", "name": "Ollama", "protocol": "openai",
+                                     "baseUrl": "http://127.0.0.1:11434/v1",
+                                     "models": ["llama3.1"] }]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut state = OptionsState::new(&settings);
         state.editor = Some(PluginId::AiAgent);
         let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
             options_plugin_editor(ctx, &palette, &mut state);
