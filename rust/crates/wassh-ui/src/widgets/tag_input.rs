@@ -5,7 +5,7 @@
 //! leaving the field commits whatever is half-typed, and a word that is already
 //! there (in any case) is not added twice.
 
-use egui::{Align2, CornerRadius, FontId, Response, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Response, Sense, Stroke, Ui, Vec2};
 use wassh_core::Palette;
 
 use crate::terminal_view::to_color32;
@@ -24,6 +24,15 @@ pub const TAG_PILL_RADIUS: u8 = 10;
 pub const TAG_REMOVE_WIDTH: f32 = 12.0;
 /// Height of the ✕ inside a chip.
 pub const TAG_REMOVE_HEIGHT: f32 = 14.0;
+/// Font size of a chip's label.
+const TAG_TEXT_SIZE: f32 = 12.0;
+/// Horizontal padding inside a chip.
+const TAG_PILL_PADDING: i8 = 8;
+/// Gap between a chip's label and its ✕.
+const TAG_PILL_SPACING: f32 = 4.0;
+/// Width a chip adds around its label: padding, the ✕ and the border.
+const TAG_PILL_CHROME: f32 =
+    2.0 * TAG_PILL_PADDING as f32 + TAG_PILL_SPACING + TAG_REMOVE_WIDTH + 2.0;
 
 /// What the widget did this frame.
 #[derive(Clone, Debug)]
@@ -86,6 +95,90 @@ pub fn remove_last(tags: &mut Vec<String>) -> bool {
     tags.pop().is_some()
 }
 
+/// Smallest width the text field keeps, even under a row full of chips.
+const TAG_EDIT_MIN_WIDTH: f32 = 90.0;
+
+/// Group chip indices into rows that fit `width`.
+fn chip_rows(ui: &Ui, tags: &[String], width: f32) -> Vec<Vec<usize>> {
+    let font = FontId::proportional(TAG_TEXT_SIZE);
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut used = 0.0;
+    for (index, tag) in tags.iter().enumerate() {
+        let text = ui
+            .painter()
+            .layout_no_wrap(tag.clone(), font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        let pill = text + TAG_PILL_CHROME;
+        match rows.last_mut() {
+            // Start a new row when this chip would cross the field's edge.
+            Some(row) if !row.is_empty() && used + TAG_GAP + pill > width => {
+                rows.push(vec![index]);
+                used = pill;
+            }
+            Some(row) => {
+                if !row.is_empty() {
+                    used += TAG_GAP;
+                }
+                row.push(index);
+                used += pill;
+            }
+            None => {
+                rows.push(vec![index]);
+                used = pill;
+            }
+        }
+    }
+    rows
+}
+
+/// One chip: its label and a clickable ✕ that records `index` in `remove`.
+fn chip(
+    ui: &mut Ui,
+    palette: &Palette,
+    tag: &str,
+    index: usize,
+    remove: &mut Option<usize>,
+) {
+    let pill = egui::Frame::new()
+        .fill(to_color32(palette.bg_panel_2))
+        .stroke(Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(CornerRadius::same(TAG_PILL_RADIUS))
+        .inner_margin(egui::Margin::symmetric(TAG_PILL_PADDING, 2));
+    pill.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = TAG_PILL_SPACING;
+            ui.label(
+                egui::RichText::new(tag)
+                    .size(TAG_TEXT_SIZE)
+                    .color(to_color32(palette.text)),
+            );
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(TAG_REMOVE_WIDTH, TAG_REMOVE_HEIGHT),
+                Sense::click(),
+            );
+            let colour = if response.hovered() {
+                to_color32(palette.danger)
+            } else {
+                to_color32(palette.text_muted)
+            };
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "✕",
+                FontId::proportional(10.0),
+                colour,
+            );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                *remove = Some(index);
+            }
+        });
+    });
+}
+
 /// Draw the tag input.
 ///
 /// `draft` is the text in the field: the caller keeps it so half-typed text
@@ -118,69 +211,40 @@ pub fn tag_input(
     let outer = frame.show(ui, |ui| {
         // The frame sizes to its content, so pin the width to the column and the
         // height to the reference's `min-height: 36px`.
-        ui.set_min_width((width - f32::from(TAG_PADDING) * 2.0 - 2.0).max(40.0));
+        let inner_width = (width - f32::from(TAG_PADDING) * 2.0 - 2.0).max(40.0);
+        ui.set_min_width(inner_width);
         ui.set_min_height(TAG_INPUT_MIN_HEIGHT - 6.0 * 2.0 - 2.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::splat(TAG_GAP);
-            let mut remove = None;
-            for (index, tag) in tags.iter().enumerate() {
-                let pill = egui::Frame::new()
-                    .fill(to_color32(palette.bg_panel_2))
-                    .stroke(Stroke::new(1.0, to_color32(palette.border)))
-                    .corner_radius(CornerRadius::same(TAG_PILL_RADIUS))
-                    .inner_margin(egui::Margin::symmetric(8, 2));
-                pill.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(
-                            egui::RichText::new(tag.as_str())
-                                .size(12.0)
-                                .color(to_color32(palette.text)),
-                        );
-                        let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(TAG_REMOVE_WIDTH, TAG_REMOVE_HEIGHT),
-                            Sense::click(),
-                        );
-                        let colour = if response.hovered() {
-                            to_color32(palette.danger)
-                        } else {
-                            to_color32(palette.text_muted)
-                        };
-                        ui.painter().text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            "✕",
-                            FontId::proportional(10.0),
-                            colour,
-                        );
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if response.clicked() {
-                            remove = Some(index);
-                        }
-                    });
-                });
-            }
-            if let Some(index) = remove {
-                tags.remove(index);
-                changed = true;
-            }
+        ui.spacing_mut().item_spacing = Vec2::splat(TAG_GAP);
 
-            // The field takes whatever room is left, never under 90 px.
-            let room = ui.available_width().max(90.0);
-            edit_response = Some(
-                ui.add(
-                    egui::TextEdit::singleline(draft)
-                        .id(field_id)
-                        .hint_text(placeholder)
-                        .frame(egui::Frame::NONE)
-                        .desired_width(room)
-                        .margin(egui::Margin::symmetric(2, 2))
-                        .text_color(to_color32(palette.text)),
-                ),
-            );
-        });
+        // Chips flow into as many rows as they need. egui never wraps a `Frame` on its
+        // own, so the rows are measured here; otherwise a long tag list would widen the
+        // whole dialog column.
+        let mut remove = None;
+        for row in chip_rows(ui, tags, inner_width) {
+            ui.horizontal(|ui| {
+                for index in row {
+                    chip(ui, palette, &tags[index], index, &mut remove);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            tags.remove(index);
+            changed = true;
+        }
+
+        // The field sits under the chips and takes whatever room is left, never under 90 px.
+        let room = ui.available_width().max(TAG_EDIT_MIN_WIDTH);
+        edit_response = Some(
+            ui.add(
+                egui::TextEdit::singleline(draft)
+                    .id(field_id)
+                    .hint_text(placeholder)
+                    .frame(egui::Frame::NONE)
+                    .desired_width(room)
+                    .margin(egui::Margin::symmetric(2, 2))
+                    .text_color(to_color32(palette.text)),
+            ),
+        );
     });
 
     // Clicking anywhere in the field focuses the text, like the reference. This
@@ -359,6 +423,73 @@ mod tests {
         assert!(!texts.contains(&"work, db"), "still a text field: {texts:?}");
         // The placeholder shows while the field is empty.
         assert!(texts.contains(&"Add tag…"), "placeholder missing: {texts:?}");
+    }
+
+    #[test]
+    fn chips_wrap_inside_a_narrow_field() {
+        for list in [
+            &["potentiostat", "fitlet 2", "controller", "octopy"][..],
+            &["cryohab", "octopy", "plc", "beckhoff", "BSD"][..],
+            &[
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            ][..],
+        ] {
+            let ctx = egui::Context::default();
+            let palette = Palette::dark();
+            let mut tags = tags(list);
+            let mut draft = String::new();
+            let mut field = egui::Rect::NOTHING;
+            let mut chips_right = 0.0f32;
+            let mut rows = 0;
+            let mut ys = Vec::new();
+            // The first frame is egui's sizing pass.
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    let mut column = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::Vec2::new(280.0, 280.0),
+                            ))
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    field = tag_input(&mut column, &palette, "tags", &mut tags, &mut draft, "Add tag…")
+                        .response
+                        .rect;
+                });
+                // Every chip stays inside the field, at two or more distinct heights.
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        chips_right = chips_right.max(text.pos.x + text.galley.size().x);
+                        if text.galley.text() == "✕" {
+                            ys.push(text.pos.y as i32);
+                        }
+                    }
+                }
+                ys.sort_unstable();
+                ys.dedup();
+                rows = ys.len();
+                output.drop_without_applying_deltas();
+            }
+            assert!(
+                field.width() <= 280.5,
+                "{list:?}: the field grew past its column to {}",
+                field.width()
+            );
+            assert!(
+                chips_right <= field.max.x,
+                "{list:?}: a chip ends at {chips_right}, past the field edge {}",
+                field.max.x
+            );
+            assert!(rows >= 2, "{list:?}: the chips should use two rows, got {rows}");
+        }
     }
 
     #[test]

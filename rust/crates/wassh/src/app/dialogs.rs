@@ -56,6 +56,10 @@ const BACKDROP_ALPHA: u8 = 140;
 const EDITOR_WIDTH: f32 = 620.0;
 /// Scroll height of a plugin's dedicated settings editor.
 const EDITOR_HEIGHT: f32 = 420.0;
+/// Width of a tunnel's port box, which sits next to its host field.
+const TUNNEL_PORT_WIDTH: f32 = 64.0;
+/// Smallest width a tunnel's host field keeps when the port box takes its share.
+const TUNNEL_HOST_MIN_WIDTH: f32 = 80.0;
 
 /// A group being edited in its own dialog.
 #[derive(Clone, Debug)]
@@ -1049,6 +1053,36 @@ fn control_label(ui: &mut Ui, palette: &Palette, label: &str) {
             .size(11.0)
             .color(to_color32(palette.text_muted)),
     );
+}
+
+/// A text field that leaves `reserved` pixels free for the widget after it.
+///
+/// [`text_input`] fills whatever room it is given, so a fixed-width sibling would be
+/// pushed past the row's edge without this.
+fn text_input_before(
+    ui: &mut Ui,
+    palette: &Palette,
+    text: &mut String,
+    placeholder: &str,
+    reserved: f32,
+) {
+    let width = (ui.available_width() - reserved - ui.spacing().item_spacing.x)
+        .max(TUNNEL_HOST_MIN_WIDTH);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        text_input(ui, palette, text, placeholder);
+    });
+}
+
+/// A tunnel's port box, sized to [`TUNNEL_PORT_WIDTH`].
+fn tunnel_port(ui: &mut Ui, palette: &Palette, port: &mut u16) {
+    let mut value = u32::from(*port);
+    ui.scope(|ui| {
+        ui.set_width(TUNNEL_PORT_WIDTH);
+        if number_input(ui, palette, &mut value, 0, u32::from(u16::MAX)) {
+            *port = value as u16;
+        }
+    });
 }
 
 fn small_button(ui: &mut Ui, palette: &Palette, label: &str) -> bool {
@@ -2451,13 +2485,9 @@ fn host_tunnels(ui: &mut Ui, palette: &Palette, draft: &mut HostProfile) {
                 .inner_margin(egui::Margin::same(8));
             frame.show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // Remove reserves its space first, so a long summary wraps instead of
+                // shoving the button out of the card.
                 ui.horizontal(|ui| {
-                    checkbox(ui, palette, &mut tunnel.enabled, "");
-                    ui.label(
-                        egui::RichText::new(tunnel.summary())
-                            .size(12.0)
-                            .color(to_color32(palette.text)),
-                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if Button::new("Remove")
                             .compact()
@@ -2481,37 +2511,31 @@ fn host_tunnels(ui: &mut Ui, palette: &Palette, draft: &mut HostProfile) {
                     }
                 });
                 ui.add_space(4.0);
+                control_label(ui, palette, "Listen");
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        control_label(ui, palette, "Listen");
-                        ui.horizontal(|ui| {
-                            text_input(ui, palette, &mut tunnel.listen_host, "127.0.0.1");
-                            let mut port = u32::from(tunnel.listen_port);
-                            ui.scope(|ui| {
-                                ui.set_width(64.0);
-                                if number_input(ui, palette, &mut port, 0, 65_535) {
-                                    tunnel.listen_port = port as u16;
-                                }
-                            });
-                        });
-                    });
-                    if tunnel.kind != TunnelKind::Dynamic {
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            control_label(ui, palette, "Destination");
-                            ui.horizontal(|ui| {
-                                text_input(ui, palette, &mut tunnel.dest_host, "db.internal");
-                                let mut port = u32::from(tunnel.dest_port);
-                                ui.scope(|ui| {
-                                    ui.set_width(64.0);
-                                    if number_input(ui, palette, &mut port, 0, 65_535) {
-                                        tunnel.dest_port = port as u16;
-                                    }
-                                });
-                            });
-                        });
-                    }
+                    text_input_before(
+                        ui,
+                        palette,
+                        &mut tunnel.listen_host,
+                        "127.0.0.1",
+                        TUNNEL_PORT_WIDTH,
+                    );
+                    tunnel_port(ui, palette, &mut tunnel.listen_port);
                 });
+                if tunnel.kind != TunnelKind::Dynamic {
+                    ui.add_space(4.0);
+                    control_label(ui, palette, "Destination");
+                    ui.horizontal(|ui| {
+                        text_input_before(
+                            ui,
+                            palette,
+                            &mut tunnel.dest_host,
+                            "db.internal",
+                            TUNNEL_PORT_WIDTH,
+                        );
+                        tunnel_port(ui, palette, &mut tunnel.dest_port);
+                    });
+                }
             });
             ui.add_space(6.0);
         }
@@ -3094,6 +3118,82 @@ mod tests {
         let shapes = output.shapes.len();
         output.drop_without_applying_deltas();
         shapes
+    }
+
+    #[test]
+    fn the_host_dialog_stays_inside_its_panel() {
+        // A row that overflows its column widens every row after it, which used to push
+        // the whole dialog past its panel. Tags and the tunnel editor both did that.
+        let size = Vec2::new(1175.0, 765.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        let panel = Rect::from_center_size(
+            screen.center(),
+            Vec2::new(DIALOG_MAX_WIDTH, DIALOG_MAX_HEIGHT),
+        );
+        let host = wassh_core::HostProfile {
+            id: "h1".to_owned(),
+            name: "probe".to_owned(),
+            tags: ["cryohab", "octopy", "plc", "beckhoff", "BSD"]
+                .iter()
+                .map(|tag| (*tag).to_owned())
+                .collect(),
+            connection: ConnectionParams {
+                tunnels: vec![
+                    wassh_core::Tunnel {
+                        id: "t1".to_owned(),
+                        kind: wassh_core::TunnelKind::Local,
+                        listen_host: "127.0.0.1".to_owned(),
+                        listen_port: 8080,
+                        dest_host: "db.internal".to_owned(),
+                        dest_port: 5432,
+                        enabled: true,
+                    },
+                    wassh_core::Tunnel {
+                        id: "t2".to_owned(),
+                        kind: wassh_core::TunnelKind::Dynamic,
+                        listen_host: "127.0.0.1".to_owned(),
+                        listen_port: 1080,
+                        dest_host: String::new(),
+                        dest_port: 0,
+                        enabled: false,
+                    },
+                ],
+                ..ConnectionParams::default()
+            },
+            ..wassh_core::HostProfile::default()
+        };
+        let mut dialogs = Dialogs {
+            host: Some(HostState::draft(host, false)),
+            ..Dialogs::default()
+        };
+        let ctx = Context::default();
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let output = ctx.run_pass(input, |ctx| {
+                dialogs.show(ctx, &Palette::dark(), &[], 0);
+            });
+            for clipped in &output.shapes {
+                let painted = clipped.shape.visual_bounding_rect();
+                // The backdrop covers the whole screen; the panel itself ends at its edge.
+                if painted.width() >= size.x - 1.0 || painted.max.x <= panel.right() + 0.5 {
+                    continue;
+                }
+                if matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text().is_empty())
+                {
+                    continue;
+                }
+                assert!(
+                    painted.max.x <= panel.right(),
+                    "{:?} is painted at {painted:?}, past the panel edge {}",
+                    clipped.shape,
+                    panel.right()
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
     }
 
     /// Run two frames (the first is egui's sizing pass) and collect the painted text.
