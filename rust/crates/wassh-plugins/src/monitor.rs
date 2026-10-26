@@ -1,7 +1,8 @@
-//! The Server Monitor plugin: CPU, memory, disk and load for the host, sampled over SSH.
+//! The Server Monitor plugin: CPU, memory, disk and load for the host.
 //!
-//! The session runs one small shell command per poll and hands the raw text to
-//! [`parse_report`]; everything here is pure so the parsing can be tested without a server.
+//! The session runs one small shell command per poll — over SSH, or on this
+//! machine for a Local tab — and hands the raw text to [`parse_report`];
+//! everything here is pure so the parsing can be tested without a host.
 
 use egui::Ui;
 use wassh_core::Palette;
@@ -1362,7 +1363,7 @@ impl Plugin for ServerMonitor {
                 ui,
                 &palette,
                 "No statistics",
-                "System statistics need an SSH session.",
+                "System statistics need an SSH or local session.",
             );
             return;
         };
@@ -3037,9 +3038,63 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         painted
     }
 
+    /// Per-frame cost with every section full, so a regression is caught here
+    /// rather than by the user's fan.
     #[test]
-    fn the_pane_shows_the_reference_sections() {
+    fn the_pane_redraws_quickly() {
         let mut access = FakeMonitor {
+            sample: Some(sample()),
+            ..FakeMonitor::default()
+        };
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(460.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut view = View {
+            gauges: true,
+            history: true,
+            status: true,
+            processes: true,
+            network: true,
+        };
+        let mut state = PaneState::default();
+        // Ten minutes of samples, so every chart holds its full window.
+        let mut snapshot = sample();
+        for index in 0..300u64 {
+            snapshot.at_ms = 1_700_000_000_000 + index * 2_000;
+            state.history.push(&snapshot);
+            state.record_processes(&snapshot);
+            state.last_at = snapshot.at_ms;
+        }
+        let mut frame = |state: &mut PaneState| {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                draw(ui, &palette, "dev", &mut access, &mut view, state);
+            });
+            output.drop_without_applying_deltas();
+        };
+        for _ in 0..3 {
+            frame(&mut state);
+        }
+        let frames = 20;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            frame(&mut state);
+        }
+        let per_frame = started.elapsed() / frames;
+        println!("monitor frame: {per_frame:?}");
+        assert!(
+            per_frame < std::time::Duration::from_millis(8),
+            "one monitor frame took {per_frame:?}"
+        );
+    }
+
+    #[test]
+    fn the_pane_shows_the_reference_sections() {        let mut access = FakeMonitor {
             sample: Some(sample()),
             requested: 0,
             sampling: false,

@@ -1,9 +1,11 @@
-//! The Files plugin: a remote directory browser over SFTP.
+//! The Files plugin: a directory browser for SSH and Local sessions.
 //!
 //! The pane mirrors the reference file manager: a connection status bar, an
 //! action toolbar, breadcrumbs, a sortable table with mode and date columns,
-//! multi-selection, a row context menu and the dialogs that change the remote
-//! filesystem (new folder, rename, permissions, delete).
+//! multi-selection, a row context menu and the dialogs that change the browsed
+//! filesystem (new folder, rename, permissions, delete). Over SSH the bytes travel
+//! through SFTP; on a Local tab the same requests run on this machine, so the pane
+//! looks and behaves the same either way.
 
 use egui::Ui;
 use wassh_core::colors;
@@ -46,7 +48,10 @@ pub struct SftpListing {
     pub entries: Vec<SftpEntry>,
 }
 
-/// Remote file access handed to the plugin by the session.
+/// File access handed to the plugin by the session.
+///
+/// An SSH tab serves these over its SFTP subsystem; a Local tab answers them from
+/// this machine, so a pane never needs to know which one it is talking to.
 pub trait SftpAccess {
     /// Ask for `path` to be listed. Cheap to call every frame: repeats are ignored once a
     /// request for the same path has been made.
@@ -735,7 +740,7 @@ impl Plugin for Files {
 
         let Some(access) = context.session.as_deref_mut() else {
             ui.label(
-                egui::RichText::new("Remote files are available for SSH sessions.")
+                egui::RichText::new("Files are available for SSH and Local sessions.")
                     .size(12.0)
                     .color(muted),
             );

@@ -5,6 +5,8 @@
 //! everything else is rebuilt on launch.
 
 pub mod dialogs;
+pub mod local_exec;
+pub mod local_files;
 pub mod quick_connect;
 pub mod session;
 

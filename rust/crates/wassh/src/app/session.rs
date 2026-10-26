@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
+use super::{local_exec, local_files};
 use wassh_core::{
     AuthMethod, ConnectionParams, ConnectionType, DockEdge, DockPlacement, Palette, ReconnectMode,
     SessionStatus, SessionStyleDefaults, TabPluginLayout,
@@ -1035,7 +1036,64 @@ impl SessionEntry {
 }
 
 impl SessionEntry {
-    /// Ask the SSH transport for a directory listing.
+    /// Start `request` on whichever filesystem backs this session.
+    ///
+    /// An SSH tab talks to its SFTP subsystem; a Local tab reads and writes this
+    /// machine. `None` means the transport (telnet, serial, closed) has no files.
+    fn file_job(&self, request: wassh_ssh::SftpRequest) -> Option<wassh_ssh::SftpJob> {
+        match &self.backend {
+            Backend::Ssh(session) => Some(session.sftp(request)),
+            Backend::Local(_) => Some(local_files::spawn(request)),
+            _ => None,
+        }
+    }
+
+    /// Whether this session has a filesystem to browse.
+    fn can_browse_files(&self) -> bool {
+        matches!(self.backend, Backend::Ssh(_) | Backend::Local(_))
+    }
+
+    /// Run `command` on the host behind this tab.
+    ///
+    /// An SSH tab runs it on its host; a Local tab's host is this machine, so the
+    /// command goes through the local shell, like the reference's
+    /// `runHostCommand`.
+    fn start_command(&mut self, key: &str, command: &str, input: Option<&str>) {
+        self.commands.poll();
+        // A new request replaces whatever the pane read last.
+        self.commands.results.remove(key);
+        let pending = match &self.backend {
+            Backend::Ssh(session) => match input {
+                Some(input) => {
+                    session.exec_with_input(command.to_owned(), Some(format!("{input}\n")))
+                }
+                None => session.exec(command.to_owned()),
+            },
+            _ if self.connection.kind == ConnectionType::Local => {
+                let stdin = input.map(|input| format!("{input}\n"));
+                local_exec::exec(command, stdin.as_deref())
+            }
+            _ => {
+                self.commands.results.insert(
+                    key.to_owned(),
+                    CommandResult {
+                        output: None,
+                        failure: Some(COMMAND_TRANSPORT_ERROR.to_owned()),
+                    },
+                );
+                return;
+            }
+        };
+        self.commands.pending.push((key.to_owned(), pending));
+    }
+
+    /// Take the slot for a started job, so the next frames collect its answer.
+    fn adopt_job(&mut self, job: wassh_ssh::SftpJob) {
+        self.files.pending = Some(job.outcome);
+        self.files.progress = Some(job.progress);
+        self.files.moved = None;
+    }
+
     /// Queue a transfer and start it when the current one finishes.
     fn enqueue_transfer(
         &mut self,
@@ -1043,8 +1101,8 @@ impl SessionEntry {
         direction: TransferDirection,
         path: String,
     ) {
-        if !matches!(self.backend, Backend::Ssh(_)) {
-            self.files.error = Some("Remote files need an SSH session.".to_owned());
+        if !self.can_browse_files() {
+            self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return;
         }
         self.files.queue.push_back(QueuedTransfer {
@@ -1064,13 +1122,10 @@ impl SessionEntry {
         let Some(next) = self.files.queue.pop_front() else {
             return;
         };
-        let Backend::Ssh(session) = &self.backend else {
+        let Some(job) = self.file_job(next.request.clone()) else {
             return;
         };
-        let job = session.sftp(next.request.clone());
-        self.files.pending = Some(job.outcome);
-        self.files.progress = Some(job.progress);
-        self.files.moved = None;
+        self.adopt_job(job);
         self.files.request = Some(next.request);
         self.files.active = Some((next.direction, next.path.clone()));
         self.files.job = Some(FileJob::Transfer {
@@ -1086,44 +1141,36 @@ impl SessionEntry {
         dir: std::path::PathBuf,
         archive: std::path::PathBuf,
     ) {
-        let Backend::Ssh(session) = &self.backend else {
-            self.files.error = Some("Remote files need an SSH session.".to_owned());
+        let Some(job) = self.file_job(request) else {
+            self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return;
         };
-        let job = session.sftp(request);
-        self.files.pending = Some(job.outcome);
-        self.files.progress = Some(job.progress);
-        self.files.moved = None;
+        self.adopt_job(job);
         self.files.job = Some(FileJob::Zip { dir, archive });
         self.files.error = None;
         self.files.status = None;
     }
 
-    /// Run a change on the remote filesystem, reloading the listing after it.
+    /// Run a change on the browsed filesystem, reloading the listing after it.
     fn start_file_action(&mut self, request: wassh_ssh::SftpRequest, done: String) {
-        let Backend::Ssh(session) = &self.backend else {
-            self.files.error = Some("Remote files need an SSH session.".to_owned());
+        let Some(job) = self.file_job(request) else {
+            self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return;
         };
-        let job = session.sftp(request);
-        self.files.pending = Some(job.outcome);
-        self.files.progress = Some(job.progress);
-        self.files.moved = None;
+        self.adopt_job(job);
         self.files.job = Some(FileJob::Action { done });
     }
 
     fn start_file_request(&mut self, path: &str) {
-        self.poll_files();
-        let Backend::Ssh(session) = &self.backend else {
-            self.files.error = Some("Remote files need an SSH session.".to_owned());
+        // Collect whatever finished; this listing takes the slot either way.
+        self.files.poll();
+        let Some(job) = self.file_job(wassh_ssh::SftpRequest::List {
+            path: path.to_owned(),
+        }) else {
+            self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return;
         };
-        let job = session.sftp(wassh_ssh::SftpRequest::List {
-            path: path.to_owned(),
-        });
-        self.files.pending = Some(job.outcome);
-        self.files.progress = Some(job.progress);
-        self.files.moved = None;
+        self.adopt_job(job);
         self.files.job = Some(FileJob::List {
             path: path.to_owned(),
         });
@@ -1131,7 +1178,7 @@ impl SessionEntry {
         self.files.error = None;
     }
 
-    /// Whether a remote request is still running.
+    /// Whether a file or statistics request is still running.
     pub fn requests_pending(&self) -> bool {
         self.files.pending.is_some() || self.monitor.pending.is_some() || !self.commands.pending.is_empty()
     }
@@ -1354,11 +1401,21 @@ impl SessionEntry {
         self.forwards.poll();
     }
 
-    /// Handle one remote-file request cycle.
+    /// Handle one file-request cycle.
     pub fn poll_files(&mut self) {
-        if let Some(path) = self.files.poll() {
-            // A transfer landed: show the directory as it is now.
-            self.start_file_request(&path);
+        match self.files.poll() {
+            Some(path) => {
+                // A transfer landed: let the next queued one start, then show
+                // the directory as it is now.
+                self.start_next_transfer();
+                if self.files.pending.is_none() {
+                    self.start_file_request(&path);
+                } else {
+                    self.files.requested = Some(path);
+                }
+            }
+            // Nothing is running, so a queued transfer may start now.
+            None => self.start_next_transfer(),
         }
     }
 
@@ -1762,7 +1819,10 @@ fn pack_zip(dir: &std::path::Path, archive: &std::path::Path) -> String {
     }
 }
 
-/// Remote files state for one session.
+/// File-browsing state for one session.
+///
+/// The same state serves an SSH tab (over SFTP) and a Local tab (over this
+/// machine's filesystem), so the pane never needs to know which it has.
 #[derive(Default)]
 struct RemoteFiles {
     /// Answer for the request in flight.
@@ -1806,6 +1866,15 @@ struct QueuedTransfer {
 
 /// How many finished transfers the pane keeps showing.
 const FINISHED_TRANSFERS: usize = 6;
+
+/// Shown when a tab has neither an SFTP connection nor a local filesystem.
+const FILES_TRANSPORT_ERROR: &str = "Files are available for SSH and Local sessions";
+
+/// Shown when a tab's transport cannot run a shell command.
+const COMMAND_TRANSPORT_ERROR: &str = "Commands need an SSH or local session";
+
+/// Shown when a tab's transport cannot be sampled.
+const MONITOR_TRANSPORT_ERROR: &str = "System statistics need an SSH or local session";
 
 impl RemoteFiles {
     /// Remember how a transfer ended, keeping the last few rows.
@@ -2052,16 +2121,30 @@ impl wassh_plugins::SftpAccess for SessionEntry {
         if self.files.pending.is_some() {
             return None;
         }
-        let Backend::Ssh(session) = &self.backend else {
-            self.files.error = Some("Remote files need an SSH session.".to_owned());
+        // A Local tab answers at once: this machine's paths need no round trip.
+        if matches!(self.backend, Backend::Local(_)) {
+            let resolved = if path == "." {
+                // The browser opens in the user's home directory.
+                local_files::start_dir()
+            } else {
+                match local_files::canonical(path) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        self.files.error = Some(error);
+                        return None;
+                    }
+                }
+            };
+            self.files.resolved = Some(resolved.clone());
+            return Some(resolved);
+        }
+        let Some(job) = self.file_job(wassh_ssh::SftpRequest::RealPath {
+            path: path.to_owned(),
+        }) else {
+            self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return None;
         };
-        let job = session.sftp(wassh_ssh::SftpRequest::RealPath {
-            path: path.to_owned(),
-        });
-        self.files.pending = Some(job.outcome);
-        self.files.progress = Some(job.progress);
-        self.files.moved = None;
+        self.adopt_job(job);
         self.files.job = Some(FileJob::Resolve);
         None
     }
@@ -2114,16 +2197,11 @@ impl wassh_plugins::SftpAccess for SessionEntry {
         if self.files.pending.is_some() {
             return None;
         }
-        let Backend::Ssh(session) = &self.backend else {
-            return None;
-        };
-        let job = session.sftp(wassh_ssh::SftpRequest::Read {
+        let job = self.file_job(wassh_ssh::SftpRequest::Read {
             path: path.to_owned(),
             max_bytes,
-        });
-        self.files.pending = Some(job.outcome);
-        self.files.progress = Some(job.progress);
-        self.files.moved = None;
+        })?;
+        self.adopt_job(job);
         self.files.job = Some(FileJob::Read {
             path: path.to_owned(),
         });
@@ -2231,11 +2309,17 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
             return;
         }
         self.monitor.poll();
-        let Backend::Ssh(session) = &self.backend else {
-            self.monitor.error = Some("System statistics need an SSH session.".to_owned());
-            return;
+        // A Local tab's host is this machine, so the same probe runs locally.
+        let command = wassh_plugins::monitor::MONITOR_COMMAND;
+        let pending = match &self.backend {
+            Backend::Ssh(session) => session.exec(command),
+            _ if self.connection.kind == ConnectionType::Local => local_exec::exec(command, None),
+            _ => {
+                self.monitor.error = Some(MONITOR_TRANSPORT_ERROR.to_owned());
+                return;
+            }
         };
-        self.monitor.pending = Some(session.exec(wassh_plugins::monitor::MONITOR_COMMAND));
+        self.monitor.pending = Some(pending);
         self.monitor.last_sent = Some(std::time::Instant::now());
         self.monitor.error = None;
     }
@@ -2255,39 +2339,11 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
 
 impl wassh_plugins::CommandAccess for SessionEntry {
     fn exec(&mut self, key: &str, command: &str) {
-        self.commands.poll();
-        // A new request replaces whatever the pane read last.
-        self.commands.results.remove(key);
-        let Backend::Ssh(session) = &self.backend else {
-            self.commands.results.insert(
-                key.to_owned(),
-                CommandResult {
-                    output: None,
-                    failure: Some("Commands need an SSH session.".to_owned()),
-                },
-            );
-            return;
-        };
-        self.commands
-            .pending
-            .push((key.to_owned(), session.exec(command.to_owned())));
+        self.start_command(key, command, None);
     }
 
     fn exec_input(&mut self, key: &str, command: &str, input: &str) {
-        self.commands.poll();
-        self.commands.results.remove(key);
-        let Backend::Ssh(session) = &self.backend else {
-            self.commands.results.insert(
-                key.to_owned(),
-                CommandResult {
-                    output: None,
-                    failure: Some("Commands need an SSH session.".to_owned()),
-                },
-            );
-            return;
-        };
-        let pending = session.exec_with_input(command.to_owned(), Some(format!("{input}\n")));
-        self.commands.pending.push((key.to_owned(), pending));
+        self.start_command(key, command, Some(input));
     }
 
     fn output(&self, key: &str) -> Option<&wassh_plugins::CommandOutput> {
@@ -2790,27 +2846,61 @@ mod tests {
     }
 
     #[test]
-    fn pane_commands_need_an_ssh_session() {
-        let mut entry = SessionEntry::new_local(
-            "t-commands",
-            &Palette::dark(),
-            &SessionStyleDefaults::default(),
-            "xterm-256color",
-            TerminalSize::new(80, 24),
-        );
+    fn pane_commands_need_a_transport_that_can_run_them() {
+        // An SSH tab that never reached its host has no shell to ask.
+        let mut entry = password_entry();
         use wassh_plugins::CommandAccess as _;
         entry.exec("docker.list", "docker ps");
         assert!(!entry.is_running("docker.list"));
-        assert_eq!(entry.failure("docker.list"), Some("Commands need an SSH session."));
+        assert_eq!(entry.failure("docker.list"), Some(COMMAND_TRANSPORT_ERROR));
         assert!(entry.output("docker.list").is_none());
 
         // System statistics use the same path and report the same way.
         use wassh_plugins::MonitorAccess as _;
         entry.request_sample();
+        assert_eq!(entry.last_error(), Some(MONITOR_TRANSPORT_ERROR));
+    }
+
+    #[test]
+    fn commands_run_on_this_machine_for_a_local_session() {
+        use wassh_plugins::CommandAccess as _;
+        let mut entry = local_entry("t-local-command");
+
+        entry.exec("probe", "printf 'local'");
+        settle_command(&mut entry, "probe");
+        let output = entry.output("probe").expect("output");
+        assert_eq!(output.stdout, "local");
+        assert_eq!(output.code, Some(0));
+        assert!(entry.failure("probe").is_none());
+
+        // stdin travels too, which is how `sudo -S` gets its password.
+        entry.exec_input("stdin", "cat", "s3cret");
+        settle_command(&mut entry, "stdin");
         assert_eq!(
-            entry.last_error(),
-            Some("System statistics need an SSH session.")
+            entry.output("stdin").map(|output| output.stdout.as_str()),
+            Some("s3cret\n")
         );
+    }
+
+    #[test]
+    fn a_local_session_samples_this_machine() {
+        use wassh_plugins::MonitorAccess as _;
+        let mut entry = local_entry("t-local-monitor");
+        entry.request_sample();
+        let mut sample = None;
+        for _ in 0..1_000 {
+            entry.poll_monitor();
+            if let Some(current) = entry.sample() {
+                sample = Some(current.clone());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let sample = sample.expect("a sample from this machine");
+        assert!(entry.last_error().is_none(), "{:?}", entry.last_error());
+        assert!(sample.uptime_s.is_some(), "no uptime in {sample:?}");
+        assert!(sample.memory.total.is_some(), "no memory in {sample:?}");
+        assert!(sample.disk_total.is_some(), "no disk in {sample:?}");
     }
 
     #[test]
@@ -2837,33 +2927,178 @@ mod tests {
         assert!(result.failure.is_none());
     }
 
-    #[test]
-    fn remote_files_need_an_ssh_session() {
-        let mut entry = SessionEntry::new_local(
-            "t-files",
+    /// A local tab, with a shell of its own.
+    fn local_entry(id: &str) -> SessionEntry {
+        SessionEntry::new_local(
+            id,
             &Palette::dark(),
             &SessionStyleDefaults::default(),
             "xterm-256color",
             TerminalSize::new(80, 24),
-        );
+        )
+    }
+
+    /// Fresh directory under the system temp dir.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "wassh-session-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    /// Poll the session until no file request or transfer is left.
+    fn settle(entry: &mut SessionEntry) {
+        use wassh_plugins::SftpAccess as _;
+        for _ in 0..2_000 {
+            entry.poll_files();
+            let busy = entry.transfers().iter().any(|row| {
+                matches!(row.state, TransferState::Queued | TransferState::Running)
+            });
+            if !busy && !entry.is_loading() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the file request never finished: {:?}", entry.error());
+    }
+
+    /// Poll the session until the command asked for under `key` has finished.
+    fn settle_command(entry: &mut SessionEntry, key: &str) {
+        use wassh_plugins::CommandAccess as _;
+        for _ in 0..2_000 {
+            entry.poll_commands();
+            if !entry.is_running(key) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the command {key} never finished");
+    }
+
+    #[test]
+    fn files_are_available_for_ssh_and_local_sessions() {
+        let mut entry = local_entry("t-no-files");
+        // Neither telnet, serial nor a dead tab has a filesystem for the pane.
+        entry.backend = Backend::Closed;
         use wassh_plugins::SftpAccess as _;
         entry.request_listing("/");
-        assert_eq!(
-            entry.error(),
-            Some("Remote files need an SSH session.")
-        );
+        assert_eq!(entry.error(), Some(FILES_TRANSPORT_ERROR));
         assert!(entry.listing().is_none());
-        assert!(!entry.is_loading());
-        // Asking again for the same path keeps the message rather than retrying.
-        entry.request_listing("/");
         assert!(!entry.is_loading());
 
         entry.upload("/tmp/report.txt", "/home/alice/report.txt");
-        assert_eq!(
-            entry.error(),
-            Some("Remote files need an SSH session.")
-        );
+        assert_eq!(entry.error(), Some(FILES_TRANSPORT_ERROR));
         assert!(!entry.is_transferring());
+        assert!(entry.resolve(".").is_none());
+    }
+
+    #[test]
+    fn a_local_session_browses_this_machine() {
+        use wassh_plugins::SftpAccess as _;
+        let mut entry = local_entry("t-local-browse");
+        // A local tab starts in the user's home directory.
+        let start = entry.resolve(".").expect("a starting directory");
+        assert_eq!(start, local_files::start_dir());
+
+        entry.request_listing(&start);
+        settle(&mut entry);
+        let listing = entry.listing().expect("a listing").clone();
+        assert_eq!(listing.path, start);
+        assert!(entry.error().is_none(), "{:?}", entry.error());
+        // Rows carry the full path the pane navigates to.
+        for row in &listing.entries {
+            assert_eq!(row.path, wassh_plugins::files::join_remote(&start, &row.name));
+        }
+    }
+
+    #[test]
+    fn a_local_session_moves_files_on_this_machine() {
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("move");
+        let mut entry = local_entry("t-local-move");
+        let folder = dir.to_string_lossy().into_owned();
+
+        let source = dir.join("source.txt");
+        std::fs::write(&source, b"hello").expect("write");
+        entry.upload(
+            &source.to_string_lossy(),
+            &dir.join("report.txt").to_string_lossy(),
+        );
+        settle(&mut entry);
+        assert!(entry.error().is_none(), "{:?}", entry.error());
+        assert_eq!(
+            std::fs::read(dir.join("report.txt")).expect("read"),
+            b"hello"
+        );
+        assert!(entry.transfer_status().is_some(), "the pane shows the result");
+
+        let back = dir.join("back.txt");
+        entry.download(&format!("{folder}/report.txt"), &back.to_string_lossy());
+        settle(&mut entry);
+        assert!(entry.error().is_none(), "{:?}", entry.error());
+        assert_eq!(std::fs::read(&back).expect("read"), b"hello");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_session_runs_queued_transfers_one_after_another() {
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("queue");
+        let mut entry = local_entry("t-local-queue");
+
+        let first = dir.join("one.txt");
+        let second = dir.join("two.txt");
+        std::fs::write(&first, b"one").expect("write");
+        std::fs::write(&second, b"two").expect("write");
+        entry.upload_many(vec![
+            (
+                first.to_string_lossy().into_owned(),
+                dir.join("one-out.txt").to_string_lossy().into_owned(),
+            ),
+            (
+                second.to_string_lossy().into_owned(),
+                dir.join("two-out.txt").to_string_lossy().into_owned(),
+            ),
+        ]);
+        settle(&mut entry);
+        assert!(entry.error().is_none(), "{:?}", entry.error());
+        assert_eq!(
+            std::fs::read(dir.join("one-out.txt")).expect("read"),
+            b"one",
+            "the first queued transfer never ran"
+        );
+        assert_eq!(std::fs::read(dir.join("two-out.txt")).expect("read"), b"two");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_session_creates_renames_and_deletes() {
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("ops");
+        let folder = dir.to_string_lossy().into_owned();
+        let mut entry = local_entry("t-local-ops");
+
+        entry.mkdir(&format!("{folder}/docs"));
+        settle(&mut entry);
+        assert!(dir.join("docs").is_dir(), "{:?}", entry.error());
+
+        entry.rename(&format!("{folder}/docs"), &format!("{folder}/papers"));
+        settle(&mut entry);
+        assert!(dir.join("papers").is_dir() && !dir.join("docs").exists());
+
+        entry.remove(&format!("{folder}/papers"), true);
+        settle(&mut entry);
+        assert!(!dir.join("papers").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
