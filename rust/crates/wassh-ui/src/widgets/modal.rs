@@ -53,8 +53,14 @@ pub fn modal(
 ) -> ModalResponse {
     let screen = ctx.content_rect();
     let mut dismissed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+    // Every id below hangs off the dialog's own id: two modals can be open in one frame
+    // (a plugin's editor and a dialog it opens on top of itself), and shared ids in two
+    // layers trip egui's "widget id changed layer_id during the frame" assertion.
+    let backdrop_id = Id::unique("wassh-modal-backdrop").with(&id);
+    let panel_id = Id::unique("wassh-modal").with(&id);
+    let close_id = Id::unique("wassh-modal-close").with(&id);
 
-    egui::Area::new(Id::unique("wassh-modal-backdrop"))
+    egui::Area::new(backdrop_id)
         .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .interactable(true)
@@ -67,7 +73,7 @@ pub fn modal(
             }
         });
 
-    egui::Area::new(Id::unique("wassh-modal").with(id))
+    egui::Area::new(panel_id)
         .order(egui::Order::Foreground)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .show(ctx, |ui| {
@@ -96,7 +102,7 @@ pub fn modal(
                     Pos2::new(header.right() - BODY_PADDING - 10.0, header.center().y),
                     Vec2::splat(24.0),
                 );
-                let close = ui.interact(close_rect, Id::unique("wassh-modal-close"), Sense::click());
+                let close = ui.interact(close_rect, close_id, Sense::click());
                 let close_colour = if close.hovered() {
                     to_color32(palette.danger)
                 } else {
@@ -162,5 +168,48 @@ mod tests {
     fn modal_response_reports_open_state() {
         assert!(ModalResponse { dismissed: false }.is_open());
         assert!(!ModalResponse { dismissed: true }.is_open());
+    }
+
+    #[test]
+    fn two_modals_can_be_open_in_the_same_frame() {
+        // A plugin editor can open a dialog on top of itself (the AI agent's "Add a
+        // provider" sits on its settings editor). Both use a ✕ button and a backdrop, so
+        // those widget ids have to be per dialog — shared ones made egui panic with
+        // "widget id changed layer_id during the frame".
+        let ctx = Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let output = ctx.run_pass(input.clone(), |ctx| {
+                let outer = modal(
+                    ctx,
+                    ("plugin-settings-editor", "ai-agent"),
+                    &palette,
+                    "AI agent providers",
+                    420.0,
+                    |ui| {
+                        ui.label("outer body");
+                    },
+                );
+                let inner = modal(
+                    ctx,
+                    "ai-agent-add-provider",
+                    &palette,
+                    "Add a provider",
+                    360.0,
+                    |ui| {
+                        ui.label("inner body");
+                    },
+                );
+                assert!(outer.is_open() && inner.is_open(), "no events, no dismissal");
+            });
+            output.drop_without_applying_deltas();
+        }
     }
 }
