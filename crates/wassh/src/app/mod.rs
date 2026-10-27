@@ -57,6 +57,9 @@ const MAX_FRAME_OFFSET: f32 = 200.0;
 /// A `Paste` event after this belongs to the platform's Ctrl+V and goes to the shell.
 const PASTE_WAIT: Duration = Duration::from_secs(1);
 
+/// The program icon shown in the task bar and in Alt-Tab.
+const ICON_PNG: &[u8] = include_bytes!("../../../../res/WaSSH program icon.png");
+
 /// Repaint interval when nothing is happening.
 ///
 /// The transports are polled rather than waking the window, so a slow poll keeps
@@ -235,6 +238,11 @@ pub fn run_perf(tabs: usize) -> eframe::Result<()> {
     run_app(true, tabs)
 }
 
+/// Decode the bundled program icon for the window.
+fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(ICON_PNG).expect("the bundled program icon is a valid PNG")
+}
+
 fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
     let config = if perf {
         None
@@ -250,7 +258,8 @@ fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_min_inner_size([800.0, 500.0])
         .with_title(APP_NAME)
-        .with_app_id("wassh");
+        .with_app_id("wassh")
+        .with_icon(window_icon());
     viewport = match bounds {
         // `width`/`height` are points, so the window keeps its apparent size on a monitor
         // with different scaling. The position is applied on the first frame, in pixels.
