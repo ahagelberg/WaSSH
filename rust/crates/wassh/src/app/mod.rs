@@ -1754,16 +1754,19 @@ impl Shell {
         let mut retries = Vec::new();
 
         for (index, session) in self.sessions.iter_mut().enumerate() {
-            // A pending retry that has come due.
+            // A pending retry that has come due. Booking one moves the session to
+            // `Reconnecting`, so that state has to count as retryable here as well.
             if session.retry_at.is_some_and(|at| at <= now)
-                && matches!(session.status, SessionStatus::Disconnected | SessionStatus::Failed)
+                && session.status.is_retryable()
                 && session.host_key_prompt.is_none()
             {
                 session.retry_at = None;
                 retries.push(index);
                 continue;
             }
-            if !matches!(session.status, SessionStatus::Disconnected | SessionStatus::Failed) {
+            // Only a failed transport keeps a retry timer; a session that connected,
+            // closed or was never up holds none.
+            if !session.status.is_retryable() {
                 session.retry_at = None;
                 continue;
             }
@@ -1800,7 +1803,9 @@ impl Shell {
     }
 
     fn forward_input(&mut self, ctx: &egui::Context) {
-        if self.dialogs.modal_open() || ctx.egui_wants_keyboard_input() {
+        // A widget holding egui's focus (a button reached by Tab, say) consumes nothing,
+        // so only a text field being edited may keep the keys from the terminal.
+        if self.dialogs.modal_open() || ctx.text_edit_focused() {
             return;
         }
         let Some(index) = self.active else {
@@ -2828,6 +2833,15 @@ impl Shell {
     fn frame_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
+        // egui reads Tab, Shift+Tab and the arrow keys as navigation between focusable
+        // widgets, and the first widget that wants focus takes it. The terminal is the
+        // only keyboard client here, so that would hand the keys to a chrome widget and
+        // leave the terminal deaf — Tab has to reach the shell. Only a text field being
+        // edited still navigates.
+        if !ctx.text_edit_focused() {
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        }
+
         self.pump(&ctx);
         self.shortcuts(&ctx);
         self.update_find_matches();
@@ -3351,6 +3365,39 @@ mod tests {
         );
     }
 
+    /// A plain Tab is terminal input, never egui's focus navigation.
+    ///
+    /// egui gives a Tab to the first widget that wants focus, and the widget then held the
+    /// keyboard: every later keystroke was kept from the shell.
+    #[test]
+    fn tab_stays_with_the_terminal_instead_of_moving_focus() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        let ctx = egui::Context::default();
+        // The widgets must have been drawn before one of them can take focus.
+        run_shell(&mut shell, &ctx, 2);
+        assert_eq!(ctx.memory(|memory| memory.focused()), None);
+
+        for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(1280.0, 800.0),
+                )),
+                events: vec![key_event(egui::Key::Tab, modifiers)],
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| shell.frame(ui));
+            output.drop_without_applying_deltas();
+            assert_eq!(
+                ctx.memory(|memory| memory.focused()),
+                None,
+                "Tab moved the focus out of the terminal"
+            );
+            assert!(!ctx.egui_wants_keyboard_input());
+        }
+    }
+
     #[test]
     fn ctrl_c_interrupts_a_running_command() {
         let mut shell = Shell::new_with(Some(scratch_config()), false);
@@ -3494,6 +3541,25 @@ mod tests {
             shell.sessions[0].status,
             SessionStatus::Reconnecting,
             "and the reconnect policy takes over"
+        );
+
+        // The booked wait must end in an attempt on its own; a scheduled retry that is
+        // cancelled leaves the tab in `Reconnecting` forever.
+        assert_eq!(shell.sessions[0].reconnect_attempt, 1);
+        shell.sessions[0].retry_at = Some(std::time::Instant::now());
+        run_shell(&mut shell, &ctx, 1);
+        assert_ne!(
+            shell.sessions[0].status,
+            SessionStatus::Reconnecting,
+            "the scheduled retry never ran"
+        );
+        assert!(
+            shell.sessions[0].retry_at.is_none(),
+            "the wait outlived the retry it belonged to"
+        );
+        assert_eq!(
+            shell.sessions[0].reconnect_attempt, 1,
+            "one attempt was due, not two"
         );
     }
 

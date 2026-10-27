@@ -8,7 +8,7 @@ use egui::{Align2, Color32, FontId, Id, Pos2, Rect, Sense, Ui, Vec2};
 use wassh_core::{Palette, Rgba, SessionStatus, colors};
 
 use crate::terminal_view::to_color32;
-use crate::widgets::truncating_galley;
+use crate::widgets::{SplitAxis, drop_index, drop_indicator, truncating_galley};
 
 /// Height of the strip.
 pub const TABBAR_HEIGHT: f32 = 36.0;
@@ -34,8 +34,8 @@ pub const STATUS_DOT: f32 = 8.0;
 pub const ACTIVE_BORDER: f32 = 2.0;
 /// How far the active tab overlaps the edge below the strip so it reads as connected.
 const TAB_BOTTOM_OVERLAP: f32 = 1.0;
-/// Width of the drag insertion indicator.
-pub const DROP_INDICATOR: f32 = 2.0;
+/// Vertical inset of the drag insertion marker from the strip's edges.
+const TAB_MARKER_INSET: f32 = 6.0;
 /// Width of the "new tab" button.
 pub const NEW_TAB_WIDTH: f32 = 28.0;
 /// Inset of the "new tab" button box inside its slot.
@@ -213,6 +213,30 @@ pub fn tab_bar(
         rects.push(rect);
         draw_tab(&mut strip, palette, tab, rect, index, &mut actions, state);
     }
+    let mids: Vec<f32> = rects.iter().map(|rect| rect.center().x).collect();
+
+    // While a tab is dragged, mark the gap it would drop into, so the new order is visible
+    // before the pointer is released. The two slots beside the dragged tab are where it is.
+    if let Some(drag) = state.drag.as_ref().filter(|drag| drag.active)
+        && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
+    {
+        let slot = drop_index(pointer.x, &mids);
+        if slot != drag.from && slot != drag.from + 1 {
+            let x = match rects.get(slot) {
+                Some(rect) => rect.left() - TAB_GAP / 2.0,
+                None => rects
+                    .last()
+                    .map_or(bar.center().x, |last| last.right() + TAB_GAP / 2.0),
+            };
+            drop_indicator(
+                &mut strip,
+                palette,
+                Pos2::new(x, bar.center().y),
+                TABBAR_HEIGHT - TAB_MARKER_INSET * 2.0,
+                SplitAxis::Horizontal,
+            );
+        }
+    }
 
     let new_button = ui.interact(new_rect, Id::unique("wassh-tab-new"), Sense::click());
     let hovered = new_button.hovered();
@@ -265,8 +289,7 @@ pub fn tab_bar(
             .ctx()
             .input(|input| input.pointer.interact_pos())
             .unwrap_or(bar.center());
-        let mids: Vec<f32> = rects.iter().map(|rect| rect.center().x).collect();
-        let mut to = crate::widgets::splitter::drop_index(pointer.x, &mids);
+        let mut to = drop_index(pointer.x, &mids);
         if drag.from < to {
             to = to.saturating_sub(1);
         }
@@ -494,6 +517,34 @@ mod tests {
     /// Frames needed for egui's smoothed wheel delta to be fully delivered.
     const WHEEL_FRAMES: usize = 20;
 
+    /// Centre x of each drag insertion marker painted in one frame at `pointer`.
+    fn markers(
+        ctx: &egui::Context,
+        tabs: &[TabView<'static>],
+        state: &mut TabBarState,
+        pointer: Pos2,
+    ) -> Vec<f32> {
+        let input = egui::RawInput {
+            screen_rect: Some(SCREEN),
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            tab_bar(ui, &Palette::dark(), tabs, state);
+        });
+        let accent = to_color32(Palette::dark().accent);
+        let found = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.fill == accent => Some(rect.rect.center().x),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        found
+    }
+
     /// Turn the wheel at `pointer` and let egui finish delivering the delta.
     fn wheel(
         ctx: &egui::Context,
@@ -588,6 +639,49 @@ mod tests {
 
         frame(&ctx, &tabs(2), &mut state, None, Vec2::ZERO);
         assert_eq!(state.scroll, 0.0);
+    }
+
+    #[test]
+    fn a_dragged_tab_marks_the_gap_it_will_drop_into() {
+        let ctx = egui::Context::default();
+        let tabs = tabs(4);
+        let mut state = TabBarState::new();
+        let bar = frame(&ctx, &tabs, &mut state, None, Vec2::ZERO);
+        let width = tab_width(tabs.len(), bar.width());
+        // The first tab is being dragged.
+        state.drag = Some(DragState {
+            from: 0,
+            active: true,
+        });
+
+        // Over the fourth tab the marker sits in the gap just before it.
+        let fourth = tab_slot(bar, width, state.scroll, 3);
+        let found = markers(&ctx, &tabs, &mut state, fourth.center());
+        assert_eq!(found.len(), 1, "expected one marker, got {found:?}");
+        let expected = fourth.left() - TAB_GAP / 2.0;
+        assert!(
+            (found[0] - expected).abs() < 0.5,
+            "marker at {} instead of {expected}",
+            found[0]
+        );
+
+        // Past the last tab it would become the last tab.
+        let past_end = Pos2::new(bar.right() - 1.0, bar.center().y);
+        let last = tab_slot(bar, width, state.scroll, tabs.len() - 1);
+        let found = markers(&ctx, &tabs, &mut state, past_end);
+        assert_eq!(found.len(), 1, "expected one marker, got {found:?}");
+        let expected = last.right() + TAB_GAP / 2.0;
+        assert!(
+            (found[0] - expected).abs() < 0.5,
+            "marker at {} instead of {expected}",
+            found[0]
+        );
+
+        // Hanging over the dragged tab itself promises no move, so nothing is marked.
+        let first = tab_slot(bar, width, state.scroll, 0);
+        assert!(markers(&ctx, &tabs, &mut state, first.center()).is_empty());
+        let just_right = Pos2::new(first.right() + 1.0, first.center().y);
+        assert!(markers(&ctx, &tabs, &mut state, just_right).is_empty());
     }
 
     #[test]
