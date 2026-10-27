@@ -3039,32 +3039,73 @@ fn group_edit_dialog(
 
 // --- About, palette, find bar --------------------------------------------
 
+/// What the program is, in one sentence for the About dialog.
+const ABOUT_TEXT: &str = "Well Advanced SSH Client - an user-friendly SSH client and \
+terminal emulator with advanced features.";
+
+/// Height the credits list may take before it scrolls.
+const CREDITS_MAX_HEIGHT: f32 = 190.0;
+
+/// Third-party libraries the program is built on, and the licence each one uses.
+///
+/// The direct dependencies only; their own dependencies carry their licences with them in
+/// `Cargo.lock`. Kept alphabetical by library so a new dependency is easy to slot in.
+const CREDITS: &[(&str, &str)] = &[
+    (
+        "aes-gcm, getrandom, sha2, base64 — credential vault and hashing",
+        "Apache-2.0 OR MIT",
+    ),
+    (
+        "alacritty_terminal, vte — terminal emulation and escape sequences",
+        "Apache-2.0",
+    ),
+    ("anyhow, thiserror — error handling", "MIT OR Apache-2.0"),
+    ("egui, eframe — user interface", "MIT OR Apache-2.0"),
+    ("portable-pty — local shells", "MIT"),
+    ("regex — the agent's allow and deny rules", "MIT OR Apache-2.0"),
+    ("rfd — native open and save dialogs", "MIT"),
+    ("russh, russh-sftp — SSH, SFTP and forwarding", "Apache-2.0"),
+    ("Rust — language, compiler, standard library", "Apache-2.0 OR MIT"),
+    ("serde, serde_json — saved configuration", "MIT OR Apache-2.0"),
+    ("serial2 — serial ports", "BSD-2-Clause OR Apache-2.0"),
+    ("tokio — asynchronous runtime", "MIT"),
+    ("ureq — HTTP for the AI agent's providers", "MIT OR Apache-2.0"),
+    ("winit — windowing and input", "Apache-2.0"),
+];
+
 fn about_dialog(ctx: &Context, palette: &Palette) -> Vec<DialogAction> {
     let mut actions = Vec::new();
-    let response = modal(ctx, "about", palette, "About", 420.0, |ui| {
-        ui.label(
-            egui::RichText::new(APP_NAME)
-                .size(20.0)
-                .strong()
-                .color(to_color32(palette.text)),
-        );
+    let response = modal(ctx, "about", palette, "About", 460.0, |ui| {
+        let text = to_color32(palette.text);
+        let muted = to_color32(palette.text_muted);
+        ui.label(egui::RichText::new(APP_NAME).size(20.0).strong().color(text));
         ui.label(
             egui::RichText::new(format!("Version {APP_VERSION}"))
                 .size(12.0)
-                .color(to_color32(palette.text_muted)),
+                .color(muted),
         );
         ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new(
-                "A native SSH, Telnet and serial client. Rewritten in Rust for speed.",
-            )
-            .size(12.0)
-            .color(to_color32(palette.text)),
-        );
+        ui.label(egui::RichText::new(ABOUT_TEXT).size(12.0).color(text));
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             badge(ui, palette, "MIT licence", Tone::Info);
         });
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("BUILT WITH").size(11.0).color(muted));
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("about-credits")
+            .max_height(CREDITS_MAX_HEIGHT)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (library, licence) in CREDITS {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new(*library).size(11.0).color(text));
+                        ui.label(egui::RichText::new(*licence).size(11.0).color(muted));
+                    });
+                }
+            });
         ui.add_space(12.0);
         wassh_ui::widgets::footer(ui, |ui| {
             if Button::new("Close").primary().show(ui, palette).clicked() {
