@@ -1,63 +1,34 @@
 # WaSSH
 
-Advanced Multi-tab SSH client for Windows, macOS, and Linux (Electron + React + xterm.js).
+Native WaSSH desktop client, built as a single self-contained Cargo workspace.
 
-## Develop
+## Layout
 
-```bash
-npm install
-npm run setup-native   # if `npm run dev` says "Electron uninstall"
-npm run dev
+| Crate | Responsibility |
+|---|---|
+| `wassh-core` | Domain model: app constants, palette/theme, session status + backoff, dock layout |
+| `wassh-store` | Config persistence (settings, hosts, tabs, known hosts, plugin data) |
+| `wassh-ssh` | SSH transport: auth, jump chains, channels, tunnels, X11, SFTP |
+| `wassh-term` | Terminal emulation glue (alacritty_terminal), input encoding, selection/search |
+| `wassh-term-render` | Glyph atlas and cell mesh generation |
+| `wassh-ui` | egui shell, widget kit, screens |
+| `wassh-plugins` | Internal plugin trait and the eight built-in plugins |
+| `wassh` | Application binary |
+
+## Commands
+
+```
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p wassh
 ```
 
-If npm blocked install scripts (`install-scripts not yet covered by allowScripts`):
+## Notes
 
-```bash
-npm install-scripts approve electron ssh2
-npm run setup-native
-```
-
-## Package locally
-
-```bash
-npm run dist        # packages for current host OS
-npm run dist:win    # packages Windows NSIS + portable
-npm run dist:mac    # packages macOS DMG + ZIP
-npm run dist:linux  # packages Linux AppImage + deb + rpm
-```
-
-Artifacts in `release/`:
-- Windows: `WaSSH-Setup-<version>.exe` (NSIS) and `WaSSH-Portable-<version>.exe`
-- macOS: `WaSSH-<version>-mac-arm64.dmg` / `.zip` (Apple Silicon) and `WaSSH-<version>-mac-x64.dmg` / `.zip` (Intel)
-- Linux: `WaSSH-<version>-linux-arm64.AppImage` / `.deb` / `.rpm` (ARM64) and `WaSSH-<version>-linux-x64.AppImage` / `.deb` / `.rpm` (x64)
-
-## Releases & auto-update
-
-Pushing a `v*` tag runs `.github/workflows/release.yml`: it validates the tag against
-`package.json` `version`, builds Windows, macOS, and Linux artifacts, and publishes installers to a GitHub
-Release. The version string has a single source of truth — `package.json` (shown in the
-About dialog, installer filenames, and executable properties).
-
-```bash
-npm version patch      # bumps version, creates the vX.Y.Z tag
-git push --follow-tags # workflow builds and publishes
-```
-
-Installed Windows NSIS builds check GitHub Releases for updates shortly after startup and via
-**Help → Check for Updates…**. Portable, dev, macOS, and Linux builds currently do not auto-update.
-
-Builds are unsigned:
-- **Windows**: SmartScreen shows "Windows protected your PC" on first run — choose **More info → Run anyway**.
-- **macOS**: Gatekeeper blocks unsigned apps on first launch — open **System Settings → Privacy & Security** and choose **Open Anyway** (or right-click `WaSSH.app` in `/Applications` and select **Open**).
-
-## Data & credentials
-
-All configuration lives in the per-user data directory:
-- **Windows**: `%APPDATA%\WaSSH`
-- **macOS**: `~/Library/Application Support/WaSSH`
-- **Linux**: `~/.config/WaSSH`
-
-Files stored: `hosts.json`, `settings.json`, `tabs.json`, `known_hosts.json`, `vault.json`, `plugin-*.json`.
-
-SSH passwords, key passphrases, and API keys are encrypted with the OS credential store (Windows DPAPI / macOS Keychain / Linux Secret Service via Electron `safeStorage`) in `vault.json`, and the other files only reference vault IDs. Nothing sensitive is written to the installation folder, and uninstalling the app leaves configuration intact.
-
+- Long-running builds: `CARGO_BUILD_JOBS=8 taskset -c 0-9 cargo build` (this machine is
+  limited to 10 cores and must not run parallel builds).
+- `wassh --spike` runs the terminal/SSH spike harness; `--widgets` shows the widget gallery.
+- `vendor/winit` is winit 0.30.13 with the Windows 11 mixed-DPI fix backported (see
+  `vendor/winit/PATCHED.md`). Drop the directory and the `[patch.crates-io]` entry once
+  eframe moves to a winit release that contains it.

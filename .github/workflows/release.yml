@@ -13,6 +13,9 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   release-windows:
     runs-on: windows-latest
@@ -20,62 +23,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: 24.21.0
-          cache: npm
-
-      - name: Validate tag matches package.json version
+      - name: Validate tag matches Cargo.toml version
         if: github.event_name == 'push'
         shell: bash
         run: |
-          version="$(node -p "require('./package.json').version")"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
             exit 1
           fi
 
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
+      - name: Build
+        run: cargo build --release -p wassh
 
-      - name: Build native modules
-        run: npm run setup-native
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Build and publish release
-        run: npm run dist:win -- --publish ${{ github.event_name == 'push' && 'always' || 'never' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      # electron-builder can occasionally leave duplicate releases on one tag with
-      # assets split across them. Keep only the release that carries latest.yml,
-      # otherwise the in-app updater cannot find the update metadata.
-      - name: Keep only the complete release for this tag
-        if: github.event_name == 'push'
+      - name: Package
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          for id in $(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name == \"${tag}\") | .id"); do
-            has_latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${id}/assets" --jq '[.[].name] | index("latest.yml") != null')
-            if [ "$has_latest" != "true" ]; then
-              echo "Deleting duplicate release ${id} on ${tag} (missing latest.yml)"
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
-            fi
-          done
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          name="wassh-$version-windows-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/wassh.exe README.md TODO.md "dist/$name/"
+          (cd dist && 7z a "$name.zip" "$name")
 
-      - name: Upload Windows artifacts
+      - name: Attach assets to GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
           name: wassh-${{ github.ref_name }}-windows
-          path: |
-            release/*.exe
-            release/*.yml
-            release/*.blockmap
+          path: dist/*.zip
           if-no-files-found: error
 
   release-mac:
@@ -85,60 +65,44 @@ jobs:
       matrix:
         include:
           - runner: macos-15-intel
-            arch: x64
-            expected_uname: x86_64
+            arch: x86_64
           - runner: macos-14
             arch: arm64
-            expected_uname: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: 24.21.0
-          cache: npm
-
       - name: Verify runner architecture
         run: |
           actual_uname="$(uname -m)"
-          if [ "${actual_uname}" != "${{ matrix.expected_uname }}" ]; then
-            echo "::error::Runner architecture mismatch: expected ${{ matrix.expected_uname }}, got ${actual_uname}"
+          if [ "${actual_uname}" != "${{ matrix.arch }}" ]; then
+            echo "::error::Runner architecture mismatch: expected ${{ matrix.arch }}, got ${actual_uname}"
             exit 1
           fi
 
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
+      - name: Build
+        run: cargo build --release -p wassh
 
-      - name: Build native modules
-        run: npm run setup-native
-        env:
-          npm_config_arch: ${{ matrix.arch }}
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Build macOS artifacts
-        run: npm run dist:mac -- --${{ matrix.arch }} --publish never
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Attach macOS assets to GitHub release
-        if: github.event_name == 'push'
+      - name: Package
         run: |
-          gh release upload "${GITHUB_REF_NAME}" release/*.dmg release/*.zip --clobber
-        env:
-          GH_TOKEN: ${{ github.token }}
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          name="wassh-$version-macos-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp target/release/wassh README.md TODO.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
 
-      - name: Upload macOS workflow artifacts
+      - name: Attach assets to GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
           name: wassh-${{ github.ref_name }}-mac-${{ matrix.arch }}
-          path: |
-            release/*.dmg
-            release/*.zip
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   release-linux:
@@ -148,62 +112,48 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-latest
-            arch: x64
-            expected_uname: x86_64
+            arch: x86_64
           - runner: ubuntu-24.04-arm
-            arch: arm64
-            expected_uname: aarch64
+            arch: aarch64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: 24.21.0
-          cache: npm
-
       - name: Verify runner architecture
         run: |
           actual_uname="$(uname -m)"
-          if [ "${actual_uname}" != "${{ matrix.expected_uname }}" ]; then
-            echo "::error::Runner architecture mismatch: expected ${{ matrix.expected_uname }}, got ${actual_uname}"
+          if [ "${actual_uname}" != "${{ matrix.arch }}" ]; then
+            echo "::error::Runner architecture mismatch: expected ${{ matrix.arch }}, got ${actual_uname}"
             exit 1
           fi
 
-      - name: Install rpm tooling
-        run: sudo apt-get update && sudo apt-get install -y rpm
-
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Build native modules
-        run: npm run setup-native
-        env:
-          npm_config_arch: ${{ matrix.arch }}
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Build Linux artifacts
-        run: npm run dist:linux -- --${{ matrix.arch }} --publish never
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Attach Linux assets to GitHub release
-        if: github.event_name == 'push'
+      - name: Install windowing headers
         run: |
-          gh release upload "${GITHUB_REF_NAME}" release/*.AppImage release/*.deb release/*.rpm --clobber
-        env:
-          GH_TOKEN: ${{ github.token }}
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev
 
-      - name: Upload Linux workflow artifacts
+      - name: Build
+        run: cargo build --release -p wassh
+
+      - name: Package
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          name="wassh-$version-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp target/release/wassh packaging/wassh.desktop README.md TODO.md "dist/$name/"
+          cp "res/WaSSH program icon.png" "dist/$name/wassh.png"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - name: Attach assets to GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
           name: wassh-${{ github.ref_name }}-linux-${{ matrix.arch }}
-          path: |
-            release/*.AppImage
-            release/*.deb
-            release/*.rpm
+          path: dist/*.tar.gz
           if-no-files-found: error

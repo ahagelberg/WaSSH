@@ -9,7 +9,6 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-root="$(cd "$here/.." && pwd)"
 out="${1:-$here/target/package}"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$here/Cargo.toml" | head -1)"
 name="wassh-$version-linux-x86_64"
@@ -24,10 +23,10 @@ mkdir -p "$stage"
 install -m 755 "$here/target/release/wassh" "$stage/wassh"
 install -m 644 "$here/packaging/wassh.desktop" "$stage/wassh.desktop"
 
-if [[ -f "$root/res/WaSSH program icon.png" ]]; then
-    install -m 644 "$root/res/WaSSH program icon.png" "$stage/wassh.png"
+if [[ -f "$here/res/WaSSH program icon.png" ]]; then
+    install -m 644 "$here/res/WaSSH program icon.png" "$stage/wassh.png"
 fi
-install -m 644 "$here/../README.md" "$stage/README.md" 2>/dev/null || true
+install -m 644 "$here/README.md" "$stage/README.md" 2>/dev/null || true
 
 cat >"$stage/INSTALL.txt" <<'TXT'
 WaSSH — portable Linux build
