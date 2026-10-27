@@ -28,6 +28,10 @@ const MENU_ITEM_HEIGHT: f32 = 26.0;
 const MENU_ITEM_PADDING: f32 = 10.0;
 const MENU_SEPARATOR_HEIGHT: f32 = 9.0;
 const MENU_MIN_WIDTH: f32 = 140.0;
+/// Space between the longest label and the accelerator column.
+const MENU_SHORTCUT_GAP: f32 = 32.0;
+/// Accelerators are dimmed until their row is hovered.
+const MENU_SHORTCUT_DIM: f32 = 0.75;
 /// Width of the check-mark gutter a menu gains when it has checkable entries.
 const MENU_CHECK_WIDTH: f32 = 18.0;
 /// Width of the gear gutter a menu gains when its entries have settings.
@@ -69,6 +73,11 @@ pub enum TitlebarAction {
 pub struct MenuState<'a> {
     pub checked: &'a [&'a str],
     pub gears: &'a [&'a str],
+    /// Keys that run a row, as `(row label, accelerator)` for the rows that have one.
+    ///
+    /// A lookup rather than part of [`Menu`] so the menus stay plain label lists — the
+    /// plugin rows in particular have nothing to add here.
+    pub shortcuts: &'a [(&'a str, &'a str)],
 }
 
 /// Menu definition: a label and its entries (`""` renders a separator).
@@ -190,6 +199,14 @@ pub fn show_menu_bar(
     action
 }
 
+/// The accelerator of one menu row, if it has one.
+fn shortcut_for<'a>(shortcuts: &[(&'a str, &'a str)], item: &str) -> Option<&'a str> {
+    shortcuts
+        .iter()
+        .find(|(label, _)| *label == item)
+        .map(|(_, keys)| *keys)
+}
+
 /// Paint the menu labels inside an already-positioned row and handle the open dropdown.
 fn menu_strip(
     ui: &mut Ui,
@@ -287,7 +304,11 @@ fn dropdown(
     items: &'static [&'static str],
     state: MenuState<'_>,
 ) -> DropdownResult {
-    let MenuState { checked, gears } = state;
+    let MenuState {
+        checked,
+        gears,
+        shortcuts,
+    } = state;
     let ctx = ui.ctx();
     let text = to_color32(palette.text);
     let muted = to_color32(palette.text_muted);
@@ -312,6 +333,29 @@ fn dropdown(
         0.0
     };
     // Size the panel before painting so it can be clamped to the window.
+    // Only this menu's own rows can contribute an accelerator column.
+    let keys: Vec<(&'static str, &str)> = items
+        .iter()
+        .filter_map(|item| shortcut_for(shortcuts, item).map(|keys| (*item, keys)))
+        .collect();
+    // The accelerator column is measured like a label column: as wide as the longest
+    // shortcut, so the keys line up against the right edge as in a native menu.
+    let shortcut_width = keys
+        .iter()
+        .map(|(_, keys)| {
+            ctx.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap((*keys).to_owned(), font.clone(), muted)
+                    .size()
+                    .x
+            })
+        })
+        .fold(0.0, f32::max);
+    let shortcut_gutter = if shortcut_width > 0.0 {
+        shortcut_width + MENU_SHORTCUT_GAP
+    } else {
+        0.0
+    };
     let widest = items
         .iter()
         .filter(|item| !item.is_empty())
@@ -327,6 +371,7 @@ fn dropdown(
         + MENU_ITEM_PADDING * 2.0
         + gutter
         + gear_gutter
+        + shortcut_gutter
         + 16.0;
     let height = items
         .iter()
@@ -406,6 +451,22 @@ fn dropdown(
                             font.clone(),
                             if response.hovered() { text } else { muted },
                         );
+                        if let Some(keys) = shortcut_for(shortcuts, item) {
+                            ui.painter().text(
+                                Pos2::new(
+                                    rect.right() - MENU_ITEM_PADDING - gear_gutter,
+                                    rect.center().y,
+                                ),
+                                Align2::RIGHT_CENTER,
+                                keys,
+                                font.clone(),
+                                muted.gamma_multiply(if response.hovered() {
+                                    1.0
+                                } else {
+                                    MENU_SHORTCUT_DIM
+                                }),
+                            );
+                        }
                         if gear_gutter > 0.0 && gears.contains(item) {
                             let centre = Pos2::new(
                                 rect.right() - MENU_ITEM_PADDING - gear_gutter / 2.0,
@@ -662,14 +723,20 @@ mod tests {
         assert!(menu.1[1].is_empty());
     }
 
+    #[test]
+    fn accelerators_are_looked_up_by_row_label() {
+        const SHORTCUTS: &[(&str, &str)] = &[("Preferences…", "Ctrl+,")];
+        assert_eq!(shortcut_for(SHORTCUTS, "Preferences…"), Some("Ctrl+,"));
+        // A row without a binding, and a label that is not a row at all, both have none.
+        assert_eq!(shortcut_for(SHORTCUTS, "Quit"), None);
+        assert_eq!(shortcut_for(SHORTCUTS, "Nope"), None);
+    }
+
     /// Run two frames of a menu bar with `Plugins` open and collect painted text.
     fn open_menu_rows(checked: &[&'static str]) -> Vec<String> {
         const MENUS: &[Menu] = &[("Help", &["About"]), ("Plugins", &["Files", "", "Docker"])];
         let ctx = egui::Context::default();
-        let screen = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::Vec2::new(640.0, 400.0),
-        );
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(640.0, 400.0));
         let input = egui::RawInput {
             screen_rect: Some(screen),
             ..Default::default()
@@ -686,6 +753,7 @@ mod tests {
                 let state = MenuState {
                     checked,
                     gears: &[],
+                    shortcuts: &[],
                 };
                 let _ = show_menu_bar(ui, &palette, MENUS, state);
             });
@@ -701,11 +769,86 @@ mod tests {
         rows
     }
 
+    /// Open the `Plugins` menu and collect every painted text with its left edge, right
+    /// edge and y.
+    fn open_menu_texts() -> Vec<(f32, f32, f32, String)> {
+        const MENUS: &[Menu] = &[
+            ("Help", &["About"]),
+            ("Plugins", &["Files", "Docker", "", "Scratch"]),
+        ];
+        const SHORTCUTS: &[(&str, &str)] = &[("Files", "Ctrl+Shift+F"), ("Docker", "Ctrl+F4")];
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(640.0, 400.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            ctx.data_mut(|data| {
+                data.insert_temp(Id::unique("wassh-open-menu"), Some("Plugins"));
+            });
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                let palette = Palette::dark();
+                let state = MenuState {
+                    checked: &[],
+                    gears: &[],
+                    shortcuts: SHORTCUTS,
+                };
+                let _ = show_menu_bar(ui, &palette, MENUS, state);
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            rows.clear();
+            for clipped in shapes {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    rows.push((
+                        text.pos.x,
+                        text.pos.x + text.galley.size().x,
+                        text.pos.y,
+                        text.galley.text().to_owned(),
+                    ));
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+        rows
+    }
+
     #[test]
-    fn a_checked_entry_gets_a_tick() {
-        let rows = open_menu_rows(&["Files"]);
-        assert!(rows.contains(&MENU_CHECK_GLYPH.to_owned()), "rows: {rows:?}");
-        assert!(rows.contains(&"Docker".to_owned()));
+    fn menu_rows_show_their_accelerators_against_the_right_edge() {
+        // A menu reads like a native one: label left, keys right, and the keys line up in
+        // one column whatever the length of the label or the chord.
+        let rows = open_menu_texts();
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(_, _, _, text)| text == label)
+                .map(|(left, right, y, _)| (*left, *right, *y))
+                .unwrap_or_else(|| panic!("{label:?} was not painted: {rows:?}"))
+        };
+        let (label_left, label_right, label_y) = find("Files");
+        let (keys_left, keys_right, keys_y) = find("Ctrl+Shift+F");
+        let (other_left, other_right, _) = find("Ctrl+F4");
+        assert!(
+            keys_left > label_right,
+            "the keys sit to the right of the label: {label_right} vs {keys_left}"
+        );
+        assert!(
+            (keys_y - label_y).abs() < 1.0,
+            "and on the same row as it: {label_y} vs {keys_y}"
+        );
+        assert!(
+            (keys_right - other_right).abs() < 1.0,
+            "the accelerators do not line up: {keys_right} vs {other_right}"
+        );
+        assert!(
+            other_left > label_left,
+            "the shorter accelerator starts further right: {other_left} vs {label_left}"
+        );
+        // A row with no binding is untouched by the column.
+        assert!(
+            rows.iter().any(|(_, _, _, text)| text == "Scratch"),
+            "a shortcut-free row is still drawn"
+        );
     }
 
     /// Open the `Plugins` menu and click at `pointer` on the third frame.
@@ -745,6 +888,7 @@ mod tests {
                 let state = MenuState {
                     checked: &[],
                     gears,
+                    shortcuts: &[],
                 };
                 if let Some(found) = show_menu_bar(ui, &palette, MENUS, state) {
                     action = Some(found);

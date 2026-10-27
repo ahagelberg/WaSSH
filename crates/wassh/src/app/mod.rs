@@ -80,15 +80,16 @@ const PLUGIN_MENU_LABELS: &[&str] = &[
     "Docker",
 ];
 
+
+/// Menus shown in the titlebar.
 const MENUS: &[wassh_ui::titlebar::Menu] = &[
-    (
-        "File",
-        &["New tab", "New host…", "", "Options…", "Quit"],
-    ),
+    ("File", &["Options…", "", "Quit"]),
     ("Edit", &["Copy", "Paste", "", "Find…"]),
     (
         "Session",
         &[
+            "New terminal",
+            "",
             "Reconnect",
             "Reconnect all",
             "Reopen closed tab",
@@ -110,6 +111,20 @@ const MENUS: &[wassh_ui::titlebar::Menu] = &[
     ),
     ("Plugins", PLUGIN_MENU_LABELS),
     ("Help", &["About WaSSH"]),
+];
+
+/// Keys that run a menu row, for the rows that have a binding.
+///
+/// A table of its own rather than a field per row, so the menus stay plain label lists and
+/// only the rows that really are wired up appear here: an accelerator is a promise.
+const MENU_SHORTCUTS: &[(&str, &str)] = &[
+    ("Options…", "Ctrl+,"),
+    ("Copy", "Ctrl+Shift+C"),
+    ("Paste", "Ctrl+Shift+V"),
+    ("Find…", "Ctrl+Shift+F"),
+    ("New terminal", "Ctrl+Shift+N"),
+    ("Reconnect", "Ctrl+Shift+R"),
+    ("Reopen closed tab", "Ctrl+Shift+T"),
 ];
 
 /// A tab that was closed and can be reopened.
@@ -1514,8 +1529,7 @@ impl Shell {
         match item {
             "Copy" => self.copy_selection(ctx),
             "Paste" => self.paste_clipboard(ctx),
-            "New tab" => self.handle_command(Command::NewLocalTab),
-            "New host…" => self.handle_command(Command::NewHost),
+            "New terminal" => self.handle_command(Command::NewLocalTab),
             "Reopen closed tab" => self.handle_command(Command::ReopenTab),
             "Options…" => self.handle_command(Command::OpenOptions),
             "Quit" => self.handle_command(Command::Quit),
@@ -1569,6 +1583,19 @@ impl Shell {
                 .with_backup_default(&home, now)
                 .focusing_plugin(id),
         );
+    }
+
+    /// Toolbar labels of the plugins that have their own section in Options.
+    ///
+    /// Only those get the gear in the Plugins menu: a plugin with nothing to configure has
+    /// no section to open, and a disabled one has none either.
+    fn configurable_plugin_labels(&self) -> Vec<&'static str> {
+        wassh_plugins::PluginId::UI_ORDER
+            .into_iter()
+            .filter(|id| self.settings.plugin_enabled(id.as_str()))
+            .filter(|id| !wassh_plugins::settings::app_schema(*id).is_empty())
+            .map(|id| id.manifest().toolbar_label)
+            .collect()
     }
 
     /// Toolbar labels of the plugins open in the active tab, so the Plugins menu
@@ -1652,6 +1679,12 @@ impl Shell {
             if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::T) {
                 commands.push(Command::ReopenTab);
             }
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::N) {
+                commands.push(Command::NewLocalTab);
+            }
+            if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::R) {
+                commands.push(Command::Reconnect);
+            }
             // Ctrl+W belongs to the shell (Emacs and readline use it to delete a word),
             // so only the shifted form and Ctrl+F4 close a tab.
             if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::W)
@@ -1680,6 +1713,10 @@ impl Shell {
             }
             if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::F) {
                 commands.push(Command::Find);
+            }
+            // Ctrl+, opens Options, as it does in every other desktop application.
+            if consume_chord(input, Modifiers::CTRL, Key::Comma) {
+                commands.push(Command::OpenOptions);
             }
         });
         if palette {
@@ -2858,9 +2895,11 @@ impl Shell {
         // The desktop owns the title bar, the window buttons, the resize border and the
         // shadow, so the app only adds its menu strip underneath.
         let checked = self.active_plugin_labels();
+        let gears = self.configurable_plugin_labels();
         let state = wassh_ui::titlebar::MenuState {
+            shortcuts: MENU_SHORTCUTS,
             checked: &checked,
-            gears: PLUGIN_MENU_LABELS,
+            gears: &gears,
         };
         let action = wassh_ui::show_menu_bar(ui, &self.palette, MENUS, state);
         match action {
@@ -4701,6 +4740,27 @@ mod tests {
     }
 
     #[test]
+    fn only_plugins_with_an_options_section_get_a_config_gear() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.settings.enabled_plugins = wassh_plugins::PluginId::UI_ORDER
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        // Every plugin that declares app-wide settings gets a gear: the monitor, the
+        // scratchpad and the files pane declare none, so their rows have nothing to open.
+        assert_eq!(
+            shell.configurable_plugin_labels(),
+            ["Macros", "MQTT", "AI Agent", "Conn Log", "Docker"]
+        );
+
+        // A disabled plugin has no section in Options, so it loses its gear too.
+        shell.settings.enabled_plugins = vec!["docker-manager".to_owned()];
+        assert_eq!(shell.configurable_plugin_labels(), ["Docker"]);
+        shell.settings.enabled_plugins.clear();
+        assert!(shell.configurable_plugin_labels().is_empty());
+    }
+
+    #[test]
     fn the_gear_in_the_plugins_menu_opens_the_plugin_options() {
         let mut shell = Shell::new_with(Some(scratch_config()), false);
         shell.settings.enabled_plugins = vec!["macro-pad".to_owned()];
@@ -4716,6 +4776,135 @@ mod tests {
         shell.dialogs.options = None;
         shell.open_plugin_options("Nonexistent");
         assert!(shell.dialogs.options.is_none());
+    }
+
+    /// The labels of one menu, as the title bar offers them.
+    fn menu_items(name: &str) -> &'static [&'static str] {
+        MENUS
+            .iter()
+            .find(|(menu, _)| *menu == name)
+            .map(|(_, items)| *items)
+            .expect("the menu exists")
+    }
+
+    #[test]
+    fn the_file_menu_keeps_only_the_application_commands() {
+        // New tabs and hosts have their own places (the tab strip and the sidebar), so the
+        // File menu carries the program's own commands only.
+        let items = menu_items("File");
+        assert_eq!(items, ["Options…", "", "Quit"]);
+        assert!(!items.contains(&"New tab"));
+        assert!(!items.contains(&"New host…"));
+    }
+
+    #[test]
+    fn the_menu_accelerators_are_the_bindings_that_exist() {
+        // Only chords that really are wired are advertised, and nothing the terminal keeps
+        // for the shell (Ctrl+C, Ctrl+W …) ever appears next to a menu row.
+        let shortcuts: Vec<(&str, &str)> = MENU_SHORTCUTS.to_vec();
+        // Every advertised accelerator belongs to a row that exists, in one menu only.
+        for (label, keys) in &shortcuts {
+            assert!(!keys.is_empty(), "{label:?} has no accelerator");
+            let rows: Vec<&str> = MENUS
+                .iter()
+                .flat_map(|(_, items)| items.iter().copied())
+                .filter(|item| item == label)
+                .collect();
+            assert_eq!(rows.len(), 1, "{label:?} names one menu row: {rows:?}");
+        }
+        assert_eq!(
+            shortcuts,
+            [
+                ("Options…", "Ctrl+,"),
+                ("Copy", "Ctrl+Shift+C"),
+                ("Paste", "Ctrl+Shift+V"),
+                ("Find…", "Ctrl+Shift+F"),
+                ("New terminal", "Ctrl+Shift+N"),
+                ("Reconnect", "Ctrl+Shift+R"),
+                ("Reopen closed tab", "Ctrl+Shift+T"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_session_menu_opens_a_local_terminal() {
+        let items = menu_items("Session");
+        assert_eq!(items.first(), Some(&"New terminal"));
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        shell.menu_command(&ctx, "New terminal");
+        assert_eq!(shell.sessions.len(), 1, "New terminal opened a tab");
+        assert_eq!(shell.active, Some(0));
+        assert!(
+            matches!(
+                shell.sessions[0].connection.kind,
+                wassh_core::ConnectionType::Local
+            ),
+            "the new tab is a local terminal"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_n_opens_a_local_terminal() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::N,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(shell.sessions.len(), 1, "Ctrl+Shift+N opened a tab");
+        assert!(matches!(
+            shell.sessions[0].connection.kind,
+            wassh_core::ConnectionType::Local
+        ));
+    }
+
+    #[test]
+    fn ctrl_shift_r_restarts_the_active_session() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        let ctx = egui::Context::default();
+        run_shell(&mut shell, &ctx, 2);
+
+        // A session that failed keeps its tab and shows the reason there; reconnect is what
+        // clears it and starts the transport again.
+        shell.sessions[0].error = Some("connection lost".to_owned());
+        shell.sessions[0].status_message = Some("stale".to_owned());
+        frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::R,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert!(
+            shell.sessions[0].error.is_none(),
+            "Ctrl+Shift+R did not restart the session"
+        );
+        assert!(shell.sessions[0].status_message.is_none());
+
+        // And the chord never reaches the shell, where Ctrl+R is readline's reverse search.
+        run_shell(&mut shell, &ctx, 2);
+        assert!(
+            !shell.sessions[0].visible_text().contains("reverse-i-search"),
+            "Ctrl+Shift+R was typed into the terminal"
+        );
+    }
+
+    #[test]
+    fn ctrl_comma_opens_options() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::Comma,
+                egui::Modifiers::CTRL,
+            )],
+        );
+        assert!(shell.dialogs.options.is_some(), "Ctrl+, opens Options");
     }
 
     #[test]
