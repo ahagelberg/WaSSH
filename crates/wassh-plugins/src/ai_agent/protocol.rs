@@ -37,6 +37,8 @@ pub const SETTING_WEB_SEARCH_KEY: &str = "webSearchApiKey";
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";
+/// Tool: run a shell command as root, asking the user for the password first.
+pub const TOOL_RUN_SUDO: &str = "run_sudo";
 /// Tool: ask the user a multiple-choice question.
 pub const TOOL_ASK_USER: &str = "ask_user";
 /// Tool: fetch a URL.

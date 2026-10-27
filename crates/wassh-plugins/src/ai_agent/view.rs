@@ -9,15 +9,16 @@ use std::sync::mpsc::Receiver;
 
 use egui::Ui;
 use serde_json::{json, Value};
-use wassh_core::SessionStatus;
+use wassh_core::{Palette, SessionStatus};
 use wassh_ui::dock::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, select_str, select_width, small_button_enabled, text_area, text_input,
+    Button, ButtonKind, password_input, select_str, select_width, small_button, small_button_enabled,
+    text_area,
 };
 
 use super::agent::{
     history_from_json, history_to_json, turns_from_json, turns_to_json, Agent, Phase, ToolSettings,
-    Turn, SUMMARY_SYSTEM_PROMPT,
+    Turn, UserMeta, SUMMARY_SYSTEM_PROMPT,
 };
 use super::protocol::{
     Protocol, ProviderConfig, CONVERSATIONS_PER_HOST_MAX, DATA_VERSION,
@@ -41,22 +42,29 @@ const CONVERSATION_KEY: &str = "conversation";
 const MAX_TOKENS: u32 = 4096;
 /// Gap between the provider and model dropdowns under the composer.
 const FOOTER_GAP: f32 = 6.0;
-/// Narrowest a footer dropdown gets before it stops shrinking.
-const FOOTER_SELECT_MIN_WIDTH: f32 = 80.0;
-/// Room the provider and model row takes under the composer.
-const FOOTER_HEIGHT: f32 = 26.0;
 /// Type size of the two dropdowns.
 const FOOTER_TEXT_SIZE: f32 = 11.0;
-/// Room the composer and the two buttons under it keep free.
-const COMPOSER_HEIGHT: f32 = 116.0;
-/// The same while the agent waits for an answer to its question.
-const COMPOSER_HEIGHT_ASKING: f32 = 150.0;
-/// Shortest the transcript gets, whatever the pane height.
-const MIN_TRANSCRIPT_HEIGHT: f32 = 80.0;
-/// Room kept for the Send / Stop button next to the composer.
-const SEND_BUTTON_WIDTH: f32 = 96.0;
 /// Narrowest the composer text area gets.
 const MIN_COMPOSER_WIDTH: f32 = 80.0;
+/// Gap between two entries of the transcript.
+const TURN_GAP: f32 = 8.0;
+/// Share of the pane a user message may take, like the reference's bubble.
+const USER_BUBBLE_SHARE: f32 = 0.92;
+/// Share of the accent mixed into the user bubble's background.
+const USER_BUBBLE_TINT: f32 = 0.20;
+/// Share of the accent mixed into the user bubble's border.
+const USER_BUBBLE_BORDER_TINT: f32 = 0.40;
+/// Share of a tool badge's colour mixed into its pill.
+const BADGE_TINT: f32 = 0.25;
+/// Characters kept from one tool's output.
+const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
+/// Characters shown from a queued message.
+const QUEUE_PREVIEW_MAX_CHARS: usize = 120;
+
+/// How long one dot of the animated "Thinking…" stays on.
+const THINKING_DOT_MS: u64 = 400;
+/// Dots cycled while the model has not answered yet.
+const THINKING_DOT_COUNT: usize = 3;
 /// Caption of the file-attach button.
 const ATTACH_GLYPH: &str = "📎";
 /// Caption of the terminal-context toggle.
@@ -184,6 +192,26 @@ pub struct StoredChat {
     pub provider: String,
 }
 
+/// A message typed while a run was in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Queued {
+    /// The prompt as typed, put back in the composer by "Edit".
+    text: String,
+    /// The message as it will be sent, with attachments and terminal context folded in.
+    message: String,
+    /// What travels with it, for the tags on its bubble.
+    meta: UserMeta,
+}
+
+/// What the user did with the sudo card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SudoAnswer {
+    /// Run the command with the password they typed.
+    Run,
+    /// Leave the command unrun.
+    Cancel,
+}
+
 /// The AI agent pane.
 pub struct AiAgent {
     /// Conversation and tool loop.
@@ -200,6 +228,8 @@ pub struct AiAgent {
     keys: std::collections::BTreeMap<String, String>,
     /// What the user is typing.
     draft: String,
+    /// A message typed while a run was in flight, sent when it ends.
+    queued: Option<Queued>,
     /// Files attached to the next message.
     attachments: Vec<Attachment>,
     /// Whether the next message carries the recent terminal output.
@@ -216,7 +246,7 @@ pub struct AiAgent {
     summary: Option<(SummaryMode, Receiver<Result<String, String>>)>,
     /// The question composer, while `ask_user` waits.
     answer: String,
-    /// The sudo password field, after a refused command.
+    /// The password being typed into the sudo card.
     sudo: String,
     /// Whether the stored conversation has been read back.
     loaded: bool,
@@ -236,6 +266,7 @@ impl Default for AiAgent {
             model: String::new(),
             keys: std::collections::BTreeMap::new(),
             draft: String::new(),
+            queued: None,
             attachments: Vec::new(),
             attach_terminal: false,
             picking: None,
@@ -374,6 +405,10 @@ impl AiAgent {
             "Guidelines:".to_owned(),
             "- Use run_command for terminal work on the host and the terminal_* tools to drive the live shell."
                 .to_owned(),
+            "- When a task needs root, call run_sudo with the same command: it asks the user for \
+their sudo password before running. Plain run_command cannot answer sudo's prompt, and never \
+pipe a password to sudo yourself."
+                .to_owned(),
             "- Prefer the file tools over shell commands when reading or editing files.".to_owned(),
             "- After each command or tool call you see its actual result. Never invent output.".to_owned(),
             "- Ask before doing anything destructive or ambiguous.".to_owned(),
@@ -480,6 +515,61 @@ impl AiAgent {
             tools: tools::specs(),
             max_tokens: MAX_TOKENS,
         })
+    }
+
+    /// Whether a message can go out: a provider and a model are configured.
+    fn ready(&self) -> Result<(), &'static str> {
+        if self.providers.is_empty() {
+            return Err("No model providers configured — add one in Options.");
+        }
+        if self.model.trim().is_empty() {
+            return Err("Pick a model before sending.");
+        }
+        Ok(())
+    }
+
+    /// Hand one message to the agent: it becomes a turn and its reply starts.
+    fn send_message(
+        &mut self,
+        message: &str,
+        meta: UserMeta,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+    ) {
+        if !self.agent.push_user(message, meta) {
+            return;
+        }
+        self.error = None;
+        if let Some(request) = self.request(settings, host) {
+            self.agent.start(request);
+        }
+    }
+
+    /// Ask the model again after a run was cut off, like the reference's Continue.
+    fn resume(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
+        if !self.agent.can_resume() {
+            return;
+        }
+        if let Err(error) = self.ready() {
+            self.error = Some(error.to_owned());
+            return;
+        }
+        self.agent.prune_unresolved_tail();
+        if let Some(request) = self.request(settings, host) {
+            self.error = None;
+            self.agent.start(request);
+        }
+    }
+
+    /// Whether a reply is under way but has painted nothing yet.
+    fn waiting_for_the_first_token(&self) -> bool {
+        let Some(Phase::Streaming { turn, .. }) = &self.agent.phase else {
+            return false;
+        };
+        matches!(
+            self.agent.turns.get(*turn),
+            Some(Turn::Assistant { text, .. }) if text.is_empty()
+        )
     }
 
     /// Take the provider list and API keys from the app-wide settings and the vault.
@@ -645,7 +735,7 @@ impl AiAgent {
     /// Title for the header and the stored conversation.
     fn title(&self) -> String {
         let first = self.agent.turns.iter().find_map(|turn| match turn {
-            Turn::User(text) => Some(text.clone()),
+            Turn::User { text, .. } => Some(text.clone()),
             _ => None,
         });
         match first {
@@ -849,65 +939,43 @@ impl AiAgent {
     }
 
     /// Paint the transcript.
-    fn transcript(&self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
+    fn transcript(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
         if self.agent.turns.is_empty() {
-            ui.label(
-                egui::RichText::new("Ask anything about this session.")
-                    .size(12.0)
-                    .color(muted),
+            let empty = if self.providers.is_empty() {
+                "No model providers configured yet. Configure one in Options."
+            } else {
+                "Ask the agent to help with this session. It can use terminal tools when you approve them."
+            };
+            ui.add(
+                egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap(),
             );
         }
-        for turn in &self.agent.turns {
+        let mut rewind = None;
+        for (index, turn) in self.agent.turns.iter().enumerate() {
             match turn {
-                Turn::User(text) => {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(text)
-                                .size(12.5)
-                                .color(to_color32(palette.accent))
-                                .strong(),
-                        )
-                        .wrap(),
-                    );
+                Turn::User { text, meta } => {
+                    if user_bubble(ui, palette, text, *meta) {
+                        rewind = Some(index);
+                    }
                 }
                 Turn::Assistant { text, stopped } => {
                     // Answers are Markdown, like the reference's react-markdown.
                     super::markdown::render(ui, palette, text);
                     if *stopped {
-                        ui.label(egui::RichText::new("stopped").size(10.0).color(muted));
-                    }
-                }
-                Turn::Tool {
-                    label,
-                    output,
-                    failed,
-                    ..
-                } => {
-                    ui.label(
-                        egui::RichText::new(label.as_str())
-                            .size(11.5)
-                            .monospace()
-                            .color(if *failed {
-                                to_color32(palette.danger)
-                            } else {
-                                muted
-                            }),
-                    );
-                    if !output.is_empty() {
-                        let shown = if output.chars().count() > 4_000 {
-                            let head: String = output.chars().take(4_000).collect();
-                            format!("{head}\n…")
-                        } else {
-                            output.clone()
-                        };
                         ui.label(
-                            egui::RichText::new(shown)
+                            egui::RichText::new("interrupted")
                                 .size(11.0)
-                                .monospace()
+                                .italics()
                                 .color(muted),
                         );
                     }
                 }
+                Turn::Tool {
+                    name,
+                    label,
+                    output,
+                    failed,
+                } => tool_card(ui, palette, name, label, output, *failed),
                 Turn::Denied(reason) => {
                     ui.add(
                         egui::Label::new(
@@ -960,8 +1028,196 @@ impl AiAgent {
                     );
                 }
             }
-            ui.add_space(6.0);
+            ui.add_space(TURN_GAP);
         }
+        // The reference shows this until the first token of the reply arrives.
+        if self.waiting_for_the_first_token() {
+            let step = (self.agent.now_ms / THINKING_DOT_MS) as usize;
+            let dots: String = ".".repeat(1 + step % THINKING_DOT_COUNT);
+            ui.label(
+                egui::RichText::new(format!("Thinking{dots}"))
+                    .size(12.0)
+                    .italics()
+                    .color(muted),
+            );
+        }
+        // Clicking a message takes the conversation back to it, like the reference.
+        if let Some(text) = rewind.and_then(|index| self.agent.rewind_to(index)) {
+            self.draft = text;
+            self.attachments.clear();
+            self.attach_terminal = false;
+            self.queued = None;
+        }
+    }
+}
+
+/// A dropdown that never grows past `width`: a long label is cropped rather than
+/// pushing whatever follows it out of the row.
+fn cropped_select<T: Clone + PartialEq>(
+    ui: &mut Ui,
+    id: &str,
+    selected: &T,
+    options: &[(T, &str)],
+    width: f32,
+) -> Option<T> {
+    let height = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.shrink_clip_rect(rect);
+    select_width(&mut child, id, selected, options, width)
+}
+
+/// A user message: a bubble against the right edge, tinted with the accent like the
+/// reference's `.ai-agent-user-text`. Clicking it rewinds the conversation to that point.
+fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bool {
+    let room = ui.available_width() * USER_BUBBLE_SHARE;
+    let fill = to_color32(wassh_core::colors::tint(
+        palette.accent,
+        palette.bg_panel_2,
+        USER_BUBBLE_TINT,
+    ));
+    let border = to_color32(wassh_core::colors::tint(
+        palette.accent,
+        palette.border,
+        USER_BUBBLE_BORDER_TINT,
+    ));
+    let response = ui
+        .with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            egui::Frame::new()
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, border))
+                .corner_radius(wassh_core::RADIUS)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.set_max_width(room);
+                    // What went out with the message, like the reference's ctx tags.
+                    if meta.attachments > 0 || meta.terminal {
+                        let mut tags: Vec<String> = Vec::new();
+                        if meta.attachments > 0 {
+                            let plural = if meta.attachments == 1 { "" } else { "s" };
+                            tags.push(format!("+{} file{plural}", meta.attachments));
+                        }
+                        if meta.terminal {
+                            tags.push("+terminal".to_owned());
+                        }
+                        ui.label(
+                            egui::RichText::new(tags.join("  "))
+                                .size(9.5)
+                                .color(to_color32(palette.text_muted)),
+                        );
+                    }
+                    super::markdown::render(ui, palette, text);
+                })
+                .response
+        })
+        .inner;
+    response
+        .interact(egui::Sense::click())
+        .on_hover_text("Click to rewind to this message")
+        .clicked()
+}
+
+/// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
+/// and the output.
+fn tool_card(ui: &mut Ui, palette: &Palette, name: &str, label: &str, output: &str, failed: bool) {
+    let (badge, colour) = tool_badge(name, palette);
+    let muted = to_color32(palette.text_muted);
+    egui::Frame::new()
+        .fill(to_color32(palette.bg_input))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                badge_pill(ui, palette, badge, colour);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .size(11.0)
+                            .monospace()
+                            .color(to_color32(palette.text)),
+                    )
+                    .truncate(),
+                );
+            });
+            ui.horizontal(|ui| {
+                let outcome = if failed { "failed" } else { "ok" };
+                ui.label(
+                    egui::RichText::new(outcome)
+                        .size(10.0)
+                        .strong()
+                        .color(if failed {
+                            to_color32(palette.danger)
+                        } else {
+                            to_color32(palette.ok)
+                        }),
+                );
+            });
+            if output.is_empty() {
+                ui.label(
+                    egui::RichText::new("(no output)")
+                        .size(11.0)
+                        .color(muted),
+                );
+                return;
+            }
+            let shown = if output.chars().count() > TOOL_OUTPUT_MAX_CHARS {
+                let head: String = output.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+                format!("{head}\n…")
+            } else {
+                output.to_owned()
+            };
+            ui.label(
+                egui::RichText::new(shown)
+                    .size(11.0)
+                    .monospace()
+                    .color(muted),
+            );
+        });
+}
+
+/// One tool's pill, e.g. `SSH` or `REMOTE FILESYSTEM`.
+fn badge_pill(ui: &mut Ui, palette: &Palette, label: &str, colour: wassh_core::Rgba) {
+    egui::Frame::new()
+        .fill(to_color32(wassh_core::colors::tint(
+            colour,
+            palette.bg_panel_2,
+            BADGE_TINT,
+        )))
+        .corner_radius(3)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(label.to_uppercase())
+                    .size(9.0)
+                    .strong()
+                    .color(to_color32(colour)),
+            );
+        });
+}
+
+/// The badge a tool call gets, named after the reference's `toolBadge`.
+fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba) {
+    let rgb = wassh_core::Rgba::rgb;
+    match name {
+        "" | super::protocol::TOOL_RUN_COMMAND => ("SSH", palette.accent),
+        super::protocol::TOOL_RUN_SUDO => ("Root", palette.danger),
+        other if other.starts_with("dev_") || other.starts_with("remote_fs_") => {
+            ("Remote filesystem", rgb(0x3dd68c))
+        }
+        other if other.starts_with("local_fs_") => ("Local PC", rgb(0xf0b429)),
+        super::protocol::TOOL_WEB_SEARCH => ("Search", rgb(0x38bdf8)),
+        super::protocol::TOOL_WEB_FETCH => ("Web", rgb(0xa78bfa)),
+        super::protocol::TOOL_CURRENT_TIME => ("Time", rgb(0xfb7185)),
+        super::protocol::TOOL_RAG_SEARCH => ("RAG", rgb(0xc084fc)),
+        other if other.starts_with("system_") => ("System", rgb(0x2dd4bf)),
+        other if other.starts_with("terminal_") => ("Your terminal", rgb(0xf472b6)),
+        _ => ("Tool", palette.text_muted),
     }
 }
 
@@ -1000,6 +1256,25 @@ impl Plugin for AiAgent {
                 self.agent.start(request);
             }
         }
+        // A queued follow-up goes out as soon as the run in front of it ends.
+        if !self.agent.blocked()
+            && let Some(queued) = self.queued.take()
+        {
+            match self.ready() {
+                Ok(()) => {
+                    self.send_message(
+                        &queued.message,
+                        queued.meta,
+                        context.settings,
+                        &context.host_label,
+                    );
+                }
+                Err(error) => {
+                    self.error = Some(error.to_owned());
+                    self.queued = Some(queued);
+                }
+            }
+        }
         if self.agent.busy() || self.summary.is_some() || self.picking.is_some() || self.fetch.is_some() {
             ui.ctx().request_repaint();
         }
@@ -1013,7 +1288,6 @@ impl Plugin for AiAgent {
         };
 
         let busy = self.agent.busy();
-        let mut sudo_retry = false;
 
         // The pane controls; provider and model live under the composer.
         ui.horizontal(|ui| {
@@ -1041,39 +1315,256 @@ impl Plugin for AiAgent {
 
         // The provider, model and keys are configured in Options → AI agent; the pane
         // only picks which of them this conversation uses.
-
-        // A refused sudo password is asked for here, like the reference.
-        if self.agent.sudo_waiting {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("sudo password").size(11.0).color(muted));
-                let room = (ui.available_width() - 96.0).max(80.0);
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(room, 0.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(room);
-                        text_input(ui, palette, &mut self.sudo, "password");
-                    },
-                );
-                if small_button_enabled(ui, palette, "Run with sudo", !self.sudo.is_empty()) {
-                    sudo_retry = true;
-                }
-            });
-        }
         ui.separator();
 
+        // Everything pinned under the transcript sits in a bottom panel, so the transcript
+        // gets exactly the rest of the pane and no room is left over.
+        let mut submit = false;
+        let mut command: Option<SlashCommand> = None;
+        let slash = parse_slash_input(&self.draft);
+        egui::Panel::bottom("ai-composer")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                // A run cut off before the model answered can be picked up again.
+                if self.agent.can_resume() {
+                    let mut resume = false;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("The previous run was interrupted.")
+                                .size(11.0)
+                                .color(muted),
+                        );
+                        resume = small_button_enabled(ui, palette, "Continue", true);
+                    });
+                    if resume {
+                        self.resume(context.settings, &context.host_label);
+                    }
+                }
+
+                // Attachment chips.
+                if !self.attachments.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut drop = None;
+                        for (index, attachment) in self.attachments.iter().enumerate() {
+                            let label = format!("{} ✕", attachment.name());
+                            if small_button_enabled(ui, palette, &label, true) {
+                                drop = Some(index);
+                            }
+                        }
+                        if let Some(index) = drop {
+                            self.attachments.remove(index);
+                        }
+                    });
+                }
+
+                // Slash suggestions.
+                if let Some(slash) = &slash
+                    && !slash.matches.is_empty()
+                {
+                    for command in &slash.matches {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} — {}",
+                                command.label, command.description
+                            ))
+                            .size(11.0)
+                            .color(muted),
+                        );
+                    }
+                }
+
+                // A message typed while the agent was busy, like the reference's queue strip.
+                if let Some(queued) = self.queued.clone() {
+                    let mut edit = false;
+                    let mut drop = false;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Queued")
+                                .size(10.0)
+                                .strong()
+                                .color(to_color32(palette.accent)),
+                        );
+                        let preview = if queued.text.chars().count() > QUEUE_PREVIEW_MAX_CHARS {
+                            let head: String = queued
+                                .text
+                                .chars()
+                                .take(QUEUE_PREVIEW_MAX_CHARS)
+                                .collect();
+                            format!("{head}…")
+                        } else {
+                            queued.text.clone()
+                        };
+                        let room = (ui.available_width() - 90.0).max(60.0);
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(room, 0.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(room);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(preview).size(11.0).color(muted),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+                        edit = small_button(ui, palette, "Edit");
+                        drop = small_button(ui, palette, "\u{2715}");
+                    });
+                    if edit {
+                        self.draft = queued.text;
+                        self.queued = None;
+                    } else if drop {
+                        self.queued = None;
+                    }
+                }
+
+                // Composer: the include tools stack in a column beside the prompt, both
+                // starting at the prompt's top edge.
+                ui.separator();
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        let attach = Button::new(ATTACH_GLYPH)
+                            .compact()
+                            .enabled(
+                                self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS,
+                            )
+                            .show(ui, palette);
+                        if attach.clicked() {
+                            self.pick_attachments();
+                        }
+                        let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
+                            .compact()
+                            .active(self.attach_terminal)
+                            .show(ui, palette);
+                        if terminal.clicked() {
+                            self.attach_terminal = !self.attach_terminal;
+                        }
+                    });
+                    let room = ui.available_width().max(MIN_COMPOSER_WIDTH);
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(room, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(room);
+                            let response =
+                                text_area(ui, palette, &mut self.draft, 2, "Ask the agent…");
+                            if response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                && !ui.input(|input| input.modifiers.shift)
+                            {
+                                submit = true;
+                            }
+                        },
+                    );
+                });
+
+                // Provider and model, with the action at the right end of the same row.
+                let (chosen_provider, chosen_model, action_clicked) = {
+                    let provider_options: Vec<(usize, &str)> = self
+                        .providers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, provider)| (index, provider.name.as_str()))
+                        .collect();
+                    let model_options: Vec<(String, &str)> = self
+                        .active()
+                        .map(|provider| {
+                            provider
+                                .models
+                                .iter()
+                                .map(|model| (model.clone(), model.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = FOOTER_GAP;
+                        // The reference footer is set in the same small type as the rest.
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Button,
+                            egui::FontId::proportional(FOOTER_TEXT_SIZE),
+                        );
+                        let action = if busy {
+                            Button::new("Stop").compact().kind(ButtonKind::Danger)
+                        } else {
+                            Button::new("Send").compact().enabled(
+                                !self.providers.is_empty() && !self.draft.trim().is_empty(),
+                            )
+                        };
+                        if self.providers.is_empty() {
+                            // The action comes first; the hint is cropped to what is left.
+                            let room = (ui.available_width()
+                                - action.size(ui).x
+                                - FOOTER_GAP)
+                                .max(0.0);
+                            let height = ui.spacing().interact_size.y;
+                            ui.add_sized(
+                                egui::Vec2::new(room, height),
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "No model providers configured — add one in Options.",
+                                    )
+                                    .size(FOOTER_TEXT_SIZE)
+                                    .color(muted),
+                                )
+                                .truncate(),
+                            );
+                            return (None, None, action.show(ui, palette).clicked());
+                        }
+                        // The dropdowns give way to the action, never the other way round.
+                        let spare = (ui.available_width()
+                            - action.size(ui).x
+                            - FOOTER_GAP * 2.0)
+                            .max(0.0);
+                        let select_room = spare / 2.0;
+                        let provider = cropped_select(
+                            ui,
+                            "ai-provider",
+                            &self.provider,
+                            &provider_options,
+                            select_room,
+                        );
+                        let model = cropped_select(
+                            ui,
+                            "ai-model",
+                            &self.model,
+                            &model_options,
+                            select_room,
+                        );
+                        (provider, model, action.show(ui, palette).clicked())
+                    })
+                    .inner
+                };
+                if action_clicked {
+                    if busy {
+                        self.agent.stop();
+                    } else {
+                        submit = true;
+                    }
+                }
+                if let Some(index) = chosen_provider {
+                    self.provider = index;
+                    // A provider starts on its first model, like the reference.
+                    self.model = self
+                        .providers
+                        .get(index)
+                        .and_then(|provider| provider.models.first())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                if let Some(model) = chosen_model {
+                    self.model = model;
+                }
+            });
+
         // Transcript.
-        let composer_height = if self.agent.asking() {
-            COMPOSER_HEIGHT_ASKING
-        } else {
-            COMPOSER_HEIGHT
-        } + FOOTER_HEIGHT;
-        let height = (ui.available_height() - composer_height).max(MIN_TRANSCRIPT_HEIGHT);
         let mut approval: Option<(bool, Option<usize>, bool)> = None;
         let mut answer: Option<String> = None;
+        let mut sudo_answer: Option<SudoAnswer> = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-transcript")
-            .max_height(height)
+            .max_height(ui.available_height())
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -1169,6 +1660,69 @@ impl Plugin for AiAgent {
                     }
                 }
 
+                // The sudo card: the command that needs root, and the password for it.
+                if let Some((command, reason)) = self.agent.sudo_prompt().map(|(c, r)| (c.to_owned(), r.map(str::to_owned))) {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Sudo password required")
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(command.as_str())
+                                .size(11.5)
+                                .monospace()
+                                .color(to_color32(palette.accent)),
+                        )
+                        .wrap(),
+                    );
+                    if let Some(reason) = reason {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(reason)
+                                    .size(11.0)
+                                    .color(muted),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    let room = (ui.available_width() - 8.0).max(80.0);
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(room, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(room);
+                            let response =
+                                password_input(ui, palette, &mut self.sudo, "sudo password");
+                            if response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            {
+                                sudo_answer = Some(SudoAnswer::Run);
+                            }
+                        },
+                    );
+                    ui.horizontal(|ui| {
+                        if Button::new("Continue")
+                            .compact()
+                            .primary()
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            sudo_answer = Some(SudoAnswer::Run);
+                        }
+                        if Button::new("Cancel")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            sudo_answer = Some(SudoAnswer::Cancel);
+                        }
+                    });
+                }
+
                 if let Some(error) = &self.error {
                     ui.add(
                         egui::Label::new(
@@ -1191,152 +1745,13 @@ impl Plugin for AiAgent {
         if let Some(answer) = answer {
             self.agent.answer(&answer, &mut session);
         }
-        if sudo_retry {
-            let password = std::mem::take(&mut self.sudo);
-            self.agent.retry_with_sudo(&password, &mut session);
-        }
-
-        // Attachment chips.
-        if !self.attachments.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                let mut drop = None;
-                for (index, attachment) in self.attachments.iter().enumerate() {
-                    let label = format!("{} ✕", attachment.name());
-                    if small_button_enabled(ui, palette, &label, true) {
-                        drop = Some(index);
-                    }
-                }
-                if let Some(index) = drop {
-                    self.attachments.remove(index);
-                }
-            });
-        }
-
-        // Slash suggestions.
-        let slash = parse_slash_input(&self.draft);
-        if let Some(slash) = &slash
-            && !slash.matches.is_empty()
-        {
-            for command in &slash.matches {
-                ui.label(
-                    egui::RichText::new(format!("{} — {}", command.label, command.description))
-                        .size(11.0)
-                        .color(muted),
-                );
+        match sudo_answer {
+            Some(SudoAnswer::Run) => {
+                let password = std::mem::take(&mut self.sudo);
+                self.agent.submit_sudo(&password, &mut session);
             }
-        }
-
-        // Composer.
-        ui.separator();
-        let mut submit = false;
-        let mut command: Option<SlashCommand> = None;
-        ui.horizontal(|ui| {
-            // Both composer tools sit side by side on the left and share one shape, like the
-            // reference's input-bar buttons; only the toggle's accent shows its state.
-            let attach = Button::new(ATTACH_GLYPH)
-                .compact()
-                .enabled(self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS)
-                .show(ui, palette);
-            if attach.clicked() {
-                self.pick_attachments();
-            }
-            let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
-                .compact()
-                .active(self.attach_terminal)
-                .show(ui, palette);
-            if terminal.clicked() {
-                self.attach_terminal = !self.attach_terminal;
-            }
-            let room = (ui.available_width() - SEND_BUTTON_WIDTH).max(MIN_COMPOSER_WIDTH);
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(room, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_width(room);
-                    let response = text_area(ui, palette, &mut self.draft, 2, "Ask the agent…");
-                    if response.has_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                        && !ui.input(|input| input.modifiers.shift)
-                    {
-                        submit = true;
-                    }
-                },
-            );
-            if busy {
-                if Button::new("Stop")
-                    .compact()
-                    .kind(ButtonKind::Danger)
-                    .show(ui, palette)
-                    .clicked()
-                {
-                    self.agent.stop();
-                }
-            } else if small_button_enabled(
-                ui,
-                palette,
-                "Send",
-                !self.providers.is_empty() && !self.draft.trim().is_empty(),
-            ) {
-                submit = true;
-            }
-        });
-
-        // Provider and model under the composer, like the reference footer.
-        let footer_room = ((ui.available_width() - FOOTER_GAP) / 2.0).max(FOOTER_SELECT_MIN_WIDTH);
-        if self.providers.is_empty() {
-            ui.label(
-                egui::RichText::new("No model providers configured — add one in Options.")
-                    .size(FOOTER_TEXT_SIZE)
-                    .color(muted),
-            );
-        }
-        let (chosen_provider, chosen_model) = {
-            let provider_options: Vec<(usize, &str)> = self
-                .providers
-                .iter()
-                .enumerate()
-                .map(|(index, provider)| (index, provider.name.as_str()))
-                .collect();
-            let model_options: Vec<(String, &str)> = self
-                .active()
-                .map(|provider| {
-                    provider
-                        .models
-                        .iter()
-                        .map(|model| (model.clone(), model.as_str()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if self.providers.is_empty() {
-                (None, None)
-            } else {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = FOOTER_GAP;
-                    // The reference footer is set in the same small type as the rest.
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Button,
-                        egui::FontId::proportional(FOOTER_TEXT_SIZE),
-                    );
-                    let provider =
-                        select_width(ui, "ai-provider", &self.provider, &provider_options, footer_room);
-                    let model = select_width(ui, "ai-model", &self.model, &model_options, footer_room);
-                    (provider, model)
-                })
-                .inner
-            }
-        };
-        if let Some(index) = chosen_provider {
-            self.provider = index;
-            // A provider starts on its first model, like the reference.
-            self.model = self
-                .providers
-                .get(index)
-                .and_then(|provider| provider.models.first())
-                .cloned()
-                .unwrap_or_default();
-        }
-        if let Some(model) = chosen_model {
-            self.model = model;
+            Some(SudoAnswer::Cancel) => self.agent.cancel_sudo(&mut session),
+            None => {}
         }
 
         if submit && !busy && let Some(slash) = &slash && let Some(exact) = slash.exact {
@@ -1344,24 +1759,38 @@ impl Plugin for AiAgent {
         }
         if let Some(command) = command {
             self.run_command(command, context.settings, &context.host_label);
-        } else if submit && !busy && !self.draft.trim().is_empty() {
-            // The toggle attaches the live terminal screen to this one message.
-            let terminal = self
-                .attach_terminal
-                .then(|| {
-                    session
-                        .as_ref()
-                        .map(|access| access.screen_text())
-                        .unwrap_or_default()
-                });
-            let message = self.message_with_attachments(self.draft.trim(), terminal.as_deref());
-            if self.agent.push_user(&message) {
+        } else if submit && !self.draft.trim().is_empty() {
+            // Say why nothing would go out instead of dropping the message silently.
+            if let Err(error) = self.ready() {
+                self.error = Some(error.to_owned());
+            } else {
+                // The toggle attaches the live terminal screen to this one message.
+                let terminal = self
+                    .attach_terminal
+                    .then(|| {
+                        session
+                            .as_ref()
+                            .map(|access| access.screen_text())
+                            .unwrap_or_default()
+                    });
+                let text = self.draft.trim().to_owned();
+                let message = self.message_with_attachments(&text, terminal.as_deref());
+                let meta = UserMeta {
+                    attachments: self.attachments.len(),
+                    terminal: terminal.is_some(),
+                };
                 self.draft.clear();
                 self.attachments.clear();
                 self.attach_terminal = false;
-                let request = self.request(context.settings, &context.host_label);
-                if let Some(request) = request {
-                    self.agent.start(request);
+                if busy {
+                    // The reference queues a follow-up typed during a run.
+                    self.queued = Some(Queued {
+                        text,
+                        message,
+                        meta,
+                    });
+                } else {
+                    self.send_message(&message, meta, context.settings, &context.host_label);
                 }
             }
         }
@@ -1404,6 +1833,10 @@ mod tests {
     /// No secret settings in these tests: panes read them through the context.
     static EMPTY_SECRETS: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+
+    /// Pane widths the layout tests draw at.
+    const WIDE_PANE: f32 = 560.0;
+    const NARROW_PANE: f32 = 120.0;
 
     use super::super::settings_ui::{API_KEYS_KEY, provider_secret_field};
     use super::*;
@@ -1456,83 +1889,258 @@ mod tests {
         painted
     }
 
-    /// Draw the pane and keep every text with the position it was painted at.
-    fn painted_rows(
+    /// One frame of the pane with `events`, collecting every painted text and its position.
+    fn frame(
         plugin: &mut AiAgent,
         settings: &mut serde_json::Map<String, Value>,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
     ) -> Vec<(i32, i32, String)> {
-        let ctx = egui::Context::default();
-        let palette = Palette::dark();
+        frame_at(plugin, settings, ctx, events, WIDE_PANE)
+    }
+
+    /// One frame of the pane drawn `width` points wide.
+    fn frame_at(
+        plugin: &mut AiAgent,
+        settings: &mut serde_json::Map<String, Value>,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> Vec<(i32, i32, String)> {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::Vec2::new(560.0, 760.0),
+                egui::Vec2::new(width, 760.0),
             )),
+            events,
             ..Default::default()
         };
-        let mut rows = Vec::new();
-        for _ in 0..2 {
-            let mut context = PluginContext {
-                palette,
-                host_label: "dev".to_owned(),
-                status: SessionStatus::Connected,
-                settings,
-                scope: "host-1".to_owned(),
-                session: None,
-                events: &[],
-                pending_input: Vec::new(),
-                secrets: &EMPTY_SECRETS,
-                secret_writes: Vec::new(),
-            };
-            let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
-            let shapes = std::mem::take(&mut output.shapes);
-            rows.clear();
-            for clipped in shapes {
-                if let egui::Shape::Text(text) = clipped.shape {
-                    rows.push((
-                        text.pos.y as i32,
-                        text.pos.x as i32,
-                        text.galley.text().to_owned(),
-                    ));
-                }
-            }
-            output.drop_without_applying_deltas();
-        }
+        let mut context = PluginContext {
+            palette: Palette::dark(),
+            host_label: "dev".to_owned(),
+            status: SessionStatus::Connected,
+            settings,
+            scope: "host-1".to_owned(),
+            session: None,
+            events: &[],
+            pending_input: Vec::new(),
+            secrets: &EMPTY_SECRETS,
+            secret_writes: Vec::new(),
+        };
+        let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        let mut rows: Vec<_> = shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    text.pos.y as i32,
+                    text.pos.x as i32,
+                    text.galley.text().to_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
         rows.sort();
         rows
     }
 
+    /// A provider stand-in: lists `models` and answers one chat call with `chat`, then
+    /// reports the chat request it was sent.
+    fn provider(
+        chat: &'static str,
+        models: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let (sender, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let request = read_request(&mut stream);
+                let path = request.split_whitespace().nth(1).unwrap_or_default().to_owned();
+                let reply = if path.contains("models") {
+                    http_response("application/json", models)
+                } else {
+                    http_response("text/event-stream", chat)
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                if !path.contains("models") {
+                    let _ = sender.send(request);
+                    break;
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), requests)
+    }
+
+    /// One readable HTTP response: the body is measured, so the peer needs no chunking.
+    fn http_response(content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Read one whole HTTP request: the head, then the announced body.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(read @ 1..) = stream.read(&mut chunk) {
+            request.extend_from_slice(&chunk[..read]);
+            let Some(head) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let head_text = String::from_utf8_lossy(&request[..head]).to_lowercase();
+            let length: usize = head_text
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if request.len() >= head + 4 + length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
     #[test]
-    fn both_composer_tools_are_the_same_button_on_one_row() {
-        // The terminal toggle used to be a chip of its own between the paperclip and the
-        // prompt, and its glyph had no font, so it read as a broken box.
+    fn a_prompt_is_sent_to_the_provider_and_its_answer_shown() {
+        // What OpenAI-compatible providers really send: a role-only event, a blank line
+        // between events, then the text.
+        const CHAT: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"hello back\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, requests) = provider(CHAT, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
         let mut plugin = AiAgent::default();
-        let mut settings = serde_json::Map::new();
-        let rows = painted_rows(&mut plugin, &mut settings);
-        let attach = rows
+        let ctx = egui::Context::default();
+        plugin.draft = "hello".to_owned();
+        // The composer panel settles its height on the first frame.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let send = rows
             .iter()
-            .find(|(_, _, text)| text == ATTACH_GLYPH)
+            .find(|(_, _, text)| text == "Send")
             .cloned()
-            .expect("the paperclip button is missing");
-        let terminal = rows
+            .expect("the composer has a Send button");
+        let pos = egui::Pos2::new(send.1 as f32 + 4.0, send.0 as f32 + 4.0);
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+
+        // The worker posts the completion as soon as the pane is drawn again.
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the provider was never asked");
+        assert!(request.contains("\"model\": \"test-model\""), "{request}");
+        assert!(request.contains("\"content\": \"hello\""), "{request}");
+
+        // And the answer lands in the transcript.
+        let answered = |plugin: &AiAgent| {
+            plugin.agent.turns.iter().any(|turn| {
+                matches!(turn, Turn::Assistant { text, .. } if text.contains("hello back"))
+            })
+        };
+        for _ in 0..50 {
+            frame(&mut plugin, &mut settings, &ctx, Vec::new());
+            if answered(&plugin) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            answered(&plugin),
+            "the answer never reached the transcript: {:?}",
+            plugin.agent.turns
+        );
+    }
+
+    #[test]
+    fn an_interrupted_run_is_picked_up_by_continue() {
+        const CHAT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"resumed\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, requests) = provider(CHAT, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        // A run cut off after the prompt went out: no reply ever came back.
+        assert!(plugin.agent.push_user("hello", UserMeta::default()));
+        plugin.agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: true,
+        });
+
+        // The composer panel settles its height on the first frame.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let resume = rows
             .iter()
-            .find(|(_, _, text)| text == TERMINAL_ATTACH_GLYPH)
+            .find(|(_, _, text)| text == "Continue")
             .cloned()
-            .expect("the terminal toggle is missing");
-        assert_eq!(
-            attach.0, terminal.0,
-            "both tools sit on one row: {attach:?} vs {terminal:?}"
+            .unwrap_or_else(|| panic!("nothing offers to continue the run: {rows:?}"));
+        let pos = egui::Pos2::new(resume.1 as f32 + 4.0, resume.0 as f32 + 4.0);
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
         );
-        assert!(
-            terminal.1 > attach.1,
-            "the terminal toggle follows the paperclip: {attach:?} vs {terminal:?}"
-        );
-        assert!(
-            terminal.1 - attach.1 < 60,
-            "and sits right next to it, not across the row: {attach:?} vs {terminal:?}"
-        );
-        // ASCII, so the bundled fonts can draw it.
-        assert!(TERMINAL_ATTACH_GLYPH.is_ascii());
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the cut-off run was never resumed");
+        assert!(request.contains("\"content\": \"hello\""), "{request}");
     }
 
     #[test]
@@ -1547,7 +2155,7 @@ mod tests {
             "the missing-provider hint is not shown: {texts:?}"
         );
         assert!(
-            texts.contains(&"Ask anything about this session."),
+            texts.contains(&"No model providers configured yet. Configure one in Options."),
             "empty hint missing: {texts:?}"
         );
         assert!(texts.contains(&"Send"), "composer missing: {texts:?}");
@@ -1796,7 +2404,10 @@ mod tests {
     #[test]
     fn a_long_question_is_cut_short_in_the_header() {
         let mut plugin = AiAgent::default();
-        plugin.agent.turns.push(Turn::User("x".repeat(200)));
+        plugin.agent.turns.push(Turn::User {
+            text: "x".repeat(200),
+            meta: UserMeta::default(),
+        });
         let caption = plugin.title();
         assert_eq!(caption.chars().count(), TITLE_MAX_CHARS + 1);
         assert!(caption.ends_with('…'));
@@ -1866,7 +2477,10 @@ mod tests {
     #[test]
     fn a_new_chat_files_the_old_one_and_reopens_it() {
         let mut plugin = AiAgent::default();
-        plugin.agent.turns.push(Turn::User("first question".to_owned()));
+        plugin.agent.turns.push(Turn::User {
+            text: "first question".to_owned(),
+            meta: UserMeta::default(),
+        });
         plugin.agent.history.push(super::super::protocol::ApiMessage::User {
             content: "first question".to_owned(),
         });
@@ -1889,7 +2503,10 @@ mod tests {
             plugin
                 .agent
                 .turns
-                .push(Turn::User(format!("question {index}")));
+                .push(Turn::User {
+                    text: format!("question {index}"),
+                    meta: UserMeta::default(),
+                });
             plugin.begin_new_chat();
         }
         assert_eq!(plugin.chats.len(), CONVERSATIONS_PER_HOST_MAX);
@@ -1930,15 +2547,113 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_sudo_password_is_asked_for_in_the_pane() {
+    fn the_include_buttons_stack_beside_the_prompt() {
+        // Enough lines that the prompt box is taller than the button column: the column
+        // must stay pinned to the box's top edge instead of being centred against it.
+        let mut plugin = AiAgent {
+            draft: "one\ntwo\nthree\nfour".to_owned(),
+            ..AiAgent::default()
+        };
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        // The composer panel settles its height on the first frame.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let find = |want: &str| {
+            rows.iter()
+                .find(|(_, _, text)| text == want)
+                .cloned()
+                .unwrap_or_else(|| panic!("{want} is missing: {rows:?}"))
+        };
+        let attach = find(ATTACH_GLYPH);
+        let terminal = find(TERMINAL_ATTACH_GLYPH);
+        assert_eq!(
+            attach.1, terminal.1,
+            "the two include tools share one column: {attach:?} vs {terminal:?}"
+        );
+        assert!(
+            terminal.0 > attach.0,
+            "the terminal toggle is the lower one: {attach:?} vs {terminal:?}"
+        );
+        // The top button starts level with the box's first line of text.
+        let prompt = find("one\ntwo\nthree\nfour");
+        assert!(
+            (attach.0 - prompt.0).abs() < 12,
+            "the column is level with the prompt top: {attach:?} vs {prompt:?}"
+        );
+        assert!(
+            (attach.1 - prompt.1).abs() < 60,
+            "the column sits beside the prompt: {attach:?} vs {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_crops_the_dropdowns_instead_of_the_send_button() {
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": "http://127.0.0.1:1", "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent {
+            draft: "hi".to_owned(),
+            ..AiAgent::default()
+        };
+        let ctx = egui::Context::default();
+        // The composer panel settles its height on the first frame.
+        frame_at(&mut plugin, &mut settings, &ctx, Vec::new(), NARROW_PANE);
+        let rows = frame_at(&mut plugin, &mut settings, &ctx, Vec::new(), NARROW_PANE);
+
+        let send = rows
+            .iter()
+            .find(|(_, _, text)| text == "Send")
+            .cloned()
+            .expect("the narrow row still offers Send");
+        assert!(
+            (send.1 as f32) < NARROW_PANE,
+            "Send was pushed out of the pane: {send:?}"
+        );
+        let provider = rows
+            .iter()
+            .find(|(_, _, text)| text == "Local")
+            .cloned()
+            .expect("the provider dropdown is still there");
+        assert!(
+            provider.1 < send.1,
+            "Send stays to the right of the dropdowns: {provider:?} vs {send:?}"
+        );
+    }
+
+    #[test]
+    fn the_sudo_card_names_the_command_and_takes_a_password() {
         let mut plugin = AiAgent::default();
-        plugin.agent.sudo_waiting = true;
-        plugin.agent.last_command = Some("apt-get update".to_owned());
+        plugin.agent.phase = Some(Phase::Sudo {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_SUDO.to_owned(),
+                arguments: r#"{"command":"apt-get update"}"#.to_owned(),
+            },
+            command: "apt-get update".to_owned(),
+            reason: Some("refresh the package lists".to_owned()),
+        });
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
-        assert!(texts.contains(&"sudo password"), "password row missing: {texts:?}");
-        assert!(texts.contains(&"Run with sudo"), "retry button missing: {texts:?}");
+        assert!(
+            texts.contains(&"Sudo password required"),
+            "the card is missing: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"apt-get update"),
+            "the command is not shown: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"refresh the package lists"),
+            "the reason is not shown: {texts:?}"
+        );
+        assert!(texts.contains(&"Continue"), "no way to go on: {texts:?}");
+        assert!(texts.contains(&"Cancel"), "no way out: {texts:?}");
     }
 
     #[test]

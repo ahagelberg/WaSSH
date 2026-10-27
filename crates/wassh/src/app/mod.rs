@@ -3509,6 +3509,152 @@ mod tests {
         assert_eq!(shell.closed.len(), 1, "and stay reopenable");
     }
 
+    /// One shell frame, returning every painted text and its position.
+    fn shell_rows(
+        shell: &mut Shell,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<(i32, i32, String)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| shell.frame(ui));
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        let mut rows: Vec<_> = shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    text.pos.y as i32,
+                    text.pos.x as i32,
+                    text.galley.text().to_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn a_prompt_in_the_ai_agent_pane_reaches_the_provider() {
+        use std::io::{Read, Write};
+        // A provider that lists one model and answers one chat call, reporting what it was
+        // asked.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let (sender, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read @ 1..) = stream.read(&mut chunk) {
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(head) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head_text = String::from_utf8_lossy(&request[..head]).to_lowercase();
+                    let length: usize = head_text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if request.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).into_owned();
+                let listed = text.starts_with("GET ");
+                let body = if listed {
+                    "{\"data\":[{\"id\":\"test-model\"}]}"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{\"content\":\"hello back\"}}]}\n\n\
+                     data: [DONE]\n\n"
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+                if !listed {
+                    let _ = sender.send(text);
+                    break;
+                }
+            }
+        });
+
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.settings.enabled_plugins.push("ai-agent".to_owned());
+        shell
+            .settings
+            .plugin_settings
+            .entry("ai-agent".to_owned())
+            .or_default()
+            .insert(
+                wassh_plugins::ai_agent::PROVIDERS_KEY.to_owned(),
+                serde_json::json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                                     "baseUrl": format!("http://127.0.0.1:{port}"),
+                                     "models": ["test-model"] }]),
+            );
+        shell.open_local();
+        shell.sessions[0].open_plugin(wassh_plugins::PluginId::AiAgent);
+
+        let ctx = egui::Context::default();
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows = shell_rows(&mut shell, &ctx, Vec::new());
+        }
+        // The empty prompt shows its placeholder; clicking it takes the focus.
+        let prompt = rows
+            .iter()
+            .find(|(_, _, text)| text == "Ask the agent…")
+            .cloned()
+            .expect("the AI agent composer shows its prompt");
+        let composer = egui::Pos2::new(prompt.1 as f32 + 8.0, prompt.0 as f32 + 4.0);
+        let click = [
+            egui::Event::PointerMoved(composer),
+            egui::Event::PointerButton {
+                pos: composer,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: composer,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ];
+        shell_rows(&mut shell, &ctx, click.to_vec());
+        shell_rows(&mut shell, &ctx, vec![egui::Event::Text("hello".to_owned())]);
+        shell_rows(
+            &mut shell,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the provider was never asked");
+        assert!(request.contains("\"content\": \"hello\""), "{request}");
+    }
+
     #[test]
     fn a_failed_connection_keeps_its_tab_and_retries() {
         use wassh_core::ReconnectMode;

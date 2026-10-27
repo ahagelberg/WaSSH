@@ -17,6 +17,9 @@ use super::protocol::{
 /// Cap on the error text attached to a failed call.
 pub const MAX_ERROR_BODY_CHARS: usize = 500;
 
+/// Said when the endpoint answered but streamed no events at all.
+pub const NO_STREAM: &str = "The provider sent no event stream — check the base URL and the key.";
+
 /// One completion to request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionRequest {
@@ -412,26 +415,26 @@ pub fn complete(request: &CompletionRequest, events: &Sender<StreamEvent>) {
     };
 
     let mut reader = response.into_body().into_reader();
-    let mut buffer = Vec::new();
     let mut openai = OpenAiStream::default();
     let mut anthropic = AnthropicStream::default();
     let mut line = String::new();
+    let mut saw_payload = false;
     loop {
         line.clear();
         // Read one line at a time so deltas reach the pane as they arrive.
         match read_line(&mut reader, &mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
+            Ok(true) => {}
+            Ok(false) => break,
             Err(error) => {
                 let _ = events
                     .send(StreamEvent::Failed(shorten(format!("reading the stream: {error}"))));
                 return;
             }
         }
-        buffer.push(1u8);
         let Some(payload) = sse_payload(&line) else {
             continue;
         };
+        saw_payload = true;
         let added = match request.protocol {
             Protocol::Openai => openai.push(payload),
             Protocol::Anthropic => anthropic.push(payload),
@@ -443,6 +446,11 @@ pub fn complete(request: &CompletionRequest, events: &Sender<StreamEvent>) {
         }
     }
 
+    if !saw_payload {
+        // A body with no events at all is an error page or the wrong endpoint, not an answer.
+        let _ = events.send(StreamEvent::Failed(NO_STREAM.to_owned()));
+        return;
+    }
     let completion = match request.protocol {
         Protocol::Openai => openai.finish(),
         Protocol::Anthropic => anthropic.finish(),
@@ -450,23 +458,26 @@ pub fn complete(request: &CompletionRequest, events: &Sender<StreamEvent>) {
     let _ = events.send(StreamEvent::Done(completion));
 }
 
-/// One line of a byte stream, without its newline.
-fn read_line(reader: &mut impl std::io::Read, out: &mut String) -> std::io::Result<usize> {
+/// Read one line into `out`, newline dropped; false at the end of the stream.
+///
+/// A blank line is a line of its own — SSE separates events with one — so only
+/// end of stream ends the read.
+fn read_line(reader: &mut impl std::io::Read, out: &mut String) -> std::io::Result<bool> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         match reader.read(&mut byte)? {
-            0 => break,
-            _ => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                bytes.push(byte[0]);
+            0 => {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+                return Ok(!bytes.is_empty());
             }
+            _ if byte[0] == b'\n' => {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+                return Ok(true);
+            }
+            _ => bytes.push(byte[0]),
         }
     }
-    out.push_str(&String::from_utf8_lossy(&bytes));
-    Ok(bytes.len())
 }
 
 /// Cut a message down to the length the reference shows.

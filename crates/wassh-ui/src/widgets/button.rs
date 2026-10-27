@@ -85,13 +85,7 @@ impl<'a> Button<'a> {
     }
 
     pub fn show(self, ui: &mut Ui, palette: &Palette) -> Response {
-        let font = FontId::proportional(self.font_size());
-        let text_width = ui
-            .painter()
-            .layout_no_wrap(self.label.to_owned(), font.clone(), Color32::WHITE)
-            .size()
-            .x;
-        let size = button_size(text_width, self.compact, self.min_width);
+        let size = self.size(ui);
 
         let sense = if self.enabled {
             Sense::click()
@@ -118,10 +112,21 @@ impl<'a> Button<'a> {
             rect.center(),
             Align2::CENTER_CENTER,
             self.label,
-            font,
+            FontId::proportional(self.font_size()),
             text,
         );
         response
+    }
+
+    /// How much room the button needs, for callers that lay it out by hand.
+    pub fn size(&self, ui: &Ui) -> Vec2 {
+        let font = FontId::proportional(self.font_size());
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(self.label.to_owned(), font, Color32::WHITE)
+            .size()
+            .x;
+        button_size(text_width, self.compact, self.min_width)
     }
 
     fn font_size(&self) -> f32 {

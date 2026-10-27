@@ -16,8 +16,9 @@ use wassh_core::{
 use wassh_plugins::settings::{self as plugin_settings, FieldKind, SettingsField};
 use wassh_plugins::PluginId;
 use wassh_ui::widgets::{
-    BannerKind, Button, Tone, badge, banner, card, checkbox, hex_color_input, modal, number_input,
-    password_input, select, select_str, tag_input, text_input,
+    BannerKind, Button, Tone, badge, banner, card, checkbox, footer, hex_color_input, modal,
+    number_input, password_input, select, select_str, small_button, small_button_enabled, tag_input,
+    text_input,
 };
 
 use wassh_ui::terminal_view::to_color32;
@@ -632,6 +633,7 @@ impl Dialogs {
             });
             if !committed {
                 options_plugin_editor(ctx, palette, state);
+                options_provider_dialog(ctx, palette, state);
             }
         }
         if let Some(state) = self.host.as_mut() {
@@ -1069,10 +1071,6 @@ fn tunnel_port(ui: &mut Ui, palette: &Palette, port: &mut u16) {
     });
 }
 
-fn small_button(ui: &mut Ui, palette: &Palette, label: &str) -> bool {
-    Button::new(label).compact().show(ui, palette).clicked()
-}
-
 // --- Options --------------------------------------------------------------
 
 const OPTION_SECTIONS: [&str; 6] = [
@@ -1100,9 +1098,9 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
     } = state;
     // Set while the section closure runs; applied once the shell returns.
     let mut open_editor = None;
-    // The AI agent's "add a provider" dialog is drawn inside this one, so while it is open
-    // Escape closes that dialog and not Options.
-    let adding_provider = ai_providers.dialog_open();
+    // Dialogs the sections open on top of the settings: a plugin's own editor and the
+    // AI agent's provider draft. Escape closes the top one, not Options.
+    let sub_dialog = editor.is_some() || ai_providers.dialog_open();
     // Plugins add one section each after the built-in ones, in plugin order, the
     // same way the original app appends them to its section list.
     let plugin_sections = app_plugin_sections(draft);
@@ -1190,12 +1188,11 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
                 plugin_secrets.clone(),
             ));
         }
-        // With a plugin editor open, Escape closes that editor only.
-        ShellOutcome::Dismissed if editor.is_some() => {
+        // A dialog on top of the settings takes the dismissal, so the settings stay open.
+        ShellOutcome::Dismissed if sub_dialog => {
             *editor = None;
+            ai_providers.cancel();
         }
-        // Likewise for the provider dialog a plugin section draws on top.
-        ShellOutcome::Dismissed if adding_provider => {}
         ShellOutcome::Cancel | ShellOutcome::Dismissed => actions.push(DialogAction::Close),
         ShellOutcome::Delete | ShellOutcome::Apply | ShellOutcome::Pending => {}
     }
@@ -1474,7 +1471,7 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
                         });
                 },
             );
-            wassh_ui::widgets::footer(ui, |ui| {
+            footer(ui, |ui| {
                 if small_button(ui, palette, "Close") {
                     close = true;
                 }
@@ -1492,10 +1489,60 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
     }
 }
 
+/// The AI agent's "add or edit a provider" dialog.
+///
+/// The plugin owns the draft and its fields; the frame, the title, the buttons and
+/// Escape are this app's, so the dialog behaves like every other one here and sits on
+/// top of Options without either dialog knowing the other.
+fn options_provider_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) {
+    if !state.ai_providers.dialog_open() {
+        return;
+    }
+    let OptionsState {
+        draft,
+        ai_providers,
+        plugin_secrets,
+        ..
+    } = state;
+    let values = draft
+        .plugin_settings
+        .entry(PluginId::AiAgent.as_str().to_owned())
+        .or_default();
+    let title = ai_providers.dialog_title();
+    let primary = ai_providers.dialog_primary();
+    let can_commit = ai_providers.can_commit();
+    let mut commit = false;
+    let mut cancel = false;
+    let response = modal(
+        ctx,
+        "ai-agent-provider",
+        palette,
+        title,
+        wassh_plugins::ai_agent::PROVIDER_DIALOG_WIDTH,
+        |ui| {
+            ai_providers.dialog_body(ui, palette, values, plugin_secrets);
+            footer(ui, |ui| {
+                if small_button_enabled(ui, palette, primary, can_commit) {
+                    commit = true;
+                }
+                if small_button(ui, palette, "Cancel") {
+                    cancel = true;
+                }
+            });
+        },
+    );
+    if commit {
+        ai_providers.commit(values, plugin_secrets);
+    } else if cancel || response.dismissed {
+        ai_providers.cancel();
+    }
+}
+
 /// One plugin section's content: its provider list (when it has one) and its settings.
 ///
-/// Everything is drawn inline in the global dialog — the only dialog a plugin section opens
-/// is the one its own editor draws for a single item (adding a provider).
+/// Everything is drawn inline in the global dialog; the only dialog a plugin section opens
+/// is the app's single-item editor, which the AI agent fills with an add/edit provider
+/// draft (see [`options_provider_dialog`]).
 fn plugin_section_rows(
     ui: &mut Ui,
     palette: &Palette,
@@ -3734,47 +3781,90 @@ mod tests {
         assert!(!texts.contains(&"Configure…"));
     }
 
+    /// The Options dialog with the AI agent section scrolled to the top, settled.
+    fn settled_options(
+        ctx: &Context,
+        dialogs: &mut Dialogs,
+        size: Vec2,
+    ) -> Vec<(i32, i32, String)> {
+        let mut rows = Vec::new();
+        for step in 0..12 {
+            if let Some(state) = dialogs.options.as_mut() {
+                state.nav.scroll_to = Some(OPTION_SECTIONS.len());
+            }
+            rows = run_options(ctx, dialogs, size, f64::from(step) * 0.05, Vec::new());
+        }
+        rows
+    }
+
+    /// Click a painted row and return the frame that draws the result.
+    fn click_options(
+        ctx: &Context,
+        dialogs: &mut Dialogs,
+        size: Vec2,
+        row: &(i32, i32, String),
+    ) -> Vec<(i32, i32, String)> {
+        let pos = Pos2::new(row.1 as f32 + 4.0, row.0 as f32 + 4.0);
+        let click = [
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ];
+        run_options(ctx, dialogs, size, 20.0, click.to_vec());
+        // The dialog's area is sized on its first frame, so read the next one.
+        run_options(ctx, dialogs, size, 20.05, Vec::new())
+    }
+
     #[test]
-    fn adding_a_provider_opens_its_dialog() {
-        // The one dialog a plugin section still opens is the single-item editor: adding a
-        // provider. It must appear on top of the section without disturbing it.
+    fn the_provider_dialog_is_one_of_the_apps_dialogs() {
+        // Adding or editing a provider opens the same kind of dialog as everything else
+        // here: the app draws its frame, its buttons and Escape.
         let ctx = Context::default();
-        let size = Vec2::new(1000.0, 2000.0);
-        let mut state = OptionsState::new(&ai_agent_settings(0));
-        let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
-        let (y, x) = rows
+        let size = Vec2::new(1280.0, 1300.0);
+        let mut dialogs = Dialogs {
+            options: Some(OptionsState::new(&ai_agent_settings(0))),
+            ..Dialogs::default()
+        };
+        let rows = settled_options(&ctx, &mut dialogs, size);
+        let add = rows
             .iter()
             .find(|(_, _, text)| text == "+ Add provider")
-            .map(|(y, x, _)| (*y, *x))
+            .cloned()
             .expect("the provider list offers an add button");
-        let pos = Pos2::new(x as f32 + 4.0, y as f32 + 4.0);
-        draw_ai_agent_section(
-            &ctx,
-            size,
-            &mut state,
-            vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Default::default(),
-                },
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: Default::default(),
-                },
-            ],
-            1,
+        let rows = click_options(&ctx, &mut dialogs, size, &add);
+        assert!(
+            dialogs
+                .options
+                .as_ref()
+                .is_some_and(|state| state.ai_providers.dialog_open()),
+            "the draft is open"
         );
-        assert!(state.ai_providers.dialog_open(), "the add dialog should be open");
-        // The next frame draws the section and the dialog together.
-        let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
-        let texts: Vec<_> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
-        assert!(texts.contains(&"Add a provider"), "the add dialog is drawn");
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(texts.contains(&"Add a provider"), "the dialog is drawn");
+        assert!(texts.contains(&"API key"), "with the plugin's fields");
         assert!(texts.contains(&"Providers"), "and the list stays put");
+
+        // Escape closes the dialog on top, not the settings under it.
+        let escape = [egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        run_options(&ctx, &mut dialogs, size, 30.0, escape.to_vec());
+        let state = dialogs.options.as_ref().expect("Options stays open");
+        assert!(!state.ai_providers.dialog_open(), "Escape closed the draft");
     }
 
     /// One Options dialog frame with a clock (the settings scroll area animates its

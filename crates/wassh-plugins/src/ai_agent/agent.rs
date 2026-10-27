@@ -14,7 +14,7 @@ use super::protocol::{
     TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
     TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
     TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
-    TOOL_RUN_COMMAND, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
     TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
@@ -43,19 +43,47 @@ pub const EXEC_KEY: &str = "ai.run_command";
 pub const PROBE_KEY: &str = "ai.probe";
 /// Marker the sudo preamble prints when the password was refused.
 pub const SUDO_AUTH_FAILED_MARKER: &str = "__WASSH_SUDO_FAILED__";
+/// What the user is told when `sudo` refused the password they typed.
+pub const SUDO_REFUSED: &str = "sudo refused the password.";
+/// Said to the model when a command needed root it did not have.
+pub const SUDO_HINT: &str =
+    "[This command needs root: call run_sudo with it so the user can type their password.]";
+/// Lines a shell prints when `sudo` cannot ask for its password.
+const SUDO_DEMAND_MARKERS: [&str; 4] = [
+    "sudo: a password is required",
+    "sudo: no tty present",
+    "sudo: a terminal is required",
+    "must be root",
+];
 /// Longest a `terminal_wait` blocks by default.
 pub const TERMINAL_WAIT_DEFAULT_MS: u64 = 5_000;
+/// Said when a reply arrives with neither text nor tool calls.
+pub const EMPTY_ANSWER: &str = "The model returned an empty answer.";
 /// System prompt used when summarising a chat for a new one.
 pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarise the conversation above for a fresh agent session that must \
 continue the work. Reply with terse bullet points, at most 150 words, covering: Goal (what the user wants), \
 State (what has been done and what was learned, including hosts, paths and commands that matter), Next (the \
 immediate next step). No preamble, no closing sentence.";
 
+/// What went out with the user's message, shown as tags on its bubble.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UserMeta {
+    /// Files attached to the message.
+    pub attachments: usize,
+    /// Whether the terminal screen came along.
+    pub terminal: bool,
+}
+
 /// One line of the transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Turn {
-    /// What the user asked.
-    User(String),
+    /// What the user asked, and what came with it.
+    User {
+        /// The text they typed.
+        text: String,
+        /// Files and terminal output folded into what the model saw.
+        meta: UserMeta,
+    },
     /// What the model answered.
     Assistant {
         /// The text so far.
@@ -124,6 +152,15 @@ pub enum Phase {
         call: ApiToolCall,
         /// The question.
         text: String,
+    },
+    /// A command needs root, so the user is asked for their password.
+    Sudo {
+        /// The call being answered.
+        call: ApiToolCall,
+        /// The command to run as root.
+        command: String,
+        /// Why it needs root, when the model said.
+        reason: Option<String>,
     },
 }
 
@@ -247,8 +284,6 @@ pub struct Agent {
     pub now_ms: u64,
     /// The last command, kept so a refused `sudo` can be retried.
     pub last_command: Option<String>,
-    /// Set when the last command failed because `sudo` wanted a password.
-    pub sudo_waiting: bool,
     /// Tool calls still to run for the current reply.
     queue: VecDeque<ApiToolCall>,
 }
@@ -280,9 +315,19 @@ impl Agent {
         matches!(self.phase, Some(Phase::Asking { .. }))
     }
 
+    /// Whether the pane is asking for a sudo password.
+    pub fn sudo_prompt(&self) -> Option<(&str, Option<&str>)> {
+        match &self.phase {
+            Some(Phase::Sudo {
+                command, reason, ..
+            }) => Some((command.as_str(), reason.as_deref())),
+            _ => None,
+        }
+    }
+
     /// Whether anything at all blocks a new message.
     pub fn blocked(&self) -> bool {
-        self.busy() || self.approving() || self.asking()
+        self.busy() || self.approving() || self.asking() || self.sudo_prompt().is_some()
     }
 
     /// Throw the conversation away.
@@ -296,17 +341,48 @@ impl Agent {
     }
 
     /// Add the user's turn, if the conversation is idle.
-    pub fn push_user(&mut self, text: &str) -> bool {
+    pub fn push_user(&mut self, text: &str, meta: UserMeta) -> bool {
         let text = text.trim();
         if text.is_empty() || self.blocked() {
             return false;
         }
         self.error = None;
-        self.turns.push(Turn::User(text.to_owned()));
+        self.turns.push(Turn::User {
+            text: text.to_owned(),
+            meta,
+        });
         self.history.push(ApiMessage::User {
             content: text.to_owned(),
         });
         true
+    }
+
+    /// Drop everything from the user turn at `index` on, returning its text so the
+    /// composer can take it back — the reference's rewind-on-click.
+    pub fn rewind_to(&mut self, index: usize) -> Option<String> {
+        let text = match self.turns.get(index) {
+            Some(Turn::User { text, .. }) if !self.blocked() => text.clone(),
+            _ => return None,
+        };
+        // Turns and provider messages line up one user turn per user message.
+        let wanted = self.turns[..index]
+            .iter()
+            .filter(|turn| matches!(turn, Turn::User { .. }))
+            .count();
+        if let Some(cut) = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message, ApiMessage::User { .. }))
+            .nth(wanted)
+            .map(|(position, _)| position)
+        {
+            self.history.truncate(cut);
+        }
+        self.turns.truncate(index);
+        self.error = None;
+        self.needs_reply = false;
+        Some(text)
     }
 
     /// Start a reply for the conversation as it stands.
@@ -417,18 +493,30 @@ impl Agent {
                         {
                             self.cwd = directory;
                         }
-                        // A refused sudo password is the user's to resolve.
+                        // The wrapper prints a marker when `sudo` refused the password; say so.
                         let refused_sudo = visible.contains(SUDO_AUTH_FAILED_MARKER);
-                        if refused_sudo {
-                            self.sudo_waiting = true;
-                            self.error = Some("sudo needs your password.".to_owned());
-                            self.needs_reply = false;
+                        let mut visible = if refused_sudo {
+                            visible
+                                .replace(SUDO_AUTH_FAILED_MARKER, SUDO_REFUSED)
+                                .trim_end()
+                                .to_owned()
+                        } else {
+                            visible
+                        };
+                        // A plain `run_command` cannot answer sudo's prompt, so point the
+                        // model at the tool that asks the user for the password.
+                        let plain_command = matches!(
+                            self.turns.get(turn),
+                            Some(Turn::Tool { name, .. }) if name == TOOL_RUN_COMMAND
+                        );
+                        if plain_command && needs_sudo_help(&visible) {
+                            visible.push('\n');
+                            visible.push_str(SUDO_HINT);
                         }
-                        let visible = visible.replace(SUDO_AUTH_FAILED_MARKER, "").trim_end().to_owned();
                         Ready::Settle(
                             self.label(turn),
                             command_result_text(&visible, exit_code, truncated),
-                            exit_code.is_some_and(|code| code != 0) && !refused_sudo,
+                            exit_code.is_some_and(|code| code != 0) || refused_sudo,
                         )
                     }
                     CommandThen::WriteRemote {
@@ -574,10 +662,6 @@ impl Agent {
             Ready::Settle(label, output, failed) => {
                 self.phase = None;
                 self.settle(call, turn, label, output, failed, session);
-                // A refused sudo password waits for the user, not the model.
-                if self.sudo_waiting {
-                    self.needs_reply = false;
-                }
             }
             Ready::WriteRemote(target, payload) => {
                 // An edit packs the diff after a NUL so the file keeps its bytes.
@@ -698,6 +782,12 @@ impl Agent {
                 self.turns.push(Turn::Error(error));
             }
             Ok(completion) => {
+                if completion.text.is_empty() && completion.tool_calls.is_empty() {
+                    // Silence here looks like the pane ignored the prompt.
+                    self.error = Some(EMPTY_ANSWER.to_owned());
+                    self.turns.push(Turn::Error(EMPTY_ANSWER.to_owned()));
+                    return;
+                }
                 if let Some(Turn::Assistant { text, .. }) = self.turns.get_mut(turn)
                     && text.is_empty()
                 {
@@ -827,6 +917,52 @@ impl Agent {
                         });
                     }
                 }
+            }
+            TOOL_RUN_SUDO => {
+                let Some(command) = arguments["command"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .map(str::to_owned)
+                else {
+                    self.settle(
+                        call,
+                        turn,
+                        "run_sudo".to_owned(),
+                        "The command argument was missing or empty.".to_owned(),
+                        true,
+                        session,
+                    );
+                    return;
+                };
+                // The password prompt is the approval: it names the command and only the
+                // user can answer it. Rules that refuse a command still refuse it here.
+                let decision = decide_command(
+                    &command,
+                    Some(&self.host_allow),
+                    Some(&self.host_deny),
+                    Some(&self.app_allow),
+                    Some(&self.app_deny),
+                    &self.session_allow,
+                    &self.session_deny,
+                );
+                if decision == RuleDecision::Deny {
+                    let reason =
+                        format!("Running `{command}` is not allowed by the permission rules.");
+                    let label = call_label(&call);
+                    self.settle(call, turn, label, reason, true, session);
+                    return;
+                }
+                let reason = arguments["reason"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .map(str::to_owned);
+                self.phase = Some(Phase::Sudo {
+                    call,
+                    command,
+                    reason,
+                });
             }
             _ => {
                 if let Some(command) = tools::remote_shell_command(&name, &arguments) {
@@ -1059,6 +1195,16 @@ impl Agent {
         turn: usize,
         session: Session<'_, '_>,
     ) {
+        // A command that calls `sudo` cannot answer the password prompt itself, so it
+        // waits for the user instead of running blind.
+        if sudo_stdin.is_none() && command_needs_sudo(&command) {
+            self.phase = Some(Phase::Sudo {
+                call,
+                command,
+                reason: None,
+            });
+            return;
+        }
         let Some(access) = session.as_mut() else {
             self.settle(
                 call,
@@ -1070,8 +1216,6 @@ impl Agent {
             );
             return;
         };
-        self.last_command = Some(command.clone());
-        self.sudo_waiting = false;
         match &sudo_stdin {
             Some(password) => {
                 let wrapped = wrap_command_with_sudo(&self.cwd, &command);
@@ -1206,42 +1350,31 @@ impl Agent {
         }
     }
 
-    /// Re-run the last command with a `sudo` password on stdin.
-    pub fn retry_with_sudo(&mut self, password: &str, session: Session<'_, '_>) {
-        let Some(command) = self.last_command.clone() else {
+    /// Answer the sudo prompt: run the command with the password on stdin. An empty
+    /// password tries passwordless `sudo`, like the reference.
+    pub fn submit_sudo(&mut self, password: &str, session: Session<'_, '_>) {
+        let Some(Phase::Sudo { call, command, .. }) = self.phase.take() else {
             return;
         };
+        let turn = self.turn_for(&call);
         let password = password.trim().to_owned();
-        if password.is_empty() {
-            return;
-        }
-        self.sudo_waiting = false;
-        self.error = None;
-        // The last tool turn answers again, so reuse it.
-        let turn = self
-            .turns
-            .iter()
-            .rposition(|turn| matches!(turn, Turn::Tool { .. }))
-            .unwrap_or_else(|| {
-                self.turns.push(Turn::Tool {
-                    name: TOOL_RUN_COMMAND.to_owned(),
-                    label: format!("$ {command}"),
-                    output: String::new(),
-                    failed: false,
-                });
-                self.turns.len() - 1
-            });
-        let call = ApiToolCall {
-            id: format!("sudo-{}", self.now_ms),
-            name: TOOL_RUN_COMMAND.to_owned(),
-            arguments: serde_json::json!({ "command": command, "sudoStdin": password }).to_string(),
-        };
-        // The retry is a tool call of its own, so the history stays valid.
-        self.history.push(ApiMessage::Assistant {
-            content: String::new(),
-            tool_calls: vec![call.clone()],
-        });
         self.exec_command(call, command, Some(password), turn, session);
+    }
+
+    /// Refuse the sudo prompt; the model is told the command did not run.
+    pub fn cancel_sudo(&mut self, session: Session<'_, '_>) {
+        let Some(Phase::Sudo { call, command, .. }) = self.phase.take() else {
+            return;
+        };
+        let turn = self.turn_for(&call);
+        self.settle(
+            call,
+            turn,
+            format!("$ sudo {command}"),
+            "The user did not give a sudo password, so the command did not run.".to_owned(),
+            true,
+            session,
+        );
     }
 
     /// Allow every command for the rest of this session, then run this one.
@@ -1297,12 +1430,49 @@ impl Agent {
         std::mem::take(&mut self.needs_reply)
     }
 
+    /// Whether a run was cut off before the model answered — the reference's
+    /// "the previous run was interrupted" state.
+    pub fn can_resume(&self) -> bool {
+        !self.blocked()
+            && matches!(
+                self.history.last(),
+                Some(ApiMessage::User { .. } | ApiMessage::Tool { .. })
+            )
+    }
+
+    /// Drop a reply whose tool calls never all came back, e.g. the app was closed
+    /// mid-tool. Providers reject history that answers a call it does not hold.
+    pub fn prune_unresolved_tail(&mut self) {
+        let Some(position) = self
+            .history
+            .iter()
+            .rposition(|message| matches!(message, ApiMessage::Assistant { .. }))
+        else {
+            return;
+        };
+        let ApiMessage::Assistant { tool_calls, .. } = &self.history[position] else {
+            return;
+        };
+        let mut open: Vec<&str> = tool_calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect();
+        for message in &self.history[position + 1..] {
+            if let ApiMessage::Tool { tool_call_id, .. } = message {
+                open.retain(|id| *id != tool_call_id);
+            }
+        }
+        if !open.is_empty() {
+            self.history.truncate(position);
+        }
+    }
+
     /// The transcript as plain text, for summarising.
     pub fn transcript_text(&self) -> String {
         let mut out = String::new();
         for turn in &self.turns {
             match turn {
-                Turn::User(text) => out.push_str(&format!("User: {text}\n")),
+                Turn::User { text, .. } => out.push_str(&format!("User: {text}\n")),
                 Turn::Assistant { text, .. } => out.push_str(&format!("Assistant: {text}\n")),
                 Turn::Tool { label, output, .. } => {
                     let body: String = output.chars().take(2_000).collect();
@@ -1326,6 +1496,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
     let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     match call.name.as_str() {
         TOOL_RUN_COMMAND => format!("$ {}", arguments["command"].as_str().unwrap_or_default()),
+        TOOL_RUN_SUDO => format!(
+            "$ sudo {}",
+            arguments["command"].as_str().unwrap_or_default()
+        ),
         TOOL_REMOTE_READ | TOOL_LOCAL_READ | TOOL_DEV_VIEW => {
             format!("read {}", arguments["path"].as_str().unwrap_or_default())
         }
@@ -1396,13 +1570,37 @@ pub fn wrap_command(cwd: &str, command: &str) -> String {
     .join("\n")
 }
 
+/// Whether a command's output says it needed root.
+fn needs_sudo_help(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    SUDO_DEMAND_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Whether a command line runs `sudo` at all.
+///
+/// Splits on whitespace and shell separators, then compares the program's name, so
+/// `sudo` and `/usr/bin/sudo` count while `pseudo` does not.
+fn command_needs_sudo(command: &str) -> bool {
+    command
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+        .any(|word| word.rsplit('/').next() == Some("sudo"))
+}
+
 /// Wrap a command that needs `sudo`, reading the password from stdin.
 ///
 /// Port of the reference's sudo preamble: the password is written to the channel
-/// and read with `IFS= read -r`, so it never reaches the command line.
+/// and read with `IFS= read -r`, so it never reaches the command line. The command
+/// itself is run as root unless it already calls `sudo`.
 pub fn wrap_command_with_sudo(cwd: &str, command: &str) -> String {
     let status = "__WASSH_STATUS";
     let pwd = "__WASSH_PWD";
+    let line = if command_needs_sudo(command) {
+        command.to_owned()
+    } else {
+        format!("sudo -n {command}")
+    };
     [
         format!("cd {} >/dev/null 2>&1 || true", shell_quote(cwd)),
         "IFS= read -r __wassh_sudo_pw || true".to_owned(),
@@ -1418,7 +1616,7 @@ pub fn wrap_command_with_sudo(cwd: &str, command: &str) -> String {
         format!("  printf '%s\\n' '{SUDO_AUTH_FAILED_MARKER}'"),
         "  __wassh_status=1".to_owned(),
         "else".to_owned(),
-        format!("  {command}"),
+        format!("  {line}"),
         "  __wassh_status=$?".to_owned(),
         "fi".to_owned(),
         format!(r#"printf '\n{status}:%s__\n' "$__wassh_status""#),
@@ -1502,7 +1700,12 @@ pub fn turns_to_json(turns: &[Turn]) -> Vec<Value> {
     turns
         .iter()
         .map(|turn| match turn {
-            Turn::User(text) => serde_json::json!({ "role": "user", "text": text }),
+            Turn::User { text, meta } => serde_json::json!({
+                "role": "user",
+                "text": text,
+                "attachments": meta.attachments,
+                "terminal": meta.terminal
+            }),
             Turn::Assistant { text, stopped } => {
                 serde_json::json!({ "role": "assistant", "text": text, "stopped": stopped })
             }
@@ -1535,7 +1738,13 @@ pub fn turns_from_json(items: &[Value]) -> Vec<Turn> {
         .filter_map(|item| {
             let text = || item["text"].as_str().unwrap_or_default().to_owned();
             match item["role"].as_str()? {
-                "user" => Some(Turn::User(text())),
+                "user" => Some(Turn::User {
+                    text: text(),
+                    meta: UserMeta {
+                        attachments: item["attachments"].as_u64().unwrap_or(0) as usize,
+                        terminal: item["terminal"].as_bool().unwrap_or(false),
+                    },
+                }),
                 "assistant" => Some(Turn::Assistant {
                     text: text(),
                     stopped: item["stopped"].as_bool().unwrap_or(false),
@@ -1686,9 +1895,93 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_whose_tools_never_came_back_is_dropped_before_resuming() {
+        let call = |id: &str| ApiToolCall {
+            id: id.to_owned(),
+            name: TOOL_RUN_COMMAND.to_owned(),
+            arguments: r#"{"command":"uptime"}"#.to_owned(),
+        };
+        let mut agent = Agent::new();
+        agent.history = vec![
+            ApiMessage::User {
+                content: "go".to_owned(),
+            },
+            ApiMessage::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("a"), call("b")],
+            },
+            ApiMessage::Tool {
+                tool_call_id: "a".to_owned(),
+                content: "up 3 days".to_owned(),
+            },
+        ];
+        assert!(agent.can_resume(), "the model owes an answer to this run");
+        agent.prune_unresolved_tail();
+        assert_eq!(
+            agent.history.len(),
+            1,
+            "the half-answered reply is gone: {:?}",
+            agent.history
+        );
+
+        agent.history.push(ApiMessage::Assistant {
+            content: String::new(),
+            tool_calls: vec![call("c")],
+        });
+        agent.history.push(ApiMessage::Tool {
+            tool_call_id: "c".to_owned(),
+            content: "up 3 days".to_owned(),
+        });
+        agent.prune_unresolved_tail();
+        assert_eq!(agent.history.len(), 3, "a settled reply is kept");
+    }
+
+    #[test]
+    fn rewinding_takes_the_conversation_back_to_the_clicked_message() {
+        let mut agent = Agent::new();
+        assert!(agent.push_user("first", UserMeta::default()));
+        agent.turns.push(Turn::Assistant {
+            text: "one".to_owned(),
+            stopped: false,
+        });
+        assert!(agent.push_user("second", UserMeta::default()));
+        agent.turns.push(Turn::Assistant {
+            text: "two".to_owned(),
+            stopped: false,
+        });
+
+        assert_eq!(agent.rewind_to(2).as_deref(), Some("second"));
+        assert_eq!(
+            agent.turns.iter().filter(|turn| matches!(turn, Turn::User { .. })).count(),
+            1,
+            "the later exchange is gone: {:?}",
+            agent.turns
+        );
+        assert_eq!(
+            agent
+                .history
+                .iter()
+                .filter(|message| matches!(message, ApiMessage::User { .. }))
+                .count(),
+            1,
+            "the provider history is cut to the same point: {:?}",
+            agent.history
+        );
+        assert!(agent.rewind_to(0).is_some(), "the first message can be rewound to too");
+        assert!(agent.turns.is_empty() && agent.history.is_empty());
+        assert_eq!(agent.rewind_to(0), None, "there is nothing left to rewind to");
+    }
+
+    #[test]
     fn the_transcript_round_trips_through_json() {
         let turns = vec![
-            Turn::User("hello".to_owned()),
+            Turn::User {
+                text: "hello".to_owned(),
+                meta: UserMeta {
+                    attachments: 2,
+                    terminal: true,
+                },
+            },
             Turn::Assistant {
                 text: "hi".to_owned(),
                 stopped: false,
@@ -1850,6 +2143,8 @@ mod tests {
         listing: Option<crate::files::SftpListing>,
         contents: std::collections::HashMap<String, String>,
         commands: Vec<(String, String)>,
+        /// What each `exec_input` wrote to stdin.
+        stdin: Vec<String>,
         answers: std::collections::HashMap<String, crate::command::CommandOutput>,
         uploads: Vec<(String, String)>,
         transferring: bool,
@@ -1927,6 +2222,10 @@ mod tests {
     impl crate::command::CommandAccess for FakeSession {
         fn exec(&mut self, key: &str, command: &str) {
             self.commands.push((key.to_owned(), command.to_owned()));
+        }
+        fn exec_input(&mut self, key: &str, command: &str, input: &str) {
+            self.stdin.push(input.to_owned());
+            self.exec(key, command);
         }
         fn output(&self, key: &str) -> Option<&crate::command::CommandOutput> {
             self.answers.get(key)
@@ -2149,24 +2448,32 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_sudo_password_waits_for_the_user_and_then_runs() {
+    fn the_sudo_tool_asks_for_the_password_and_then_runs_the_command() {
         let mut agent = Agent::new();
         agent.app_allow = vec!["apt-get*".to_owned()];
         let mut fake = FakeSession::default();
-        fake.answers.insert(
-            EXEC_KEY.to_owned(),
-            crate::command::CommandOutput {
-                stdout: format!("{SUDO_AUTH_FAILED_MARKER}\n__WASSH_STATUS:1__\n__WASSH_PWD:/__\n"),
-                stderr: String::new(),
-                code: Some(1),
-            },
-        );
-        run_tool(&mut agent, &mut fake, TOOL_RUN_COMMAND, r#"{"command":"apt-get update"}"#);
-        assert!(agent.sudo_waiting, "a refused password must be the user's to fix");
-        assert!(!agent.needs_reply, "the model must not be asked again yet");
-        assert_eq!(agent.last_command.as_deref(), Some("apt-get update"));
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SUDO.to_owned(),
+                    arguments: r#"{"command":"apt-get update","reason":"refresh packages"}"#
+                        .to_owned(),
+                },
+                &mut session,
+            );
+        }
 
-        // Answering with the password re-runs it through `sudo -S`.
+        // Nothing runs until the user types a password.
+        assert!(fake.commands.is_empty(), "the command ran without a password");
+        assert_eq!(
+            agent.sudo_prompt(),
+            Some(("apt-get update", Some("refresh packages"))),
+            "the pane must be told to ask for the password"
+        );
+        assert!(!agent.needs_reply);
+
         fake.answers.insert(
             EXEC_KEY.to_owned(),
             crate::command::CommandOutput {
@@ -2175,12 +2482,73 @@ mod tests {
                 code: Some(0),
             },
         );
-        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
-        agent.retry_with_sudo("hunter2", &mut session);
-        assert!(!agent.sudo_waiting);
-        let sent = &fake.commands.last().expect("a second command").1;
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.submit_sudo("hunter2", &mut session);
+        }
+        assert!(agent.sudo_prompt().is_none(), "the prompt must close");
+        let sent = &fake.commands.last().expect("the command did not run").1;
         assert!(sent.contains("sudo -S -p '' -v"), "{sent}");
+        assert!(sent.contains("apt-get update"), "{sent}");
         assert!(!sent.contains("hunter2"), "the password must not reach the command line");
+        assert_eq!(fake.stdin.last().map(String::as_str), Some("hunter2"));
+    }
+
+    #[test]
+    fn a_command_that_wanted_root_is_answered_with_the_run_sudo_hint() {
+        let mut agent = Agent::new();
+        agent.app_allow = vec!["du*".to_owned()];
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: String::new(),
+                stderr: "sudo: a password is required\n".to_owned(),
+                code: Some(1),
+            },
+        );
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_RUN_COMMAND,
+            r#"{"command":"du -sh /root"}"#,
+        );
+        assert!(output.contains(SUDO_HINT), "the model was not told: {output}");
+        // A failure that has nothing to do with root is left alone.
+        assert!(!needs_sudo_help("cat: missing: No such file or directory"));
+    }
+
+    #[test]
+    fn cancelling_the_sudo_prompt_reports_that_nothing_ran() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SUDO.to_owned(),
+                    arguments: r#"{"command":"systemctl restart nginx"}"#.to_owned(),
+                },
+                &mut session,
+            );
+        }
+        assert!(agent.sudo_prompt().is_some());
+
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.cancel_sudo(&mut session);
+        }
+        assert!(agent.sudo_prompt().is_none());
+        assert!(fake.commands.is_empty(), "a cancelled command must not run");
+        match agent.turns.last() {
+            Some(Turn::Tool { output, failed, .. }) => {
+                assert!(output.contains("did not run"), "{output}");
+                assert!(*failed);
+            }
+            other => panic!("expected a tool turn, got {other:?}"),
+        }
+        assert!(agent.needs_reply, "the model has to be told the tool failed");
     }
 
     #[test]
@@ -2188,16 +2556,71 @@ mod tests {
         let wrapped = wrap_command_with_sudo("/srv", "apt-get update");
         assert!(wrapped.contains("IFS= read -r __wassh_sudo_pw"));
         assert!(wrapped.contains("sudo -S -p '' -v"));
-        assert!(wrapped.contains("apt-get update"));
+        // A bare command is run as root; one that already calls sudo is left alone.
+        assert!(wrapped.contains("sudo -n apt-get update"), "{wrapped}");
+        assert!(!wrapped.contains("sudo -n sudo"));
+        assert!(wrap_command_with_sudo("/srv", "sudo du -sh /root").contains("\n  sudo du -sh /root\n"));
         assert!(wrapped.contains(SUDO_AUTH_FAILED_MARKER));
         // The password itself is never part of the command line.
         assert!(!wrapped.contains("hunter2"));
     }
 
     #[test]
+    fn a_run_command_that_calls_sudo_asks_for_the_password() {
+        let mut agent = Agent::new();
+        agent.app_allow = vec!["sudo*".to_owned()];
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_COMMAND.to_owned(),
+                    arguments: r#"{"command":"sudo du -xhd1 /"}"#.to_owned(),
+                },
+                &mut session,
+            );
+        }
+        assert!(fake.commands.is_empty(), "sudo ran without a password");
+        assert_eq!(agent.sudo_prompt(), Some(("sudo du -xhd1 /", None)));
+
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.submit_sudo("hunter2", &mut session);
+        }
+        let sent = &fake.commands.last().expect("the command did not run").1;
+        assert!(sent.contains("sudo -S -p '' -v"), "{sent}");
+        assert!(sent.contains("\n  sudo du -xhd1 /\n"), "{sent}");
+        assert_eq!(fake.stdin.last().map(String::as_str), Some("hunter2"));
+    }
+
+    #[test]
+    fn a_command_without_sudo_does_not_ask_for_a_password() {
+        let mut agent = Agent::new();
+        agent.app_allow = vec!["du*".to_owned()];
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_COMMAND.to_owned(),
+                    arguments: r#"{"command":"du -sh /tmp"}"#.to_owned(),
+                },
+                &mut session,
+            );
+        }
+        assert!(agent.sudo_prompt().is_none(), "no password is needed here");
+        assert_eq!(fake.commands.len(), 1, "the command runs straight away");
+    }
+
+    #[test]
     fn the_summary_prompt_carries_the_transcript() {
         let mut agent = Agent::new();
-        agent.turns.push(Turn::User("restart nginx".to_owned()));
+        agent.turns.push(Turn::User {
+            text: "restart nginx".to_owned(),
+            meta: UserMeta::default(),
+        });
         agent.turns.push(Turn::Assistant {
             text: "done".to_owned(),
             stopped: false,

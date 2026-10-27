@@ -18,7 +18,7 @@ use super::protocol::{
     TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_CURRENT_TIME,
     TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE,
     TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ,
-    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
+    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
     TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
     TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
@@ -71,6 +71,11 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: TOOL_RUN_COMMAND,
         description: "Run a shell command on the connected SSH host and return its output and exit code.",
+    },
+    ToolSpec {
+        name: TOOL_RUN_SUDO,
+        description: "Run a shell command with root rights. The user is asked for their sudo password \
+first, so use this only when run_command failed for lack of permissions.",
     },
     ToolSpec {
         name: TOOL_ASK_USER,
@@ -213,9 +218,13 @@ fn parameters(name: &str) -> (Value, Value) {
     let boolean = |description: &str| json!({ "type": "boolean", "description": description });
     match name {
         TOOL_RUN_COMMAND => (
+            json!({ "command": string("The command line to run, exactly as it would be typed.") }),
+            json!(["command"]),
+        ),
+        TOOL_RUN_SUDO => (
             json!({
-                "command": string("The command line to run, exactly as it would be typed."),
-                "sudoStdin": string("Password to feed `sudo -S` on stdin, when the command needs it.")
+                "command": string("The command to run as root, without the word sudo."),
+                "reason": string("One line on why it needs root, shown above the password prompt.")
             }),
             json!(["command"]),
         ),
@@ -386,6 +395,7 @@ pub fn needs_session(name: &str) -> bool {
     matches!(
         name,
         TOOL_RUN_COMMAND
+            | TOOL_RUN_SUDO
             | TOOL_REMOTE_READ
             | TOOL_REMOTE_WRITE
             | TOOL_REMOTE_LIST
@@ -1043,9 +1053,10 @@ mod tests {
     #[test]
     fn every_reference_tool_has_a_schema() {
         let schemas = specs();
-        assert_eq!(schemas.len(), 30);
+        assert_eq!(schemas.len(), 31);
         let names: Vec<&str> = schemas.iter().map(|schema| schema["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"run_sudo"));
         assert!(names.contains(&"dev_grep_search"));
         assert!(names.contains(&"terminal_send_keys"));
         assert!(names.contains(&"system_memory_report"));

@@ -32,6 +32,18 @@ const MENU_MIN_WIDTH: f32 = 140.0;
 const MENU_CHECK_WIDTH: f32 = 18.0;
 /// Width of the gear gutter a menu gains when its entries have settings.
 const MENU_GEAR_WIDTH: f32 = 22.0;
+/// Radius of the gear's body ring, measured to its centreline.
+const GEAR_RING_RADIUS: f32 = 3.3;
+/// Thickness of the gear's body ring.
+const GEAR_RING_WIDTH: f32 = 2.6;
+/// Number of teeth around the gear.
+const GEAR_TEETH: usize = 8;
+/// Where a tooth starts, measured from the gear's centre.
+const GEAR_TOOTH_INNER: f32 = 4.0;
+/// Where a tooth ends, measured from the gear's centre.
+const GEAR_TOOTH_OUTER: f32 = 6.2;
+/// Thickness of a tooth.
+const GEAR_TOOTH_WIDTH: f32 = 2.4;
 /// Glyph of a checked entry.
 const MENU_CHECK_GLYPH: &str = "\u{2713}";
 const MENU_PADDING: f32 = 5.0;
@@ -452,22 +464,28 @@ fn dropdown(
     }
 }
 
-/// A small gear: a ring with six teeth. Drawn rather than typed so it looks the
-/// same whatever fonts are configured.
+/// A small gear: a thick body ring with eight teeth, so it reads as a cog at
+/// menu size. Drawn rather than typed so it looks the same whatever fonts are
+/// configured.
 fn paint_gear(painter: &egui::Painter, centre: Pos2, colour: egui::Color32) {
-    let radius = 4.0;
-    painter.circle_stroke(centre, radius, Stroke::new(1.0, colour));
-    for step in 0..6 {
-        let angle = std::f32::consts::TAU * step as f32 / 6.0;
+    for step in 0..GEAR_TEETH {
+        // Teeth sit between the gaps of the ring, so the icon is symmetric.
+        let angle = std::f32::consts::TAU * (step as f32 + 0.5) / GEAR_TEETH as f32;
         let (sin, cos) = angle.sin_cos();
+        let direction = Vec2::new(cos, sin);
         painter.line_segment(
             [
-                Pos2::new(centre.x + cos * (radius + 1.0), centre.y + sin * (radius + 1.0)),
-                Pos2::new(centre.x + cos * (radius + 3.0), centre.y + sin * (radius + 3.0)),
+                centre + direction * GEAR_TOOTH_INNER,
+                centre + direction * GEAR_TOOTH_OUTER,
             ],
-            Stroke::new(1.0, colour),
+            Stroke::new(GEAR_TOOTH_WIDTH, colour),
         );
     }
+    painter.circle_stroke(
+        centre,
+        GEAR_RING_RADIUS,
+        Stroke::new(GEAR_RING_WIDTH, colour),
+    );
 }
 
 /// Which window button to draw.
