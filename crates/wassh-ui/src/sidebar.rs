@@ -217,6 +217,21 @@ pub fn sidebar(
             action = Some(SidebarAction::ToggleCollapsed);
         }
 
+        // The two buttons sit under the list rather than in it, so a list that scrolls
+        // never carries them off screen.
+        egui::Panel::bottom("wassh-sidebar-actions")
+            .frame(
+                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(
+                    LIST_PADDING as i8,
+                    LIST_PADDING as i8,
+                )),
+            )
+            .show(ui, |ui| {
+                if let Some(found) = list_footer(ui, palette) {
+                    action = Some(found);
+                }
+            });
+
         // Host list.
         let list_rect = Rect::from_min_max(
             Pos2::new(header.left(), header.bottom()),
@@ -339,11 +354,28 @@ fn host_list(
         empty_hosts(ui, palette);
     }
 
-    ui.add_space(8.0);
-    let footer_width = ui.available_width();
-    let button_width = ((footer_width - LIST_PADDING * 2.0 - HOST_GAP) / 2.0).max(60.0);
+    // Finish a drag once the pointer is released.
+    let released = ui.ctx().input(|input| input.pointer.any_released());
+    if released
+        && let Some(drag) = state.drag.take()
+        && drag.active
+        && let Some((group, index)) = drop_target
+    {
+        action = Some(SidebarAction::MoveHost {
+            host: drag.host,
+            group,
+            index,
+        });
+    }
+
+    action
+}
+
+/// The "New host…" / "New group" pair, pinned under the scrolling list.
+fn list_footer(ui: &mut Ui, palette: &Palette) -> Option<SidebarAction> {
+    let mut action = None;
+    let button_width = ((ui.available_width() - HOST_GAP) / 2.0).max(60.0);
     ui.horizontal(|ui| {
-        ui.add_space(LIST_PADDING);
         if Button::new("New host…")
             .primary()
             .min_width(button_width)
@@ -361,21 +393,6 @@ fn host_list(
             action = Some(SidebarAction::NewGroup);
         }
     });
-
-    // Finish a drag once the pointer is released.
-    let released = ui.ctx().input(|input| input.pointer.any_released());
-    if released
-        && let Some(drag) = state.drag.take()
-        && drag.active
-        && let Some((group, index)) = drop_target
-    {
-        action = Some(SidebarAction::MoveHost {
-            host: drag.host,
-            group,
-            index,
-        });
-    }
-
     action
 }
 
@@ -821,6 +838,93 @@ mod tests {
             output.drop_without_applying_deltas();
         }
         labels
+    }
+
+    /// Painted labels with the position each was drawn at.
+    fn label_positions(
+        input: &egui::RawInput,
+        hosts: &HostsDocument,
+        state: &mut SidebarState,
+    ) -> Vec<(String, egui::Pos2)> {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let mut labels = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                sidebar(ui, &palette, hosts, state);
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            labels.clear();
+            labels.extend(shapes.into_iter().filter_map(|clipped| match clipped.shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_owned(), text.pos)),
+                _ => None,
+            }));
+            output.drop_without_applying_deltas();
+        }
+        labels
+    }
+
+    #[test]
+    fn the_new_host_buttons_stay_under_a_scrolling_list() {
+        let hosts = HostsDocument {
+            hosts: (0..40)
+                .map(|index| HostProfile {
+                    id: format!("h{index}"),
+                    name: format!("Host {index}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .normalized();
+        let mut state = SidebarState::new();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(240.0, 400.0))),
+            ..Default::default()
+        };
+        let label = |labels: &[(String, egui::Pos2)], needle: &str| {
+            labels
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, pos)| *pos)
+                .unwrap_or_else(|| panic!("{needle} was not painted"))
+        };
+        let before = label_positions(&input, &hosts, &mut state);
+        let new_host = label(&before, "New host…");
+        assert!(
+            before.iter().any(|(text, _)| text == "Host 0"),
+            "the list painted no hosts: {before:?}"
+        );
+        assert!(
+            new_host.y > 340.0,
+            "the button sits at {} instead of under the list",
+            new_host.y
+        );
+
+        // Scrolling the list must not move the buttons.
+        let scrolled = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(Pos2::new(120.0, 150.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -300.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..input.clone()
+        };
+        let after = label_positions(&scrolled, &hosts, &mut state);
+        assert_eq!(label(&after, "New host…"), new_host);
+        let host0 = after
+            .iter()
+            .find(|(text, _)| text == "Host 0")
+            .map(|(_, pos)| *pos);
+        assert!(
+            host0.is_none_or(|pos| pos.y < 0.0),
+            "the list did not scroll: {host0:?}"
+        );
     }
 
     #[test]
