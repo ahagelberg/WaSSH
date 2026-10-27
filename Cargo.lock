@@ -5272,7 +5272,7 @@ dependencies = [
 
 [[package]]
 name = "wassh"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "eframe",
  "egui",
@@ -5290,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "wassh-core"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5298,11 +5298,11 @@ dependencies = [
 
 [[package]]
 name = "wassh-mqtt"
-version = "0.1.0"
+version = "2.0.2"
 
 [[package]]
 name = "wassh-plugins"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "egui",
  "regex",
@@ -5317,7 +5317,7 @@ dependencies = [
 
 [[package]]
 name = "wassh-serial"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "serial2",
@@ -5326,7 +5326,7 @@ dependencies = [
 
 [[package]]
 name = "wassh-ssh"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5343,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "wassh-store"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -5356,7 +5356,7 @@ dependencies = [
 
 [[package]]
 name = "wassh-telnet"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "tokio",
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "wassh-term"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5377,14 +5377,14 @@ dependencies = [
 
 [[package]]
 name = "wassh-term-render"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "wassh-term",
 ]
 
 [[package]]
 name = "wassh-ui"
-version = "0.1.0"
+version = "2.0.2"
 dependencies = [
  "egui",
  "wassh-core",
