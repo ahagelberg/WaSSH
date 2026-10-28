@@ -11,6 +11,7 @@ Native WaSSH desktop client, built as a single self-contained Cargo workspace.
 | `wassh-ssh` | SSH transport: auth, jump chains, channels, tunnels, X11, SFTP |
 | `wassh-term` | Terminal emulation glue (alacritty_terminal), input encoding, selection/search |
 | `wassh-term-render` | Glyph atlas and cell mesh generation |
+| `wassh-sys` | Native facts about this machine through the Win32 API (CPU, memory, disk, network, processes) |
 | `wassh-ui` | egui shell, widget kit, screens |
 | `wassh-plugins` | Internal plugin trait and the eight built-in plugins |
 | `wassh` | Application binary |

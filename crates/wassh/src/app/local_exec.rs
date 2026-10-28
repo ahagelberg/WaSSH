@@ -201,27 +201,4 @@ mod tests {
             "the deadline was not enforced"
         );
     }
-
-    #[test]
-    fn the_monitor_probe_runs_here() {
-        // The very probe the Server Monitor sends also works on this machine, which is
-        // what makes a Local tab sample itself.
-        let output = wait(exec(wassh_plugins::monitor::probe_command(cfg!(windows)), None))
-            .expect("output");
-        assert_eq!(output.exit_status, Some(0));
-        if cfg!(windows) {
-            let (sample, _) = wassh_plugins::monitor::parse_windows_report(&output.stdout, None, 0);
-            assert!(
-                sample.memory.total.is_some(),
-                "the probe printed {:?}",
-                output.stdout
-            );
-        } else {
-            assert!(
-                output.stdout.contains("@@"),
-                "the probe printed {:?}",
-                output.stdout
-            );
-        }
-    }
 }

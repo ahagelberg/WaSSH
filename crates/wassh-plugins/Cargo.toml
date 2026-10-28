@@ -16,4 +16,5 @@ serde_json = { workspace = true }
 ureq = { workspace = true }
 wassh-core = { path = "../wassh-core" }
 wassh-mqtt = { path = "../wassh-mqtt" }
+wassh-sys = { path = "../wassh-sys" }
 wassh-ui = { path = "../wassh-ui" }

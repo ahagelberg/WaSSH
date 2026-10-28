@@ -10,6 +10,7 @@ members = [
     "crates/wassh-serial",
     "crates/wassh-term",
     "crates/wassh-term-render",
+    "crates/wassh-sys",
     "crates/wassh-ui",
     "crates/wassh-plugins",
 ]
@@ -66,6 +67,24 @@ tokio = { version = "1", features = [
     "macros",
 ] }
 vte = "0.15"
+# Win32 bindings for the native system facts; only compiled on Windows.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_WindowsProgramming",
+    "Wdk_System_SystemInformation",
+    "Wdk_System_SystemServices",
+    "Wdk_System_Threading",
+] }
 
 [profile.release]
 lto = "thin"

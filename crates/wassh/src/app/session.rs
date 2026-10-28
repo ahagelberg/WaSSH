@@ -1746,17 +1746,32 @@ impl RemoteCommands {
     }
 }
 
+/// A statistics sample in flight.
+enum MonitorPending {
+    /// The shell probe's answer, parsed when it arrives.
+    Shell(std::sync::mpsc::Receiver<Result<wassh_ssh::ExecOutput, String>>),
+    /// A sample this machine read from its own operating system.
+    Native(std::sync::mpsc::Receiver<NativeSample>),
+}
+
+/// One native sample, with the counters the next one compares against.
+type NativeSample = Result<
+    (
+        wassh_plugins::Snapshot,
+        Option<wassh_plugins::monitor::Counters>,
+    ),
+    String,
+>;
+
 /// System statistics polling for one session.
 #[derive(Default)]
 struct RemoteMonitor {
     /// Probe in flight.
-    pending: Option<std::sync::mpsc::Receiver<Result<wassh_ssh::ExecOutput, String>>>,
+    pending: Option<MonitorPending>,
     /// When the last probe was sent, so polls keep to [`MONITOR_INTERVAL`].
     last_sent: Option<std::time::Instant>,
     /// Counters from the previous sample; every rate is a delta of these.
     counters: Option<wassh_plugins::monitor::Counters>,
-    /// Whether the in-flight probe is the JSON report a local Windows tab answers.
-    windows: bool,
     /// Newest sample.
     sample: Option<wassh_plugins::Snapshot>,
     /// Last failure.
@@ -1774,36 +1789,64 @@ impl RemoteMonitor {
 
     /// Take the answer of a finished probe.
     fn poll(&mut self) {
-        let Some(receiver) = self.pending.take() else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
-        match receiver.try_recv() {
-            Ok(Ok(output)) => {
-                let at_ms = wassh_plugins::connection_logger::now_ms();
-                let (snapshot, counters) = if self.windows {
-                    wassh_plugins::monitor::parse_windows_report(
+        let closed = "the session closed before the sample arrived";
+        match pending {
+            MonitorPending::Shell(receiver) => match receiver.try_recv() {
+                Ok(Ok(output)) => {
+                    let (snapshot, counters) = wassh_plugins::monitor::parse_report(
                         &output.stdout,
                         self.counters.take(),
-                        at_ms,
-                    )
-                } else {
-                    wassh_plugins::monitor::parse_report(
-                        &output.stdout,
-                        self.counters.take(),
-                        at_ms,
-                    )
-                };
-                self.counters = counters;
-                self.sample = Some(snapshot);
-                self.error = None;
-            }
-            Ok(Err(error)) => self.error = Some(error),
-            Err(std::sync::mpsc::TryRecvError::Empty) => self.pending = Some(receiver),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.error = Some("the session closed before the sample arrived".to_owned());
-            }
+                        wassh_plugins::connection_logger::now_ms(),
+                    );
+                    self.counters = counters;
+                    self.sample = Some(snapshot);
+                    self.error = None;
+                }
+                Ok(Err(error)) => self.error = Some(error),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(MonitorPending::Shell(receiver));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.error = Some(closed.to_owned());
+                }
+            },
+            MonitorPending::Native(receiver) => match receiver.try_recv() {
+                Ok(Ok((snapshot, counters))) => {
+                    self.counters = counters;
+                    self.sample = Some(snapshot);
+                    self.error = None;
+                }
+                Ok(Err(error)) => self.error = Some(error),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(MonitorPending::Native(receiver));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.error = Some(closed.to_owned());
+                }
+            },
         }
     }
+}
+
+/// Read one sample of this machine on its own thread, so the frame never waits for it.
+fn sample_this_machine(
+    previous: Option<wassh_plugins::monitor::Counters>,
+) -> std::sync::mpsc::Receiver<NativeSample> {
+    let (sender, receiver) = channel();
+    let unused = sender.clone();
+    let spawned = std::thread::Builder::new()
+        .name("wassh-monitor".to_owned())
+        .spawn(move || {
+            let at_ms = wassh_plugins::connection_logger::now_ms();
+            let _ = sender.send(Ok(wassh_plugins::monitor::native_sample(previous, at_ms)));
+        });
+    if let Err(error) = spawned {
+        let _ = unused.send(Err(format!("starting the sample: {error}")));
+    }
+    receiver
 }
 
 /// What the in-flight remote-file request is for.
@@ -2362,19 +2405,27 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
             return;
         }
         self.monitor.poll();
-        // A Local tab's host is this machine, so the same probe runs locally; a Windows
-        // host has no `/proc`, so it answers with the JSON report instead.
-        let windows = cfg!(windows) && self.connection.kind == ConnectionType::Local;
-        let command = wassh_plugins::monitor::probe_command(windows);
+        // A Local tab's host is this machine: read it with the operating system's own API
+        // where there is one, and with the same shell probe an SSH host gets otherwise.
         let pending = match &self.backend {
-            Backend::Ssh(session) => session.exec(command),
-            _ if self.connection.kind == ConnectionType::Local => local_exec::exec(command, None),
+            Backend::Ssh(session) => {
+                MonitorPending::Shell(session.exec(wassh_plugins::monitor::MONITOR_COMMAND))
+            }
+            _ if self.connection.kind == ConnectionType::Local => {
+                if cfg!(windows) {
+                    MonitorPending::Native(sample_this_machine(self.monitor.counters.take()))
+                } else {
+                    MonitorPending::Shell(local_exec::exec(
+                        wassh_plugins::monitor::MONITOR_COMMAND,
+                        None,
+                    ))
+                }
+            }
             _ => {
                 self.monitor.error = Some(MONITOR_TRANSPORT_ERROR.to_owned());
                 return;
             }
         };
-        self.monitor.windows = windows;
         self.monitor.pending = Some(pending);
         self.monitor.last_sent = Some(std::time::Instant::now());
         self.monitor.error = None;
@@ -2390,6 +2441,24 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
 
     fn last_error(&self) -> Option<&str> {
         self.monitor.error.as_deref()
+    }
+
+    fn native_details(&mut self, pid: u32) -> Option<Result<Vec<(String, String)>, String>> {
+        // Only a Local tab on Windows can read its own processes through the OS.
+        if !(cfg!(windows) && self.connection.kind == ConnectionType::Local) {
+            return None;
+        }
+        Some(
+            wassh_plugins::monitor::native_details(pid)
+                .ok_or_else(|| format!("process {pid} is gone")),
+        )
+    }
+
+    fn native_stop(&mut self, pid: u32, signal: &str) -> Option<Result<(), String>> {
+        if !(cfg!(windows) && self.connection.kind == ConnectionType::Local) {
+            return None;
+        }
+        Some(wassh_plugins::monitor::native_stop(pid, signal))
     }
 }
 

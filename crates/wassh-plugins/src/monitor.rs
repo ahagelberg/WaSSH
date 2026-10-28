@@ -5,7 +5,6 @@
 //! everything here is pure so the parsing can be tested without a host.
 
 use egui::Ui;
-use serde::Deserialize;
 use wassh_core::Palette;
 use wassh_ui::widgets::{
     BannerKind, MenuItem, SLIDER_WIDTH, bar_meter, banner, chip, context_menu, empty_state, faded,
@@ -285,22 +284,8 @@ pub fn signal_command(pid: u32, signal: &str) -> Option<String> {
 }
 
 /// The signals a Windows host understands. It has no POSIX signals, so both of these
-/// stop the process; `KILL` skips the request to close first.
+/// stop the process.
 pub const WINDOWS_SIGNALS: [&str; 2] = ["TERM", "KILL"];
-
-/// The `Stop-Process` command that stops `pid` on a Windows host, or `None` for a
-/// signal Windows cannot deliver.
-pub fn windows_signal_command(pid: u32, signal: &str) -> Option<String> {
-    if pid == 0 || !valid_signal(signal) {
-        return None;
-    }
-    let upper = signal.trim().to_uppercase();
-    match upper.strip_prefix("SIG").unwrap_or(&upper) {
-        "TERM" => Some(format!("Stop-Process -Id {pid}")),
-        "KILL" => Some(format!("Stop-Process -Id {pid} -Force")),
-        _ => None,
-    }
-}
 
 /// Field separator of the details probe: a unit separator, which cannot appear
 /// in `/proc` text.
@@ -335,41 +320,6 @@ pub fn details_command(pid: u32) -> String {
         .map(|(label, command)| format!("echo \"{label}{sep}$({command})\""))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// The details probe for a Windows host: the same `LABEL␟value` rows, read from CIM.
-///
-/// Windows has no `/proc`, so the dialog's groups are filled from `Win32_Process` and
-/// `Get-Process`; the sections that only exist on Unix (working directory, root,
-/// limits, cgroups, environment) are left out.
-pub fn windows_details_command(pid: u32) -> String {
-    format!(
-        r#"$ErrorActionPreference = 'SilentlyContinue'
-$sep = [char]{sep}
-$process = Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -eq {pid} }}
-$owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
-$live = Get-Process -Id {pid}
-$parent = Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -eq $process.ParentProcessId }}
-$parentOwner = Invoke-CimMethod -InputObject $parent -MethodName GetOwner
-$elapsed = [TimeSpan]((Get-Date) - $parent.CreationDate)
-$status = @(
-    'State: ' + $(if ($live.Responding) {{ 'Running' }} else {{ 'Not responding' }})
-    'Threads: ' + $process.ThreadCount
-    'Uid: ' + $owner.User
-    'VmRSS: ' + $process.WorkingSetSize + ' B'
-    'VmSize: ' + $process.VirtualSize + ' B'
-) -join [char]10
-'STATUS' + $sep + $status
-'CMDLINE' + $sep + $process.CommandLine
-'EXE' + $sep + $process.ExecutablePath
-'FDS' + $sep + $process.HandleCount
-$(if ($parent -and $parentOwner.User) {{
-    'PARENT' + $sep + $parent.ProcessId + ' ' + $parentOwner.User + ' ' + $parent.CreationDate.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $elapsed.ToString('dd\.hh\:mm\:ss')
-}})
-"#,
-        sep = DETAILS_SEP as u32,
-        pid = pid
-    )
 }
 
 /// Labelled rows the details dialog shows, parsed from the probe output.
@@ -459,11 +409,11 @@ fn key_value_block(block: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// `ppid user start… elapsed` columns from `ps -o ppid=,user=,lstart=,etime=`, or
-/// from the shorter line a Windows host writes.
+/// Parent/owner/start/elapsed columns from
+/// `ps -o ppid=,user=,lstart=,etime=`.
 fn parent_line(line: &str) -> (String, String, String, String) {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 3 {
+    if parts.len() < 7 {
         return (String::new(), String::new(), String::new(), String::new());
     }
     (
@@ -838,6 +788,18 @@ pub trait MonitorAccess: crate::command::CommandAccess {
     /// Named apart from [`crate::files::SftpAccess::error`] so a pane holding both
     /// capabilities can call either one.
     fn last_error(&self) -> Option<&str>;
+
+    /// Read one process's details straight from the operating system, where it has a
+    /// native reader. `None` means the caller should ask the host with a shell probe.
+    fn native_details(&mut self, _pid: u32) -> Option<Result<Vec<(String, String)>, String>> {
+        None
+    }
+
+    /// Stop a process with the operating system's own call, where it has one. `None`
+    /// means the caller should send a signal instead.
+    fn native_stop(&mut self, _pid: u32, _signal: &str) -> Option<Result<(), String>> {
+        None
+    }
 }
 
 /// `used` as a percentage of `total`, clamped to 0..=100.
@@ -1155,190 +1117,15 @@ pub fn parse_report(text: &str, previous: Option<Counters>, at_ms: u64) -> (Snap
     finish(sample, previous, at_ms)
 }
 
-/// The probe a Local tab runs on Windows.
-///
-/// Windows has neither `/proc` nor `ps`, so PowerShell reads the same numbers from CIM
-/// and answers with one JSON document for [`parse_windows_report`].
-pub const WINDOWS_MONITOR_COMMAND: &str = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-$os = Get-CimInstance Win32_OperatingSystem
-$cpu = @(Get-CimInstance Win32_PerfRawData_PerfOS_Processor)
-$total = $cpu | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
-$cores = @($cpu | Where-Object { $_.Name -ne '_Total' } | ForEach-Object {
-    [pscustomobject]@{
-        idle = [double]$_.PercentIdleTime
-        total = [double]$_.PercentProcessorTime + [double]$_.PercentIdleTime
-    }
-})
-$memTotal = [double]$os.TotalVisibleMemorySize * 1024
-$memFree = [double]$os.FreePhysicalMemory * 1024
-$drive = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $env:SystemDrive } | Select-Object -First 1
-$io = @(Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk | Where-Object { $_.Name -ne '_Total' })
-$net = @(Get-CimInstance Win32_PerfRawData_Tcpip_NetworkInterface |
-    Where-Object { $_.Name -notmatch 'Loopback|isatap|Teredo|Pseudo' } |
-    ForEach-Object {
-        [pscustomobject]@{
-            name = $_.Name
-            rx = [double]$_.BytesReceivedPersec
-            tx = [double]$_.BytesSentPersec
-            speedMbps = [double]$_.CurrentBandwidth / 1000000
-        }
-    })
-$processes = @(Get-Process | Where-Object { $_.Id -ne 0 } | ForEach-Object {
-    [pscustomobject]@{
-        pid = $_.Id
-        cpuS = $_.TotalProcessorTime.TotalSeconds
-        mem = [double]$_.WorkingSet64
-        threads = @($_.Threads).Count
-        command = $_.ProcessName
-    }
-})
-$ips = @(Get-CimInstance Win32_NetworkAdapterConfiguration |
-    Where-Object { $_.IPEnabled } |
-    ForEach-Object { $_.IPAddress } |
-    Where-Object { $_ -notmatch ':' } |
-    Select-Object -First 1)
-[pscustomobject]@{
-    cpu = [pscustomobject]@{
-        idle = [double]$total.PercentIdleTime
-        total = [double]$total.PercentProcessorTime + [double]$total.PercentIdleTime
-        cores = $cores
-    }
-    memory = [pscustomobject]@{
-        total = $memTotal
-        free = $memFree
-        available = $memFree
-        swapTotal = [Math]::Max(0.0, ([double]$os.TotalVirtualMemorySize - [double]$os.TotalVisibleMemorySize) * 1024)
-        swapFree = [Math]::Max(0.0, ([double]$os.FreeVirtualMemory - [double]$os.FreePhysicalMemory) * 1024)
-    }
-    disk = $(if ($drive) {
-        [pscustomobject]@{
-            total = [double]$drive.Size
-            free = [double]$drive.FreeSpace
-            used = [double]$drive.Size - [double]$drive.FreeSpace
-        }
-    } else { $null })
-    uptimeS = ((Get-Date) - $os.LastBootUpTime).TotalSeconds
-    net = $net
-    diskIo = [pscustomobject]@{
-        read = ($io | Measure-Object DiskReadBytesPersec -Sum).Sum
-        write = ($io | Measure-Object DiskWriteBytesPersec -Sum).Sum
-    }
-    processes = $processes
-    system = [pscustomobject]@{
-        os = [string]$os.Caption
-        kernel = [string]$os.Version
-        arch = $env:PROCESSOR_ARCHITECTURE
-        ip = $(if ($ips.Count -gt 0) { [string]$ips[0] } else { $null })
-    }
-} | ConvertTo-Json -Depth 5 -Compress
-"#;
-
-/// The probe to send. `windows` asks for the JSON report a local Windows host can answer.
-pub fn probe_command(windows: bool) -> &'static str {
-    if windows {
-        WINDOWS_MONITOR_COMMAND
-    } else {
-        MONITOR_COMMAND
-    }
-}
-
 /// Rows the process table keeps.
 const PROCESS_ROWS: usize = 30;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WindowsReport {
-    cpu: WindowsCpu,
-    memory: WindowsMemory,
-    disk: Option<WindowsDisk>,
-    uptime_s: Option<f64>,
-    #[serde(default)]
-    net: Vec<WindowsNet>,
-    disk_io: Option<WindowsDiskIo>,
-    #[serde(default)]
-    processes: Vec<WindowsProcess>,
-    system: WindowsSystem,
-}
-
-#[derive(Deserialize)]
-struct WindowsCpu {
-    idle: f64,
-    total: f64,
-    #[serde(default)]
-    cores: Vec<WindowsCore>,
-}
-
-#[derive(Deserialize)]
-struct WindowsCore {
-    idle: f64,
-    total: f64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WindowsMemory {
-    total: Option<f64>,
-    free: Option<f64>,
-    available: Option<f64>,
-    swap_total: Option<f64>,
-    swap_free: Option<f64>,
-}
-
-#[derive(Deserialize)]
-struct WindowsDisk {
-    total: Option<f64>,
-    used: Option<f64>,
-    free: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WindowsNet {
-    name: String,
-    rx: f64,
-    tx: f64,
-    speed_mbps: Option<f64>,
-}
-
-#[derive(Deserialize)]
-struct WindowsDiskIo {
-    read: Option<f64>,
-    write: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WindowsProcess {
-    pid: u32,
-    cpu_s: Option<f64>,
-    mem: Option<f64>,
-    #[serde(default)]
-    threads: u32,
-    command: String,
-}
-
-#[derive(Deserialize)]
-struct WindowsSystem {
-    os: Option<String>,
-    kernel: Option<String>,
-    arch: Option<String>,
-    ip: Option<String>,
-}
-
-/// Bytes from a JSON number; the probe never sends a negative count.
-fn bytes(value: f64) -> u64 {
-    value.max(0.0) as u64
-}
-
-/// Turn the Windows probe's JSON into a snapshot, with the same counters and rates as
-/// the POSIX report.
-pub fn parse_windows_report(
-    text: &str,
-    previous: Option<Counters>,
-    at_ms: u64,
-) -> (Snapshot, Option<Counters>) {
-    let Ok(report) = serde_json::from_str::<WindowsReport>(text.trim()) else {
+/// A sample of this machine read straight from the operating system.
+///
+/// Nothing is spawned: [`wassh_sys`] asks the kernel for the counters, so polling a
+/// Local tab costs a handful of syscalls instead of a shell round trip.
+pub fn native_sample(previous: Option<Counters>, at_ms: u64) -> (Snapshot, Option<Counters>) {
+    let Some(cpu) = wassh_sys::cpu() else {
         return (
             Snapshot {
                 at_ms,
@@ -1347,32 +1134,26 @@ pub fn parse_windows_report(
             None,
         );
     };
-    let uptime_s = report.uptime_s.map(|seconds| seconds.max(0.0) as u64);
-    let memory = Memory {
-        total: report.memory.total.map(bytes),
-        free: report.memory.free.map(bytes),
-        available: report.memory.available.map(bytes),
-        buffers: None,
-        cached: None,
-        swap_total: report.memory.swap_total.map(bytes),
-        swap_free: report.memory.swap_free.map(bytes),
-    };
-    let process_cpu: Vec<(u32, f64)> = report
-        .processes
+    let memory = wassh_sys::memory().unwrap_or_default();
+    let disk = wassh_sys::disk();
+    let interfaces = wassh_sys::network();
+    let processes = wassh_sys::processes();
+    let system = wassh_sys::system();
+    let uptime_s = system.as_ref().map(|system| system.uptime_s);
+
+    let process_cpu: Vec<(u32, f64)> = processes
         .iter()
-        .map(|process| (process.pid, process.cpu_s.unwrap_or(0.0).max(0.0)))
+        .map(|process| (process.pid, process.cpu_s))
         .collect();
     let elapsed_s = previous
         .as_ref()
         .map(|previous| at_ms.saturating_sub(previous.at_ms) as f64 / 1000.0)
         .filter(|seconds| *seconds > 0.0);
-    let mut processes: Vec<Process> = report
-        .processes
+    let mut rows: Vec<Process> = processes
         .iter()
         .map(|process| {
-            let seconds = process.cpu_s.unwrap_or(0.0).max(0.0);
             // A process's CPU share is the growth of its own CPU time; the first sample
-            // has nothing to subtract, so it falls back to the average since start.
+            // has nothing to subtract, so it falls back to the average since boot.
             let cpu = previous
                 .as_ref()
                 .zip(elapsed_s)
@@ -1381,12 +1162,12 @@ pub fn parse_windows_report(
                         .process_cpu
                         .iter()
                         .find(|(pid, _)| *pid == process.pid)
-                        .map(|(_, before)| ((seconds - before) / elapsed * 100.0) as f32)
+                        .map(|(_, before)| ((process.cpu_s - before) / elapsed * 100.0) as f32)
                 })
                 .or_else(|| {
                     uptime_s
                         .filter(|uptime| *uptime > 0)
-                        .map(|uptime| (seconds / uptime as f64 * 100.0) as f32)
+                        .map(|uptime| (process.cpu_s / uptime as f64 * 100.0) as f32)
                 })
                 .unwrap_or(0.0)
                 .max(0.0);
@@ -1397,76 +1178,163 @@ pub fn parse_windows_report(
                 nice: 0,
                 threads: process.threads,
                 cpu,
-                mem: memory
-                    .total
-                    .and_then(|total| percent(bytes(process.mem.unwrap_or(0.0)), total))
-                    .unwrap_or(0.0),
-                command: process.command.clone(),
+                mem: percent(process.working_set, memory.total).unwrap_or(0.0),
+                command: process.name.clone(),
             }
         })
         .collect();
-    let running = processes.iter().filter(|process| process.cpu > 0.0).count() as u32;
-    let total = processes.len() as u32;
-    processes.sort_by(|left, right| right.cpu.total_cmp(&left.cpu));
-    processes.truncate(PROCESS_ROWS);
+    let running = rows.iter().filter(|process| process.cpu > 0.0).count() as u32;
+    let total = rows.len() as u32;
+    rows.sort_by(|left, right| right.cpu.total_cmp(&left.cpu));
+    rows.truncate(PROCESS_ROWS);
 
     let sample = Sample {
         cpu: Some(CpuTimes {
-            total: bytes(report.cpu.total),
-            idle: bytes(report.cpu.idle),
+            total: cpu.total.total,
+            idle: cpu.total.idle,
         }),
-        cores: report
-            .cpu
+        cores: cpu
             .cores
-            .iter()
+            .into_iter()
             .map(|core| CpuTimes {
-                total: bytes(core.total),
-                idle: bytes(core.idle),
+                total: core.total,
+                idle: core.idle,
             })
             .collect(),
         load: [None; 3],
         tasks_running: Some(running),
         tasks_total: Some(total),
-        memory,
-        disk: match report.disk {
+        memory: Memory {
+            total: Some(memory.total),
+            free: Some(memory.available),
+            available: Some(memory.available),
+            buffers: None,
+            cached: None,
+            swap_total: Some(memory.swap_total),
+            swap_free: Some(memory.swap_available),
+        },
+        disk: match disk {
             Some(disk) => (
-                disk.total.map(bytes),
-                disk.used.map(bytes),
-                disk.free.map(bytes),
+                Some(disk.total),
+                Some(disk.total.saturating_sub(disk.free)),
+                Some(disk.free),
             ),
             None => (None, None, None),
         },
-        net: report
-            .net
+        net: interfaces
             .iter()
-            .map(|iface| (iface.name.clone(), bytes(iface.rx), bytes(iface.tx)))
+            .map(|interface| (interface.name.clone(), interface.rx, interface.tx))
             .collect(),
-        speeds: report
-            .net
+        speeds: interfaces
             .iter()
-            .map(|iface| {
-                let speed = iface
-                    .speed_mbps
-                    .filter(|speed| *speed > 0.0)
-                    .map(|speed| speed as u64);
-                (iface.name.clone(), speed)
-            })
+            .map(|interface| (interface.name.clone(), interface.speed_mbps))
             .collect(),
-        disk_io: report
-            .disk_io
-            .map(|io| (bytes(io.read.unwrap_or(0.0)), bytes(io.write.unwrap_or(0.0))))
-            .unwrap_or_default(),
-        processes,
+        disk_io: (
+            processes.iter().map(|process| process.read_bytes).sum(),
+            processes.iter().map(|process| process.write_bytes).sum(),
+        ),
+        processes: rows,
         process_cpu,
         system: SystemInfo {
-            os: report.system.os,
-            kernel: report.system.kernel,
-            arch: report.system.arch,
-            ip: report.system.ip,
+            os: system.as_ref().map(|system| system.os.clone()),
+            kernel: system.as_ref().map(|system| system.kernel.clone()),
+            arch: system.as_ref().map(|system| system.arch.clone()),
+            ip: system.as_ref().and_then(|system| system.ip.clone()),
         },
         uptime_s,
     };
     finish(sample, previous, at_ms)
+}
+
+/// The rows the details dialog shows for a process read from the operating system.
+pub fn details_rows(details: &wassh_sys::ProcessDetails) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut add = |label: &str, value: String| {
+        let value = value.trim();
+        if !value.is_empty() {
+            rows.push((label.to_owned(), value.to_owned()));
+        }
+    };
+    add("Executable", details.executable.clone().unwrap_or_default());
+    add(
+        "Parent PID",
+        if details.parent_pid == 0 {
+            String::new()
+        } else {
+            details.parent_pid.to_string()
+        },
+    );
+    add("Owner", details.owner.clone().unwrap_or_default());
+    add("Started", details.started.clone().unwrap_or_default());
+    add(
+        "Elapsed",
+        if details.elapsed_s == 0 {
+            String::new()
+        } else {
+            format_uptime(details.elapsed_s)
+        },
+    );
+    add(
+        "Threads",
+        if details.threads == 0 {
+            String::new()
+        } else {
+            details.threads.to_string()
+        },
+    );
+    add(
+        "Virtual memory",
+        if details.private_bytes == 0 {
+            String::new()
+        } else {
+            format_bytes(details.private_bytes)
+        },
+    );
+    add(
+        "Resident memory",
+        if details.working_set == 0 {
+            String::new()
+        } else {
+            format_bytes(details.working_set)
+        },
+    );
+    add(
+        "Peak memory",
+        if details.peak_working_set == 0 {
+            String::new()
+        } else {
+            format_bytes(details.peak_working_set)
+        },
+    );
+    add(
+        "Open handles",
+        if details.handles == 0 {
+            String::new()
+        } else {
+            details.handles.to_string()
+        },
+    );
+    rows
+}
+
+/// Read one process's details from the operating system, or `None` when the platform has
+/// no native reader (or the process is gone).
+pub fn native_details(pid: u32) -> Option<Vec<(String, String)>> {
+    wassh_sys::process_details(pid).map(|details| details_rows(&details))
+}
+
+/// Stop a process with the operating system's own call; `signal` is one of
+/// [`WINDOWS_SIGNALS`].
+pub fn native_stop(pid: u32, signal: &str) -> Result<(), String> {
+    if pid == 0 || !valid_signal(signal) {
+        return Err(format!("Cannot send {signal} to {pid}"));
+    }
+    let upper = signal.trim().to_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if !WINDOWS_SIGNALS.contains(&name) {
+        return Err(format!("This host cannot send SIG{name}"));
+    }
+    wassh_sys::stop_process(pid)
 }
 
 /// Build the snapshot and the counters the next sample compares against.
@@ -2898,12 +2766,22 @@ fn processes_card(
 
 /// Ask the host for one process's details.
 fn open_details(access: &mut dyn MonitorAccess, state: &mut PaneState, pid: u32, command: String) {
-    let probe = if state.windows {
-        windows_details_command(pid)
-    } else {
-        details_command(pid)
-    };
-    access.exec(DETAILS_COMMAND_KEY, &probe);
+    if let Some(result) = access.native_details(pid) {
+        let (fields, error) = match result {
+            Ok(fields) => (Some(fields), None),
+            Err(error) => (None, Some(error)),
+        };
+        state.details = Some(Details {
+            pid,
+            command,
+            fields,
+            error,
+            signal: SIGNAL_DEFAULT,
+            loading: false,
+        });
+        return;
+    }
+    access.exec(DETAILS_COMMAND_KEY, &details_command(pid));
     state.details = Some(Details {
         pid,
         command,
@@ -2916,25 +2794,19 @@ fn open_details(access: &mut dyn MonitorAccess, state: &mut PaneState, pid: u32,
 
 /// Send `signal` to `pid` and say how it went.
 fn send_signal(access: &mut dyn MonitorAccess, state: &mut PaneState, pid: u32, signal: &str) {
-    let windows = state.windows;
-    let command = if windows {
-        windows_signal_command(pid, signal)
-    } else {
-        signal_command(pid, signal)
-    };
-    let Some(command) = command else {
+    if let Some(result) = access.native_stop(pid, signal) {
+        state.status = Some(match result {
+            Ok(()) => (format!("Stopped {pid}"), false),
+            Err(error) => (error, true),
+        });
+        return;
+    }
+    let Some(command) = signal_command(pid, signal) else {
         state.status = Some((format!("Cannot send {signal} to {pid}"), true));
         return;
     };
     access.exec(SIGNAL_COMMAND_KEY, &command);
-    state.status = Some((
-        if windows {
-            format!("Stopping {pid}…")
-        } else {
-            format!("Sending SIG{signal} to {pid}…")
-        },
-        false,
-    ));
+    state.status = Some((format!("Sending SIG{signal} to {pid}…"), false));
     if let Some(details) = state.details.as_mut() {
         details.loading = true;
     }
@@ -2953,14 +2825,7 @@ fn poll_details(access: &mut dyn MonitorAccess, state: &mut PaneState) {
         } else if let Some(output) = access.output(SIGNAL_COMMAND_KEY) {
             let pid = details.pid;
             if output.succeeded() {
-                state.status = Some((
-                    if state.windows {
-                        format!("Stopped {pid}")
-                    } else {
-                        format!("Signal sent to {pid}")
-                    },
-                    false,
-                ));
+                state.status = Some((format!("Signal sent to {pid}"), false));
             } else {
                 let detail = output
                     .error_line()
@@ -3238,100 +3103,46 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         assert_eq!(counters.expect("counters").at_ms, 3_000);
     }
 
-    /// One answer of the Windows probe, as PowerShell writes it.
-    const WINDOWS_REPORT: &str = r#"{
-        "cpu": {"idle": 1000, "total": 4000, "cores": [{"idle": 500, "total": 2000}, {"idle": 500, "total": 2000}]},
-        "memory": {"total": 17179869184, "free": 4294967296, "available": 4294967296, "swapTotal": 8589934592, "swapFree": 4294967296},
-        "disk": {"total": 107374182400, "free": 53687091200, "used": 53687091200},
-        "uptimeS": 3600,
-        "net": [{"name": "Ethernet", "rx": 1000, "tx": 2000, "speedMbps": 1000}],
-        "diskIo": {"read": 4096, "write": 8192},
-        "processes": [
-            {"pid": 100, "cpuS": 10, "mem": 858993459, "threads": 4, "command": "alpha"},
-            {"pid": 200, "cpuS": 2, "mem": 42949672, "threads": 2, "command": "beta"}
-        ],
-        "system": {"os": "Microsoft Windows 11 Pro", "kernel": "10.0.22631", "arch": "AMD64", "ip": "192.168.1.5"}
-    }"#;
-
-    /// The same probe ten seconds later: half the new CPU time was busy, 2 kB more
-    /// arrived, 16 kB more was read and `alpha` burnt four more CPU seconds.
-    const WINDOWS_REPORT_LATER: &str = r#"{
-        "cpu": {"idle": 1500, "total": 5000, "cores": [{"idle": 750, "total": 2500}, {"idle": 750, "total": 2500}]},
-        "memory": {"total": 17179869184, "free": 4294967296, "available": 4294967296, "swapTotal": 8589934592, "swapFree": 4294967296},
-        "disk": {"total": 107374182400, "free": 53687091200, "used": 53687091200},
-        "uptimeS": 3610,
-        "net": [{"name": "Ethernet", "rx": 3000, "tx": 2000, "speedMbps": 1000}],
-        "diskIo": {"read": 20480, "write": 8192},
-        "processes": [
-            {"pid": 100, "cpuS": 14, "mem": 858993459, "threads": 4, "command": "alpha"},
-            {"pid": 200, "cpuS": 2, "mem": 42949672, "threads": 2, "command": "beta"}
-        ],
-        "system": {"os": "Microsoft Windows 11 Pro", "kernel": "10.0.22631", "arch": "AMD64", "ip": "192.168.1.5"}
-    }"#;
-
     #[test]
-    fn the_windows_report_becomes_a_snapshot() {
-        let (snapshot, counters) = parse_windows_report(WINDOWS_REPORT, None, 1_000_000);
-        assert_eq!(snapshot.memory.total, Some(17_179_869_184));
-        assert_eq!(snapshot.memory.swap_free, Some(4_294_967_296));
-        assert_eq!(snapshot.disk_total, Some(107_374_182_400));
-        assert_eq!(snapshot.disk_used, Some(53_687_091_200));
-        assert_eq!(snapshot.uptime_s, Some(3600));
-        assert_eq!(snapshot.net.len(), 1);
-        assert_eq!(snapshot.net[0].name, "Ethernet");
-        assert_eq!(snapshot.net[0].rx_total, 1000);
-        assert_eq!(snapshot.net[0].speed, Some(1000));
-        assert_eq!(snapshot.tasks_total, Some(2));
-        assert_eq!(snapshot.tasks_running, Some(2));
-        assert_eq!(snapshot.system.os.as_deref(), Some("Microsoft Windows 11 Pro"));
-        assert_eq!(snapshot.system.ip.as_deref(), Some("192.168.1.5"));
-        // Windows has no load average, and the first sample has no counters to compare.
-        assert_eq!(snapshot.load, [None, None, None]);
-        assert_eq!(snapshot.cpu, None);
-        // Without a previous sample a process shows its average CPU since boot.
-        assert_eq!(snapshot.processes.len(), 2);
-        assert_eq!(snapshot.processes[0].command, "alpha");
-        assert!((snapshot.processes[0].cpu - 10.0 / 36.0).abs() < 0.01);
-        assert!((snapshot.processes[0].mem - 5.0).abs() < 0.01);
-        let counters = counters.expect("counters");
-        assert_eq!(counters.cpu.total, 4000);
-        assert_eq!(counters.process_cpu.len(), 2);
+    fn native_details_fill_the_dialog_rows() {
+        let details = wassh_sys::ProcessDetails {
+            executable: Some("C:\\Windows\\System32\\svchost.exe".to_owned()),
+            parent_pid: 600,
+            owner: Some("NT AUTHORITY\\SYSTEM".to_owned()),
+            started: Some("2026-10-28 13:02:03".to_owned()),
+            elapsed_s: 3725,
+            threads: 12,
+            working_set: 12_345_678,
+            peak_working_set: 20_000_000,
+            private_bytes: 8_765_432,
+            handles: 420,
+        };
+        let rows = details_rows(&details);
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(name, _)| name == label)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(find("Executable"), "C:\\Windows\\System32\\svchost.exe");
+        assert_eq!(find("Parent PID"), "600");
+        assert_eq!(find("Owner"), "NT AUTHORITY\\SYSTEM");
+        assert_eq!(find("Started"), "2026-10-28 13:02:03");
+        assert_eq!(find("Elapsed"), format_uptime(3725));
+        assert_eq!(find("Threads"), "12");
+        assert_eq!(find("Resident memory"), format_bytes(12_345_678));
+        assert_eq!(find("Open handles"), "420");
+        // Nothing is invented for the rows this host does not report.
+        assert!(!rows.iter().any(|(label, _)| label == "Working dir"));
     }
 
     #[test]
-    fn the_next_windows_report_turns_counters_into_rates() {
-        let (_, counters) = parse_windows_report(WINDOWS_REPORT, None, 1_000_000);
-        let (snapshot, _) = parse_windows_report(WINDOWS_REPORT_LATER, counters, 1_010_000);
-        // 500 of the 1000 new processor ticks were busy.
-        assert_eq!(snapshot.cpu, Some(50.0));
-        assert_eq!(snapshot.cores.len(), 2);
-        assert_eq!(snapshot.net[0].rx_rate, Some(200));
-        assert_eq!(snapshot.net[0].tx_rate, Some(0));
-        assert_eq!(snapshot.disk_read_rate, Some(1638));
-        assert_eq!(snapshot.disk_write_rate, Some(0));
-        // `alpha` burnt four of the ten seconds.
-        let alpha = snapshot
-            .processes
-            .iter()
-            .find(|process| process.command == "alpha")
-            .expect("alpha");
-        assert!((alpha.cpu - 40.0).abs() < 0.01, "alpha at {}", alpha.cpu);
-        assert_eq!(alpha.state, "R");
-        let beta = snapshot
-            .processes
-            .iter()
-            .find(|process| process.command == "beta")
-            .expect("beta");
-        assert_eq!(beta.cpu, 0.0);
-        assert_eq!(beta.state, "S");
-    }
-
-    #[test]
-    fn a_broken_windows_report_degrades_instead_of_failing() {
-        let (snapshot, counters) = parse_windows_report("no json here", None, 5);
-        assert_eq!(snapshot.at_ms, 5);
-        assert_eq!(snapshot.memory.total, None);
-        assert!(counters.is_none());
+    fn a_windows_host_only_stops_processes_for_the_signals_it_has() {
+        // No process 0, no invented signal names.
+        assert!(native_stop(0, "TERM").is_err());
+        assert!(native_stop(420, "NOPE").is_err());
+        // Windows cannot deliver the rest of the POSIX signals.
+        assert!(native_stop(420, "USR1").unwrap_err().contains("USR1"));
     }
 
     #[test]
@@ -4153,96 +3964,6 @@ ENVIRON\u{1f}HOME=/home/brainchild\n";
         assert_eq!(find("Max open files"), "1024 files");
         // Nothing was invented for the probes the host did not answer.
         assert!(parse_details("").is_empty());
-    }
-
-    /// A details answer from a Windows host, in the same row format.
-    const WINDOWS_DETAILS_PROBE: &str = "STATUS\u{1f}State: Running\r\n\
-Threads: 12\r\n\
-Uid: andreashagelberg\r\n\
-VmRSS: 12345678 B\r\n\
-VmSize: 87654321 B\r\n\
-CMDLINE\u{1f}\"C:\\Windows\\System32\\svchost.exe\" -k netsvcs\r\n\
-EXE\u{1f}C:\\Windows\\System32\\svchost.exe\r\n\
-FDS\u{1f}420\r\n\
-PARENT\u{1f}600 andreashagelberg 2026-10-28 13:02:03 00.01:02:05\r\n";
-
-    #[test]
-    fn a_windows_host_answers_the_details_rows() {
-        let rows = parse_details(WINDOWS_DETAILS_PROBE);
-        let find = |label: &str| {
-            rows.iter()
-                .find(|(name, _)| name == label)
-                .map(|(_, value)| value.clone())
-                .unwrap_or_default()
-        };
-        assert_eq!(
-            find("Command line"),
-            "\"C:\\Windows\\System32\\svchost.exe\" -k netsvcs"
-        );
-        assert_eq!(find("Executable"), "C:\\Windows\\System32\\svchost.exe");
-        assert_eq!(find("Parent PID"), "600");
-        assert_eq!(find("Owner"), "andreashagelberg");
-        assert_eq!(find("Started"), "2026-10-28 13:02:03");
-        assert_eq!(find("Elapsed"), "00.01:02:05");
-        assert_eq!(find("State"), "Running");
-        assert_eq!(find("Threads"), "12");
-        assert_eq!(find("Resident memory"), "12345678 B");
-        assert_eq!(find("Open file descriptors"), "420");
-        // Windows has no working directory, root, cgroup or limits groups.
-        assert!(!rows.iter().any(|(label, _)| label == "Working dir"));
-    }
-
-    #[test]
-    fn a_windows_host_is_probed_with_powershell() {
-        let command = windows_details_command(420);
-        assert!(command.contains("ProcessId -eq 420"), "{command}");
-        assert!(!command.contains("/proc"), "{command}");
-        assert_eq!(
-            windows_signal_command(420, "KILL").as_deref(),
-            Some("Stop-Process -Id 420 -Force")
-        );
-        assert_eq!(
-            windows_signal_command(420, "TERM").as_deref(),
-            Some("Stop-Process -Id 420")
-        );
-        // Windows cannot deliver the rest of the POSIX signals.
-        assert_eq!(windows_signal_command(420, "USR1"), None);
-    }
-
-    #[test]
-    fn a_windows_host_stops_a_process_instead_of_signalling_it() {
-        let mut access = FakeMonitor::default();
-        let mut state = PaneState {
-            windows: true,
-            ..PaneState::default()
-        };
-
-        open_details(&mut access, &mut state, 420, "svchost".to_owned());
-        assert_eq!(access.commands[0].0, DETAILS_COMMAND_KEY);
-        assert!(access.commands[0].1.contains("ProcessId -eq 420"));
-
-        send_signal(&mut access, &mut state, 420, "KILL");
-        assert_eq!(
-            access.commands[1],
-            (
-                SIGNAL_COMMAND_KEY.to_owned(),
-                "Stop-Process -Id 420 -Force".to_owned()
-            )
-        );
-        assert!(
-            state
-                .status
-                .as_ref()
-                .is_some_and(|(line, failed)| !*failed && line.contains("420"))
-        );
-
-        send_signal(&mut access, &mut state, 420, "USR1");
-        assert!(
-            state
-                .status
-                .as_ref()
-                .is_some_and(|(line, failed)| *failed && line.contains("USR1"))
-        );
     }
 
     #[test]

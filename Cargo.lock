@@ -5312,6 +5312,7 @@ dependencies = [
  "ureq",
  "wassh-core",
  "wassh-mqtt",
+ "wassh-sys",
  "wassh-ui",
 ]
 
@@ -5352,6 +5353,13 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "wassh-core",
+]
+
+[[package]]
+name = "wassh-sys"
+version = "2.0.2"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
