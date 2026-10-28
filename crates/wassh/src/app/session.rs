@@ -1755,6 +1755,8 @@ struct RemoteMonitor {
     last_sent: Option<std::time::Instant>,
     /// Counters from the previous sample; every rate is a delta of these.
     counters: Option<wassh_plugins::monitor::Counters>,
+    /// Whether the in-flight probe is the JSON report a local Windows tab answers.
+    windows: bool,
     /// Newest sample.
     sample: Option<wassh_plugins::Snapshot>,
     /// Last failure.
@@ -1777,11 +1779,20 @@ impl RemoteMonitor {
         };
         match receiver.try_recv() {
             Ok(Ok(output)) => {
-                let (snapshot, counters) = wassh_plugins::monitor::parse_report(
-                    &output.stdout,
-                    self.counters.take(),
-                    wassh_plugins::connection_logger::now_ms(),
-                );
+                let at_ms = wassh_plugins::connection_logger::now_ms();
+                let (snapshot, counters) = if self.windows {
+                    wassh_plugins::monitor::parse_windows_report(
+                        &output.stdout,
+                        self.counters.take(),
+                        at_ms,
+                    )
+                } else {
+                    wassh_plugins::monitor::parse_report(
+                        &output.stdout,
+                        self.counters.take(),
+                        at_ms,
+                    )
+                };
                 self.counters = counters;
                 self.sample = Some(snapshot);
                 self.error = None;
@@ -2351,8 +2362,10 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
             return;
         }
         self.monitor.poll();
-        // A Local tab's host is this machine, so the same probe runs locally.
-        let command = wassh_plugins::monitor::MONITOR_COMMAND;
+        // A Local tab's host is this machine, so the same probe runs locally; a Windows
+        // host has no `/proc`, so it answers with the JSON report instead.
+        let windows = cfg!(windows) && self.connection.kind == ConnectionType::Local;
+        let command = wassh_plugins::monitor::probe_command(windows);
         let pending = match &self.backend {
             Backend::Ssh(session) => session.exec(command),
             _ if self.connection.kind == ConnectionType::Local => local_exec::exec(command, None),
@@ -2361,6 +2374,7 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
                 return;
             }
         };
+        self.monitor.windows = windows;
         self.monitor.pending = Some(pending);
         self.monitor.last_sent = Some(std::time::Instant::now());
         self.monitor.error = None;
@@ -2903,24 +2917,38 @@ mod tests {
         assert_eq!(entry.last_error(), Some(MONITOR_TRANSPORT_ERROR));
     }
 
+    /// Prints `local` on this platform's shell.
+    #[cfg(unix)]
+    const ECHO_LOCAL: &str = "printf 'local'";
+    #[cfg(windows)]
+    const ECHO_LOCAL: &str = "'local'";
+
+    /// Echoes its stdin back on this platform's shell.
+    #[cfg(unix)]
+    const ECHO_STDIN: &str = "cat";
+    #[cfg(windows)]
+    const ECHO_STDIN: &str = "[Console]::In.ReadToEnd()";
+
     #[test]
     fn commands_run_on_this_machine_for_a_local_session() {
         use wassh_plugins::CommandAccess as _;
         let mut entry = local_entry("t-local-command");
 
-        entry.exec("probe", "printf 'local'");
+        entry.exec("probe", ECHO_LOCAL);
         settle_command(&mut entry, "probe");
         let output = entry.output("probe").expect("output");
-        assert_eq!(output.stdout, "local");
+        assert_eq!(output.stdout.trim(), "local");
         assert_eq!(output.code, Some(0));
         assert!(entry.failure("probe").is_none());
 
         // stdin travels too, which is how `sudo -S` gets its password.
-        entry.exec_input("stdin", "cat", "s3cret");
+        entry.exec_input("stdin", ECHO_STDIN, "s3cret");
         settle_command(&mut entry, "stdin");
         assert_eq!(
-            entry.output("stdin").map(|output| output.stdout.as_str()),
-            Some("s3cret\n")
+            entry
+                .output("stdin")
+                .map(|output| output.stdout.trim().to_owned()),
+            Some("s3cret".to_owned())
         );
     }
 

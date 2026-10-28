@@ -5,6 +5,7 @@
 //! everything here is pure so the parsing can be tested without a host.
 
 use egui::Ui;
+use serde::Deserialize;
 use wassh_core::Palette;
 use wassh_ui::widgets::{
     BannerKind, MenuItem, SLIDER_WIDTH, bar_meter, banner, chip, context_menu, empty_state, faded,
@@ -283,6 +284,24 @@ pub fn signal_command(pid: u32, signal: &str) -> Option<String> {
     Some(format!("kill -s {name} {pid}"))
 }
 
+/// The signals a Windows host understands. It has no POSIX signals, so both of these
+/// stop the process; `KILL` skips the request to close first.
+pub const WINDOWS_SIGNALS: [&str; 2] = ["TERM", "KILL"];
+
+/// The `Stop-Process` command that stops `pid` on a Windows host, or `None` for a
+/// signal Windows cannot deliver.
+pub fn windows_signal_command(pid: u32, signal: &str) -> Option<String> {
+    if pid == 0 || !valid_signal(signal) {
+        return None;
+    }
+    let upper = signal.trim().to_uppercase();
+    match upper.strip_prefix("SIG").unwrap_or(&upper) {
+        "TERM" => Some(format!("Stop-Process -Id {pid}")),
+        "KILL" => Some(format!("Stop-Process -Id {pid} -Force")),
+        _ => None,
+    }
+}
+
 /// Field separator of the details probe: a unit separator, which cannot appear
 /// in `/proc` text.
 const DETAILS_SEP: char = '\u{1f}';
@@ -316,6 +335,41 @@ pub fn details_command(pid: u32) -> String {
         .map(|(label, command)| format!("echo \"{label}{sep}$({command})\""))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// The details probe for a Windows host: the same `LABEL␟value` rows, read from CIM.
+///
+/// Windows has no `/proc`, so the dialog's groups are filled from `Win32_Process` and
+/// `Get-Process`; the sections that only exist on Unix (working directory, root,
+/// limits, cgroups, environment) are left out.
+pub fn windows_details_command(pid: u32) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'SilentlyContinue'
+$sep = [char]{sep}
+$process = Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -eq {pid} }}
+$owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
+$live = Get-Process -Id {pid}
+$parent = Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -eq $process.ParentProcessId }}
+$parentOwner = Invoke-CimMethod -InputObject $parent -MethodName GetOwner
+$elapsed = [TimeSpan]((Get-Date) - $parent.CreationDate)
+$status = @(
+    'State: ' + $(if ($live.Responding) {{ 'Running' }} else {{ 'Not responding' }})
+    'Threads: ' + $process.ThreadCount
+    'Uid: ' + $owner.User
+    'VmRSS: ' + $process.WorkingSetSize + ' B'
+    'VmSize: ' + $process.VirtualSize + ' B'
+) -join [char]10
+'STATUS' + $sep + $status
+'CMDLINE' + $sep + $process.CommandLine
+'EXE' + $sep + $process.ExecutablePath
+'FDS' + $sep + $process.HandleCount
+$(if ($parent -and $parentOwner.User) {{
+    'PARENT' + $sep + $parent.ProcessId + ' ' + $parentOwner.User + ' ' + $parent.CreationDate.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $elapsed.ToString('dd\.hh\:mm\:ss')
+}})
+"#,
+        sep = DETAILS_SEP as u32,
+        pid = pid
+    )
 }
 
 /// Labelled rows the details dialog shows, parsed from the probe output.
@@ -405,11 +459,11 @@ fn key_value_block(block: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// Parent/owner/start/elapsed columns from
-/// `ps -o ppid=,user=,lstart=,etime=`.
+/// `ppid user start… elapsed` columns from `ps -o ppid=,user=,lstart=,etime=`, or
+/// from the shorter line a Windows host writes.
 fn parent_line(line: &str) -> (String, String, String, String) {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 7 {
+    if parts.len() < 3 {
         return (String::new(), String::new(), String::new(), String::new());
     }
     (
@@ -545,6 +599,8 @@ pub struct Counters {
     pub net: Vec<(String, u64, u64)>,
     pub disk_read: u64,
     pub disk_write: u64,
+    /// Cumulative CPU seconds per process, for hosts that report times rather than a rate.
+    pub process_cpu: Vec<(u32, f64)>,
 }
 
 /// Space kept free on the right for the pane's scrollbar.
@@ -1045,6 +1101,26 @@ pub fn parse_system(text: &str) -> SystemInfo {
     }
 }
 
+/// Everything one probe reported, before rates are worked out from the previous counters.
+#[derive(Default)]
+struct Sample {
+    cpu: Option<CpuTimes>,
+    cores: Vec<CpuTimes>,
+    load: [Option<f32>; 3],
+    tasks_running: Option<u32>,
+    tasks_total: Option<u32>,
+    memory: Memory,
+    disk: (Option<u64>, Option<u64>, Option<u64>),
+    net: Vec<(String, u64, u64)>,
+    speeds: Vec<(String, Option<u64>)>,
+    disk_io: (u64, u64),
+    processes: Vec<Process>,
+    /// Cumulative CPU seconds per process, kept so the next sample can tell the rate.
+    process_cpu: Vec<(u32, f64)>,
+    system: SystemInfo,
+    uptime_s: Option<u64>,
+}
+
 /// Turn one probe's output into a snapshot. `previous` is the sample counters,
 /// needed because every rate is a delta.
 pub fn parse_report(text: &str, previous: Option<Counters>, at_ms: u64) -> (Snapshot, Option<Counters>) {
@@ -1060,66 +1136,401 @@ pub fn parse_report(text: &str, previous: Option<Counters>, at_ms: u64) -> (Snap
     let processes_text = sections.next().unwrap_or_default();
     let system_text = sections.next().unwrap_or_default();
 
-    let counters = parse_cpu(stat_text);
-    let cores = parse_cores(stat_text);
-    let (disk_total, disk_used, disk_free) = parse_disk(disk_text);
-    let net_raw = parse_net(net_text);
-    let speeds = parse_speeds(speed_text);
-    let (disk_read, disk_write) = parse_diskstats(diskstats_text);
+    let sample = Sample {
+        cpu: parse_cpu(stat_text),
+        cores: parse_cores(stat_text),
+        load: loadavg.0,
+        tasks_running: loadavg.1,
+        tasks_total: loadavg.2,
+        memory: parse_memory(memory_text),
+        disk: parse_disk(disk_text),
+        net: parse_net(net_text),
+        speeds: parse_speeds(speed_text),
+        disk_io: parse_diskstats(diskstats_text),
+        processes: parse_processes(processes_text),
+        process_cpu: Vec::new(),
+        system: parse_system(system_text),
+        uptime_s: parse_uptime(uptime_text),
+    };
+    finish(sample, previous, at_ms)
+}
 
+/// The probe a Local tab runs on Windows.
+///
+/// Windows has neither `/proc` nor `ps`, so PowerShell reads the same numbers from CIM
+/// and answers with one JSON document for [`parse_windows_report`].
+pub const WINDOWS_MONITOR_COMMAND: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = @(Get-CimInstance Win32_PerfRawData_PerfOS_Processor)
+$total = $cpu | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+$cores = @($cpu | Where-Object { $_.Name -ne '_Total' } | ForEach-Object {
+    [pscustomobject]@{
+        idle = [double]$_.PercentIdleTime
+        total = [double]$_.PercentProcessorTime + [double]$_.PercentIdleTime
+    }
+})
+$memTotal = [double]$os.TotalVisibleMemorySize * 1024
+$memFree = [double]$os.FreePhysicalMemory * 1024
+$drive = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $env:SystemDrive } | Select-Object -First 1
+$io = @(Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk | Where-Object { $_.Name -ne '_Total' })
+$net = @(Get-CimInstance Win32_PerfRawData_Tcpip_NetworkInterface |
+    Where-Object { $_.Name -notmatch 'Loopback|isatap|Teredo|Pseudo' } |
+    ForEach-Object {
+        [pscustomobject]@{
+            name = $_.Name
+            rx = [double]$_.BytesReceivedPersec
+            tx = [double]$_.BytesSentPersec
+            speedMbps = [double]$_.CurrentBandwidth / 1000000
+        }
+    })
+$processes = @(Get-Process | Where-Object { $_.Id -ne 0 } | ForEach-Object {
+    [pscustomobject]@{
+        pid = $_.Id
+        cpuS = $_.TotalProcessorTime.TotalSeconds
+        mem = [double]$_.WorkingSet64
+        threads = @($_.Threads).Count
+        command = $_.ProcessName
+    }
+})
+$ips = @(Get-CimInstance Win32_NetworkAdapterConfiguration |
+    Where-Object { $_.IPEnabled } |
+    ForEach-Object { $_.IPAddress } |
+    Where-Object { $_ -notmatch ':' } |
+    Select-Object -First 1)
+[pscustomobject]@{
+    cpu = [pscustomobject]@{
+        idle = [double]$total.PercentIdleTime
+        total = [double]$total.PercentProcessorTime + [double]$total.PercentIdleTime
+        cores = $cores
+    }
+    memory = [pscustomobject]@{
+        total = $memTotal
+        free = $memFree
+        available = $memFree
+        swapTotal = [Math]::Max(0.0, ([double]$os.TotalVirtualMemorySize - [double]$os.TotalVisibleMemorySize) * 1024)
+        swapFree = [Math]::Max(0.0, ([double]$os.FreeVirtualMemory - [double]$os.FreePhysicalMemory) * 1024)
+    }
+    disk = $(if ($drive) {
+        [pscustomobject]@{
+            total = [double]$drive.Size
+            free = [double]$drive.FreeSpace
+            used = [double]$drive.Size - [double]$drive.FreeSpace
+        }
+    } else { $null })
+    uptimeS = ((Get-Date) - $os.LastBootUpTime).TotalSeconds
+    net = $net
+    diskIo = [pscustomobject]@{
+        read = ($io | Measure-Object DiskReadBytesPersec -Sum).Sum
+        write = ($io | Measure-Object DiskWriteBytesPersec -Sum).Sum
+    }
+    processes = $processes
+    system = [pscustomobject]@{
+        os = [string]$os.Caption
+        kernel = [string]$os.Version
+        arch = $env:PROCESSOR_ARCHITECTURE
+        ip = $(if ($ips.Count -gt 0) { [string]$ips[0] } else { $null })
+    }
+} | ConvertTo-Json -Depth 5 -Compress
+"#;
+
+/// The probe to send. `windows` asks for the JSON report a local Windows host can answer.
+pub fn probe_command(windows: bool) -> &'static str {
+    if windows {
+        WINDOWS_MONITOR_COMMAND
+    } else {
+        MONITOR_COMMAND
+    }
+}
+
+/// Rows the process table keeps.
+const PROCESS_ROWS: usize = 30;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsReport {
+    cpu: WindowsCpu,
+    memory: WindowsMemory,
+    disk: Option<WindowsDisk>,
+    uptime_s: Option<f64>,
+    #[serde(default)]
+    net: Vec<WindowsNet>,
+    disk_io: Option<WindowsDiskIo>,
+    #[serde(default)]
+    processes: Vec<WindowsProcess>,
+    system: WindowsSystem,
+}
+
+#[derive(Deserialize)]
+struct WindowsCpu {
+    idle: f64,
+    total: f64,
+    #[serde(default)]
+    cores: Vec<WindowsCore>,
+}
+
+#[derive(Deserialize)]
+struct WindowsCore {
+    idle: f64,
+    total: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsMemory {
+    total: Option<f64>,
+    free: Option<f64>,
+    available: Option<f64>,
+    swap_total: Option<f64>,
+    swap_free: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct WindowsDisk {
+    total: Option<f64>,
+    used: Option<f64>,
+    free: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsNet {
+    name: String,
+    rx: f64,
+    tx: f64,
+    speed_mbps: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct WindowsDiskIo {
+    read: Option<f64>,
+    write: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsProcess {
+    pid: u32,
+    cpu_s: Option<f64>,
+    mem: Option<f64>,
+    #[serde(default)]
+    threads: u32,
+    command: String,
+}
+
+#[derive(Deserialize)]
+struct WindowsSystem {
+    os: Option<String>,
+    kernel: Option<String>,
+    arch: Option<String>,
+    ip: Option<String>,
+}
+
+/// Bytes from a JSON number; the probe never sends a negative count.
+fn bytes(value: f64) -> u64 {
+    value.max(0.0) as u64
+}
+
+/// Turn the Windows probe's JSON into a snapshot, with the same counters and rates as
+/// the POSIX report.
+pub fn parse_windows_report(
+    text: &str,
+    previous: Option<Counters>,
+    at_ms: u64,
+) -> (Snapshot, Option<Counters>) {
+    let Ok(report) = serde_json::from_str::<WindowsReport>(text.trim()) else {
+        return (
+            Snapshot {
+                at_ms,
+                ..Snapshot::default()
+            },
+            None,
+        );
+    };
+    let uptime_s = report.uptime_s.map(|seconds| seconds.max(0.0) as u64);
+    let memory = Memory {
+        total: report.memory.total.map(bytes),
+        free: report.memory.free.map(bytes),
+        available: report.memory.available.map(bytes),
+        buffers: None,
+        cached: None,
+        swap_total: report.memory.swap_total.map(bytes),
+        swap_free: report.memory.swap_free.map(bytes),
+    };
+    let process_cpu: Vec<(u32, f64)> = report
+        .processes
+        .iter()
+        .map(|process| (process.pid, process.cpu_s.unwrap_or(0.0).max(0.0)))
+        .collect();
+    let elapsed_s = previous
+        .as_ref()
+        .map(|previous| at_ms.saturating_sub(previous.at_ms) as f64 / 1000.0)
+        .filter(|seconds| *seconds > 0.0);
+    let mut processes: Vec<Process> = report
+        .processes
+        .iter()
+        .map(|process| {
+            let seconds = process.cpu_s.unwrap_or(0.0).max(0.0);
+            // A process's CPU share is the growth of its own CPU time; the first sample
+            // has nothing to subtract, so it falls back to the average since start.
+            let cpu = previous
+                .as_ref()
+                .zip(elapsed_s)
+                .and_then(|(previous, elapsed)| {
+                    previous
+                        .process_cpu
+                        .iter()
+                        .find(|(pid, _)| *pid == process.pid)
+                        .map(|(_, before)| ((seconds - before) / elapsed * 100.0) as f32)
+                })
+                .or_else(|| {
+                    uptime_s
+                        .filter(|uptime| *uptime > 0)
+                        .map(|uptime| (seconds / uptime as f64 * 100.0) as f32)
+                })
+                .unwrap_or(0.0)
+                .max(0.0);
+            Process {
+                pid: process.pid,
+                user: "-".to_owned(),
+                state: if cpu > 0.0 { "R" } else { "S" }.to_owned(),
+                nice: 0,
+                threads: process.threads,
+                cpu,
+                mem: memory
+                    .total
+                    .and_then(|total| percent(bytes(process.mem.unwrap_or(0.0)), total))
+                    .unwrap_or(0.0),
+                command: process.command.clone(),
+            }
+        })
+        .collect();
+    let running = processes.iter().filter(|process| process.cpu > 0.0).count() as u32;
+    let total = processes.len() as u32;
+    processes.sort_by(|left, right| right.cpu.total_cmp(&left.cpu));
+    processes.truncate(PROCESS_ROWS);
+
+    let sample = Sample {
+        cpu: Some(CpuTimes {
+            total: bytes(report.cpu.total),
+            idle: bytes(report.cpu.idle),
+        }),
+        cores: report
+            .cpu
+            .cores
+            .iter()
+            .map(|core| CpuTimes {
+                total: bytes(core.total),
+                idle: bytes(core.idle),
+            })
+            .collect(),
+        load: [None; 3],
+        tasks_running: Some(running),
+        tasks_total: Some(total),
+        memory,
+        disk: match report.disk {
+            Some(disk) => (
+                disk.total.map(bytes),
+                disk.used.map(bytes),
+                disk.free.map(bytes),
+            ),
+            None => (None, None, None),
+        },
+        net: report
+            .net
+            .iter()
+            .map(|iface| (iface.name.clone(), bytes(iface.rx), bytes(iface.tx)))
+            .collect(),
+        speeds: report
+            .net
+            .iter()
+            .map(|iface| {
+                let speed = iface
+                    .speed_mbps
+                    .filter(|speed| *speed > 0.0)
+                    .map(|speed| speed as u64);
+                (iface.name.clone(), speed)
+            })
+            .collect(),
+        disk_io: report
+            .disk_io
+            .map(|io| (bytes(io.read.unwrap_or(0.0)), bytes(io.write.unwrap_or(0.0))))
+            .unwrap_or_default(),
+        processes,
+        process_cpu,
+        system: SystemInfo {
+            os: report.system.os,
+            kernel: report.system.kernel,
+            arch: report.system.arch,
+            ip: report.system.ip,
+        },
+        uptime_s,
+    };
+    finish(sample, previous, at_ms)
+}
+
+/// Build the snapshot and the counters the next sample compares against.
+fn finish(
+    sample: Sample,
+    previous: Option<Counters>,
+    at_ms: u64,
+) -> (Snapshot, Option<Counters>) {
     let elapsed_s = previous
         .as_ref()
         .map(|previous| at_ms.saturating_sub(previous.at_ms) as f32 / 1000.0)
         .filter(|seconds| *seconds > 0.0);
 
     // Rates are per second between this sample and the previous counters.
-    let (cpu, core_rates, net, read_rate, write_rate) = match (&previous, counters) {
+    let (cpu, core_rates, net, read_rate, write_rate) = match (&previous, sample.cpu) {
         (Some(previous), Some(current)) => {
             let cpu = cpu_percent(previous.cpu, current);
-            let core_rates = core_percents(&previous.cores, &cores);
-            let net = net_rates(&net_raw, &previous.net, elapsed_s);
-            let read_rate = rate(previous.disk_read, disk_read, elapsed_s);
-            let write_rate = rate(previous.disk_write, disk_write, elapsed_s);
+            let core_rates = core_percents(&previous.cores, &sample.cores);
+            let net = net_rates(&sample.net, &previous.net, elapsed_s);
+            let read_rate = rate(previous.disk_read, sample.disk_io.0, elapsed_s);
+            let write_rate = rate(previous.disk_write, sample.disk_io.1, elapsed_s);
             (cpu, core_rates, net, read_rate, write_rate)
         }
         _ => (
             None,
             Vec::new(),
-            net_rates(&net_raw, &[], None),
+            net_rates(&sample.net, &[], None),
             None,
             None,
         ),
     };
 
-    let (load, tasks_running, tasks_total) = loadavg;
+    let counters = sample.cpu.map(|cpu| Counters {
+        at_ms,
+        cpu,
+        cores: sample.cores,
+        net: sample.net,
+        disk_read: sample.disk_io.0,
+        disk_write: sample.disk_io.1,
+        process_cpu: sample.process_cpu,
+    });
     let snapshot = Snapshot {
         at_ms,
         cpu,
         cores: core_rates,
-        load,
-        tasks_running,
-        tasks_total,
-        memory: parse_memory(memory_text),
-        disk_total,
-        disk_used,
-        disk_free,
+        load: sample.load,
+        tasks_running: sample.tasks_running,
+        tasks_total: sample.tasks_total,
+        memory: sample.memory,
+        disk_total: sample.disk.0,
+        disk_used: sample.disk.1,
+        disk_free: sample.disk.2,
         disk_read_rate: read_rate,
         disk_write_rate: write_rate,
-        disk_read_total: Some(disk_read),
-        disk_write_total: Some(disk_write),
-        net: net.into_iter().map(|iface| attach_speed(iface, &speeds)).collect(),
-        processes: parse_processes(processes_text),
-        system: parse_system(system_text),
-        uptime_s: parse_uptime(uptime_text),
+        disk_read_total: Some(sample.disk_io.0),
+        disk_write_total: Some(sample.disk_io.1),
+        net: net
+            .into_iter()
+            .map(|iface| attach_speed(iface, &sample.speeds))
+            .collect(),
+        processes: sample.processes,
+        system: sample.system,
+        uptime_s: sample.uptime_s,
     };
-    let counters = counters.map(|cpu| Counters {
-        at_ms,
-        cpu,
-        cores,
-        net: net_raw,
-        disk_read,
-        disk_write,
-    });
     (snapshot, counters)
 }
 
@@ -1242,6 +1653,8 @@ struct PaneState {
     status: Option<(String, bool)>,
     /// Recent CPU percentages per pid, for the details graph.
     proc_history: std::collections::HashMap<u32, std::collections::VecDeque<(u64, f32)>>,
+    /// Whether the sampled host is Windows, where the process probes are PowerShell.
+    windows: bool,
 }
 
 impl Default for PaneState {
@@ -1257,6 +1670,7 @@ impl Default for PaneState {
             details: None,
             status: None,
             proc_history: std::collections::HashMap::new(),
+            windows: false,
         }
     }
 }
@@ -2270,6 +2684,11 @@ fn processes_card(
     width: f32,
 ) {
     let mut intent: Option<ProcIntent> = None;
+    state.windows = sample
+        .system
+        .os
+        .as_deref()
+        .is_some_and(|os| os.contains("Windows"));
     sized_card(ui, palette, width, |ui| {
         let content = ui.available_width();
         let muted = to_color32(palette.text_muted);
@@ -2479,7 +2898,12 @@ fn processes_card(
 
 /// Ask the host for one process's details.
 fn open_details(access: &mut dyn MonitorAccess, state: &mut PaneState, pid: u32, command: String) {
-    access.exec(DETAILS_COMMAND_KEY, &details_command(pid));
+    let probe = if state.windows {
+        windows_details_command(pid)
+    } else {
+        details_command(pid)
+    };
+    access.exec(DETAILS_COMMAND_KEY, &probe);
     state.details = Some(Details {
         pid,
         command,
@@ -2492,12 +2916,25 @@ fn open_details(access: &mut dyn MonitorAccess, state: &mut PaneState, pid: u32,
 
 /// Send `signal` to `pid` and say how it went.
 fn send_signal(access: &mut dyn MonitorAccess, state: &mut PaneState, pid: u32, signal: &str) {
-    let Some(command) = signal_command(pid, signal) else {
+    let windows = state.windows;
+    let command = if windows {
+        windows_signal_command(pid, signal)
+    } else {
+        signal_command(pid, signal)
+    };
+    let Some(command) = command else {
         state.status = Some((format!("Cannot send {signal} to {pid}"), true));
         return;
     };
     access.exec(SIGNAL_COMMAND_KEY, &command);
-    state.status = Some((format!("Sending SIG{signal} to {pid}…"), false));
+    state.status = Some((
+        if windows {
+            format!("Stopping {pid}…")
+        } else {
+            format!("Sending SIG{signal} to {pid}…")
+        },
+        false,
+    ));
     if let Some(details) = state.details.as_mut() {
         details.loading = true;
     }
@@ -2516,7 +2953,14 @@ fn poll_details(access: &mut dyn MonitorAccess, state: &mut PaneState) {
         } else if let Some(output) = access.output(SIGNAL_COMMAND_KEY) {
             let pid = details.pid;
             if output.succeeded() {
-                state.status = Some((format!("Signal sent to {pid}"), false));
+                state.status = Some((
+                    if state.windows {
+                        format!("Stopped {pid}")
+                    } else {
+                        format!("Signal sent to {pid}")
+                    },
+                    false,
+                ));
             } else {
                 let detail = output
                     .error_line()
@@ -2630,7 +3074,11 @@ fn process_details_dialog(
             if small_button(ui, palette, "Send") {
                 send_signal(access, state, details.pid, details.signal);
             }
-            let options: Vec<&'static str> = SIGNALS.iter().map(|(name, _)| *name).collect();
+            let options: Vec<&'static str> = if state.windows {
+                WINDOWS_SIGNALS.to_vec()
+            } else {
+                SIGNALS.iter().map(|(name, _)| *name).collect()
+            };
             if let Some(chosen) = select_str(
                 ui,
                 ("process-signal", details.pid),
@@ -2788,6 +3236,102 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         assert_eq!(snapshot.disk_read_rate, Some(524_288));
         assert_eq!(snapshot.disk_write_rate, Some(0));
         assert_eq!(counters.expect("counters").at_ms, 3_000);
+    }
+
+    /// One answer of the Windows probe, as PowerShell writes it.
+    const WINDOWS_REPORT: &str = r#"{
+        "cpu": {"idle": 1000, "total": 4000, "cores": [{"idle": 500, "total": 2000}, {"idle": 500, "total": 2000}]},
+        "memory": {"total": 17179869184, "free": 4294967296, "available": 4294967296, "swapTotal": 8589934592, "swapFree": 4294967296},
+        "disk": {"total": 107374182400, "free": 53687091200, "used": 53687091200},
+        "uptimeS": 3600,
+        "net": [{"name": "Ethernet", "rx": 1000, "tx": 2000, "speedMbps": 1000}],
+        "diskIo": {"read": 4096, "write": 8192},
+        "processes": [
+            {"pid": 100, "cpuS": 10, "mem": 858993459, "threads": 4, "command": "alpha"},
+            {"pid": 200, "cpuS": 2, "mem": 42949672, "threads": 2, "command": "beta"}
+        ],
+        "system": {"os": "Microsoft Windows 11 Pro", "kernel": "10.0.22631", "arch": "AMD64", "ip": "192.168.1.5"}
+    }"#;
+
+    /// The same probe ten seconds later: half the new CPU time was busy, 2 kB more
+    /// arrived, 16 kB more was read and `alpha` burnt four more CPU seconds.
+    const WINDOWS_REPORT_LATER: &str = r#"{
+        "cpu": {"idle": 1500, "total": 5000, "cores": [{"idle": 750, "total": 2500}, {"idle": 750, "total": 2500}]},
+        "memory": {"total": 17179869184, "free": 4294967296, "available": 4294967296, "swapTotal": 8589934592, "swapFree": 4294967296},
+        "disk": {"total": 107374182400, "free": 53687091200, "used": 53687091200},
+        "uptimeS": 3610,
+        "net": [{"name": "Ethernet", "rx": 3000, "tx": 2000, "speedMbps": 1000}],
+        "diskIo": {"read": 20480, "write": 8192},
+        "processes": [
+            {"pid": 100, "cpuS": 14, "mem": 858993459, "threads": 4, "command": "alpha"},
+            {"pid": 200, "cpuS": 2, "mem": 42949672, "threads": 2, "command": "beta"}
+        ],
+        "system": {"os": "Microsoft Windows 11 Pro", "kernel": "10.0.22631", "arch": "AMD64", "ip": "192.168.1.5"}
+    }"#;
+
+    #[test]
+    fn the_windows_report_becomes_a_snapshot() {
+        let (snapshot, counters) = parse_windows_report(WINDOWS_REPORT, None, 1_000_000);
+        assert_eq!(snapshot.memory.total, Some(17_179_869_184));
+        assert_eq!(snapshot.memory.swap_free, Some(4_294_967_296));
+        assert_eq!(snapshot.disk_total, Some(107_374_182_400));
+        assert_eq!(snapshot.disk_used, Some(53_687_091_200));
+        assert_eq!(snapshot.uptime_s, Some(3600));
+        assert_eq!(snapshot.net.len(), 1);
+        assert_eq!(snapshot.net[0].name, "Ethernet");
+        assert_eq!(snapshot.net[0].rx_total, 1000);
+        assert_eq!(snapshot.net[0].speed, Some(1000));
+        assert_eq!(snapshot.tasks_total, Some(2));
+        assert_eq!(snapshot.tasks_running, Some(2));
+        assert_eq!(snapshot.system.os.as_deref(), Some("Microsoft Windows 11 Pro"));
+        assert_eq!(snapshot.system.ip.as_deref(), Some("192.168.1.5"));
+        // Windows has no load average, and the first sample has no counters to compare.
+        assert_eq!(snapshot.load, [None, None, None]);
+        assert_eq!(snapshot.cpu, None);
+        // Without a previous sample a process shows its average CPU since boot.
+        assert_eq!(snapshot.processes.len(), 2);
+        assert_eq!(snapshot.processes[0].command, "alpha");
+        assert!((snapshot.processes[0].cpu - 10.0 / 36.0).abs() < 0.01);
+        assert!((snapshot.processes[0].mem - 5.0).abs() < 0.01);
+        let counters = counters.expect("counters");
+        assert_eq!(counters.cpu.total, 4000);
+        assert_eq!(counters.process_cpu.len(), 2);
+    }
+
+    #[test]
+    fn the_next_windows_report_turns_counters_into_rates() {
+        let (_, counters) = parse_windows_report(WINDOWS_REPORT, None, 1_000_000);
+        let (snapshot, _) = parse_windows_report(WINDOWS_REPORT_LATER, counters, 1_010_000);
+        // 500 of the 1000 new processor ticks were busy.
+        assert_eq!(snapshot.cpu, Some(50.0));
+        assert_eq!(snapshot.cores.len(), 2);
+        assert_eq!(snapshot.net[0].rx_rate, Some(200));
+        assert_eq!(snapshot.net[0].tx_rate, Some(0));
+        assert_eq!(snapshot.disk_read_rate, Some(1638));
+        assert_eq!(snapshot.disk_write_rate, Some(0));
+        // `alpha` burnt four of the ten seconds.
+        let alpha = snapshot
+            .processes
+            .iter()
+            .find(|process| process.command == "alpha")
+            .expect("alpha");
+        assert!((alpha.cpu - 40.0).abs() < 0.01, "alpha at {}", alpha.cpu);
+        assert_eq!(alpha.state, "R");
+        let beta = snapshot
+            .processes
+            .iter()
+            .find(|process| process.command == "beta")
+            .expect("beta");
+        assert_eq!(beta.cpu, 0.0);
+        assert_eq!(beta.state, "S");
+    }
+
+    #[test]
+    fn a_broken_windows_report_degrades_instead_of_failing() {
+        let (snapshot, counters) = parse_windows_report("no json here", None, 5);
+        assert_eq!(snapshot.at_ms, 5);
+        assert_eq!(snapshot.memory.total, None);
+        assert!(counters.is_none());
     }
 
     #[test]
@@ -3609,6 +4153,96 @@ ENVIRON\u{1f}HOME=/home/brainchild\n";
         assert_eq!(find("Max open files"), "1024 files");
         // Nothing was invented for the probes the host did not answer.
         assert!(parse_details("").is_empty());
+    }
+
+    /// A details answer from a Windows host, in the same row format.
+    const WINDOWS_DETAILS_PROBE: &str = "STATUS\u{1f}State: Running\r\n\
+Threads: 12\r\n\
+Uid: andreashagelberg\r\n\
+VmRSS: 12345678 B\r\n\
+VmSize: 87654321 B\r\n\
+CMDLINE\u{1f}\"C:\\Windows\\System32\\svchost.exe\" -k netsvcs\r\n\
+EXE\u{1f}C:\\Windows\\System32\\svchost.exe\r\n\
+FDS\u{1f}420\r\n\
+PARENT\u{1f}600 andreashagelberg 2026-10-28 13:02:03 00.01:02:05\r\n";
+
+    #[test]
+    fn a_windows_host_answers_the_details_rows() {
+        let rows = parse_details(WINDOWS_DETAILS_PROBE);
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(name, _)| name == label)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            find("Command line"),
+            "\"C:\\Windows\\System32\\svchost.exe\" -k netsvcs"
+        );
+        assert_eq!(find("Executable"), "C:\\Windows\\System32\\svchost.exe");
+        assert_eq!(find("Parent PID"), "600");
+        assert_eq!(find("Owner"), "andreashagelberg");
+        assert_eq!(find("Started"), "2026-10-28 13:02:03");
+        assert_eq!(find("Elapsed"), "00.01:02:05");
+        assert_eq!(find("State"), "Running");
+        assert_eq!(find("Threads"), "12");
+        assert_eq!(find("Resident memory"), "12345678 B");
+        assert_eq!(find("Open file descriptors"), "420");
+        // Windows has no working directory, root, cgroup or limits groups.
+        assert!(!rows.iter().any(|(label, _)| label == "Working dir"));
+    }
+
+    #[test]
+    fn a_windows_host_is_probed_with_powershell() {
+        let command = windows_details_command(420);
+        assert!(command.contains("ProcessId -eq 420"), "{command}");
+        assert!(!command.contains("/proc"), "{command}");
+        assert_eq!(
+            windows_signal_command(420, "KILL").as_deref(),
+            Some("Stop-Process -Id 420 -Force")
+        );
+        assert_eq!(
+            windows_signal_command(420, "TERM").as_deref(),
+            Some("Stop-Process -Id 420")
+        );
+        // Windows cannot deliver the rest of the POSIX signals.
+        assert_eq!(windows_signal_command(420, "USR1"), None);
+    }
+
+    #[test]
+    fn a_windows_host_stops_a_process_instead_of_signalling_it() {
+        let mut access = FakeMonitor::default();
+        let mut state = PaneState {
+            windows: true,
+            ..PaneState::default()
+        };
+
+        open_details(&mut access, &mut state, 420, "svchost".to_owned());
+        assert_eq!(access.commands[0].0, DETAILS_COMMAND_KEY);
+        assert!(access.commands[0].1.contains("ProcessId -eq 420"));
+
+        send_signal(&mut access, &mut state, 420, "KILL");
+        assert_eq!(
+            access.commands[1],
+            (
+                SIGNAL_COMMAND_KEY.to_owned(),
+                "Stop-Process -Id 420 -Force".to_owned()
+            )
+        );
+        assert!(
+            state
+                .status
+                .as_ref()
+                .is_some_and(|(line, failed)| !*failed && line.contains("420"))
+        );
+
+        send_signal(&mut access, &mut state, 420, "USR1");
+        assert!(
+            state
+                .status
+                .as_ref()
+                .is_some_and(|(line, failed)| *failed && line.contains("USR1"))
+        );
     }
 
     #[test]

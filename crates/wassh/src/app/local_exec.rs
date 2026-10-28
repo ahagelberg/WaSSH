@@ -4,10 +4,8 @@
 //! host — the server monitor's sample, the process table's details and signals —
 //! runs its shell command here instead of over SSH.
 //!
-//! This is the reference's `runHostCommand`: `execFile('/bin/sh', ['-c',
-//! command], { timeout, maxBuffer })`, with the same timeout and output cap. The
-//! command runs on its own thread and answers on a later frame, so the window
-//! never waits for it.
+//! The command goes to `/bin/sh -c` on Unix and to `powershell.exe` on Windows, with
+//! the same timeout and output cap as the reference's `runHostCommand`.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -29,10 +27,10 @@ const POLL: Duration = Duration::from_millis(5);
 
 /// Whether this machine can run host commands at all.
 ///
-/// The reference restricts local host commands to Linux, macOS and FreeBSD;
-/// elsewhere it refuses rather than guessing at a shell.
+/// Unix gets `/bin/sh`, Windows its own PowerShell; other targets have no shell
+/// this code knows how to drive.
 pub fn supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// Run `command` with `/bin/sh -c`, answering on a later frame.
@@ -62,13 +60,35 @@ fn run_with(
     receiver
 }
 
+/// A shell that runs `command` as one line, whichever shell the platform has.
+#[cfg(unix)]
+fn shell(command: &str) -> Command {
+    let mut shell = Command::new("/bin/sh");
+    shell.arg("-c").arg(command);
+    shell
+}
+
+#[cfg(windows)]
+fn shell(command: &str) -> Command {
+    // `-Command` takes the whole line as one script, so `;`, pipes and blocks in
+    // the probe reach PowerShell exactly as written.
+    let mut shell = Command::new("powershell.exe");
+    shell.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+    ]);
+    shell
+}
+
 fn run(command: &str, input: Option<&str>, timeout: Duration) -> Result<ExecOutput, String> {
     if !supported() {
-        return Err("Local host commands need a Unix shell.".to_owned());
+        return Err("Local host commands need a shell on this platform.".to_owned());
     }
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
+    let mut child = shell(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -121,6 +141,24 @@ fn drain<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Strin
 mod tests {
     use super::*;
 
+    /// A line that prints `hello` on this platform's shell.
+    #[cfg(unix)]
+    const ECHO: &str = "printf 'hello'";
+    #[cfg(windows)]
+    const ECHO: &str = "'hello'";
+
+    /// A line that writes `boom` to stderr and exits with 3.
+    #[cfg(unix)]
+    const FAIL: &str = "echo boom >&2; exit 3";
+    #[cfg(windows)]
+    const FAIL: &str = "Write-Error boom; exit 3";
+
+    /// A line that echoes its stdin back.
+    #[cfg(unix)]
+    const STDIN: &str = "cat";
+    #[cfg(windows)]
+    const STDIN: &str = "[Console]::In.ReadToEnd()";
+
     /// Collect a finished command, waiting for it like the UI does.
     fn wait(receiver: Receiver<Result<ExecOutput, String>>) -> Result<ExecOutput, String> {
         receiver
@@ -130,24 +168,24 @@ mod tests {
 
     #[test]
     fn a_command_reports_its_output_and_status() {
-        let output = wait(exec("printf 'hello'", None)).expect("output");
-        assert_eq!(output.stdout, "hello");
+        let output = wait(exec(ECHO, None)).expect("output");
+        assert_eq!(output.stdout.trim(), "hello");
         assert_eq!(output.exit_status, Some(0));
         assert!(output.stderr.is_empty());
     }
 
     #[test]
     fn a_failing_command_keeps_its_output_and_exit_code() {
-        let output = wait(exec("echo boom >&2; exit 3", None)).expect("output");
+        let output = wait(exec(FAIL, None)).expect("output");
         assert_eq!(output.exit_status, Some(3));
-        assert_eq!(output.stderr.trim(), "boom");
+        assert!(output.stderr.contains("boom"), "{:?}", output.stderr);
     }
 
     #[test]
     fn stdin_reaches_the_command() {
-        // `cat` only finishes because stdin is closed after the write.
-        let output = wait(exec("cat", Some("s3cret\n"))).expect("output");
-        assert_eq!(output.stdout, "s3cret\n");
+        // The command only finishes because stdin is closed after the write.
+        let output = wait(exec(STDIN, Some("s3cret\n"))).expect("output");
+        assert_eq!(output.stdout.trim(), "s3cret");
     }
 
     #[test]
@@ -166,18 +204,24 @@ mod tests {
 
     #[test]
     fn the_monitor_probe_runs_here() {
-        // The very command the Server Monitor sends to an SSH host also works on
-        // this one, which is what makes a Local tab sample itself.
-        let output = wait(exec(
-            "cat /proc/loadavg; echo @@; cat /proc/uptime",
-            None,
-        ))
-        .expect("output");
-        assert!(
-            output.stdout.contains("@@"),
-            "the probe printed {:?}",
-            output.stdout
-        );
+        // The very probe the Server Monitor sends also works on this machine, which is
+        // what makes a Local tab sample itself.
+        let output = wait(exec(wassh_plugins::monitor::probe_command(cfg!(windows)), None))
+            .expect("output");
         assert_eq!(output.exit_status, Some(0));
+        if cfg!(windows) {
+            let (sample, _) = wassh_plugins::monitor::parse_windows_report(&output.stdout, None, 0);
+            assert!(
+                sample.memory.total.is_some(),
+                "the probe printed {:?}",
+                output.stdout
+            );
+        } else {
+            assert!(
+                output.stdout.contains("@@"),
+                "the probe printed {:?}",
+                output.stdout
+            );
+        }
     }
 }
