@@ -1692,9 +1692,11 @@ impl Shell {
             {
                 commands.push(Command::CloseTab);
             }
-            // Ctrl+Shift+C / Ctrl+Insert copy the selection, Ctrl+Shift+V / Shift+Insert
-            // paste. Every other Ctrl combination — Ctrl+C and Ctrl+Z above all — reaches
-            // the shell, so nothing else here may claim one.
+            // Ctrl+Shift+C / Ctrl+Insert copy the selection; Ctrl+Shift+V / Shift+Insert /
+            // Ctrl+Shift+Insert paste. egui-winit leaves Insert to the application (see
+            // vendor/egui-winit/PATCHED.md), so the Insert chords are ordinary key events;
+            // every other Ctrl combination — Ctrl+C and Ctrl+Z above all — reaches the
+            // shell, so nothing else here may claim one.
             if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::C)
                 || consume_chord(input, Modifiers::CTRL, Key::Insert)
             {
@@ -1702,6 +1704,7 @@ impl Shell {
             }
             if consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::V)
                 || consume_chord(input, Modifiers::SHIFT, Key::Insert)
+                || consume_chord(input, Modifiers::CTRL | Modifiers::SHIFT, Key::Insert)
             {
                 paste = true;
             }
@@ -3840,6 +3843,19 @@ mod tests {
         assert!(
             requested_paste(&output),
             "Shift+Insert requests a paste"
+        );
+
+        // Ctrl+Shift+Insert does the same.
+        let output = frame_with_events(
+            &mut shell,
+            vec![key_event(
+                egui::Key::Insert,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert!(
+            requested_paste(&output),
+            "Ctrl+Shift+Insert requests a paste"
         );
 
         // Ctrl+Shift+V does the same, with the `command` flag a real Ctrl press carries.

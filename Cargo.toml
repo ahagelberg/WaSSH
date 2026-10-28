@@ -14,11 +14,12 @@ members = [
     "crates/wassh-ui",
     "crates/wassh-plugins",
 ]
-# Patched copy of winit 0.30.13; see vendor/winit/PATCHED.md.
-exclude = ["vendor/winit"]
+# Patched copies of winit 0.30.13 and egui-winit 0.37; see vendor/*/PATCHED.md.
+exclude = ["vendor/winit", "vendor/egui-winit"]
 
 [patch.crates-io]
 winit = { path = "vendor/winit" }
+egui-winit = { path = "vendor/egui-winit" }
 
 [workspace.package]
 version = "2.0.2"
