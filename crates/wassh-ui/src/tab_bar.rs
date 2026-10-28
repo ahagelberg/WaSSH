@@ -193,7 +193,11 @@ pub fn tab_bar(
         .is_some_and(|pos| bar.contains(pos));
     if over_strip && limit > 0.0 {
         let delta = ui.ctx().input(|input| input.smooth_scroll_delta);
-        let shift = -(if delta.y.abs() >= delta.x.abs() { delta.y } else { delta.x });
+        let shift = if delta.y.abs() >= delta.x.abs() {
+            delta.y
+        } else {
+            delta.x
+        };
         state.scroll += shift;
     }
     state.scroll = state.scroll.clamp(0.0, limit);
@@ -576,16 +580,16 @@ mod tests {
         assert!(max_scroll(tabs.len(), bar.width()) > 0.0, "the tabs must overflow");
         assert_eq!(state.scroll, 0.0);
 
-        // Wheel down reveals the tabs on the right.
-        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -40.0));
+        // Wheel up reveals the tabs on the right.
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, 40.0));
         assert_scrolled(&state, 40.0);
 
-        // Wheel up scrolls back towards the first tab.
-        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, 15.0));
+        // Wheel down scrolls back towards the first tab.
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -15.0));
         assert_scrolled(&state, 25.0);
 
         // Horizontal wheels and trackpad tilt work the same way.
-        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(10.0, 0.0));
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(-10.0, 0.0));
         assert_scrolled(&state, 15.0);
     }
 
@@ -597,10 +601,10 @@ mod tests {
         let bar = frame(&ctx, &tabs, &mut state, None, Vec2::ZERO);
         let limit = max_scroll(tabs.len(), bar.width());
 
-        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -10_000.0));
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, 10_000.0));
         assert_eq!(state.scroll, limit);
 
-        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, 10_000.0));
+        wheel(&ctx, &tabs, &mut state, bar.center(), Vec2::new(0.0, -10_000.0));
         assert_eq!(state.scroll, 0.0);
     }
 
@@ -634,7 +638,7 @@ mod tests {
         let many = tabs(TITLES.len());
         let mut state = TabBarState::new();
         let bar = frame(&ctx, &many, &mut state, None, Vec2::ZERO);
-        wheel(&ctx, &many, &mut state, bar.center(), Vec2::new(0.0, -400.0));
+        wheel(&ctx, &many, &mut state, bar.center(), Vec2::new(0.0, 400.0));
         assert!(state.scroll > 0.0);
 
         frame(&ctx, &tabs(2), &mut state, None, Vec2::ZERO);
