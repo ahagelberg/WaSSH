@@ -268,13 +268,17 @@ fn run_app(perf: bool, perf_tabs: usize) -> eframe::Result<()> {
         .as_ref()
         .and_then(|config| config.settings.get().window_bounds);
 
-    // The desktop draws the window: title bar, caption buttons, resize border, shadow and
-    // rounded corners all come from the theme, so the app only puts its menu strip inside.
+    // Windows and Linux get a title bar the app draws, so the window chrome is painted from
+    // the same palette as everything else instead of from the desktop's theme. macOS keeps
+    // the desktop's title bar and only borrows the menu strip.
     let mut viewport = egui::ViewportBuilder::default()
         .with_min_inner_size([800.0, 500.0])
         .with_title(APP_NAME)
         .with_app_id("wassh")
         .with_icon(window_icon());
+    if !cfg!(target_os = "macos") {
+        viewport = viewport.with_decorations(false);
+    }
     viewport = match bounds {
         // `width`/`height` are points, so the window keeps its apparent size on a monitor
         // with different scaling. The position is applied on the first frame, in pixels.
@@ -2878,6 +2882,14 @@ impl Shell {
         self.persist_window_bounds(false);
     }
 
+    /// The text the window's title bar shows: the app name and the active tab.
+    fn window_title(&self) -> String {
+        match self.active.and_then(|index| self.sessions.get(index)) {
+            Some(session) if !session.title.is_empty() => format!("{APP_NAME} — {}", session.title),
+            _ => APP_NAME.to_owned(),
+        }
+    }
+
     /// Everything inside the window frame.
     fn frame_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -2895,8 +2907,9 @@ impl Shell {
         self.shortcuts(&ctx);
         self.update_find_matches();
 
-        // The desktop owns the title bar, the window buttons, the resize border and the
-        // shadow, so the app only adds its menu strip underneath.
+        // The window chrome: the app draws its own title bar on Windows and Linux, so it is
+        // painted from the palette and follows the app's theme. macOS keeps the desktop's
+        // title bar, and the app only adds the menu strip under it.
         let checked = self.active_plugin_labels();
         let gears = self.configurable_plugin_labels();
         let state = wassh_ui::titlebar::MenuState {
@@ -2904,11 +2917,25 @@ impl Shell {
             checked: &checked,
             gears: &gears,
         };
-        let action = wassh_ui::show_menu_bar(ui, &self.palette, MENUS, state);
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        let title = self.window_title();
+        let action = if cfg!(target_os = "macos") {
+            wassh_ui::show_menu_bar(ui, &self.palette, MENUS, state)
+        } else {
+            wassh_ui::resize_edges(&ctx, maximized);
+            wassh_ui::show_header_bar(ui, &self.palette, &title, maximized, MENUS, state)
+        };
         match action {
             Some(wassh_ui::TitlebarAction::MenuItem(item)) => self.menu_command(&ctx, item),
             Some(wassh_ui::TitlebarAction::MenuGear(item)) => self.open_plugin_options(item),
-            _ => {}
+            Some(wassh_ui::TitlebarAction::Minimize) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            Some(wassh_ui::TitlebarAction::ToggleMaximize) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            Some(wassh_ui::TitlebarAction::Close) => self.quit_requested = true,
+            None => {}
         }
 
         // The sidebar claims the left edge first, so the tab strip starts at the sidebar's

@@ -478,7 +478,14 @@ impl eframe::App for SpikeApp {
             )
         } else {
             wassh_ui::resize_edges(&ctx, maximized);
-            wassh_ui::show_header_bar(ui, &self.palette, APP_NAME, maximized, TITLEBAR_MENUS)
+            wassh_ui::show_header_bar(
+                ui,
+                &self.palette,
+                APP_NAME,
+                maximized,
+                TITLEBAR_MENUS,
+                wassh_ui::titlebar::MenuState::default(),
+            )
         };
         if let Some(action) = action {
             self.handle_titlebar_action(&ctx, action);

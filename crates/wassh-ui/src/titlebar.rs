@@ -105,13 +105,15 @@ pub const fn caption_style() -> CaptionStyle {
 ///
 /// Use this on platforms where the app draws its own window frame
 /// (`ViewportBuilder::with_decorations(false)`); pair it with [`resize_edges`] so the window
-/// can still be resized by its border.
+/// can still be resized by its border. Everything in it is painted from `palette`, so the
+/// window chrome follows the app's theme rather than the desktop's.
 pub fn show_header_bar(
     ui: &mut Ui,
     palette: &Palette,
     title: &str,
     maximized: bool,
     menus: &[Menu],
+    state: MenuState<'_>,
 ) -> Option<TitlebarAction> {
     let mut action = None;
 
@@ -148,7 +150,7 @@ pub fn show_header_bar(
                 );
                 ui.add_space(10.0);
 
-                if let Some(chosen) = menu_strip(ui, palette, menus, MenuState::default()) {
+                if let Some(chosen) = menu_strip(ui, palette, menus, state) {
                     action = Some(chosen);
                 }
 
@@ -941,6 +943,67 @@ mod tests {
             assert!(MENU_ITEM_HEIGHT < MENU_BAR_HEIGHT);
             assert!(MENU_BUTTON_HEIGHT < MENU_BAR_HEIGHT);
             assert!(MENU_MIN_WIDTH >= 120.0);
+        }
+    }
+
+    /// Paint the client-side header bar, returning its filled rects and painted texts.
+    fn paint_header_bar(
+        palette: &Palette,
+        menus: &'static [Menu],
+    ) -> (Vec<(egui::Rect, egui::Color32)>, Vec<String>) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(640.0, 400.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut fills = Vec::new();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                let state = MenuState::default();
+                let _ = show_header_bar(ui, palette, "WaSSH", false, menus, state);
+            });
+            fills.clear();
+            texts.clear();
+            for clipped in std::mem::take(&mut output.shapes) {
+                match clipped.shape {
+                    egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                        fills.push((rect.rect, rect.fill));
+                    }
+                    egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                    _ => {}
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+        (fills, texts)
+    }
+
+    #[test]
+    fn the_title_bar_is_painted_from_the_app_theme() {
+        // The app draws its own title bar on Windows and Linux, so its background has to
+        // come from the palette: a light theme must not sit under a dark strip (or the
+        // other way round) the way a desktop-painted title bar would.
+        const MENUS: &[Menu] = &[("File", &["Quit"]), ("Help", &["About"])];
+        let strip = |fills: &[(egui::Rect, egui::Color32)]| {
+            fills
+                .iter()
+                .find(|(rect, _)| (rect.height() - WINDOW_HEADER_HEIGHT).abs() < 0.5)
+                .map(|(_, fill)| *fill)
+                .expect("the bar paints its background")
+        };
+        let (dark_fills, dark_texts) = paint_header_bar(&Palette::dark(), MENUS);
+        let (light_fills, light_texts) = paint_header_bar(&Palette::light(), MENUS);
+        assert_eq!(strip(&dark_fills), to_color32(Palette::dark().bg_app));
+        assert_eq!(strip(&light_fills), to_color32(Palette::light().bg_app));
+        assert_ne!(strip(&dark_fills), strip(&light_fills));
+
+        // The title and the menus live in the same strip, whichever theme it is.
+        for texts in [dark_texts, light_texts] {
+            for label in ["WaSSH", "File", "Help"] {
+                assert!(texts.contains(&label.to_owned()), "{label:?} in {texts:?}");
+            }
         }
     }
 }
