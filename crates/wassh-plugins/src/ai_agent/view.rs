@@ -8,28 +8,28 @@
 use std::sync::mpsc::Receiver;
 
 use egui::Ui;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use wassh_core::{Palette, SessionStatus};
 use wassh_ui::dock::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, password_input, select_str, select_width, small_button, small_button_enabled,
-    text_area,
+    Button, ButtonKind, password_input, select_str, select_width, small_button,
+    small_button_enabled, text_area,
 };
 
 use super::agent::{
-    history_from_json, history_to_json, turns_from_json, turns_to_json, Agent, Phase, ToolSettings,
-    Turn, UserMeta, SUMMARY_SYSTEM_PROMPT,
+    Agent, Phase, SUMMARY_SYSTEM_PROMPT, ToolSettings, Turn, UserMeta, history_from_json,
+    history_to_json, turns_from_json, turns_to_json,
 };
+use super::permissions::{Permissions, setting_key};
 use super::protocol::{
-    Protocol, ProviderConfig, CONVERSATIONS_PER_HOST_MAX, DATA_VERSION,
-    DEFAULT_CHAT_TITLE, MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENT_BYTES, PROVIDER_OPENROUTER, SAFE_RULES,
-    SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
-    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, SETTING_HOST_RAG_FOLDER,
-    SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY,
-    SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS,
+    CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, PROVIDER_OPENROUTER, Protocol, ProviderConfig,
+    SAFE_RULES, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
+    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
+    SETTING_HOST_RAG_FOLDER, SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER,
+    SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS,
 };
-use super::providers::{complete_blocking, provider_models, CompletionRequest, EmbedConfig};
+use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
 use super::settings_ui::{PROVIDERS_KEY, provider_secret_field};
 use super::tools;
 use crate::color::to_color32;
@@ -338,7 +338,10 @@ impl AiAgent {
             history: self.agent.history.clone(),
             cwd: self.agent.cwd.clone(),
             model: self.model.clone(),
-            provider: self.active().map(|provider| provider.id.clone()).unwrap_or_default(),
+            provider: self
+                .active()
+                .map(|provider| provider.id.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -375,7 +378,11 @@ impl AiAgent {
         if !chat.model.is_empty() {
             self.model = chat.model;
         }
-        if let Some(position) = self.providers.iter().position(|item| item.id == chat.provider) {
+        if let Some(position) = self
+            .providers
+            .iter()
+            .position(|item| item.id == chat.provider)
+        {
             self.provider = position;
         }
         self.attachments.clear();
@@ -434,19 +441,15 @@ pipe a password to sudo yourself."
     ///
     /// `web_key` is the search provider's API key, which the shell decrypts from
     /// the credential vault instead of keeping it in a settings file.
-    fn apply_settings(
-        &mut self,
-        settings: &serde_json::Map<String, Value>,
-        web_key: Option<&str>,
-    ) {
+    fn apply_settings(&mut self, settings: &serde_json::Map<String, Value>, web_key: Option<&str>) {
         self.agent.app_allow = setting_rules(settings, SETTING_DEFAULT_ALLOW_RULES)
             .unwrap_or_else(|| SAFE_RULES.iter().map(|rule| (*rule).to_owned()).collect());
         self.agent.app_deny =
             setting_rules(settings, SETTING_DEFAULT_DENY_RULES).unwrap_or_default();
         self.agent.host_allow =
             setting_rules(settings, SETTING_HOST_ALLOW_RULES).unwrap_or_default();
-        self.agent.host_deny =
-            setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
+        self.agent.host_deny = setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
+        self.agent.permissions = Permissions::from_settings(settings);
 
         let mut folders = Vec::new();
         let global_folder = setting_text(settings, SETTING_RAG_FOLDER);
@@ -473,10 +476,7 @@ pipe a password to sudo yourself."
     }
 
     /// The embedding provider from the settings, when one is configured.
-    fn embedding_config(
-        &self,
-        settings: &serde_json::Map<String, Value>,
-    ) -> Option<EmbedConfig> {
+    fn embedding_config(&self, settings: &serde_json::Map<String, Value>) -> Option<EmbedConfig> {
         let id = setting_text(settings, SETTING_RAG_PROVIDER);
         if id.is_empty() {
             return None;
@@ -512,7 +512,7 @@ pipe a password to sudo yourself."
             model: self.model.trim().to_owned(),
             system: self.system_prompt(settings, host),
             messages: self.agent.history.clone(),
-            tools: tools::specs(),
+            tools: tools::specs(&self.agent.permissions),
             max_tokens: MAX_TOKENS,
         })
     }
@@ -715,7 +715,10 @@ pipe a password to sudo yourself."
             self.chats = chats
                 .iter()
                 .map(|chat| StoredChat {
-                    title: chat["title"].as_str().unwrap_or(DEFAULT_CHAT_TITLE).to_owned(),
+                    title: chat["title"]
+                        .as_str()
+                        .unwrap_or(DEFAULT_CHAT_TITLE)
+                        .to_owned(),
                     cwd: chat["cwd"].as_str().unwrap_or("/").to_owned(),
                     model: chat["model"].as_str().unwrap_or_default().to_owned(),
                     provider: chat["provider"].as_str().unwrap_or_default().to_owned(),
@@ -784,7 +787,8 @@ pipe a password to sudo yourself."
                 tools: Vec::new(),
                 max_tokens: 1_024,
             };
-            let result = complete_blocking(&request).map(|completion| completion.text.trim().to_owned());
+            let result =
+                complete_blocking(&request).map(|completion| completion.text.trim().to_owned());
             let _ = sender.send(result);
         });
         self.summary = Some((mode, events));
@@ -819,7 +823,9 @@ pipe a password to sudo yourself."
                         "Chat transferred. Carried over:\n{summary}"
                     )));
                     self.agent.history.push(super::protocol::ApiMessage::User {
-                        content: format!("[Context carried over from the previous chat]\n{summary}"),
+                        content: format!(
+                            "[Context carried over from the previous chat]\n{summary}"
+                        ),
                     });
                 } else {
                     self.agent
@@ -928,7 +934,12 @@ pipe a password to sudo yourself."
     }
 
     /// Run a slash command.
-    fn run_command(&mut self, command: SlashCommand, settings: &serde_json::Map<String, Value>, host: &str) {
+    fn run_command(
+        &mut self,
+        command: SlashCommand,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+    ) {
         self.draft.clear();
         match command.name {
             "new" => self.begin_new_chat(),
@@ -946,9 +957,7 @@ pipe a password to sudo yourself."
             } else {
                 "Ask the agent to help with this session. It can use terminal tools when you approve them."
             };
-            ui.add(
-                egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap(),
-            );
+            ui.add(egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap());
         }
         let mut rewind = None;
         for (index, turn) in self.agent.turns.iter().enumerate() {
@@ -1159,11 +1168,7 @@ fn tool_card(ui: &mut Ui, palette: &Palette, name: &str, label: &str, output: &s
                 );
             });
             if output.is_empty() {
-                ui.label(
-                    egui::RichText::new("(no output)")
-                        .size(11.0)
-                        .color(muted),
-                );
+                ui.label(egui::RichText::new("(no output)").size(11.0).color(muted));
                 return;
             }
             let shown = if output.chars().count() > TOOL_OUTPUT_MAX_CHARS {
@@ -1275,7 +1280,11 @@ impl Plugin for AiAgent {
                 }
             }
         }
-        if self.agent.busy() || self.summary.is_some() || self.picking.is_some() || self.fetch.is_some() {
+        if self.agent.busy()
+            || self.summary.is_some()
+            || self.picking.is_some()
+            || self.fetch.is_some()
+        {
             ui.ctx().request_repaint();
         }
 
@@ -1291,7 +1300,12 @@ impl Plugin for AiAgent {
 
         // The pane controls; provider and model live under the composer.
         ui.horizontal(|ui| {
-            if small_button_enabled(ui, palette, "New chat", !busy && !self.agent.turns.is_empty()) {
+            if small_button_enabled(
+                ui,
+                palette,
+                "New chat",
+                !busy && !self.agent.turns.is_empty(),
+            ) {
                 self.begin_new_chat();
             }
         });
@@ -1386,11 +1400,8 @@ impl Plugin for AiAgent {
                                 .color(to_color32(palette.accent)),
                         );
                         let preview = if queued.text.chars().count() > QUEUE_PREVIEW_MAX_CHARS {
-                            let head: String = queued
-                                .text
-                                .chars()
-                                .take(QUEUE_PREVIEW_MAX_CHARS)
-                                .collect();
+                            let head: String =
+                                queued.text.chars().take(QUEUE_PREVIEW_MAX_CHARS).collect();
                             format!("{head}…")
                         } else {
                             queued.text.clone()
@@ -1494,10 +1505,8 @@ impl Plugin for AiAgent {
                         };
                         if self.providers.is_empty() {
                             // The action comes first; the hint is cropped to what is left.
-                            let room = (ui.available_width()
-                                - action.size(ui).x
-                                - FOOTER_GAP)
-                                .max(0.0);
+                            let room =
+                                (ui.available_width() - action.size(ui).x - FOOTER_GAP).max(0.0);
                             let height = ui.spacing().interact_size.y;
                             ui.add_sized(
                                 egui::Vec2::new(room, height),
@@ -1513,10 +1522,8 @@ impl Plugin for AiAgent {
                             return (None, None, action.show(ui, palette).clicked());
                         }
                         // The dropdowns give way to the action, never the other way round.
-                        let spare = (ui.available_width()
-                            - action.size(ui).x
-                            - FOOTER_GAP * 2.0)
-                            .max(0.0);
+                        let spare =
+                            (ui.available_width() - action.size(ui).x - FOOTER_GAP * 2.0).max(0.0);
                         let select_room = spare / 2.0;
                         let provider = cropped_select(
                             ui,
@@ -1562,6 +1569,8 @@ impl Plugin for AiAgent {
         let mut approval: Option<(bool, Option<usize>, bool)> = None;
         let mut answer: Option<String> = None;
         let mut sudo_answer: Option<SudoAnswer> = None;
+        // A capability's permission prompt: (allow, remember the answer).
+        let mut permission: Option<(bool, bool)> = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-transcript")
             .max_height(ui.available_height())
@@ -1631,6 +1640,52 @@ impl Plugin for AiAgent {
                     }
                 }
 
+                // The capability card: a tool whose permission is "ask".
+                if let Some(Phase::Allowing { label, .. }) = &self.agent.phase {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Approve action?")
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(label.as_str())
+                                .size(11.5)
+                                .monospace()
+                                .color(to_color32(palette.accent)),
+                        )
+                        .wrap(),
+                    );
+                    ui.horizontal(|ui| {
+                        if Button::new("Approve once")
+                            .compact()
+                            .kind(ButtonKind::Primary)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            permission = Some((true, false));
+                        }
+                        if Button::new("Deny once")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            permission = Some((false, false));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if small_button_enabled(ui, palette, "Always allow", true) {
+                            permission = Some((true, true));
+                        }
+                        if small_button_enabled(ui, palette, "Always deny", true) {
+                            permission = Some((false, true));
+                        }
+                    });
+                }
+
                 // The question card.
                 if let Some(Phase::Asking { text, .. }) = &self.agent.phase {
                     ui.separator();
@@ -1646,7 +1701,8 @@ impl Plugin for AiAgent {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(room);
-                            let response = text_area(ui, palette, &mut self.answer, 2, "Your answer…");
+                            let response =
+                                text_area(ui, palette, &mut self.answer, 2, "Your answer…");
                             if response.has_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter))
                                 && !ui.input(|input| input.modifiers.shift)
@@ -1655,13 +1711,22 @@ impl Plugin for AiAgent {
                             }
                         },
                     );
-                    if small_button_enabled(ui, palette, "Send answer", !self.answer.trim().is_empty()) {
+                    if small_button_enabled(
+                        ui,
+                        palette,
+                        "Send answer",
+                        !self.answer.trim().is_empty(),
+                    ) {
                         answer = Some(std::mem::take(&mut self.answer));
                     }
                 }
 
                 // The sudo card: the command that needs root, and the password for it.
-                if let Some((command, reason)) = self.agent.sudo_prompt().map(|(c, r)| (c.to_owned(), r.map(str::to_owned))) {
+                if let Some((command, reason)) = self
+                    .agent
+                    .sudo_prompt()
+                    .map(|(c, r)| (c.to_owned(), r.map(str::to_owned)))
+                {
                     ui.separator();
                     ui.label(
                         egui::RichText::new("Sudo password required")
@@ -1680,12 +1745,8 @@ impl Plugin for AiAgent {
                     );
                     if let Some(reason) = reason {
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(reason)
-                                    .size(11.0)
-                                    .color(muted),
-                            )
-                            .wrap(),
+                            egui::Label::new(egui::RichText::new(reason).size(11.0).color(muted))
+                                .wrap(),
                         );
                     }
                     let room = (ui.available_width() - 8.0).max(80.0);
@@ -1742,6 +1803,15 @@ impl Plugin for AiAgent {
                 self.agent.approve(allow, remember, &mut session);
             }
         }
+        if let Some((allow, always)) = permission {
+            if always
+                && let Some(Phase::Allowing { call, .. }) = &self.agent.phase
+                && let Some(key) = setting_key(&call.name)
+            {
+                context.set_text(&key, if allow { "allow" } else { "deny" });
+            }
+            self.agent.answer_permission(allow, &mut session);
+        }
         if let Some(answer) = answer {
             self.agent.answer(&answer, &mut session);
         }
@@ -1754,7 +1824,11 @@ impl Plugin for AiAgent {
             None => {}
         }
 
-        if submit && !busy && let Some(slash) = &slash && let Some(exact) = slash.exact {
+        if submit
+            && !busy
+            && let Some(slash) = &slash
+            && let Some(exact) = slash.exact
+        {
             command = Some(exact);
         }
         if let Some(command) = command {
@@ -1765,14 +1839,12 @@ impl Plugin for AiAgent {
                 self.error = Some(error.to_owned());
             } else {
                 // The toggle attaches the live terminal screen to this one message.
-                let terminal = self
-                    .attach_terminal
-                    .then(|| {
-                        session
-                            .as_ref()
-                            .map(|access| access.screen_text())
-                            .unwrap_or_default()
-                    });
+                let terminal = self.attach_terminal.then(|| {
+                    session
+                        .as_ref()
+                        .map(|access| access.screen_text())
+                        .unwrap_or_default()
+                });
                 let text = self.draft.trim().to_owned();
                 let message = self.message_with_attachments(&text, terminal.as_deref());
                 let meta = UserMeta {
@@ -1961,7 +2033,11 @@ mod tests {
                     break;
                 };
                 let request = read_request(&mut stream);
-                let path = request.split_whitespace().nth(1).unwrap_or_default().to_owned();
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
                 let reply = if path.contains("models") {
                     http_response("application/json", models)
                 } else {
@@ -2067,9 +2143,9 @@ mod tests {
 
         // And the answer lands in the transcript.
         let answered = |plugin: &AiAgent| {
-            plugin.agent.turns.iter().any(|turn| {
-                matches!(turn, Turn::Assistant { text, .. } if text.contains("hello back"))
-            })
+            plugin.agent.turns.iter().any(
+                |turn| matches!(turn, Turn::Assistant { text, .. } if text.contains("hello back")),
+            )
         };
         for _ in 0..50 {
             frame(&mut plugin, &mut settings, &ctx, Vec::new());
@@ -2234,7 +2310,10 @@ mod tests {
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
         // First provider and its first model are what a new conversation starts on.
-        assert!(texts.contains(&"First"), "provider dropdown missing: {texts:?}");
+        assert!(
+            texts.contains(&"First"),
+            "provider dropdown missing: {texts:?}"
+        );
         assert!(texts.contains(&"a"), "model dropdown missing: {texts:?}");
         assert_eq!(plugin.provider, 0);
         assert_eq!(plugin.model, "a");
@@ -2271,7 +2350,10 @@ mod tests {
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
-        assert!(texts.contains(&"Run this command?"), "card missing: {texts:?}");
+        assert!(
+            texts.contains(&"Run this command?"),
+            "card missing: {texts:?}"
+        );
         assert!(
             texts.contains(&"systemctl restart nginx"),
             "command missing: {texts:?}"
@@ -2302,8 +2384,14 @@ mod tests {
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
-        assert!(texts.contains(&"Which file?"), "question missing: {texts:?}");
-        assert!(texts.contains(&"Your answer…"), "answer box missing: {texts:?}");
+        assert!(
+            texts.contains(&"Which file?"),
+            "question missing: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Your answer…"),
+            "answer box missing: {texts:?}"
+        );
         assert!(texts.contains(&"Send answer"), "send missing: {texts:?}");
     }
 
@@ -2318,7 +2406,12 @@ mod tests {
         // Anything with a space, or not starting with a slash, is a message.
         assert!(parse_slash_input("/summary please").is_none());
         assert!(parse_slash_input("hello").is_none());
-        assert!(parse_slash_input("/nonexistent").unwrap().matches.is_empty());
+        assert!(
+            parse_slash_input("/nonexistent")
+                .unwrap()
+                .matches
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2328,14 +2421,22 @@ mod tests {
             path: "/tmp/notes.txt".to_owned(),
             text: "line one".to_owned(),
         });
-        let message = plugin.message_with_attachments("summarise this", Some("$ uptime\nup 3 days"));
-        assert!(message.starts_with("[Attached file notes.txt]\nline one"), "{message}");
+        let message =
+            plugin.message_with_attachments("summarise this", Some("$ uptime\nup 3 days"));
+        assert!(
+            message.starts_with("[Attached file notes.txt]\nline one"),
+            "{message}"
+        );
         assert!(message.contains("summarise this"), "{message}");
         assert!(
             message.ends_with("[Recent terminal output]\n$ uptime\nup 3 days"),
             "terminal context missing: {message}"
         );
-        assert!(plugin.message_with_attachments("plain", None).contains("Attached"));
+        assert!(
+            plugin
+                .message_with_attachments("plain", None)
+                .contains("Attached")
+        );
 
         // A blank terminal still says so, like the reference.
         let empty = plugin.message_with_attachments("plain", Some("  "));
@@ -2372,7 +2473,11 @@ mod tests {
             .expect("send");
 
         assert!(plugin.poll_models(), "the list should count as changed");
-        assert_eq!(plugin.providers[0].models, ["A", "c"], "sorted, case-insensitive");
+        assert_eq!(
+            plugin.providers[0].models,
+            ["A", "c"],
+            "sorted, case-insensitive"
+        );
         assert_eq!(plugin.model, "old", "the chosen model is left alone");
 
         let writes = plugin.take_app_settings();
@@ -2481,9 +2586,12 @@ mod tests {
             text: "first question".to_owned(),
             meta: UserMeta::default(),
         });
-        plugin.agent.history.push(super::super::protocol::ApiMessage::User {
-            content: "first question".to_owned(),
-        });
+        plugin
+            .agent
+            .history
+            .push(super::super::protocol::ApiMessage::User {
+                content: "first question".to_owned(),
+            });
         plugin.begin_new_chat();
         assert!(plugin.agent.turns.is_empty(), "the live chat was cleared");
         assert_eq!(plugin.chats.len(), 1);
@@ -2500,13 +2608,10 @@ mod tests {
     fn the_oldest_chats_are_dropped_at_the_cap() {
         let mut plugin = AiAgent::default();
         for index in 0..(CONVERSATIONS_PER_HOST_MAX + 3) {
-            plugin
-                .agent
-                .turns
-                .push(Turn::User {
-                    text: format!("question {index}"),
-                    meta: UserMeta::default(),
-                });
+            plugin.agent.turns.push(Turn::User {
+                text: format!("question {index}"),
+                meta: UserMeta::default(),
+            });
             plugin.begin_new_chat();
         }
         assert_eq!(plugin.chats.len(), CONVERSATIONS_PER_HOST_MAX);
@@ -2543,7 +2648,10 @@ mod tests {
         let painted = draw(&mut plugin, &mut settings);
         assert!(painted.iter().any(|text| text == "Chats"), "picker missing");
         // And it is written back.
-        assert_eq!(settings[CONVERSATION_KEY]["chats"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            settings[CONVERSATION_KEY]["chats"].as_array().map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2660,26 +2768,26 @@ mod tests {
     fn the_web_and_knowledge_settings_reach_the_tools() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
-        settings.insert(
-            SETTING_WEB_SEARCH_PROVIDER.to_owned(),
-            json!("duckduckgo"),
-        );
+        settings.insert(SETTING_WEB_SEARCH_PROVIDER.to_owned(), json!("duckduckgo"));
         // A key left in the settings map is ignored: the vault is the only
         // place a secret is read from.
         settings.insert(SETTING_WEB_SEARCH_KEY.to_owned(), json!("plain-text"));
         settings.insert(SETTING_RAG_FOLDER.to_owned(), json!("/docs"));
         settings.insert(SETTING_HOST_RAG_FOLDER.to_owned(), json!("/srv/docs"));
-        let secrets = [(
-            SETTING_WEB_SEARCH_KEY.to_owned(),
-            "secret".to_owned(),
-        )]
-        .into_iter()
-        .collect();
+        let secrets = [(SETTING_WEB_SEARCH_KEY.to_owned(), "secret".to_owned())]
+            .into_iter()
+            .collect();
         draw_with_secrets(&mut plugin, &mut settings, &secrets);
-        assert_eq!(plugin.agent.tools.web_provider.as_deref(), Some("duckduckgo"));
+        assert_eq!(
+            plugin.agent.tools.web_provider.as_deref(),
+            Some("duckduckgo")
+        );
         assert_eq!(plugin.agent.tools.web_key.as_deref(), Some("secret"));
         assert_eq!(plugin.agent.tools.rag_folders, ["/docs", "/srv/docs"]);
-        assert!(plugin.agent.tools.embed.is_none(), "no embedding model configured");
+        assert!(
+            plugin.agent.tools.embed.is_none(),
+            "no embedding model configured"
+        );
     }
 
     #[test]

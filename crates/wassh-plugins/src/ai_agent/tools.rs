@@ -11,17 +11,18 @@
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::protocol::{
-    TOOL_ASK_USER, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT,
-    TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_CURRENT_TIME,
-    TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE,
-    TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ,
-    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
-    TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
-    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ,
+    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
+    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK,
+    TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS,
+    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
+
+use super::permissions::Permissions;
 
 /// Longest body a fetch may return.
 pub const MAX_FETCH_CHARS: usize = 32_000;
@@ -263,12 +264,14 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["path", "content"]),
         ),
-        TOOL_REMOTE_LIST | TOOL_LOCAL_LIST => {
-            (json!({ "path": string("Directory to list.") }), json!(["path"]))
-        }
-        TOOL_REMOTE_DELETE => {
-            (json!({ "path": string("File or directory to delete.") }), json!(["path"]))
-        }
+        TOOL_REMOTE_LIST | TOOL_LOCAL_LIST => (
+            json!({ "path": string("Directory to list.") }),
+            json!(["path"]),
+        ),
+        TOOL_REMOTE_DELETE => (
+            json!({ "path": string("File or directory to delete.") }),
+            json!(["path"]),
+        ),
         TOOL_REMOTE_EDIT | TOOL_LOCAL_EDIT | TOOL_DEV_EDIT => (
             json!({
                 "path": string("File to change."),
@@ -380,9 +383,13 @@ fn parameters(name: &str) -> (Value, Value) {
     }
 }
 
-/// Every tool schema, ready for the provider.
-pub fn specs() -> Vec<Value> {
-    TOOL_SPECS.iter().map(|spec| spec.schema()).collect()
+/// Every tool schema this host may use, ready for the provider.
+pub fn specs(permissions: &Permissions) -> Vec<Value> {
+    TOOL_SPECS
+        .iter()
+        .filter(|spec| permissions.offers(spec.name))
+        .map(|spec| spec.schema())
+        .collect()
 }
 
 /// Whether a tool exists.
@@ -468,7 +475,10 @@ fn clamp(text: &str, limit: usize) -> String {
         return text.to_owned();
     }
     let kept: String = text.chars().take(limit).collect();
-    format!("{kept}\n\n[Content truncated at {limit} characters of {}]", text.chars().count())
+    format!(
+        "{kept}\n\n[Content truncated at {limit} characters of {}]",
+        text.chars().count()
+    )
 }
 
 /// `dir/name`, without doubting the separator on Windows.
@@ -489,8 +499,8 @@ pub fn join_path(dir: &str, name: &str) -> String {
 
 /// Read a text file on this machine, refusing anything that looks binary.
 fn read_text_file(path: &Path, limit: usize) -> ToolResult {
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
     if bytes.iter().take(4096).any(|byte| *byte == 0) {
         return Err(format!("{} looks like a binary file.", path.display()));
     }
@@ -500,7 +510,10 @@ fn read_text_file(path: &Path, limit: usize) -> ToolResult {
 /// Write a text file on this machine, creating parent directories.
 fn write_text_file(path: &Path, content: &str, overwrite: bool) -> ToolResult {
     if path.exists() && !overwrite {
-        return Err(format!("{} already exists; pass overwrite to replace it.", path.display()));
+        return Err(format!(
+            "{} already exists; pass overwrite to replace it.",
+            path.display()
+        ));
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -587,7 +600,11 @@ pub fn html_to_text(html: &str) -> String {
     let mut text = strip(r"(?is)<script\b.*?</script>", " ", html);
     text = strip(r"(?is)<style\b.*?</style>", " ", &text);
     text = strip(r"(?is)<noscript\b.*?</noscript>", " ", &text);
-    text = strip(r"(?i)</(p|div|h[1-6]|li|tr|blockquote|article|section|pre)>", "\n", &text);
+    text = strip(
+        r"(?i)</(p|div|h[1-6]|li|tr|blockquote|article|section|pre)>",
+        "\n",
+        &text,
+    );
     text = strip(r"(?i)<br\s*/?>", "\n", &text);
     text = strip(r"<[^>]+>", " ", &text);
     let entities = [
@@ -700,7 +717,9 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
         TOOL_LOCAL_READ | TOOL_DEV_VIEW => {
             let path = local_path(&text_argument("path").unwrap_or_default());
             let limit = if name == TOOL_LOCAL_READ {
-                args["maxChars"].as_u64().map_or(32_000, |value| value as usize)
+                args["maxChars"]
+                    .as_u64()
+                    .map_or(32_000, |value| value as usize)
                     .clamp(1_000, MAX_FILE_READ_CHARS)
             } else {
                 MAX_FILE_READ_CHARS
@@ -807,10 +826,16 @@ fn walk_files(root: &Path, depth: usize, visit: &mut impl FnMut(&Path) -> bool) 
     let Ok(entries) = std::fs::read_dir(root) else {
         return true;
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).collect();
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect();
     paths.sort();
     for path in paths {
-        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if name.starts_with('.') || name == "node_modules" || name == "target" {
             continue;
         }
@@ -849,7 +874,10 @@ fn dev_grep(args: &Value) -> ToolResult {
     let mut searched = 0usize;
     let mut visit = |path: &Path| {
         if let Some(glob) = &glob {
-            let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if !glob_matches(glob, &name) {
                 return true;
             }
@@ -909,7 +937,10 @@ fn dev_find(args: &Value) -> ToolResult {
         .clamp(1, MAX_DEV_FIND_MATCHES);
     let mut found: Vec<String> = Vec::new();
     let mut visit = |path: &Path| {
-        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if glob_matches(pattern, &name) {
             found.push(path.display().to_string());
         }
@@ -917,7 +948,10 @@ fn dev_find(args: &Value) -> ToolResult {
     };
     walk_files(&root, 0, &mut visit);
     if found.is_empty() {
-        return Ok(format!("No files matching {pattern} under {}", root.display()));
+        return Ok(format!(
+            "No files matching {pattern} under {}",
+            root.display()
+        ));
     }
     Ok(found.join("\n"))
 }
@@ -1052,9 +1086,12 @@ mod tests {
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs();
+        let schemas = specs(&Permissions::default());
         assert_eq!(schemas.len(), 31);
-        let names: Vec<&str> = schemas.iter().map(|schema| schema["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|schema| schema["name"].as_str().unwrap())
+            .collect();
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"run_sudo"));
         assert!(names.contains(&"dev_grep_search"));
@@ -1092,8 +1129,14 @@ mod tests {
 
     #[test]
     fn replacing_refuses_ambiguity() {
-        assert_eq!(replace_once("a b a", "a", "c").unwrap_err(), "oldText appears 2 times; include more surrounding text so the change is unambiguous.");
-        assert_eq!(replace_once("abc", "x", "y").unwrap_err(), "oldText was not found in the file.");
+        assert_eq!(
+            replace_once("a b a", "a", "c").unwrap_err(),
+            "oldText appears 2 times; include more surrounding text so the change is unambiguous."
+        );
+        assert_eq!(
+            replace_once("abc", "x", "y").unwrap_err(),
+            "oldText was not found in the file."
+        );
         assert_eq!(replace_once("abc", "b", "B").unwrap(), "aBc");
         assert!(replace_once("abc", "", "x").is_err());
     }
@@ -1116,9 +1159,10 @@ mod tests {
 
     #[test]
     fn the_time_tool_reports_a_parseable_stamp() {
-        let json: Value =
-            serde_json::from_str(&run_local(TOOL_CURRENT_TIME, &json!({}), 1_700_000_000_000).unwrap())
-                .unwrap();
+        let json: Value = serde_json::from_str(
+            &run_local(TOOL_CURRENT_TIME, &json!({}), 1_700_000_000_000).unwrap(),
+        )
+        .unwrap();
         assert_eq!(json["timestamp"], 1_700_000_000_000u64);
         assert!(json["iso"].as_str().unwrap().starts_with("2023-11-14T"));
     }
@@ -1132,15 +1176,30 @@ mod tests {
         let _ = std::fs::remove_file(&file);
 
         // A fresh write succeeds; a second one needs overwrite.
-        run_local(TOOL_LOCAL_WRITE, &json!({ "path": path, "content": "hello" }), 0).unwrap();
-        assert!(run_local(TOOL_LOCAL_WRITE, &json!({ "path": path, "content": "x" }), 0).is_err());
+        run_local(
+            TOOL_LOCAL_WRITE,
+            &json!({ "path": path, "content": "hello" }),
+            0,
+        )
+        .unwrap();
+        assert!(
+            run_local(
+                TOOL_LOCAL_WRITE,
+                &json!({ "path": path, "content": "x" }),
+                0
+            )
+            .is_err()
+        );
         run_local(
             TOOL_LOCAL_WRITE,
             &json!({ "path": path, "content": "hello again", "overwrite": true }),
             0,
         )
         .unwrap();
-        assert_eq!(run_local(TOOL_LOCAL_READ, &json!({ "path": path }), 0).unwrap(), "hello again");
+        assert_eq!(
+            run_local(TOOL_LOCAL_READ, &json!({ "path": path }), 0).unwrap(),
+            "hello again"
+        );
 
         // Editing reports the change.
         let diff = run_local(
@@ -1156,7 +1215,12 @@ mod tests {
         assert!(view.contains("    1\thello once more"), "{view}");
 
         // Listing and grepping find it again.
-        let list = run_local(TOOL_LOCAL_LIST, &json!({ "path": dir.display().to_string() }), 0).unwrap();
+        let list = run_local(
+            TOOL_LOCAL_LIST,
+            &json!({ "path": dir.display().to_string() }),
+            0,
+        )
+        .unwrap();
         assert!(list.contains("note.txt"), "{list}");
         let grep = run_local(
             TOOL_DEV_GREP,
@@ -1183,13 +1247,21 @@ mod tests {
         assert!(command.contains("--sort=-pcpu"));
         let sort = remote_shell_command(TOOL_SYSTEM_PROCESSES, &json!({ "sort": "mem" })).unwrap();
         assert!(sort.contains("--sort=-pmem"));
-        assert!(remote_shell_command(TOOL_SYSTEM_OVERVIEW, &json!({})).unwrap().contains("uname -a"));
-        assert!(remote_shell_command(TOOL_SYSTEM_DISK, &json!({ "includeInodes": true }))
-            .unwrap()
-            .contains("df -i"));
-        assert!(remote_shell_command(TOOL_SYSTEM_MEMORY, &json!({}))
-            .unwrap()
-            .contains("/proc/meminfo"));
+        assert!(
+            remote_shell_command(TOOL_SYSTEM_OVERVIEW, &json!({}))
+                .unwrap()
+                .contains("uname -a")
+        );
+        assert!(
+            remote_shell_command(TOOL_SYSTEM_DISK, &json!({ "includeInodes": true }))
+                .unwrap()
+                .contains("df -i")
+        );
+        assert!(
+            remote_shell_command(TOOL_SYSTEM_MEMORY, &json!({}))
+                .unwrap()
+                .contains("/proc/meminfo")
+        );
         assert!(remote_shell_command(TOOL_RUN_COMMAND, &json!({})).is_none());
     }
 

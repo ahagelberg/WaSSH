@@ -9,6 +9,7 @@ use std::sync::mpsc::Receiver;
 
 use serde_json::Value;
 
+use super::permissions::{Permission, Permissions};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
     TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
@@ -18,10 +19,10 @@ use super::protocol::{
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
     TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
-use super::providers::{complete, embeddings, CompletionRequest, EmbedConfig, StreamEvent};
+use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
 use super::rules::{
-    approval_scopes, decide_command, ApprovalScope, RuleDecision, ALLOW_ALL_PATTERN,
+    ALLOW_ALL_PATTERN, ApprovalScope, RuleDecision, approval_scopes, decide_command,
 };
 use super::tools::{self, ToolResult};
 use super::web;
@@ -59,6 +60,10 @@ const SUDO_DEMAND_MARKERS: [&str; 4] = [
 pub const TERMINAL_WAIT_DEFAULT_MS: u64 = 5_000;
 /// Said when a reply arrives with neither text nor tool calls.
 pub const EMPTY_ANSWER: &str = "The model returned an empty answer.";
+/// Said when a capability is switched off or denied in the settings.
+pub const NOT_PERMITTED: &str = "This action is not permitted.";
+/// Said when the user turns an action down.
+pub const DENIED_BY_USER: &str = "Action denied by user.";
 /// System prompt used when summarising a chat for a new one.
 pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarise the conversation above for a fresh agent session that must \
 continue the work. Reply with terse bullet points, at most 150 words, covering: Goal (what the user wants), \
@@ -136,6 +141,15 @@ pub enum Phase {
         command: String,
         /// "Always allow/deny" choices offered.
         scopes: Vec<ApprovalScope>,
+    },
+    /// A capability whose permission is "ask" waits for the user.
+    Allowing {
+        /// The call being approved.
+        call: ApiToolCall,
+        /// Its transcript line.
+        turn: usize,
+        /// What it wants to do, shown on the card.
+        label: String,
     },
     /// A tool is running.
     Running {
@@ -278,6 +292,8 @@ pub struct Agent {
     pub session_deny: Vec<String>,
     /// Tool settings from the plugin data.
     pub tools: ToolSettings,
+    /// What this host may do, read from the plugin settings.
+    pub permissions: Permissions,
     /// Set when the model owes an answer to a tool result.
     pub needs_reply: bool,
     /// Clock used by the time-based tools; the view sets it every frame.
@@ -310,6 +326,11 @@ impl Agent {
         matches!(self.phase, Some(Phase::Approving { .. }))
     }
 
+    /// Whether a capability's permission asks the user.
+    pub fn allowing(&self) -> bool {
+        matches!(self.phase, Some(Phase::Allowing { .. }))
+    }
+
     /// Whether the agent is waiting on the user.
     pub fn asking(&self) -> bool {
         matches!(self.phase, Some(Phase::Asking { .. }))
@@ -327,7 +348,11 @@ impl Agent {
 
     /// Whether anything at all blocks a new message.
     pub fn blocked(&self) -> bool {
-        self.busy() || self.approving() || self.asking() || self.sudo_prompt().is_some()
+        self.busy()
+            || self.approving()
+            || self.allowing()
+            || self.asking()
+            || self.sudo_prompt().is_some()
     }
 
     /// Throw the conversation away.
@@ -563,7 +588,9 @@ impl Agent {
                             )
                         } else {
                             match replace_and_report(&text, &old, &new) {
-                                Ok((updated, diff)) => Ready::WriteRemote(path, format!("{updated}\u{0}{diff}")),
+                                Ok((updated, diff)) => {
+                                    Ready::WriteRemote(path, format!("{updated}\u{0}{diff}"))
+                                }
                                 Err(error) => Ready::Settle(format!("edit {path}"), error, true),
                             }
                         }
@@ -597,7 +624,9 @@ impl Agent {
             }
             Waiting::Transfer { target, note } => {
                 let (target, note) = (target.clone(), note.clone());
-                let busy = session.as_ref().is_some_and(|access| access.is_transferring());
+                let busy = session
+                    .as_ref()
+                    .is_some_and(|access| access.is_transferring());
                 if busy {
                     return false;
                 }
@@ -606,7 +635,8 @@ impl Agent {
                     .and_then(|access| access.transfer_status().map(str::to_owned))
                     .unwrap_or_default();
                 let lower = status.to_lowercase();
-                let failed = lower.contains("fail") || lower.contains("denied") || lower.contains("error");
+                let failed =
+                    lower.contains("fail") || lower.contains("denied") || lower.contains("error");
                 match note {
                     Some(note) => {
                         let body = if failed {
@@ -702,7 +732,9 @@ impl Agent {
                 let _ = std::fs::remove_file(&local);
                 // The upload finishes on a later frame; a diff is the answer.
                 if let Some(Turn::Tool { output, .. }) = self.turns.get_mut(turn) {
-                    *output = diff.clone().unwrap_or_else(|| format!("Uploading to {target}…"));
+                    *output = diff
+                        .clone()
+                        .unwrap_or_else(|| format!("Uploading to {target}…"));
                 }
                 self.phase = Some(Phase::Running {
                     call,
@@ -827,6 +859,46 @@ impl Agent {
 
     /// Run one call, or park the agent on whatever it needs.
     fn dispatch(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
+        match self.permissions.decision(&call.name) {
+            Permission::Allow => {}
+            Permission::Deny => {
+                self.settle(
+                    call,
+                    turn,
+                    self.label(turn),
+                    NOT_PERMITTED.to_owned(),
+                    false,
+                    session,
+                );
+                return;
+            }
+            Permission::Ask => {
+                self.phase = Some(Phase::Allowing {
+                    label: self.label(turn),
+                    call,
+                    turn,
+                });
+                return;
+            }
+        }
+        self.run_tool(call, turn, session);
+    }
+
+    /// Answer a capability's permission prompt. "Always" answers are written
+    /// to the settings by the pane before calling this.
+    pub fn answer_permission(&mut self, allow: bool, session: Session<'_, '_>) {
+        let Some(Phase::Allowing { call, turn, label }) = self.phase.take() else {
+            return;
+        };
+        if allow {
+            self.run_tool(call, turn, session);
+        } else {
+            self.settle(call, turn, label, DENIED_BY_USER.to_owned(), false, session);
+        }
+    }
+
+    /// Run one call the permissions already allowed.
+    fn run_tool(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
         let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         let name = call.name.clone();
         if !tools::is_tool(&name) {
@@ -906,7 +978,8 @@ impl Agent {
                         self.exec_command(call, command, sudo_stdin, turn, session)
                     }
                     RuleDecision::Deny => {
-                        let reason = format!("Running `{command}` is not allowed by the permission rules.");
+                        let reason =
+                            format!("Running `{command}` is not allowed by the permission rules.");
                         self.settle(call, turn, format!("$ {command}"), reason, true, session);
                     }
                     RuleDecision::Ask => {
@@ -985,7 +1058,8 @@ impl Agent {
     ) {
         match name {
             TOOL_REMOTE_READ => {
-                let path = relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let max = arguments["maxChars"]
                     .as_u64()
                     .unwrap_or(32_000)
@@ -993,7 +1067,8 @@ impl Agent {
                 self.start_read(call, turn, path, max, ReadThen::Return, session);
             }
             TOOL_REMOTE_EDIT => {
-                let path = relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let old = arguments["oldText"].as_str().unwrap_or_default().to_owned();
                 let new = arguments["newText"].as_str().unwrap_or_default().to_owned();
                 if old.is_empty() {
@@ -1017,7 +1092,8 @@ impl Agent {
                 );
             }
             TOOL_REMOTE_WRITE => {
-                let path = relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let content = arguments["content"].as_str().unwrap_or_default().to_owned();
                 let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
                 let probe = format!("test -e {} && echo yes || echo no", shell_quote(&path));
@@ -1034,7 +1110,8 @@ impl Agent {
                 );
             }
             TOOL_REMOTE_LIST => {
-                let path = relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 match session.as_mut() {
                     Some(access) => access.request_listing(&path),
                     None => {
@@ -1056,7 +1133,8 @@ impl Agent {
                 });
             }
             TOOL_REMOTE_DELETE => {
-                let path = relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let command = format!("rm -rf -- {} && echo removed", shell_quote(&path));
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
@@ -1159,7 +1237,9 @@ impl Agent {
             }
             TOOL_RAG_SEARCH => {
                 let query = arguments["query"].as_str().unwrap_or_default().to_owned();
-                let limit = arguments["limit"].as_u64().map_or(5, |value| value as usize);
+                let limit = arguments["limit"]
+                    .as_u64()
+                    .map_or(5, |value| value as usize);
                 let folders = self.tools.rag_folders.clone();
                 let embed = self.tools.embed.clone();
                 self.spawn_worker(call, turn, move || {
@@ -1453,10 +1533,7 @@ impl Agent {
         let ApiMessage::Assistant { tool_calls, .. } = &self.history[position] else {
             return;
         };
-        let mut open: Vec<&str> = tool_calls
-            .iter()
-            .map(|call| call.id.as_str())
-            .collect();
+        let mut open: Vec<&str> = tool_calls.iter().map(|call| call.id.as_str()).collect();
         for message in &self.history[position + 1..] {
             if let ApiMessage::Tool { tool_call_id, .. } = message {
                 open.retain(|id| *id != tool_call_id);
@@ -1514,7 +1591,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
         }
         TOOL_REMOTE_DELETE => format!("delete {}", arguments["path"].as_str().unwrap_or_default()),
         TOOL_DEV_GREP => format!("grep {}", arguments["pattern"].as_str().unwrap_or_default()),
-        TOOL_DEV_FIND => format!("find {}", arguments["namePattern"].as_str().unwrap_or_default()),
+        TOOL_DEV_FIND => format!(
+            "find {}",
+            arguments["namePattern"].as_str().unwrap_or_default()
+        ),
         TOOL_DEV_DIFF => format!("diff {}", arguments["path"].as_str().unwrap_or_default()),
         TOOL_WEB_FETCH => format!("fetch {}", arguments["url"].as_str().unwrap_or_default()),
         TOOL_WEB_SEARCH => format!("search {}", arguments["query"].as_str().unwrap_or_default()),
@@ -1773,7 +1853,9 @@ pub fn history_to_json(messages: &[ApiMessage]) -> Vec<Value> {
     messages
         .iter()
         .map(|message| match message {
-            ApiMessage::User { content } => serde_json::json!({ "role": "user", "content": content }),
+            ApiMessage::User { content } => {
+                serde_json::json!({ "role": "user", "content": content })
+            }
             ApiMessage::Assistant {
                 content,
                 tool_calls,
@@ -1860,8 +1942,14 @@ mod tests {
 
     #[test]
     fn the_tool_result_carries_the_exit_code() {
-        assert_eq!(command_result_text("ok", Some(0), false), "ok\n[exit code: 0]");
-        assert_eq!(command_result_text("", Some(2), false), "(no output)\n[exit code: 2]");
+        assert_eq!(
+            command_result_text("ok", Some(0), false),
+            "ok\n[exit code: 0]"
+        );
+        assert_eq!(
+            command_result_text("", Some(2), false),
+            "(no output)\n[exit code: 2]"
+        );
         assert!(command_result_text("big", None, true).contains("[output truncated]"));
     }
 
@@ -1873,7 +1961,10 @@ mod tests {
     #[test]
     fn remote_paths_resolve_against_the_working_directory() {
         assert_eq!(relative_remote("/srv/app", "/etc/passwd"), "/etc/passwd");
-        assert_eq!(relative_remote("/srv/app", "notes.txt"), "/srv/app/notes.txt");
+        assert_eq!(
+            relative_remote("/srv/app", "notes.txt"),
+            "/srv/app/notes.txt"
+        );
         assert_eq!(relative_remote("/srv/app", ""), "/srv/app");
         assert_eq!(relative_remote("/", "etc"), "/etc");
     }
@@ -1885,13 +1976,19 @@ mod tests {
             name: name.to_owned(),
             arguments: arguments.to_owned(),
         };
-        assert_eq!(call_label(&call(TOOL_RUN_COMMAND, r#"{"command":"uptime"}"#)), "$ uptime");
+        assert_eq!(
+            call_label(&call(TOOL_RUN_COMMAND, r#"{"command":"uptime"}"#)),
+            "$ uptime"
+        );
         assert_eq!(
             call_label(&call(TOOL_REMOTE_READ, r#"{"path":"/etc/hosts"}"#)),
             "read /etc/hosts"
         );
         assert_eq!(call_label(&call(TOOL_CURRENT_TIME, "{}")), "time");
-        assert_eq!(call_label(&call(TOOL_WEB_SEARCH, r#"{"query":"rust"}"#)), "search rust");
+        assert_eq!(
+            call_label(&call(TOOL_WEB_SEARCH, r#"{"query":"rust"}"#)),
+            "search rust"
+        );
     }
 
     #[test]
@@ -1952,7 +2049,11 @@ mod tests {
 
         assert_eq!(agent.rewind_to(2).as_deref(), Some("second"));
         assert_eq!(
-            agent.turns.iter().filter(|turn| matches!(turn, Turn::User { .. })).count(),
+            agent
+                .turns
+                .iter()
+                .filter(|turn| matches!(turn, Turn::User { .. }))
+                .count(),
             1,
             "the later exchange is gone: {:?}",
             agent.turns
@@ -1967,9 +2068,16 @@ mod tests {
             "the provider history is cut to the same point: {:?}",
             agent.history
         );
-        assert!(agent.rewind_to(0).is_some(), "the first message can be rewound to too");
+        assert!(
+            agent.rewind_to(0).is_some(),
+            "the first message can be rewound to too"
+        );
         assert!(agent.turns.is_empty() && agent.history.is_empty());
-        assert_eq!(agent.rewind_to(0), None, "there is nothing left to rewind to");
+        assert_eq!(
+            agent.rewind_to(0),
+            None,
+            "there is nothing left to rewind to"
+        );
     }
 
     #[test]
@@ -2091,6 +2199,77 @@ mod tests {
     }
 
     #[test]
+    fn a_denied_capability_never_runs() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::new());
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_WEB_FETCH.to_owned(),
+                arguments: r#"{"url":"https://example.com"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == NOT_PERMITTED
+        ));
+        assert!(agent.needs_reply, "the model is told and carries on");
+    }
+
+    #[test]
+    fn an_asked_capability_waits_for_the_user() {
+        let mut agent = Agent::new();
+        agent.phase = None;
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_TERMINAL),
+            Value::Bool(true),
+        )]));
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_TERMINAL_WRITE.to_owned(),
+                arguments: r#"{"text":"ls\n"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(agent.allowing(), "the pane has to ask");
+        assert!(agent.blocked(), "and hold the conversation");
+        agent.answer_permission(false, &mut session);
+        assert!(!agent.allowing());
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == DENIED_BY_USER
+        ));
+        assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn an_allowed_capability_runs_straight_away() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_KNOWLEDGE_BASE),
+            Value::Bool(true),
+        )]));
+        agent.tools.rag_folders = vec![std::env::temp_dir().display().to_string()];
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RAG_SEARCH.to_owned(),
+                arguments: r#"{"query":"anything"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(
+            matches!(agent.phase, Some(Phase::Running { .. })),
+            "no approval"
+        );
+    }
+
+    #[test]
     fn ask_user_waits_for_the_answer() {
         let mut agent = Agent::new();
         let mut session: Option<&mut dyn SessionAccess> = None;
@@ -2133,7 +2312,6 @@ mod tests {
             other => panic!("expected a tool turn, got {other:?}"),
         }
     }
-
 
     /// A session that answers from memory, so the tool paths can be driven.
     #[derive(Default)]
@@ -2187,10 +2365,12 @@ mod tests {
         fn remove(&mut self, _path: &str, _is_dir: bool) {}
         fn chmod(&mut self, _path: &str, _mode: u32) {}
         fn read(&mut self, path: &str, _max_bytes: u64) -> Option<crate::files::FileContent> {
-            self.contents.get(path).map(|text| crate::files::FileContent {
-                data: text.as_bytes().to_vec(),
-                truncated: false,
-            })
+            self.contents
+                .get(path)
+                .map(|text| crate::files::FileContent {
+                    data: text.as_bytes().to_vec(),
+                    truncated: false,
+                })
         }
         fn upload_many(&mut self, _items: Vec<(String, String)>) {}
         fn download_many(&mut self, _items: Vec<(String, String)>) {}
@@ -2297,9 +2477,17 @@ mod tests {
                 code: Some(0),
             },
         );
-        let output = run_tool(&mut agent, &mut fake, TOOL_RUN_COMMAND, r#"{"command":"pwd"}"#);
-        assert_eq!(output, "/srv/app
-[exit code: 0]");
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_RUN_COMMAND,
+            r#"{"command":"pwd"}"#,
+        );
+        assert_eq!(
+            output,
+            "/srv/app
+[exit code: 0]"
+        );
         // The wrapper ran in the cwd and reported it back.
         let sent = &fake.commands[0].1;
         assert!(sent.starts_with("cd '/' "), "{sent}");
@@ -2311,17 +2499,23 @@ mod tests {
     fn a_remote_read_answers_from_the_session() {
         let mut agent = Agent::new();
         let mut fake = FakeSession::default();
-        fake.contents
-            .insert("/etc/hosts".to_owned(), "127.0.0.1 localhost
-".to_owned());
+        fake.contents.insert(
+            "/etc/hosts".to_owned(),
+            "127.0.0.1 localhost
+"
+            .to_owned(),
+        );
         let output = run_tool(
             &mut agent,
             &mut fake,
             TOOL_REMOTE_READ,
             r#"{"path":"/etc/hosts"}"#,
         );
-        assert_eq!(output, "127.0.0.1 localhost
-");
+        assert_eq!(
+            output,
+            "127.0.0.1 localhost
+"
+        );
     }
 
     #[test]
@@ -2329,7 +2523,8 @@ mod tests {
         let mut agent = Agent::new();
         let mut fake = FakeSession::default();
         // The edit resolves `translated.txt` against the working directory.
-        fake.contents.insert("/translated.txt".to_owned(), "one\ntwo\n".to_owned());
+        fake.contents
+            .insert("/translated.txt".to_owned(), "one\ntwo\n".to_owned());
         let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
         agent.begin_tool(
             ApiToolCall {
@@ -2346,7 +2541,11 @@ mod tests {
             upload.as_ref().map(|(path, _)| path.as_str()),
             Some("/translated.txt")
         );
-        assert!(upload.as_ref().is_some_and(|(_, body)| body.contains("TWO")));
+        assert!(
+            upload
+                .as_ref()
+                .is_some_and(|(_, body)| body.contains("TWO"))
+        );
         match agent.turns.last().cloned().expect("a tool turn") {
             Turn::Tool { output, failed, .. } => {
                 assert!(!failed, "{output}");
@@ -2385,7 +2584,12 @@ mod tests {
             }),
             ..FakeSession::default()
         };
-        let output = run_tool(&mut agent, &mut fake, TOOL_REMOTE_LIST, r#"{"path":"/etc"}"#);
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_REMOTE_LIST,
+            r#"{"path":"/etc"}"#,
+        );
         assert!(output.contains("dir   nginx"), "{output}");
         assert!(output.contains("file       220  hosts"), "{output}");
     }
@@ -2395,7 +2599,8 @@ mod tests {
         let mut agent = Agent::new();
         let mut fake = FakeSession {
             screen: "$ uptime
- 10:00 up 3 days".to_owned(),
+ 10:00 up 3 days"
+                .to_owned(),
             ..FakeSession::default()
         };
         let read = run_tool(&mut agent, &mut fake, TOOL_TERMINAL_READ, "{}");
@@ -2410,7 +2615,12 @@ mod tests {
         assert!(typed.contains("Typed 2 characters and Enter"), "{typed}");
         assert_eq!(fake.typed, "ls\r");
 
-        let keys = run_tool(&mut agent, &mut fake, TOOL_TERMINAL_KEYS, r#"{"keys":"ctrl-c"}"#);
+        let keys = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_TERMINAL_KEYS,
+            r#"{"keys":"ctrl-c"}"#,
+        );
         assert!(keys.contains("Sent ctrl-c"), "{keys}");
         assert!(fake.typed.ends_with('\u{3}'));
     }
@@ -2466,7 +2676,10 @@ mod tests {
         }
 
         // Nothing runs until the user types a password.
-        assert!(fake.commands.is_empty(), "the command ran without a password");
+        assert!(
+            fake.commands.is_empty(),
+            "the command ran without a password"
+        );
         assert_eq!(
             agent.sudo_prompt(),
             Some(("apt-get update", Some("refresh packages"))),
@@ -2477,7 +2690,8 @@ mod tests {
         fake.answers.insert(
             EXEC_KEY.to_owned(),
             crate::command::CommandOutput {
-                stdout: "Reading package lists...\n__WASSH_STATUS:0__\n__WASSH_PWD:/__\n".to_owned(),
+                stdout: "Reading package lists...\n__WASSH_STATUS:0__\n__WASSH_PWD:/__\n"
+                    .to_owned(),
                 stderr: String::new(),
                 code: Some(0),
             },
@@ -2490,7 +2704,10 @@ mod tests {
         let sent = &fake.commands.last().expect("the command did not run").1;
         assert!(sent.contains("sudo -S -p '' -v"), "{sent}");
         assert!(sent.contains("apt-get update"), "{sent}");
-        assert!(!sent.contains("hunter2"), "the password must not reach the command line");
+        assert!(
+            !sent.contains("hunter2"),
+            "the password must not reach the command line"
+        );
         assert_eq!(fake.stdin.last().map(String::as_str), Some("hunter2"));
     }
 
@@ -2513,7 +2730,10 @@ mod tests {
             TOOL_RUN_COMMAND,
             r#"{"command":"du -sh /root"}"#,
         );
-        assert!(output.contains(SUDO_HINT), "the model was not told: {output}");
+        assert!(
+            output.contains(SUDO_HINT),
+            "the model was not told: {output}"
+        );
         // A failure that has nothing to do with root is left alone.
         assert!(!needs_sudo_help("cat: missing: No such file or directory"));
     }
@@ -2548,7 +2768,10 @@ mod tests {
             }
             other => panic!("expected a tool turn, got {other:?}"),
         }
-        assert!(agent.needs_reply, "the model has to be told the tool failed");
+        assert!(
+            agent.needs_reply,
+            "the model has to be told the tool failed"
+        );
     }
 
     #[test]
@@ -2559,7 +2782,9 @@ mod tests {
         // A bare command is run as root; one that already calls sudo is left alone.
         assert!(wrapped.contains("sudo -n apt-get update"), "{wrapped}");
         assert!(!wrapped.contains("sudo -n sudo"));
-        assert!(wrap_command_with_sudo("/srv", "sudo du -sh /root").contains("\n  sudo du -sh /root\n"));
+        assert!(
+            wrap_command_with_sudo("/srv", "sudo du -sh /root").contains("\n  sudo du -sh /root\n")
+        );
         assert!(wrapped.contains(SUDO_AUTH_FAILED_MARKER));
         // The password itself is never part of the command line.
         assert!(!wrapped.contains("hunter2"));

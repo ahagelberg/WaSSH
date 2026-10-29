@@ -16,9 +16,9 @@ use wassh_core::{
 use wassh_plugins::settings::{self as plugin_settings, FieldKind, SettingsField};
 use wassh_plugins::PluginId;
 use wassh_ui::widgets::{
-    BannerKind, Button, Tone, badge, banner, card, checkbox, footer, hex_color_input, modal,
-    number_input, password_input, select, select_str, small_button, small_button_enabled, tag_input,
-    text_input,
+    BannerKind, Button, ButtonKind, Tone, badge, banner, card, checkbox, footer, hex_color_input,
+    modal, number_input, password_input, select, select_str, small_button, small_button_enabled,
+    tag_input, text_input,
 };
 
 use wassh_ui::terminal_view::to_color32;
@@ -1703,17 +1703,8 @@ fn plugin_settings_rows(
                     values.insert(field.key.to_owned(), serde_json::Value::from(number));
                 }
             }
-            FieldKind::Select | FieldKind::Permission => {
-                let options: Vec<&'static str> = if field.kind == FieldKind::Permission {
-                    vec!["allow", "deny", "ask"]
-                } else {
-                    field.options.iter().map(|option| option.label).collect()
-                };
-                let labels: Vec<&'static str> = if field.kind == FieldKind::Permission {
-                    vec!["Allow", "Deny", "Ask"]
-                } else {
-                    field.options.iter().map(|option| option.label).collect()
-                };
+            FieldKind::Select => {
+                let labels: Vec<&'static str> = field.options.iter().map(|option| option.label).collect();
                 let default = setting_text(values, field);
                 let selected = labels
                     .iter()
@@ -1729,12 +1720,20 @@ fn plugin_settings_rows(
                     }
                 });
                 if chosen != selected {
-                    let value = if field.kind == FieldKind::Permission {
-                        options[chosen]
-                    } else {
-                        field.options[chosen].value
-                    };
-                    values.insert(field.key.to_owned(), serde_json::Value::from(value));
+                    values.insert(
+                        field.key.to_owned(),
+                        serde_json::Value::from(field.options[chosen].value),
+                    );
+                }
+            }
+            FieldKind::Permission => {
+                let current = setting_text(values, field);
+                let mut chosen = current.clone();
+                row(ui, palette, field.label, Some(field.description), |ui| {
+                    chosen = permission_input(ui, palette, &current);
+                });
+                if chosen != current {
+                    values.insert(field.key.to_owned(), serde_json::Value::from(chosen));
                 }
             }
             FieldKind::StringList => {
@@ -2072,6 +2071,28 @@ fn setting_text(values: &serde_json::Map<String, serde_json::Value>, field: &Set
             _ => String::new(),
         },
     }
+}
+
+/// The three-way permission control: Allow / Ask / Deny, the chosen one tinted
+/// by what it means. Returns the value the settings store.
+fn permission_input(ui: &mut Ui, palette: &Palette, current: &str) -> String {
+    const CHOICES: [(&str, &str); 3] = [("allow", "Allow"), ("ask", "Ask"), ("deny", "Deny")];
+    let mut chosen = current.to_owned();
+    ui.horizontal(|ui| {
+        for (value, label) in CHOICES {
+            let active = chosen == value;
+            let kind = match (value, active) {
+                ("allow", true) => ButtonKind::Primary,
+                ("deny", true) => ButtonKind::Danger,
+                _ => ButtonKind::Secondary,
+            };
+            let button = Button::new(label).compact().kind(kind).active(active);
+            if button.show(ui, palette).clicked() {
+                chosen = value.to_owned();
+            }
+        }
+    });
+    chosen
 }
 
 fn setting_list_text(
@@ -3520,10 +3541,11 @@ mod tests {
             "List refresh interval (ms)",
             "Stats interval (ms)",
             "Log tail lines",
-            "sudo password",
         ] {
             assert!(has(label), "{label:?} should be a Docker host setting");
         }
+        // The password is asked for when it is needed, never stored.
+        assert!(!has("sudo password"), "no saved sudo password");
         // Drawing alone must not invent stored values.
         assert!(values.is_empty());
     }
@@ -3799,7 +3821,7 @@ mod tests {
         // Both live in the global dialog: the provider list and every agent setting are
         // rows of the section, so nothing needs a "Configure…" step.
         let ctx = Context::default();
-        let size = Vec2::new(1000.0, 2000.0);
+        let size = Vec2::new(1000.0, 6000.0);
         let mut state = OptionsState::new(&ai_agent_settings(1));
         let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
         let texts: Vec<_> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
@@ -3814,12 +3836,60 @@ mod tests {
             "Global knowledge",
             "Default allow rules",
             "Default deny rules",
-            "Web search",
+            "Live terminal",
+            "Remote filesystem",
+            "Local filesystem",
+            "Web access",
+            "Knowledge base",
+            "get_current_time",
         ] {
             assert!(texts.contains(&label), "{label:?} should be in the section");
         }
         // Nothing points at a separate editor any more.
         assert!(!texts.contains(&"Configure…"));
+    }
+
+    #[test]
+    fn a_permission_row_stores_the_choice_it_shows() {
+        // The agent reads "allow"/"ask"/"deny", so the buttons must store those,
+        // in the order Allow, Ask, Deny.
+        let ctx = Context::default();
+        let size = Vec2::new(1000.0, 6000.0);
+        let mut state = OptionsState::new(&ai_agent_settings(1));
+        let rows = draw_ai_agent_section(&ctx, size, &mut state, Vec::new(), 2);
+        // Every grouped row is disabled until its group is on; the time tool is not.
+        let deny = rows
+            .iter()
+            .filter(|(_, _, text)| text == "Deny")
+            .max_by_key(|(y, _, _)| *y)
+            .cloned()
+            .expect("a permission row offers Deny");
+        let pos = Pos2::new(deny.1 as f32 + 4.0, deny.0 as f32 + 4.0);
+        let click = [
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ];
+        draw_ai_agent_section(&ctx, size, &mut state, click.to_vec(), 1);
+        let values = state
+            .draft
+            .plugin_settings
+            .get(PluginId::AiAgent.as_str())
+            .expect("the section writes its values back");
+        assert_eq!(
+            values.get("apiMethod:ai-agent:get_current_time"),
+            Some(&serde_json::Value::from("deny"))
+        );
     }
 
     /// The Options dialog with the AI agent section scrolled to the top, settled.

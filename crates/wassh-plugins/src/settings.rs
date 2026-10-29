@@ -226,6 +226,19 @@ pub const fn item_list(
     }
 }
 
+/// An `allow`/`ask`/`deny` row.
+pub const fn permission(
+    key: &'static str,
+    label: &'static str,
+    default: &'static str,
+    description: &'static str,
+) -> SettingsField {
+    SettingsField {
+        kind: FieldKind::Permission,
+        ..text(key, label, default, description)
+    }
+}
+
 /// A boolean master toggle with child rows.
 pub const fn group(
     key: &'static str,
@@ -323,7 +336,102 @@ const AI_AGENT_KNOWLEDGE_CHILDREN: &[SettingsField] = &[
     },
 ];
 
-const AI_AGENT_SEARCH_CHILDREN: &[SettingsField] = &[
+const AI_AGENT_TERMINAL_CHILDREN: &[SettingsField] = &[
+    permission(
+        "apiMethod:ai-agent:terminal_read",
+        "terminal_read",
+        "allow",
+        "Read what is currently shown in the user\u{2019}s live terminal, with ANSI colour and cursor \
+codes stripped. Use this to see the state of the shell the user is working in, or the output of a \
+command they ran themselves. Only available when terminal access is enabled for this host.",
+    ),
+    permission(
+        "apiMethod:ai-agent:terminal_wait",
+        "terminal_wait",
+        "allow",
+        "Wait for the user\u{2019}s live terminal to stop producing output, then return its contents. \
+Use this after terminal_write or terminal_send_keys to observe the result of an interactive \
+command. Returns as soon as output has been quiet briefly, or when the timeout is reached.",
+    ),
+    permission(
+        "apiMethod:ai-agent:terminal_write",
+        "terminal_write",
+        "ask",
+        "Type text into the user\u{2019}s live terminal, as if the user typed it. Set pressEnter to \
+run it as a command (default true); set it to false to fill in a prompt without submitting. This \
+shares the user\u{2019}s shell and prompt, so anything typed appears in their session. Prefer \
+run_command for ordinary non-interactive commands - use this for interactive programs (vim, top, \
+ssh, REPLs) or when you must act in the user\u{2019}s own shell. Follow with terminal_wait to \
+observe the result.",
+    ),
+    permission(
+        "apiMethod:ai-agent:terminal_send_keys",
+        "terminal_send_keys",
+        "ask",
+        "Send named keys to the user\u{2019}s live terminal, for navigating interactive programs. \
+Supports enter, tab, escape, backspace, space, arrow keys, home/end/pageup/pagedown, and ctrl+a \
+through ctrl+z (e.g. ctrl+c to interrupt, ctrl+d to end input, ctrl+x to exit an editor). Keys are \
+sent in order in a single write.",
+    ),
+];
+
+const AI_AGENT_REMOTE_FS_CHILDREN: &[SettingsField] = &[
+    permission(
+        "apiMethod:ai-agent:dev_view_file",
+        "Read files",
+        "allow",
+        "Allow the agent to read file contents on the remote SSH server.",
+    ),
+    permission(
+        "apiMethod:ai-agent:dev_list_directory",
+        "List and search files",
+        "allow",
+        "Allow the agent to list directories and search for files or text on the remote SSH server.",
+    ),
+    permission(
+        "apiMethod:ai-agent:dev_edit_file",
+        "Write, edit, and delete files",
+        "ask",
+        "Allow the agent to create, edit, and delete files on the remote SSH server.",
+    ),
+];
+
+const AI_AGENT_LOCAL_FS_CHILDREN: &[SettingsField] = &[
+    permission(
+        "apiMethod:ai-agent:local_fs_read_file",
+        "Read files",
+        "allow",
+        "Allow the agent to read file contents on your local computer.",
+    ),
+    permission(
+        "apiMethod:ai-agent:local_fs_list_dir",
+        "List files",
+        "allow",
+        "Allow the agent to list directories on your local computer.",
+    ),
+    permission(
+        "apiMethod:ai-agent:local_fs_write_file",
+        "Write and edit files",
+        "ask",
+        "Allow the agent to create, edit, and overwrite files on your local computer.",
+    ),
+];
+
+const AI_AGENT_WEB_ACCESS_CHILDREN: &[SettingsField] = &[
+    permission(
+        "apiMethod:ai-agent:web_fetch",
+        "web_fetch",
+        "ask",
+        "Fetch the content of a web page (HTTP/HTTPS URL) and extract readable text/markdown or \
+download the text content.",
+    ),
+    permission(
+        "apiMethod:ai-agent:web_search",
+        "web_search",
+        "ask",
+        "Search the web using a search engine (defaults to Bing). Returns top search result titles, \
+snippets, and URLs.",
+    ),
     SettingsField {
         key: "webSearchProvider",
         label: "Web search provider",
@@ -343,6 +451,69 @@ const AI_AGENT_SEARCH_CHILDREN: &[SettingsField] = &[
         "Optional API key for the search engine provider.",
     ),
 ];
+
+const AI_AGENT_KNOWLEDGE_BASE_CHILDREN: &[SettingsField] = &[permission(
+    "apiMethod:ai-agent:rag_search",
+    "rag_search",
+    "allow",
+    "Search the local knowledge base (app-wide and/or per-host folders configured in AI agent \
+settings) for text chunks relevant to a query, using embeddings from the active provider. Returns \
+the most relevant chunks with their source file and similarity score.",
+)];
+
+/// The capability rows. Named one by one because a schema is a fixed slice:
+/// both the app-wide and the per-host schema list these very same fields, and
+/// this keeps their keys, labels and defaults in one place.
+const AI_AGENT_TERMINAL_GROUP: SettingsField = group(
+    "apiGroup:ai-agent:terminal",
+    "Live terminal",
+    false,
+    "Allow the agent to read and type into your live terminal session. This shares your shell and \
+prompt, so the agent acts as if it were you typing.",
+    AI_AGENT_TERMINAL_CHILDREN,
+);
+
+const AI_AGENT_REMOTE_FS_GROUP: SettingsField = group(
+    "apiGroup:ai-agent:remote-fs",
+    "Remote filesystem",
+    false,
+    "Allow the agent to inspect, search, create, and edit files on the connected remote SSH server.",
+    AI_AGENT_REMOTE_FS_CHILDREN,
+);
+
+const AI_AGENT_LOCAL_FS_GROUP: SettingsField = group(
+    "apiGroup:ai-agent:local-fs",
+    "Local filesystem",
+    false,
+    "Allow the agent to read/write files on your local computer running WaSSH.",
+    AI_AGENT_LOCAL_FS_CHILDREN,
+);
+
+/// Web access, with the search engine it uses drawn under its tools.
+const AI_AGENT_WEB_ACCESS_GROUP: SettingsField = group(
+    "apiGroup:ai-agent:web-access",
+    "Web access",
+    false,
+    "Allow the agent to fetch web pages and search the web.",
+    AI_AGENT_WEB_ACCESS_CHILDREN,
+);
+
+const AI_AGENT_KNOWLEDGE_BASE_GROUP: SettingsField = group(
+    "apiGroup:ai-agent:knowledge-base",
+    "Knowledge base",
+    false,
+    "Allow the agent to search the local knowledge base folder(s) configured below (app-wide \
+and/or per-host).",
+    AI_AGENT_KNOWLEDGE_BASE_CHILDREN,
+);
+
+/// The time tool has no group of its own, so it is a plain permission row.
+const AI_AGENT_TIME_PERMISSION: SettingsField = permission(
+    "apiMethod:ai-agent:get_current_time",
+    "get_current_time",
+    "allow",
+    "Get the current date, time, timezone, and Unix timestamp from the local client system.",
+);
 
 const AI_AGENT_APP: &[SettingsField] = &[
     text_area(
@@ -370,13 +541,12 @@ const AI_AGENT_APP: &[SettingsField] = &[
         &[],
         "App-wide command patterns that are always blocked. Deny always wins over allow.",
     ),
-    group(
-        "webSearchGroup",
-        "Web search",
-        true,
-        "Search engine and API key used by the web search tool.",
-        AI_AGENT_SEARCH_CHILDREN,
-    ),
+    AI_AGENT_TERMINAL_GROUP,
+    AI_AGENT_REMOTE_FS_GROUP,
+    AI_AGENT_LOCAL_FS_GROUP,
+    AI_AGENT_WEB_ACCESS_GROUP,
+    AI_AGENT_KNOWLEDGE_BASE_GROUP,
+    AI_AGENT_TIME_PERMISSION,
 ];
 
 const AI_AGENT_HOST: &[SettingsField] = &[
@@ -404,6 +574,12 @@ const AI_AGENT_HOST: &[SettingsField] = &[
         &[],
         "Command patterns for this host that are always blocked. Deny always wins over allow.",
     ),
+    AI_AGENT_TERMINAL_GROUP,
+    AI_AGENT_REMOTE_FS_GROUP,
+    AI_AGENT_LOCAL_FS_GROUP,
+    AI_AGENT_WEB_ACCESS_GROUP,
+    AI_AGENT_KNOWLEDGE_BASE_GROUP,
+    AI_AGENT_TIME_PERMISSION,
 ];
 
 const CONNECTION_LOGGER_APP: &[SettingsField] = &[
@@ -474,12 +650,6 @@ const DOCKER_HOST: &[SettingsField] = &[
         200,
         "How many historical log lines to load when opening container logs.",
     ),
-    secret_text(
-        "sudoPassword",
-        "sudo password",
-        "",
-        "Password piped to sudo -S when installing the Docker engine on this host. Leave empty for passwordless sudo.",
-    ),
 ];
 
 const MACRO_ITEM: &[SettingsField] = &[
@@ -515,8 +685,18 @@ const MACRO_PAD_APP: &[SettingsField] = &[
 ];
 
 const MQTT_MESSAGE_ITEM: &[SettingsField] = &[
-    text("label", "Label", "", "Caption shown in the saved-messages list."),
-    text("topic", "Topic", "", "MQTT topic the message is published to."),
+    text(
+        "label",
+        "Label",
+        "",
+        "Caption shown in the saved-messages list.",
+    ),
+    text(
+        "topic",
+        "Topic",
+        "",
+        "MQTT topic the message is published to.",
+    ),
     SettingsField {
         key: "mode",
         label: "Format",
@@ -529,7 +709,12 @@ const MQTT_MESSAGE_ITEM: &[SettingsField] = &[
         item_schema: &[],
         item_label: "",
     },
-    text_area("payload", "Payload", "", "Text published when the message is sent."),
+    text_area(
+        "payload",
+        "Payload",
+        "",
+        "Text published when the message is sent.",
+    ),
 ];
 
 const MQTT_MODES: &[SelectOption] = &[
@@ -566,7 +751,12 @@ const MQTT_HOST: &[SettingsField] = &[
         "127.0.0.1",
         "Broker address as seen from the remote SSH host.",
     ),
-    text("username", "MQTT username", "", "Optional MQTT username for this host."),
+    text(
+        "username",
+        "MQTT username",
+        "",
+        "Optional MQTT username for this host.",
+    ),
     secret_text(
         "password",
         "MQTT password",
@@ -783,7 +973,8 @@ fn list_owned_app_keys(id: PluginId) -> &'static [&'static str] {
 /// Every secret field a plugin declares, with the scope it belongs to.
 ///
 /// `true` marks an app-wide secret (stored under the `app` scope), `false` a
-/// per-host one.
+/// per-host one. A key both schemas declare (the agent's search key sits in the
+/// web-access group of each) is owned by the app scope, so it is listed once.
 pub fn secret_fields(id: PluginId) -> Vec<(&'static str, bool)> {
     let app = flatten(app_schema(id))
         .into_iter()
@@ -793,7 +984,13 @@ pub fn secret_fields(id: PluginId) -> Vec<(&'static str, bool)> {
         .into_iter()
         .filter(|field| field.secret)
         .map(|field| (field.key, false));
-    app.chain(host).collect()
+    let mut fields: Vec<(&'static str, bool)> = app.collect();
+    for (key, app) in host {
+        if !fields.iter().any(|(seen, _)| *seen == key) {
+            fields.push((key, app));
+        }
+    }
+    fields
 }
 
 /// Whether `key` is a secret field of `id`, and whether it is app-wide.
@@ -1006,7 +1203,12 @@ mod tests {
                 "Global knowledge",
                 "Default allow rules",
                 "Default deny rules",
-                "Web search"
+                "Live terminal",
+                "Remote filesystem",
+                "Local filesystem",
+                "Web access",
+                "Knowledge base",
+                "get_current_time"
             ]
         );
         let values = resolve(PluginId::AiAgent, None, None);
@@ -1039,6 +1241,57 @@ mod tests {
     }
 
     #[test]
+    fn every_gated_tool_has_a_row_in_both_schemas() {
+        // The rows name their keys by hand, so this keeps them in step with the
+        // table the agent resolves permissions through.
+        for schema in [
+            app_schema(PluginId::AiAgent),
+            host_schema(PluginId::AiAgent),
+        ] {
+            let keys: Vec<&str> = flatten(schema).iter().map(|field| field.key).collect();
+            for gate in crate::ai_agent::GATES {
+                let key = crate::ai_agent::setting_key(gate.tool).unwrap();
+                assert!(
+                    keys.contains(&key.as_str()),
+                    "{} needs a {key} row",
+                    gate.tool
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_permission_rows_default_to_what_the_agent_expects() {
+        let fields = flatten(app_schema(PluginId::AiAgent));
+        for gate in crate::ai_agent::GATES {
+            let key = crate::ai_agent::setting_key(gate.tool).unwrap();
+            let field = fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("no row for {}", gate.tool));
+            assert_eq!(field.kind, FieldKind::Permission, "{}", gate.tool);
+            assert_eq!(
+                field.default,
+                FieldDefault::Text(gate.default.as_str()),
+                "{}",
+                gate.tool
+            );
+        }
+    }
+
+    #[test]
+    fn the_capability_groups_start_switched_off() {
+        let values = resolve(PluginId::AiAgent, None, None);
+        for group in crate::ai_agent::GROUPS {
+            assert_eq!(
+                values[&crate::ai_agent::group_key(group)],
+                Value::Bool(false),
+                "{group} must start off"
+            );
+        }
+    }
+
+    #[test]
     fn the_lists_the_panels_edit_are_the_ones_the_dialogs_own() {
         // The macro pad writes `macros` and the MQTT pane writes `messages`;
         // Options edits exactly those keys, so mirroring keeps them in step.
@@ -1068,16 +1321,20 @@ mod tests {
         // The MQTT password belongs to one host, the agent's search key to the
         // whole app; the dialog needs to know which vault scope to use.
         assert_eq!(secret_fields(PluginId::MqttAnalyser), [("password", false)]);
-        assert_eq!(
-            secret_fields(PluginId::DockerManager),
-            [("sudoPassword", false)]
-        );
+        // Docker stores no password: its plugin asks for one when sudo needs it.
+        assert!(secret_fields(PluginId::DockerManager).is_empty());
         assert_eq!(
             secret_fields(PluginId::AiAgent),
             [("webSearchApiKey", true)]
         );
-        assert_eq!(secret_scope(PluginId::AiAgent, "webSearchApiKey"), Some(true));
-        assert_eq!(secret_scope(PluginId::MqttAnalyser, "password"), Some(false));
+        assert_eq!(
+            secret_scope(PluginId::AiAgent, "webSearchApiKey"),
+            Some(true)
+        );
+        assert_eq!(
+            secret_scope(PluginId::MqttAnalyser, "password"),
+            Some(false)
+        );
         assert_eq!(secret_scope(PluginId::MqttAnalyser, "host"), None);
 
         // No secret field reaches a resolved settings map.
