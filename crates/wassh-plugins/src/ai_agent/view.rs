@@ -1103,23 +1103,27 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bo
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(room);
-                    // What went out with the message, like the reference's ctx tags.
-                    if meta.attachments > 0 || meta.terminal {
-                        let mut tags: Vec<String> = Vec::new();
-                        if meta.attachments > 0 {
-                            let plural = if meta.attachments == 1 { "" } else { "s" };
-                            tags.push(format!("+{} file{plural}", meta.attachments));
+                    // The frame hugs the right edge; the blocks inside still stack top to
+                    // bottom rather than sharing the parent's right-to-left row.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                        // What went out with the message, like the reference's ctx tags.
+                        if meta.attachments > 0 || meta.terminal {
+                            let mut tags: Vec<String> = Vec::new();
+                            if meta.attachments > 0 {
+                                let plural = if meta.attachments == 1 { "" } else { "s" };
+                                tags.push(format!("+{} file{plural}", meta.attachments));
+                            }
+                            if meta.terminal {
+                                tags.push("+terminal".to_owned());
+                            }
+                            ui.label(
+                                egui::RichText::new(tags.join("  "))
+                                    .size(9.5)
+                                    .color(to_color32(palette.text_muted)),
+                            );
                         }
-                        if meta.terminal {
-                            tags.push("+terminal".to_owned());
-                        }
-                        ui.label(
-                            egui::RichText::new(tags.join("  "))
-                                .size(9.5)
-                                .color(to_color32(palette.text_muted)),
-                        );
-                    }
-                    super::markdown::render(ui, palette, text);
+                        super::markdown::render(ui, palette, text);
+                    });
                 })
                 .response
         })
@@ -2441,6 +2445,67 @@ mod tests {
         // A blank terminal still says so, like the reference.
         let empty = plugin.message_with_attachments("plain", Some("  "));
         assert!(empty.ends_with("[Recent terminal output]\n[No terminal output captured yet.]"));
+    }
+
+    /// The bubble is right-aligned, but its blocks must still stack: laid out in the
+    /// right-to-left parent, the tags, the prompt and the terminal tail shared one row,
+    /// and the tail was wrapped into the sliver left beside them.
+    #[test]
+    fn the_terminal_tail_wraps_inside_the_bubble() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 760.0),
+            )),
+            ..Default::default()
+        };
+        let plugin = AiAgent::default();
+        let message = plugin.message_with_attachments(
+            "look at this",
+            Some("aya@Luna ~/Documents/dev/ayalabrainchild\n$ ls -la\nfile1 file2"),
+        );
+        let mut texts: Vec<(i32, f32, String)> = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                user_bubble(
+                    ui,
+                    &Palette::dark(),
+                    &message,
+                    UserMeta {
+                        attachments: 0,
+                        terminal: true,
+                    },
+                );
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            texts = shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.pos.y as i32,
+                        text.galley.rect.width(),
+                        text.galley.text().to_owned(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        }
+
+        let (_, width, _) = texts
+            .iter()
+            .find(|(_, _, text)| text.contains(TERMINAL_CONTEXT_MARKER))
+            .expect("the tail is drawn");
+        assert!(
+            *width > WIDE_PANE / 2.0,
+            "the tail must use the bubble's width, not a sliver: {texts:?}"
+        );
+        let rows: Vec<i32> = texts.iter().map(|(y, _, _)| *y).collect();
+        assert!(
+            rows.windows(2).all(|pair| pair[0] < pair[1]),
+            "the bubble must stack its blocks: {texts:?}"
+        );
     }
 
     #[test]
