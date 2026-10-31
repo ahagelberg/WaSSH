@@ -563,7 +563,7 @@ impl eframe::App for SpikeApp {
 
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         if scroll.abs() > 0.0 {
-            self.terminal.scroll(-(scroll / 20.0).round() as i32);
+            self.terminal.scroll((scroll / 20.0).round() as i32);
         }
 
         let snapshot = self.terminal.snapshot();

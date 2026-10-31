@@ -349,7 +349,7 @@ impl Terminal {
         });
     }
 
-    /// Scroll the viewport (negative scrolls up into history).
+    /// Scroll the viewport (positive scrolls up into history).
     pub fn scroll(&mut self, lines: i32) {
         use alacritty_terminal::grid::Scroll;
         self.term.scroll_display(Scroll::Delta(lines));

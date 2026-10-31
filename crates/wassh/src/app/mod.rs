@@ -2417,7 +2417,7 @@ impl Shell {
             let session = &mut self.sessions[index];
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                session.terminal.scroll(-(scroll / 20.0).round() as i32);
+                session.terminal.scroll((scroll / 20.0).round() as i32);
             }
 
             // Take the layout out so the pane callbacks can borrow the session.
