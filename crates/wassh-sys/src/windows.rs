@@ -234,6 +234,11 @@ pub fn processes() -> Vec<Process> {
     processes
 }
 
+/// The Windows counters are per process, so the caller sums [`processes`] instead.
+pub fn disk_io() -> Option<(u64, u64)> {
+    None
+}
+
 /// CPU seconds, memory and IO a process used, or zeros for one that cannot be opened.
 fn process_counters(pid: u32) -> (f64, u64, u64, u64, u64) {
     // Reading the memory counters needs the VM-read right, which protected processes

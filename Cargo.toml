@@ -68,6 +68,9 @@ tokio = { version = "1", features = [
     "macros",
 ] }
 vte = "0.15"
+# `statvfs`, `sysconf` and the process counters of the native system facts; only
+# compiled on Linux.
+libc = "0.2"
 # Win32 bindings for the native system facts; only compiled on Windows.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

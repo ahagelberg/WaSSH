@@ -23,6 +23,11 @@ pub fn processes() -> Vec<Process> {
     Vec::new()
 }
 
+/// The platforms without a native reader count no device traffic either.
+pub fn disk_io() -> Option<(u64, u64)> {
+    None
+}
+
 pub fn system() -> Option<System> {
     None
 }

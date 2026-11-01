@@ -43,6 +43,6 @@ pub use table::{TableColumn, column_widths, table_header, table_row};
 pub use tag_input::{
     TagInputResponse, commit_all, commit_draft, commit_tag, remove_last, tag_input,
 };
-pub use text::truncating_galley;
+pub use text::{truncating_galley, truncating_galley_with};
 pub use toast::{Toast, ToastKind, Toasts};
 pub use tree::{TreeRow, TreeRowResponse, tree_row};

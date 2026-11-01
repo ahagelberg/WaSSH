@@ -5357,6 +5357,7 @@ dependencies = [
 name = "wassh-sys"
 version = "2.0.2"
 dependencies = [
+ "libc",
  "windows-sys 0.61.2",
 ]
 

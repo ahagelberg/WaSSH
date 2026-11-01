@@ -1,8 +1,8 @@
 //! Native facts about this machine.
 //!
 //! On Windows every number comes straight from the Win32 API — no shell, no WMI, no
-//! helper process. Other platforms report nothing, and their callers use their own
-//! probes.
+//! helper process. On Linux they come from `/proc`, `/sys` and `statvfs`. Other
+//! platforms report nothing, and their callers use their own probes.
 
 /// CPU time counters: a total and its idle share, in 100 ns ticks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,6 +51,7 @@ pub struct Interface {
 pub struct Process {
     pub pid: u32,
     pub parent: u32,
+    /// Executable name, or the command line where the platform reports one.
     pub name: String,
     pub threads: u32,
     /// CPU seconds used since the process started.
@@ -89,19 +90,40 @@ pub struct ProcessDetails {
 
 /// Whether this build reads its numbers from the operating system.
 pub const fn supported() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "linux"))
+}
+
+/// Bytes the whole machine read and wrote since boot.
+///
+/// `None` means the platform counts IO per process instead, so the caller sums the
+/// counters of [`processes`].
+pub fn disk_io() -> Option<(u64, u64)> {
+    platform::disk_io()
 }
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+use crate::windows as platform;
+#[cfg(windows)]
 pub use windows::{
     cpu, disk, memory, network, process_details, processes, stop_process, system,
 };
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use crate::linux as platform;
+#[cfg(target_os = "linux")]
+pub use linux::{
+    cpu, disk, memory, network, process_details, processes, stop_process, system,
+};
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod stub;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
+use crate::stub as platform;
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use stub::{
     cpu, disk, memory, network, process_details, processes, stop_process, system,
 };

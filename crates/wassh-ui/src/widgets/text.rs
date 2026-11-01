@@ -18,11 +18,18 @@ pub fn truncating_galley(
     colour: Color32,
     max_width: f32,
 ) -> Arc<Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        text.into(),
-        FontId::proportional(size),
-        colour,
-    );
+    truncating_galley_with(ui, text, FontId::proportional(size), colour, max_width)
+}
+
+/// [`truncating_galley`] with an explicit font, for the monospace columns of a table.
+pub fn truncating_galley_with(
+    ui: &Ui,
+    text: impl Into<String>,
+    font: FontId,
+    colour: Color32,
+    max_width: f32,
+) -> Arc<Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.into(), font, colour);
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(MIN_WIDTH));
     ui.painter().layout_job(job)
 }

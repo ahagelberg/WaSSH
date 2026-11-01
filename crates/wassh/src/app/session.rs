@@ -2412,7 +2412,7 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
                 MonitorPending::Shell(session.exec(wassh_plugins::monitor::MONITOR_COMMAND))
             }
             _ if self.connection.kind == ConnectionType::Local => {
-                if cfg!(windows) {
+                if wassh_plugins::monitor::native_supported() {
                     MonitorPending::Native(sample_this_machine(self.monitor.counters.take()))
                 } else {
                     MonitorPending::Shell(local_exec::exec(

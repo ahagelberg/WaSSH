@@ -9,7 +9,7 @@ use wassh_core::Palette;
 use wassh_ui::widgets::{
     BannerKind, MenuItem, SLIDER_WIDTH, bar_meter, banner, chip, context_menu, empty_state, faded,
     fixed_inset_card, footer, line_chart, modal, ring_gauge, segmented_bar, select_str,
-    slider_field, small_button, stat_row,
+    slider_field, small_button, stat_row, truncating_galley_with,
 };
 
 use crate::color::to_color32;
@@ -1040,10 +1040,21 @@ pub fn parse_processes(text: &str) -> Vec<Process> {
             threads: fields[4].parse().unwrap_or_default(),
             cpu: fields[5].parse().unwrap_or(0.0),
             mem: fields[6].parse().unwrap_or(0.0),
-            command: line[command_start..].trim().to_owned(),
+            command: clip_command(line[command_start..].trim()).to_owned(),
         });
     }
     out
+}
+
+/// `text` cut to [`COMMAND_CHARS`] characters.
+///
+/// A dock column shows a few dozen characters, so the rest of a multi-kilobyte command
+/// line is dropped before it can be laid out, once per frame.
+fn clip_command(text: &str) -> &str {
+    match text.char_indices().nth(COMMAND_CHARS) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
 }
 
 /// Parse the trailing section: OS name, kernel release, machine and IP.
@@ -1120,6 +1131,14 @@ pub fn parse_report(text: &str, previous: Option<Counters>, at_ms: u64) -> (Snap
 /// Rows the process table keeps.
 const PROCESS_ROWS: usize = 30;
 
+/// Longest process command kept from a `ps` row; the table shows a few dozen characters.
+const COMMAND_CHARS: usize = 200;
+
+/// Whether this build samples this machine through its own operating system.
+pub fn native_supported() -> bool {
+    wassh_sys::supported()
+}
+
 /// A sample of this machine read straight from the operating system.
 ///
 /// Nothing is spawned: [`wassh_sys`] asks the kernel for the counters, so polling a
@@ -1179,7 +1198,7 @@ pub fn native_sample(previous: Option<Counters>, at_ms: u64) -> (Snapshot, Optio
                 threads: process.threads,
                 cpu,
                 mem: percent(process.working_set, memory.total).unwrap_or(0.0),
-                command: process.name.clone(),
+                command: clip_command(&process.name).to_owned(),
             }
         })
         .collect();
@@ -1229,10 +1248,14 @@ pub fn native_sample(previous: Option<Counters>, at_ms: u64) -> (Snapshot, Optio
             .iter()
             .map(|interface| (interface.name.clone(), interface.speed_mbps))
             .collect(),
-        disk_io: (
-            processes.iter().map(|process| process.read_bytes).sum(),
-            processes.iter().map(|process| process.write_bytes).sum(),
-        ),
+        // The devices already count every byte, including the kernel's own IO; only a
+        // platform that counts IO per process needs the sum.
+        disk_io: wassh_sys::disk_io().unwrap_or_else(|| {
+            (
+                processes.iter().map(|process| process.read_bytes).sum(),
+                processes.iter().map(|process| process.write_bytes).sum(),
+            )
+        }),
         processes: rows,
         process_cpu,
         system: SystemInfo {
@@ -2646,21 +2669,17 @@ fn processes_card(
                     ""
                 };
                 let arrow_width = if active { SORT_ARROW_WIDTH } else { 0.0 };
-                let caption = ellipsize(
-                    painter,
-                    label,
+                let caption = truncating_galley_with(
+                    ui,
+                    *label,
                     heading_font.clone(),
+                    colour,
                     column_width - 4.0 - arrow_width,
                 );
-                let caption_width = painter
-                    .layout_no_wrap(caption.clone(), heading_font.clone(), egui::Color32::WHITE)
-                    .size()
-                    .x;
-                painter.text(
-                    egui::pos2(rect.left(), rect.center().y),
-                    egui::Align2::LEFT_CENTER,
+                let caption_width = caption.size().x;
+                painter.galley(
+                    egui::pos2(rect.left(), rect.center().y - caption.size().y / 2.0),
                     caption,
-                    heading_font.clone(),
                     colour,
                 );
                 if active {
@@ -2712,11 +2731,12 @@ fn processes_card(
                 let font = cell_font_for(position);
                 // The state column reads as a qualifier, like the reference.
                 let colour = if position == 2 { muted } else { text };
-                painter.text(
-                    egui::pos2(rect.left() + left, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    ellipsize(painter, cell, font.clone(), column_width - 4.0),
-                    font,
+                // One layout per cell, cut by the layout itself: measuring a long
+                // command line once per dropped character is gigabytes of glyphs.
+                let galley = truncating_galley_with(ui, cell, font, colour, column_width - 4.0);
+                painter.galley(
+                    egui::pos2(rect.left() + left, rect.center().y - galley.size().y / 2.0),
+                    galley,
                     colour,
                 );
             }
@@ -2963,31 +2983,6 @@ fn process_details_dialog(
     if response.dismissed {
         state.details = None;
     }
-}
-
-/// `text`, shortened with an ellipsis when it is wider than `width`.
-fn ellipsize(painter: &egui::Painter, text: &str, font: egui::FontId, width: f32) -> String {
-    let measure = |candidate: &str| {
-        painter
-            .layout_no_wrap(candidate.to_owned(), font.clone(), egui::Color32::WHITE)
-            .size()
-            .x
-    };
-    if width <= 0.0 {
-        return String::new();
-    }
-    if measure(text) <= width {
-        return text.to_owned();
-    }
-    let mut shortened: Vec<char> = text.chars().collect();
-    while !shortened.is_empty() {
-        shortened.pop();
-        let candidate = format!("{}…", shortened.iter().collect::<String>());
-        if measure(&candidate) <= width {
-            return candidate;
-        }
-    }
-    String::new()
 }
 
 /// `0.42`, or `—` when the host did not report it.
@@ -3393,14 +3388,12 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         painted
     }
 
-    /// Per-frame cost with every section full, so a regression is caught here
+    /// Time one frame of the whole pane may take, so a regression is caught here
     /// rather than by the user's fan.
-    #[test]
-    fn the_pane_redraws_quickly() {
-        let mut access = FakeMonitor {
-            sample: Some(sample()),
-            ..FakeMonitor::default()
-        };
+    const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
+    /// Mean time of one frame of the whole pane.
+    fn per_frame(access: &mut FakeMonitor, state: &mut PaneState) -> std::time::Duration {
         let ctx = egui::Context::default();
         let palette = Palette::dark();
         let input = egui::RawInput {
@@ -3417,6 +3410,31 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
             processes: true,
             network: true,
         };
+        let mut frame = |state: &mut PaneState| {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                draw(ui, &palette, "dev", access, &mut view, state);
+            });
+            output.drop_without_applying_deltas();
+        };
+        for _ in 0..3 {
+            frame(state);
+        }
+        let frames = 20;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            frame(state);
+        }
+        started.elapsed() / frames
+    }
+
+    /// Per-frame cost with every section full, so a regression is caught here
+    /// rather than by the user's fan.
+    #[test]
+    fn the_pane_redraws_quickly() {
+        let mut access = FakeMonitor {
+            sample: Some(sample()),
+            ..FakeMonitor::default()
+        };
         let mut state = PaneState::default();
         // Ten minutes of samples, so every chart holds its full window.
         let mut snapshot = sample();
@@ -3426,26 +3444,60 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
             state.record_processes(&snapshot);
             state.last_at = snapshot.at_ms;
         }
-        let mut frame = |state: &mut PaneState| {
-            let output = ctx.run_ui(input.clone(), |ui| {
-                draw(ui, &palette, "dev", &mut access, &mut view, state);
-            });
-            output.drop_without_applying_deltas();
-        };
-        for _ in 0..3 {
-            frame(&mut state);
-        }
-        let frames = 20;
-        let started = std::time::Instant::now();
-        for _ in 0..frames {
-            frame(&mut state);
-        }
-        let per_frame = started.elapsed() / frames;
+        let per_frame = per_frame(&mut access, &mut state);
         println!("monitor frame: {per_frame:?}");
         assert!(
-            per_frame < std::time::Duration::from_millis(8),
+            per_frame < FRAME_BUDGET,
             "one monitor frame took {per_frame:?}"
         );
+    }
+
+    /// A command line as long as the ones desktop processes really carry. The table
+    /// used to lay such a row out once per dropped character, which cost gigabytes of
+    /// glyphs in a single frame and froze the machine.
+    #[test]
+    fn a_multi_kilobyte_command_line_does_not_stall_the_table() {
+        const LONG_COMMAND: usize = 3_000;
+        let command = "x".repeat(LONG_COMMAND);
+        let row = format!("  420 brainchild Sl 0 12 2.4 1.2 {command}\n");
+        let mut snapshot = sample();
+        snapshot.processes = parse_processes(&row);
+        assert_eq!(
+            snapshot.processes[0].command.chars().count(),
+            COMMAND_CHARS,
+            "the row keeps only the characters the column can show"
+        );
+
+        let mut access = FakeMonitor {
+            sample: Some(snapshot),
+            ..FakeMonitor::default()
+        };
+        let mut state = PaneState::default();
+        let per_frame = per_frame(&mut access, &mut state);
+        assert!(
+            per_frame < FRAME_BUDGET,
+            "one frame with a {LONG_COMMAND}-character command took {per_frame:?}"
+        );
+    }
+
+    /// One sample of this machine, read the way a Local tab reads it, so the mapping
+    /// from the operating system's counters into a snapshot is covered.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_native_sample_of_this_machine_is_complete() {
+        let (snapshot, counters) = native_sample(None, 1_700_000_000_000);
+        assert!(
+            counters.is_some(),
+            "the first sample carries the counters the next one compares"
+        );
+        // A share of the CPU needs two samples, so the first one only has the gauges.
+        assert!(snapshot.cpu.is_none());
+        assert!(snapshot.memory.total.is_some_and(|total| total > 0));
+        assert!(snapshot.disk_total.is_some_and(|total| total > 0));
+        assert!(snapshot.disk_read_total.is_some());
+        assert!(snapshot.uptime_s.is_some_and(|uptime| uptime > 0));
+        assert!(!snapshot.processes.is_empty());
+        assert!(snapshot.processes.len() <= PROCESS_ROWS);
     }
 
     #[test]
