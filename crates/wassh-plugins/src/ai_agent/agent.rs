@@ -12,12 +12,13 @@ use serde_json::Value;
 use super::permissions::{Permission, Permissions};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
-    TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
-    TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
-    TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
-    TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
-    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_DEV_DELETE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST,
+    TOOL_DEV_MOVE, TOOL_DEV_MULTI_EDIT, TOOL_DEV_PATCH, TOOL_DEV_REPLACE, TOOL_DEV_RUN,
+    TOOL_DEV_VIEW, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE,
+    TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ,
+    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
+    TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
+    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
@@ -1215,6 +1216,10 @@ impl Agent {
                     },
                 });
             }
+            TOOL_DEV_RUN => {
+                let arguments = arguments.clone();
+                self.spawn_worker(call, turn, move || tools::run_local_command(&arguments));
+            }
             TOOL_WEB_FETCH => {
                 let url = arguments["url"].as_str().unwrap_or_default().to_owned();
                 let max = arguments["maxChars"].as_u64();
@@ -1596,6 +1601,23 @@ pub fn call_label(call: &ApiToolCall) -> String {
             arguments["namePattern"].as_str().unwrap_or_default()
         ),
         TOOL_DEV_DIFF => format!("diff {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_DEV_RUN => format!(
+            "local $ {}",
+            arguments["command"].as_str().unwrap_or_default()
+        ),
+        TOOL_DEV_DELETE => format!("delete {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_DEV_MOVE => format!(
+            "move {} → {}",
+            arguments["path"].as_str().unwrap_or_default(),
+            arguments["destination"].as_str().unwrap_or_default()
+        ),
+        TOOL_DEV_MULTI_EDIT | TOOL_DEV_PATCH => {
+            format!("edit {}", arguments["path"].as_str().unwrap_or_default())
+        }
+        TOOL_DEV_REPLACE => format!(
+            "replace {}",
+            arguments["pattern"].as_str().unwrap_or_default()
+        ),
         TOOL_WEB_FETCH => format!("fetch {}", arguments["url"].as_str().unwrap_or_default()),
         TOOL_WEB_SEARCH => format!("search {}", arguments["query"].as_str().unwrap_or_default()),
         TOOL_RAG_SEARCH => format!("rag {}", arguments["query"].as_str().unwrap_or_default()),

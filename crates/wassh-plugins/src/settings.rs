@@ -377,19 +377,19 @@ sent in order in a single write.",
 
 const AI_AGENT_REMOTE_FS_CHILDREN: &[SettingsField] = &[
     permission(
-        "apiMethod:ai-agent:dev_view_file",
+        "apiMethod:ai-agent:remote_fs_read_file",
         "Read files",
         "allow",
         "Allow the agent to read file contents on the remote SSH server.",
     ),
     permission(
-        "apiMethod:ai-agent:dev_list_directory",
+        "apiMethod:ai-agent:remote_fs_list_dir",
         "List and search files",
         "allow",
         "Allow the agent to list directories and search for files or text on the remote SSH server.",
     ),
     permission(
-        "apiMethod:ai-agent:dev_edit_file",
+        "apiMethod:ai-agent:remote_fs_write_file",
         "Write, edit, and delete files",
         "ask",
         "Allow the agent to create, edit, and delete files on the remote SSH server.",
@@ -413,7 +413,14 @@ const AI_AGENT_LOCAL_FS_CHILDREN: &[SettingsField] = &[
         "apiMethod:ai-agent:local_fs_write_file",
         "Write and edit files",
         "ask",
-        "Allow the agent to create, edit, and overwrite files on your local computer.",
+        "Allow the agent to create, edit, move, and delete files on your local computer.",
+    ),
+    permission(
+        "apiMethod:ai-agent:dev_run_command",
+        "Run commands",
+        "ask",
+        "Allow the agent to run shell commands on your local computer, for builds, tests and \
+version control. Every command is shown before it runs.",
     ),
 ];
 
@@ -483,9 +490,10 @@ const AI_AGENT_REMOTE_FS_GROUP: SettingsField = group(
 
 const AI_AGENT_LOCAL_FS_GROUP: SettingsField = group(
     "apiGroup:ai-agent:local-fs",
-    "Local filesystem",
+    "Local computer",
     false,
-    "Allow the agent to read/write files on your local computer running WaSSH.",
+    "Allow the agent to read and write files and run commands on your local computer running \
+WaSSH. The dev_* tools work here; the remote_fs_* tools work on the connected host.",
     AI_AGENT_LOCAL_FS_CHILDREN,
 );
 
@@ -1322,7 +1330,7 @@ mod tests {
                 "Default deny rules",
                 "Live terminal",
                 "Remote filesystem",
-                "Local filesystem",
+                "Local computer",
                 "Web access",
                 "Knowledge base",
                 "get_current_time"

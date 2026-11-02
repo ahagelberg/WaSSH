@@ -8,18 +8,23 @@
 //! immediately, [`remote_shell_command`] returns a shell line for the session to
 //! run, and the SFTP/terminal tools are driven from `agent.rs`.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::{Value, json};
 
 use super::protocol::{
-    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ,
-    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK,
-    TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS,
-    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DELETE, TOOL_DEV_DIFF,
+    TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_MOVE, TOOL_DEV_MULTI_EDIT,
+    TOOL_DEV_PATCH, TOOL_DEV_REPLACE, TOOL_DEV_RUN, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT,
+    TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
+    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND,
+    TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
+    TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 use super::permissions::Permissions;
@@ -54,6 +59,16 @@ pub const MAX_MEMORY_CONSUMERS_DEFAULT: usize = 5;
 pub const MAX_MEMORY_CONSUMERS_LIMIT: usize = 15;
 /// Longest a `terminal_wait` call blocks.
 pub const MAX_TERMINAL_WAIT_MS: u64 = 120_000;
+/// Longest output a local command returns.
+pub const MAX_DEV_COMMAND_OUTPUT_CHARS: usize = 64_000;
+/// Shortest timeout a local command may ask for.
+pub const DEV_COMMAND_TIMEOUT_MIN_MS: u64 = 1_000;
+/// Time a local command may take when it does not say.
+pub const DEV_COMMAND_TIMEOUT_DEFAULT_MS: u64 = 120_000;
+/// Longest a local command may take.
+pub const MAX_DEV_COMMAND_TIMEOUT_MS: u64 = 600_000;
+/// How often a running local command is checked for having finished.
+const DEV_COMMAND_POLL_MS: u64 = 50;
 
 /// What a tool produced.
 pub type ToolResult = Result<String, String>;
@@ -161,6 +176,31 @@ first, so use this only when run_command failed for lack of permissions.",
     ToolSpec {
         name: TOOL_DEV_DIFF,
         description: "Show the difference between two versions of a local file.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_RUN,
+        description: "Run a shell command on this computer with a timeout, and return its output \
+and exit code.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_DELETE,
+        description: "Delete a file, or a directory with recursive, on this computer.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_MOVE,
+        description: "Move or rename a file or directory on this computer.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_MULTI_EDIT,
+        description: "Apply several text replacements to a local file in one call.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_PATCH,
+        description: "Apply a unified diff to a local file.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_REPLACE,
+        description: "Replace a regular expression across local files, reporting what changes.",
     },
     ToolSpec {
         name: TOOL_TERMINAL_READ,
@@ -341,6 +381,67 @@ fn parameters(name: &str) -> (Value, Value) {
                 "contextLines": number("Lines of context (default 3, cap 20).")
             }),
             json!(["path"]),
+        ),
+        TOOL_DEV_RUN => (
+            json!({
+                "command": string("The command line to run, exactly as it would be typed."),
+                "cwd": string("Directory to run it in (default: home)."),
+                "timeoutMs": number("How long it may run (default 120000, cap 600000).")
+            }),
+            json!(["command"]),
+        ),
+        TOOL_DEV_DELETE => (
+            json!({
+                "path": string("File or directory to delete."),
+                "recursive": boolean("Delete a directory and everything in it (default false).")
+            }),
+            json!(["path"]),
+        ),
+        TOOL_DEV_MOVE => (
+            json!({
+                "path": string("File or directory to move."),
+                "destination": string("Where it goes; a new name in the same folder renames it."),
+                "overwrite": boolean("Replace an existing destination (default false).")
+            }),
+            json!(["path", "destination"]),
+        ),
+        TOOL_DEV_MULTI_EDIT => (
+            json!({
+                "path": string("File to change."),
+                "edits": json!({
+                    "type": "array",
+                    "description": "Replacements, applied in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldText": string("Text to replace; must appear exactly once unless replaceAll is set."),
+                            "newText": string("Replacement text."),
+                            "replaceAll": boolean("Replace every occurrence (default false).")
+                        },
+                        "required": ["oldText", "newText"]
+                    }
+                })
+            }),
+            json!(["path", "edits"]),
+        ),
+        TOOL_DEV_PATCH => (
+            json!({
+                "path": string("File to patch."),
+                "patch": string("Unified diff with @@ hunks, as printed by diff -u or git diff.")
+            }),
+            json!(["path", "patch"]),
+        ),
+        TOOL_DEV_REPLACE => (
+            json!({
+                "pattern": string("Regular expression to find."),
+                "replacement": string("Replacement text; $1, $2… refer to capture groups."),
+                "path": string("File or directory to search (default: home)."),
+                "glob": string("Only change files whose name matches this glob, e.g. *.rs."),
+                "caseSensitive": boolean("Match case (default false)."),
+                "dryRun": boolean("Only report what would change (default true)."),
+                "limit": number("Most files to change (default 50, cap 100).")
+            }),
+            json!(["pattern", "replacement"]),
         ),
         TOOL_TERMINAL_READ => (
             json!({ "maxLines": number("How many trailing lines to return.") }),
@@ -794,6 +895,11 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
                 .ok_or_else(|| "Pass newText or patch to diff against.".to_owned())?;
             Ok(diff_texts(&old, &new, context))
         }
+        TOOL_DEV_DELETE => dev_delete(args),
+        TOOL_DEV_MOVE => dev_move(args),
+        TOOL_DEV_MULTI_EDIT => dev_multi_edit(args),
+        TOOL_DEV_PATCH => dev_patch(args),
+        TOOL_DEV_REPLACE => dev_replace(args),
         other => Err(format!("{other} is not a local tool.")),
     }
 }
@@ -956,6 +1062,419 @@ fn dev_find(args: &Value) -> ToolResult {
     Ok(found.join("\n"))
 }
 
+/// `dev_delete_file`.
+fn dev_delete(args: &Value) -> ToolResult {
+    let raw = args["path"].as_str().unwrap_or_default().trim();
+    if raw.is_empty() {
+        return Err("path is required.".to_owned());
+    }
+    let path = local_path(raw);
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("Cannot delete {}: {error}", path.display()))?;
+    if path.parent().is_none() || path == local_root() {
+        return Err(format!("Refusing to delete {}.", path.display()));
+    }
+    if meta.is_dir() && !args["recursive"].as_bool().unwrap_or(false) {
+        return Err(format!(
+            "{} is a directory; pass recursive to delete it.",
+            path.display()
+        ));
+    }
+    let removed = if meta.is_dir() {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
+    removed.map_err(|error| format!("Cannot delete {}: {error}", path.display()))?;
+    Ok(format!("Deleted {}.", path.display()))
+}
+
+/// `dev_move_file`.
+fn dev_move(args: &Value) -> ToolResult {
+    let from = local_path(args["path"].as_str().unwrap_or_default());
+    let to = local_path(args["destination"].as_str().unwrap_or_default());
+    if args["destination"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Err("destination is required.".to_owned());
+    }
+    if !from.exists() {
+        return Err(format!("{} does not exist.", from.display()));
+    }
+    if to.exists() {
+        if !args["overwrite"].as_bool().unwrap_or(false) {
+            return Err(format!(
+                "{} already exists; pass overwrite to replace it.",
+                to.display()
+            ));
+        }
+        let removed = if to.is_dir() {
+            std::fs::remove_dir_all(&to)
+        } else {
+            std::fs::remove_file(&to)
+        };
+        removed.map_err(|error| format!("Cannot replace {}: {error}", to.display()))?;
+    }
+    if let Some(parent) = to.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+    }
+    if let Err(error) = std::fs::rename(&from, &to) {
+        // Renaming across filesystems fails; copying and removing does the same job.
+        if from.is_dir() {
+            return Err(format!(
+                "Cannot move {} to {}: {error}",
+                from.display(),
+                to.display()
+            ));
+        }
+        std::fs::copy(&from, &to).map_err(|copy| {
+            format!(
+                "Cannot move {} to {}: {error}; {copy}",
+                from.display(),
+                to.display()
+            )
+        })?;
+        std::fs::remove_file(&from)
+            .map_err(|error| format!("Cannot remove {}: {error}", from.display()))?;
+    }
+    Ok(format!("Moved {} to {}.", from.display(), to.display()))
+}
+
+/// `dev_multi_edit`.
+fn dev_multi_edit(args: &Value) -> ToolResult {
+    let path = local_path(args["path"].as_str().unwrap_or_default());
+    let Some(edits) = args["edits"].as_array() else {
+        return Err("edits must be an array of {oldText, newText} objects.".to_owned());
+    };
+    if edits.is_empty() {
+        return Err("edits must not be empty.".to_owned());
+    }
+    let before = read_text_file(&path, MAX_FILE_READ_CHARS)?;
+    let mut after = before.clone();
+    for (index, edit) in edits.iter().enumerate() {
+        let old = edit["oldText"].as_str().unwrap_or_default();
+        let new = edit["newText"].as_str().unwrap_or_default();
+        after = if edit["replaceAll"].as_bool().unwrap_or(false) {
+            replace_every(&after, old, new)
+        } else {
+            replace_once(&after, old, new)
+        }
+        .map_err(|error| format!("Edit {}: {error}", index + 1))?;
+    }
+    if after == before {
+        return Ok("No changes.".to_owned());
+    }
+    std::fs::write(&path, &after)
+        .map_err(|error| format!("Cannot write {}: {error}", path.display()))?;
+    Ok(format!(
+        "{}\n{}",
+        path.display(),
+        diff_texts(&before, &after, DIFF_CONTEXT_LINES_DEFAULT)
+    ))
+}
+
+/// Replace every occurrence of `old`, refusing an empty or missing match.
+fn replace_every(text: &str, old: &str, new: &str) -> ToolResult {
+    if old.is_empty() {
+        return Err("oldText must not be empty.".to_owned());
+    }
+    if !text.contains(old) {
+        return Err("oldText was not found in the file.".to_owned());
+    }
+    Ok(text.replace(old, new))
+}
+
+/// `dev_apply_patch`.
+fn dev_patch(args: &Value) -> ToolResult {
+    let path = local_path(args["path"].as_str().unwrap_or_default());
+    let patch = args["patch"]
+        .as_str()
+        .filter(|patch| !patch.trim().is_empty())
+        .ok_or_else(|| "patch is required.".to_owned())?;
+    let before = read_text_file(&path, MAX_FILE_READ_CHARS)?;
+    let after = apply_unified_patch(&before, patch)?;
+    if after == before {
+        return Ok("The patch changed nothing.".to_owned());
+    }
+    std::fs::write(&path, &after)
+        .map_err(|error| format!("Cannot write {}: {error}", path.display()))?;
+    Ok(format!(
+        "{}\n{}",
+        path.display(),
+        diff_texts(&before, &after, DIFF_CONTEXT_LINES_DEFAULT)
+    ))
+}
+
+/// Apply the `@@` hunks of a unified diff, checking every context line.
+pub fn apply_unified_patch(original: &str, patch: &str) -> ToolResult {
+    let original_lines: Vec<&str> = original.split('\n').collect();
+    let mut output: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    let mut hunks = 0;
+    let mut lines = patch.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !line.starts_with("@@") {
+            continue;
+        }
+        hunks += 1;
+        let (old_start, old_len) = parse_hunk_header(line)?;
+        let start = if old_len == 0 {
+            old_start
+        } else {
+            old_start.saturating_sub(1)
+        };
+        if start < cursor || start > original_lines.len() {
+            return Err(format!("Hunk {hunks} does not fit the file."));
+        }
+        output.extend(
+            original_lines[cursor..start]
+                .iter()
+                .map(|line| (*line).to_owned()),
+        );
+        cursor = start;
+        while let Some(body) = lines.peek().copied() {
+            if body.starts_with("@@") || body.starts_with("diff ") {
+                break;
+            }
+            lines.next();
+            if body.is_empty() {
+                continue;
+            }
+            let (marker, text) = body.split_at(1);
+            match marker {
+                " " => {
+                    expect_line(&original_lines, cursor, text)?;
+                    output.push(original_lines[cursor].to_owned());
+                    cursor += 1;
+                }
+                "-" => {
+                    expect_line(&original_lines, cursor, text)?;
+                    cursor += 1;
+                }
+                "+" => output.push(text.to_owned()),
+                // "\ No newline at end of file" carries no text of its own.
+                "\\" => {}
+                _ => return Err(format!("Hunk {hunks} has an invalid line: {body}")),
+            }
+        }
+    }
+    if hunks == 0 {
+        return Err("The patch has no @@ hunks.".to_owned());
+    }
+    output.extend(
+        original_lines[cursor..]
+            .iter()
+            .map(|line| (*line).to_owned()),
+    );
+    Ok(output.join("\n"))
+}
+
+/// The old-file range a hunk header names.
+fn parse_hunk_header(line: &str) -> Result<(usize, usize), String> {
+    let range = line
+        .trim_start_matches("@@")
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("Invalid hunk header: {line}"))?;
+    let range = range.trim_start_matches('-');
+    let (start, len) = range.split_once(',').unwrap_or((range, "1"));
+    let start = start
+        .parse()
+        .map_err(|_| format!("Invalid hunk header: {line}"))?;
+    let len = len
+        .parse()
+        .map_err(|_| format!("Invalid hunk header: {line}"))?;
+    Ok((start, len))
+}
+
+/// Require the original file to carry `expected` at `index`.
+fn expect_line(lines: &[&str], index: usize, expected: &str) -> Result<(), String> {
+    match lines.get(index) {
+        Some(line) if line.trim_end_matches('\r') == expected.trim_end_matches('\r') => Ok(()),
+        Some(line) => Err(format!(
+            "Patch context does not match at line {}: expected {:?}, found {:?}.",
+            index + 1,
+            expected,
+            line
+        )),
+        None => Err(format!(
+            "The patch expects line {} but the file ends at {}.",
+            index + 1,
+            lines.len()
+        )),
+    }
+}
+
+/// `dev_replace_in_files`.
+fn dev_replace(args: &Value) -> ToolResult {
+    let pattern = args["pattern"].as_str().unwrap_or_default();
+    if pattern.is_empty() {
+        return Err("pattern is required.".to_owned());
+    }
+    let replacement = args["replacement"].as_str().unwrap_or_default().to_owned();
+    let case_sensitive = args["caseSensitive"].as_bool().unwrap_or(false);
+    let source = if case_sensitive {
+        pattern.to_owned()
+    } else {
+        format!("(?i){pattern}")
+    };
+    let regex = Regex::new(&source).map_err(|error| format!("Invalid pattern: {error}"))?;
+    let root = local_path(args["path"].as_str().unwrap_or("."));
+    let glob = args["glob"].as_str().map(str::to_owned);
+    let dry_run = args["dryRun"].as_bool().unwrap_or(true);
+    let limit = args["limit"]
+        .as_u64()
+        .map_or(50, |value| value as usize)
+        .clamp(1, MAX_DEV_FIND_MATCHES);
+    let mut changed: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut replacements = 0usize;
+    {
+        let mut visit = |path: &Path| {
+            if let Some(glob) = &glob {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !glob_matches(glob, &name) {
+                    return true;
+                }
+            }
+            let Ok(bytes) = std::fs::read(path) else {
+                return true;
+            };
+            if bytes.iter().take(2048).any(|byte| *byte == 0) {
+                return true;
+            }
+            let body = String::from_utf8_lossy(&bytes);
+            let found = regex.find_iter(&body).count();
+            if found == 0 {
+                return true;
+            }
+            let updated = regex.replace_all(&body, replacement.as_str());
+            if updated == body {
+                return true;
+            }
+            if !dry_run && let Err(error) = std::fs::write(path, updated.as_bytes()) {
+                failures.push(format!("{}: {error}", path.display()));
+            }
+            replacements += found;
+            changed.push(format!("{}: {found}", path.display()));
+            changed.len() < limit
+        };
+        if root.is_file() {
+            visit(&root);
+        } else {
+            walk_files(&root, 0, &mut visit);
+        }
+    }
+    if changed.is_empty() && failures.is_empty() {
+        return Ok(format!("No matches for {pattern} under {}", root.display()));
+    }
+    let verb = if dry_run { "Would change" } else { "Changed" };
+    let mut report = vec![format!(
+        "{verb} {} files ({replacements} replacements) under {}.",
+        changed.len(),
+        root.display()
+    )];
+    report.extend(changed);
+    if dry_run {
+        report.push("Dry run: pass dryRun: false to write the changes.".to_owned());
+    }
+    report.extend(failures);
+    Ok(report.join("\n"))
+}
+
+/// Run `dev_run_command` on this machine, killing it at the timeout.
+pub fn run_local_command(args: &Value) -> ToolResult {
+    let command = args["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| "The command argument was missing or empty.".to_owned())?
+        .to_owned();
+    let cwd = local_path(args["cwd"].as_str().unwrap_or("."));
+    let timeout = args["timeoutMs"]
+        .as_u64()
+        .unwrap_or(DEV_COMMAND_TIMEOUT_DEFAULT_MS)
+        .clamp(DEV_COMMAND_TIMEOUT_MIN_MS, MAX_DEV_COMMAND_TIMEOUT_MS);
+    let mut child = shell_command(&command)
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Cannot run `{command}` in {}: {error}", cwd.display()))?;
+    let stdout = child.stdout.take().map(read_pipe);
+    let stderr = child.stderr.take().map(read_pipe);
+    let deadline = Instant::now() + Duration::from_millis(timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(DEV_COMMAND_POLL_MS));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("`{command}` did not finish within {timeout} ms."));
+            }
+            Err(error) => return Err(format!("Cannot wait for `{command}`: {error}")),
+        }
+    };
+    let out = stdout.and_then(|pipe| pipe.join().ok()).unwrap_or_default();
+    let err = stderr.and_then(|pipe| pipe.join().ok()).unwrap_or_default();
+    let mut body = String::from_utf8_lossy(&out).into_owned();
+    let error_text = String::from_utf8_lossy(&err);
+    if !error_text.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&error_text);
+    }
+    if body.trim().is_empty() {
+        body = "(no output)".to_owned();
+    }
+    let code = status
+        .code()
+        .map_or_else(|| "none".to_owned(), |code| code.to_string());
+    Ok(format!(
+        "{}\n[exit code {code}]",
+        clamp(&body, MAX_DEV_COMMAND_OUTPUT_CHARS)
+    ))
+}
+
+/// Collect a child's output on its own thread so a full pipe cannot stall it.
+fn read_pipe(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+/// The shell a local command runs through.
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut shell = Command::new("cmd");
+        shell.arg("/C").arg(command);
+        shell
+    }
+    #[cfg(not(windows))]
+    {
+        let mut shell = Command::new("sh");
+        shell.arg("-c").arg(command);
+        shell
+    }
+}
+
 /// ISO-8601 UTC now, without a date-time dependency.
 fn chrono_like_iso(now_ms: u64) -> String {
     let seconds = now_ms / 1000;
@@ -1087,7 +1606,7 @@ mod tests {
     #[test]
     fn every_reference_tool_has_a_schema() {
         let schemas = specs(&Permissions::default());
-        assert_eq!(schemas.len(), 31);
+        assert_eq!(schemas.len(), 37);
         let names: Vec<&str> = schemas
             .iter()
             .map(|schema| schema["name"].as_str().unwrap())
@@ -1095,6 +1614,9 @@ mod tests {
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"run_sudo"));
         assert!(names.contains(&"dev_grep_search"));
+        assert!(names.contains(&"dev_run_command"));
+        assert!(names.contains(&"dev_apply_patch"));
+        assert!(names.contains(&"dev_replace_in_files"));
         assert!(names.contains(&"terminal_send_keys"));
         assert!(names.contains(&"system_memory_report"));
         assert!(names.contains(&"rag_search"));
@@ -1238,6 +1760,160 @@ mod tests {
         assert!(find.contains("note.txt"), "{find}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_unified_patch_applies_its_hunks() {
+        let before = "one\ntwo\nthree\nfour\n";
+        let patch = "--- a\n+++ b\n@@ -1,4 +1,5 @@\n one\n-two\n+TWO\n three\n four\n+five\n";
+        assert_eq!(
+            apply_unified_patch(before, patch).unwrap(),
+            "one\nTWO\nthree\nfour\nfive\n"
+        );
+
+        // An empty old range inserts at the top.
+        let insert = "@@ -0,0 +1,2 @@\n+first\n+second\n";
+        assert_eq!(
+            apply_unified_patch("one\n", insert).unwrap(),
+            "first\nsecond\none\n"
+        );
+
+        // Context that does not match, and a patch with no hunks, are refused.
+        assert!(apply_unified_patch("one\n", "@@ -1,1 +1,1 @@\n-two\n+TWO\n").is_err());
+        assert!(apply_unified_patch("one\n", "no hunks").is_err());
+    }
+
+    #[test]
+    fn a_multi_edit_applies_each_replacement_in_order() {
+        let dir = std::env::temp_dir().join(format!("wassh-ai-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        let path = file.display().to_string();
+        std::fs::write(&file, "alpha beta gamma\n").unwrap();
+        let diff = run_local(
+            TOOL_DEV_MULTI_EDIT,
+            &json!({ "path": path, "edits": [
+                { "oldText": "alpha", "newText": "ALPHA" },
+                { "oldText": "beta", "newText": "BETA", "replaceAll": true }
+            ]}),
+            0,
+        )
+        .unwrap();
+        assert!(diff.contains("+   0 ALPHA BETA gamma"), "{diff}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "ALPHA BETA gamma\n"
+        );
+
+        // A later edit that cannot find its text fails the whole call.
+        let error = run_local(
+            TOOL_DEV_MULTI_EDIT,
+            &json!({ "path": path, "edits": [
+                { "oldText": "ALPHA", "newText": "A" },
+                { "oldText": "missing", "newText": "x" }
+            ]}),
+            0,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Edit 2:"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "ALPHA BETA gamma\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_files_can_be_moved_and_deleted() {
+        let dir = std::env::temp_dir().join(format!("wassh-ai-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("a.txt");
+        let to = dir.join("nested/b.txt");
+        std::fs::write(&from, "text").unwrap();
+        run_local(
+            TOOL_DEV_MOVE,
+            &json!({ "path": from.display().to_string(), "destination": to.display().to_string() }),
+            0,
+        )
+        .unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "text");
+
+        // An existing destination needs overwrite, and a directory needs recursive.
+        assert!(
+            run_local(
+                TOOL_DEV_MOVE,
+                &json!({ "path": to.display().to_string(), "destination": to.display().to_string() }),
+                0,
+            )
+            .is_err()
+        );
+        let nested = dir.join("nested");
+        assert!(
+            run_local(
+                TOOL_DEV_DELETE,
+                &json!({ "path": nested.display().to_string() }),
+                0,
+            )
+            .is_err()
+        );
+        run_local(
+            TOOL_DEV_DELETE,
+            &json!({ "path": nested.display().to_string(), "recursive": true }),
+            0,
+        )
+        .unwrap();
+        assert!(!nested.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dry_run_reports_replacements_without_writing() {
+        let dir = std::env::temp_dir().join(format!("wassh-ai-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("code.rs");
+        std::fs::write(&file, "let value = 1;\nlet other = 1;\n").unwrap();
+        let report = run_local(
+            TOOL_DEV_REPLACE,
+            &json!({ "pattern": "= 1", "replacement": "= 2", "path": dir.display().to_string(), "glob": "*.rs" }),
+            0,
+        )
+        .unwrap();
+        assert!(
+            report.contains("Would change 1 files (2 replacements)"),
+            "{report}"
+        );
+        assert!(report.contains("code.rs: 2"), "{report}");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("= 1"));
+
+        run_local(
+            TOOL_DEV_REPLACE,
+            &json!({ "pattern": "= 1", "replacement": "= 2", "path": dir.display().to_string(), "glob": "*.rs", "dryRun": false }),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "let value = 2;\nlet other = 2;\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_command_returns_output_and_exit_code() {
+        let output = run_local_command(&json!({ "command": "printf hi" })).unwrap();
+        assert!(output.starts_with("hi\n"), "{output}");
+        assert!(output.contains("[exit code 0]"), "{output}");
+        let failed = run_local_command(&json!({ "command": "exit 3" })).unwrap();
+        assert!(failed.contains("[exit code 3]"), "{failed}");
+        assert!(run_local_command(&json!({ "command": "  " })).is_err());
     }
 
     #[test]

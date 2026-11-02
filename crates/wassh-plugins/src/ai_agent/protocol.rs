@@ -81,6 +81,18 @@ pub const TOOL_DEV_GREP: &str = "dev_grep_search";
 pub const TOOL_DEV_FIND: &str = "dev_find_files";
 /// Tool: diff a file through the editor API.
 pub const TOOL_DEV_DIFF: &str = "dev_diff_file";
+/// Tool: run a shell command on this computer.
+pub const TOOL_DEV_RUN: &str = "dev_run_command";
+/// Tool: delete a file or directory on this computer.
+pub const TOOL_DEV_DELETE: &str = "dev_delete_file";
+/// Tool: move or rename a file or directory on this computer.
+pub const TOOL_DEV_MOVE: &str = "dev_move_file";
+/// Tool: apply several replacements to a local file.
+pub const TOOL_DEV_MULTI_EDIT: &str = "dev_multi_edit";
+/// Tool: apply a unified diff to a local file.
+pub const TOOL_DEV_PATCH: &str = "dev_apply_patch";
+/// Tool: replace a pattern across local files.
+pub const TOOL_DEV_REPLACE: &str = "dev_replace_in_files";
 /// Tool: read the terminal screen.
 pub const TOOL_TERMINAL_READ: &str = "terminal_read";
 /// Tool: type into the terminal.

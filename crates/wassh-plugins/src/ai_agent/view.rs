@@ -435,14 +435,19 @@ impl AiAgent {
         lines.extend([
             String::new(),
             "Guidelines:".to_owned(),
-            "- Use run_command for terminal work on the host and the terminal_* tools to drive the live shell."
+            "- Use run_command for shell work on the connected host, dev_run_command for commands \
+             on this computer (builds, tests, version control), and the terminal_* tools to drive \
+             the live shell."
                 .to_owned(),
             "- When a task needs root, call run_sudo with the same command: it asks the user for \
 their sudo password before running. Plain run_command cannot answer sudo's prompt, and never \
 pipe a password to sudo yourself."
                 .to_owned(),
-            "- Prefer the file tools over shell commands when reading or editing files.".to_owned(),
-            "- After each command or tool call you see its actual result. Never invent output.".to_owned(),
+            "- Prefer the file tools over shell commands when reading or editing files: dev_* and \
+             local_fs_* work on this computer, remote_fs_* on the connected host."
+                .to_owned(),
+            "- After each command or tool call you see its actual result. Never invent output."
+                .to_owned(),
             "- Ask before doing anything destructive or ambiguous.".to_owned(),
             "- When the task is complete, reply with a concise plain-text summary.".to_owned(),
         ]);
@@ -1279,10 +1284,10 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
     match name {
         "" | super::protocol::TOOL_RUN_COMMAND => ("SSH", palette.accent),
         super::protocol::TOOL_RUN_SUDO => ("Root", palette.danger),
-        other if other.starts_with("dev_") || other.starts_with("remote_fs_") => {
-            ("Remote filesystem", rgb(0x3dd68c))
+        other if other.starts_with("dev_") || other.starts_with("local_fs_") => {
+            ("Local PC", rgb(0xf0b429))
         }
-        other if other.starts_with("local_fs_") => ("Local PC", rgb(0xf0b429)),
+        other if other.starts_with("remote_fs_") => ("Remote filesystem", rgb(0x3dd68c)),
         super::protocol::TOOL_WEB_SEARCH => ("Search", rgb(0x38bdf8)),
         super::protocol::TOOL_WEB_FETCH => ("Web", rgb(0xa78bfa)),
         super::protocol::TOOL_CURRENT_TIME => ("Time", rgb(0xfb7185)),

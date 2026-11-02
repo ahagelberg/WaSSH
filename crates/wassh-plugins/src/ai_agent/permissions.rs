@@ -13,11 +13,12 @@
 use serde_json::{Map, Value};
 
 use super::protocol::{
-    TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP,
-    TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ,
-    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
-    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DELETE, TOOL_DEV_DIFF, TOOL_DEV_EDIT,
+    TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_MOVE, TOOL_DEV_MULTI_EDIT,
+    TOOL_DEV_PATCH, TOOL_DEV_REPLACE, TOOL_DEV_RUN, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT,
+    TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
+    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_TERMINAL_KEYS,
+    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 /// Live-terminal tools.
@@ -88,9 +89,9 @@ pub struct Gate {
 /// Every gated tool, in the reference's order.
 ///
 /// Reads and listings are allowed once their group is on; anything that
-/// changes a file asks first. `run_command`, `run_sudo`, `ask_user` and the
-/// system probes are not listed: the reference gates them with its command rule
-/// lists instead, or not at all.
+/// changes a file, or runs a command, asks first. `run_command`, `run_sudo`,
+/// `ask_user` and the system probes are not listed: the reference gates them
+/// with its command rule lists instead, or not at all.
 pub const GATES: &[Gate] = &[
     Gate {
         tool: TOOL_TERMINAL_READ,
@@ -117,75 +118,33 @@ pub const GATES: &[Gate] = &[
         default: Permission::Ask,
     },
     Gate {
-        tool: TOOL_DEV_VIEW,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_VIEW,
-        default: Permission::Allow,
-    },
-    Gate {
         tool: TOOL_REMOTE_READ,
         group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_VIEW,
-        default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_LIST,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_LIST,
-        default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_FIND,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_LIST,
-        default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_GREP,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_LIST,
+        leader: TOOL_REMOTE_READ,
         default: Permission::Allow,
     },
     Gate {
         tool: TOOL_REMOTE_LIST,
         group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_LIST,
+        leader: TOOL_REMOTE_LIST,
         default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_EDIT,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_EDIT,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_CREATE,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_EDIT,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_DIFF,
-        group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_EDIT,
-        default: Permission::Ask,
     },
     Gate {
         tool: TOOL_REMOTE_WRITE,
         group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_EDIT,
+        leader: TOOL_REMOTE_WRITE,
         default: Permission::Ask,
     },
     Gate {
         tool: TOOL_REMOTE_EDIT,
         group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_EDIT,
+        leader: TOOL_REMOTE_WRITE,
         default: Permission::Ask,
     },
     Gate {
         tool: TOOL_REMOTE_DELETE,
         group: Some(GROUP_REMOTE_FS),
-        leader: TOOL_DEV_EDIT,
+        leader: TOOL_REMOTE_WRITE,
         default: Permission::Ask,
     },
     Gate {
@@ -195,7 +154,31 @@ pub const GATES: &[Gate] = &[
         default: Permission::Allow,
     },
     Gate {
+        tool: TOOL_DEV_VIEW,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_READ,
+        default: Permission::Allow,
+    },
+    Gate {
         tool: TOOL_LOCAL_LIST,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_LIST,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_LIST,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_LIST,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_FIND,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_LIST,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_GREP,
         group: Some(GROUP_LOCAL_FS),
         leader: TOOL_LOCAL_LIST,
         default: Permission::Allow,
@@ -210,6 +193,60 @@ pub const GATES: &[Gate] = &[
         tool: TOOL_LOCAL_EDIT,
         group: Some(GROUP_LOCAL_FS),
         leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_CREATE,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_EDIT,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_DIFF,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_DELETE,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_MOVE,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_MULTI_EDIT,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_PATCH,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_REPLACE,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_RUN,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_DEV_RUN,
         default: Permission::Ask,
     },
     Gate {
@@ -366,11 +403,11 @@ mod tests {
     fn one_setting_gates_a_whole_bundle() {
         let permissions = Permissions::from_settings(&settings(json!({
             group_key(GROUP_REMOTE_FS): true,
-            method_key(TOOL_DEV_VIEW): "deny",
+            method_key(TOOL_REMOTE_WRITE): "deny",
         })));
-        assert_eq!(permissions.decision(TOOL_REMOTE_READ), Permission::Deny);
+        assert_eq!(permissions.decision(TOOL_REMOTE_EDIT), Permission::Deny);
         // A different bundle keeps its own decision.
-        assert_eq!(permissions.decision(TOOL_REMOTE_WRITE), Permission::Ask);
+        assert_eq!(permissions.decision(TOOL_REMOTE_READ), Permission::Allow);
     }
 
     #[test]
@@ -398,6 +435,12 @@ mod tests {
             TOOL_DEV_EDIT,
             TOOL_DEV_CREATE,
             TOOL_DEV_DIFF,
+            TOOL_DEV_DELETE,
+            TOOL_DEV_MOVE,
+            TOOL_DEV_MULTI_EDIT,
+            TOOL_DEV_PATCH,
+            TOOL_DEV_REPLACE,
+            TOOL_DEV_RUN,
             TOOL_REMOTE_WRITE,
             TOOL_REMOTE_EDIT,
             TOOL_REMOTE_DELETE,
@@ -414,10 +457,14 @@ mod tests {
     fn a_bundled_tool_persists_its_bundle_leader_setting() {
         assert_eq!(
             setting_key(TOOL_REMOTE_EDIT).as_deref(),
-            Some("apiMethod:ai-agent:dev_edit_file")
+            Some("apiMethod:ai-agent:remote_fs_write_file")
         );
         assert_eq!(
             setting_key(TOOL_LOCAL_EDIT).as_deref(),
+            Some("apiMethod:ai-agent:local_fs_write_file")
+        );
+        assert_eq!(
+            setting_key(TOOL_DEV_DELETE).as_deref(),
             Some("apiMethod:ai-agent:local_fs_write_file")
         );
         assert_eq!(setting_key(TOOL_RUN_COMMAND), None);
