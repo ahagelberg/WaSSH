@@ -1,4 +1,5 @@
 ## Fixes
+- Light theme changes default terminal background and foreground colors
 
 ## Additions
 - Key manager for setting up password-less logins
@@ -8,7 +9,6 @@
 - Workspaces
 - Tunnels guide: pre-defined common tunnels as templates.
 - Share settings easily
-- Overview of all open sessions with thumbnails
 - Global command history with quick search
 - Detection of server capability, services running. custom detection commands.
 - MCP interface for editing hosts.

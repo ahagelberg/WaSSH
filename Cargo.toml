@@ -9,7 +9,6 @@ members = [
     "crates/wassh-telnet",
     "crates/wassh-serial",
     "crates/wassh-term",
-    "crates/wassh-term-render",
     "crates/wassh-sys",
     "crates/wassh-ui",
     "crates/wassh-plugins",

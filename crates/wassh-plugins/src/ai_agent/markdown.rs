@@ -9,7 +9,7 @@ use egui::text::LayoutJob;
 use egui::{FontId, TextFormat, Ui};
 use wassh_core::Palette;
 
-use crate::color::{to_color32, with_alpha};
+use wassh_ui::{to_color32, with_alpha};
 
 /// One block of a document.
 #[derive(Clone, Debug, PartialEq, Eq)]

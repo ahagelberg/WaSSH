@@ -7,7 +7,6 @@
 #![forbid(unsafe_code)]
 
 pub mod ai_agent;
-pub mod color;
 pub mod command;
 pub mod connection_logger;
 pub mod docker;

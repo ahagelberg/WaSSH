@@ -60,6 +60,9 @@ impl PtySession {
                             if tx.send(buffer[..n].to_vec()).is_err() {
                                 break;
                             }
+                            // The shell paints as soon as the bytes are in, instead of at
+                            // its next idle frame.
+                            wassh_core::wake::notify();
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,

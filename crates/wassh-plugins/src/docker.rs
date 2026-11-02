@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 use egui::Ui;
 use serde_json::Value;
 use wassh_core::Palette;
-use wassh_ui::dock::HeaderHealth;
+use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, bar_meter, checkbox, line_chart, password_input, search_input, select_str,
     small_button_enabled, text_input,
 };
 
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::command::CommandAccess;
 use crate::plugin::{Plugin, PluginContext};
 use crate::{PluginId, PluginManifest};
@@ -304,6 +304,8 @@ pub struct DockerManager {
     last_poll: Option<Instant>,
     last_stats: Option<Instant>,
     pending: Option<(Action, String, String)>,
+    /// State line the pane header shows, refreshed once per draw.
+    caption: Option<(String, HeaderHealth)>,
 }
 
 /// The create-container form.
@@ -356,19 +358,10 @@ impl Plugin for DockerManager {
         PluginId::DockerManager.manifest()
     }
 
-    fn header_status(&self) -> Option<(String, HeaderHealth)> {
-        if self.engine.state.is_none() || self.engine.state == Some(engine::State::Checking) {
-            return Some(("checking".to_owned(), HeaderHealth::Warn));
-        }
-        if !self.engine.is_ready() {
-            return Some(("no daemon".to_owned(), HeaderHealth::Bad));
-        }
-        let running = self
-            .containers
-            .iter()
-            .filter(|item| item.is_running())
-            .count();
-        Some((format!("{running} up"), HeaderHealth::Ok))
+    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
+        self.caption
+            .as_ref()
+            .map(|(text, health)| (text.as_str(), *health))
     }
 
     fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
@@ -391,6 +384,22 @@ impl Plugin for DockerManager {
 }
 
 impl DockerManager {
+    /// The state line the pane header shows.
+    fn header_caption(&self) -> (String, HeaderHealth) {
+        if self.engine.state.is_none() || self.engine.state == Some(engine::State::Checking) {
+            return ("checking".to_owned(), HeaderHealth::Warn);
+        }
+        if !self.engine.is_ready() {
+            return ("no daemon".to_owned(), HeaderHealth::Bad);
+        }
+        let running = self
+            .containers
+            .iter()
+            .filter(|item| item.is_running())
+            .count();
+        (format!("{running} up"), HeaderHealth::Ok)
+    }
+
     /// Draw the pane and return anything to type into the session's terminal.
     fn draw(
         &mut self,
@@ -400,6 +409,7 @@ impl DockerManager {
         access: &mut dyn CommandAccess,
     ) -> Option<String> {
         self.poll(access);
+        self.caption = Some(self.header_caption());
         self.engine_banner(ui, palette, access);
         self.tab_bar(ui, palette);
         let mut typed = None;

@@ -168,6 +168,21 @@ pub enum LeafZone {
     Bottom,
 }
 
+/// How a pane's header dot reads.
+///
+/// A plugin reports it with its state line, so the pane API owns the type rather than
+/// borrowing it from the widget kit that paints it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeaderHealth {
+    /// Working.
+    #[default]
+    Ok,
+    /// Busy, as in "connecting".
+    Warn,
+    /// Broken.
+    Bad,
+}
+
 impl LeafZone {
     fn direction(self) -> SplitDirection {
         match self {

@@ -52,6 +52,13 @@ const ACTIVE_INTERVAL: Duration = Duration::from_millis(16);
 /// position instead, which is far larger than a decoration; that is not learned.
 const MAX_FRAME_OFFSET: f32 = 200.0;
 
+/// Frames to wait after asking the window manager to move the window, before reading back
+/// where it landed.
+const RESTORE_FRAMES: u8 = 2;
+
+/// Repaint interval while waiting for a requested window move to land.
+const RESTORE_POLL: Duration = Duration::from_millis(30);
+
 /// How long a requested clipboard paste may take to arrive.
 ///
 /// A `Paste` event after this belongs to the platform's Ctrl+V and goes to the shell.
@@ -62,56 +69,55 @@ const ICON_PNG: &[u8] = include_bytes!("../../../../res/WaSSH program icon.png")
 
 /// Repaint interval when nothing is happening.
 ///
-/// The transports are polled rather than waking the window, so a slow poll keeps
-/// unsolicited output (a build log, a `tail -f`, a prompt after a long command) prompt
-/// without redrawing a static window sixty times a second.
-const IDLE_INTERVAL: Duration = Duration::from_millis(250);
+/// The transports and the worker threads wake the window as soon as they have something
+/// to show (`wassh_core::wake`), so this only has to cover what cannot: a slow idle
+/// cadence keeps a static window from repainting its whole terminal every few frames.
+const IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Menus shown in the titlebar.
-/// Toolbar labels of the Plugins menu entries, in registry order.
-const PLUGIN_MENU_LABELS: &[&str] = &[
-    "Monitor",
-    "Scratch",
-    "Macros",
-    "MQTT",
-    "Files",
-    "AI Agent",
-    "Conn Log",
-    "Docker",
-];
-
-
-/// Menus shown in the titlebar.
-const MENUS: &[wassh_ui::titlebar::Menu] = &[
-    ("File", &["Options…", "", "Quit"]),
-    ("Edit", &["Copy", "Paste", "", "Find…"]),
-    (
-        "Session",
-        &[
-            "New terminal",
-            "",
-            "Reconnect",
-            "Reconnect all",
-            "Reopen closed tab",
-            "",
-            "Session settings…",
-            "Tunnels…",
-        ],
-    ),
-    (
-        "View",
-        &[
-            "Zoom In",
-            "Zoom Out",
-            "Reset zoom",
-            "",
-            "Toggle sidebar",
-            "Toggle Full Screen",
-        ],
-    ),
-    ("Plugins", PLUGIN_MENU_LABELS),
-    ("Help", &["About WaSSH"]),
-];
+///
+/// The Plugins rows are the registry's toolbar labels, so a built-in appears in the menu
+/// without a second list naming it.
+fn menus() -> &'static [wassh_ui::titlebar::Menu] {
+    static MENUS: std::sync::OnceLock<Vec<wassh_ui::titlebar::Menu>> = std::sync::OnceLock::new();
+    MENUS.get_or_init(|| {
+        let plugins: &'static [&'static str] = Box::leak(
+            wassh_plugins::toolbar_plugins()
+                .map(|manifest| manifest.toolbar_label)
+                .collect(),
+        );
+        vec![
+            ("File", &["Options…", "", "Quit"]),
+            ("Edit", &["Copy", "Paste", "", "Find…"]),
+            (
+                "Session",
+                &[
+                    "New terminal",
+                    "",
+                    "Reconnect",
+                    "Reconnect all",
+                    "Reopen closed tab",
+                    "",
+                    "Session settings…",
+                    "Tunnels…",
+                ],
+            ),
+            (
+                "View",
+                &[
+                    "Zoom In",
+                    "Zoom Out",
+                    "Reset zoom",
+                    "",
+                    "Toggle sidebar",
+                    "Toggle Full Screen",
+                ],
+            ),
+            ("Plugins", plugins),
+            ("Help", &["About WaSSH"]),
+        ]
+    })
+}
 
 /// Keys that run a menu row, for the rows that have a binding.
 ///
@@ -132,6 +138,13 @@ const MENU_SHORTCUTS: &[(&str, &str)] = &[
 struct ClosedTab {
     connection: ConnectionParams,
     host_id: Option<String>,
+}
+
+/// What a cached [`PluginValues`] was built from.
+struct PluginValuesKey {
+    session: String,
+    host: Option<String>,
+    generation: u64,
 }
 
 /// The whole application.
@@ -159,6 +172,25 @@ pub struct Shell {
     next_id: u64,
     find_matches: usize,
     find_index: usize,
+    /// Session, grid revision and query the match count was computed for.
+    find_computed: Option<(String, u64, String)>,
+    /// Plugin settings and decrypted secrets for the tab being drawn; moved out for the
+    /// frame, and rebuilt only when what they derive from changed.
+    plugin_values: Option<PluginValues>,
+    plugin_values_key: Option<PluginValuesKey>,
+    /// Bumped whenever the settings, the hosts or the credential vault change.
+    data_generation: u64,
+    /// Window title handed to the header bar and the platform, and the tab title it was
+    /// last built from.
+    title: String,
+    title_tab: String,
+    /// Plugin labels the Plugins menu ticks and shows a gear for, reused per frame.
+    checked_labels: Vec<&'static str>,
+    gear_labels: Vec<&'static str>,
+    /// Buttons of the plugin strip, reused per frame.
+    toolbar_buttons: Vec<wassh_ui::ToolbarButton<'static>>,
+    /// Reconnect countdown text, with the attempt and second it was built for.
+    retry_label: Option<(u32, u64, String)>,
     last_terminal_size: TerminalSize,
     quit_requested: bool,
     /// Plugin being dragged to a dock zone, from the toolbar or a pane header.
@@ -180,31 +212,161 @@ pub struct Shell {
     system_dark: Option<bool>,
     /// Palette egui's own visuals were last built from.
     styled_palette: Option<Palette>,
-    /// Normal (non-maximized) window geometry from the last frame, kept while maximized so
-    /// unmaximizing and the next launch still land on the same rectangle.
-    last_bounds: Option<WindowBounds>,
-    /// Position the window was asked to take on relaunch, in points, until it has landed.
-    restore_request: Option<egui::Pos2>,
-    /// Frames to wait before looking at where the window actually landed.
-    restore_wait: u8,
+    /// Where the window is, and how it gets put back there next launch.
+    window: WindowGeometry,
     /// When a clipboard paste was asked for, until which a `Paste` event is ours.
     ///
     /// The platform's Ctrl+V produces the same event, and that key belongs to the shell.
     paste_deadline: Option<std::time::Instant>,
-    /// Measured difference between a requested position and the client position the
-    /// platform reports for it — the frame's borders and title bar.
+    /// When the fast repaint window ends; `None` (or a past instant) means the app is idle.
+    active_until: Option<std::time::Instant>,
+}
+
+/// Where the window is, and how it gets put back there next launch.
+///
+/// Restoring a position is a small protocol with the window manager: the move is requested,
+/// the window reports where it actually landed a couple of frames later, and the difference
+/// is the frame's decoration offset — which is subtracted again when saving, or the window
+/// would walk a decoration's width across the screen on every launch.
+#[derive(Default)]
+struct WindowGeometry {
+    /// Normal (non-maximized) rectangle from the last frame, kept while maximized so
+    /// unmaximizing and the next launch still land on the same rectangle.
+    normal: Option<WindowBounds>,
+    /// Rectangle the next launch should restore.
+    saved: Option<WindowBounds>,
+    /// Position the window was asked to take, in points, until it has landed.
+    requested: Option<egui::Pos2>,
+    /// Frames to wait before looking at where the window actually landed.
+    wait: u8,
+    /// Measured distance between a requested position and the client position the platform
+    /// reports for it — the frame's borders and title bar.
     ///
     /// X11 lets the window manager add the decoration to the requested position but reports
     /// the *client* position back, so saving that report verbatim would walk the window a
     /// decoration's width further across the screen on every launch. It is measured once
     /// from the restore move and subtracted again when saving.
-    frame_offset: Option<egui::Vec2>,
-    /// When the fast repaint window ends; `None` (or a past instant) means the app is idle.
-    active_until: Option<std::time::Instant>,
-    /// Saved position to apply once the real window exists.
-    restore_bounds: Option<WindowBounds>,
-    /// When the window geometry last changed, so a drag is written once it settles.
-    bounds_changed_at: Option<std::time::Instant>,
+    offset: Option<egui::Vec2>,
+    /// When the rectangle last changed, so a drag is written once it settles.
+    changed_at: Option<std::time::Instant>,
+}
+
+impl WindowGeometry {
+    /// Take up the rectangle the last run saved.
+    fn new(saved: Option<WindowBounds>) -> Self {
+        Self {
+            normal: saved.map(|bounds| WindowBounds {
+                maximized: false,
+                ..bounds
+            }),
+            // A maximized window is restored maximized on the normal rectangle.
+            saved: saved.filter(|bounds| !bounds.maximized),
+            ..Self::default()
+        }
+    }
+
+    /// Whether a restore move is still on its way.
+    fn restoring(&self) -> bool {
+        self.requested.is_some()
+    }
+
+    /// Whether the rectangle stopped changing long enough to be written.
+    fn take_settled(&mut self, force: bool) -> bool {
+        let Some(changed_at) = self.changed_at else {
+            return false;
+        };
+        if !force && changed_at.elapsed() < WINDOW_BOUNDS_SETTLE {
+            return false;
+        }
+        self.changed_at = None;
+        true
+    }
+
+    /// Put the window back where it was saved, in physical pixels.
+    ///
+    /// `OuterPosition` takes points, so the saved pixel position is divided by the window's
+    /// current scale: the conversion happens against the same scale it is multiplied by, and
+    /// the window lands on the monitor, and at the pixel, it was saved from. The size is
+    /// already applied in points when the window is created.
+    fn restore(&mut self, ctx: &egui::Context) -> bool {
+        let Some(bounds) = self.saved.take() else {
+            return false;
+        };
+        let pixels_per_point = ctx.pixels_per_point();
+        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
+            return false;
+        }
+        let target = egui::pos2(
+            bounds.x as f32 / pixels_per_point,
+            bounds.y as f32 / pixels_per_point,
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+        // Where the window lands tells us the decoration offset; see `learn_offset`.
+        self.requested = Some(target);
+        self.wait = RESTORE_FRAMES;
+        ctx.request_repaint();
+        true
+    }
+
+    /// Measure the window frame's offset from the position asked for, once per session.
+    ///
+    /// The move is applied asynchronously, so this runs a couple of frames after the
+    /// request. A window manager that ignored the request would report a large difference;
+    /// that is discarded rather than baked into every later save.
+    fn learn_offset(&mut self, ctx: &egui::Context) {
+        let Some(requested) = self.requested else {
+            return;
+        };
+        if self.wait > 0 {
+            self.wait -= 1;
+            ctx.request_repaint_after(RESTORE_POLL);
+            return;
+        }
+        self.requested = None;
+        let Some(inner) = ctx.input(|input| input.viewport().inner_rect) else {
+            return;
+        };
+        let offset = inner.min - requested;
+        if offset.length() <= MAX_FRAME_OFFSET {
+            self.offset = Some(offset);
+        }
+        ctx.request_repaint();
+    }
+
+    /// The rectangle the window has now, if it can be saved at all.
+    ///
+    /// While maximized the normal rectangle is kept, so unmaximizing and the next launch
+    /// still use it.
+    fn current(&mut self, ctx: &egui::Context) -> Option<WindowBounds> {
+        let viewport = ctx.input(|input| input.viewport().clone());
+        if viewport.fullscreen.unwrap_or(false) || viewport.minimized.unwrap_or(false) {
+            return None;
+        }
+        let inner = viewport.inner_rect?;
+        let pixels_per_point = ctx.pixels_per_point();
+        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
+            return None;
+        }
+        let maximized = viewport.maximized.unwrap_or(false);
+        if !maximized {
+            // The frame position is what gets restored, so the measured decoration offset
+            // is removed from the client position the platform reports. Wayland reports no
+            // outer position at all, and there a known offset lets the position survive.
+            let position = match self.offset {
+                Some(offset) => inner.min - offset,
+                None => viewport.outer_rect.map_or(inner.min, |outer| outer.min),
+            };
+            self.normal = Some(WindowBounds {
+                x: (position.x * pixels_per_point).round() as i32,
+                y: (position.y * pixels_per_point).round() as i32,
+                width: inner.width().round() as u32,
+                height: inner.height().round() as u32,
+                maximized: false,
+            });
+        }
+        let normal = self.normal?;
+        Some(WindowBounds { maximized, ..normal })
+    }
 }
 
 /// Whether the desktop is currently in its dark variant.
@@ -343,15 +505,11 @@ impl Shell {
         bounds: Option<WindowBounds>,
     ) -> Self {
         let mut shell = Self::new_for_test(config, perf, perf_tabs);
-        shell.last_bounds = bounds.map(|bounds| WindowBounds {
-            maximized: false,
-            ..bounds
-        });
-        shell.restore_bounds = bounds.filter(|bounds| !bounds.maximized);
+        shell.window = WindowGeometry::new(bounds);
         let system_dark = system_prefers_dark(&cc.egui_ctx);
         shell.system_dark = Some(system_dark);
         if shell.settings.theme == wassh_core::ThemeMode::System {
-            shell.palette = Palette::for_mode(shell.settings.theme.resolve(system_dark));
+            shell.palette = Palette::for_setting(shell.settings.theme, system_dark);
         }
         shell
     }
@@ -373,7 +531,7 @@ impl Shell {
             .map(|config| config.hosts.get().clone())
             .unwrap_or_default();
         // Provisional: `Shell::new` re-resolves this against the desktop's preference.
-        let palette = Palette::for_mode(settings.theme.resolve(true));
+        let palette = Palette::for_setting(settings.theme, true);
 
         let known_hosts = match wassh_store::data_dir() {
             Ok(dir) if !perf => KnownHosts::load(wassh_store::known_hosts_file(dir)),
@@ -409,6 +567,16 @@ impl Shell {
             next_id: 1,
             find_matches: 0,
             find_index: 0,
+            find_computed: None,
+            plugin_values: None,
+            plugin_values_key: None,
+            data_generation: 0,
+            title: APP_NAME.to_owned(),
+            title_tab: String::new(),
+            checked_labels: Vec::new(),
+            gear_labels: Vec::new(),
+            toolbar_buttons: Vec::new(),
+            retry_label: None,
             last_terminal_size: TerminalSize::new(80, 24),
             quit_requested: false,
             dock_drag: None,
@@ -422,13 +590,8 @@ impl Shell {
             restore_pending: true,
             system_dark: None,
             styled_palette: None,
-            last_bounds: None,
-            restore_bounds: None,
-            bounds_changed_at: None,
-            restore_request: None,
-            restore_wait: 0,
+            window: WindowGeometry::default(),
             paste_deadline: None,
-            frame_offset: None,
             active_until: None,
             perf_tabs,
         };
@@ -831,6 +994,7 @@ impl Shell {
 
     /// Write `settings.json` without re-applying defaults to the open tabs.
     fn write_settings(&mut self) {
+        self.touch_plugin_data();
         if let Some(config) = self.config.as_mut() {
             if let Err(error) = config.settings.set(self.settings.clone()) {
                 self.toasts.push(
@@ -845,110 +1009,24 @@ impl Shell {
         }
     }
 
-    /// Put the window back where it was saved, in physical pixels.
-    ///
-    /// `OuterPosition` takes points, so the saved pixel position is divided by the window's
-    /// current scale: the conversion happens against the same scale it is multiplied by, and
-    /// the window lands on the monitor, and at the pixel, it was saved from. The size is
-    /// already applied in points when the window is created.
-    fn restore_window_position(&mut self, ctx: &egui::Context) -> bool {
-        let Some(bounds) = self.restore_bounds.take() else {
-            return false;
-        };
-        let pixels_per_point = ctx.pixels_per_point();
-        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
-            return false;
-        }
-        let target = egui::pos2(
-            bounds.x as f32 / pixels_per_point,
-            bounds.y as f32 / pixels_per_point,
-        );
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
-        // Where the window lands tells us the decoration offset; see `learn_frame_offset`.
-        self.restore_request = Some(target);
-        self.restore_wait = 2;
-        ctx.request_repaint();
-        true
-    }
-
-    /// Measure the window frame's offset from the position asked for, once per session.
-    ///
-    /// The move is applied asynchronously, so this runs a couple of frames after the
-    /// request. A window manager that ignored the request would report a large difference;
-    /// that is discarded rather than baked into every later save.
-    fn learn_frame_offset(&mut self, ctx: &egui::Context) {
-        let Some(requested) = self.restore_request else {
-            return;
-        };
-        if self.restore_wait > 0 {
-            self.restore_wait -= 1;
-            ctx.request_repaint_after(std::time::Duration::from_millis(30));
-            return;
-        }
-        self.restore_request = None;
-        let Some(inner) = ctx.input(|input| input.viewport().inner_rect) else {
-            return;
-        };
-        let offset = inner.min - requested;
-        if offset.length() <= MAX_FRAME_OFFSET {
-            self.frame_offset = Some(offset);
-        }
-        ctx.request_repaint();
-    }
-
     /// Remember the window rectangle so the next launch can restore it.
     fn track_window_bounds(&mut self, ctx: &egui::Context) {
-        let viewport = ctx.input(|input| input.viewport().clone());
-        if viewport.fullscreen.unwrap_or(false) || viewport.minimized.unwrap_or(false) {
-            return;
-        }
-        let Some(inner) = viewport.inner_rect else {
+        let Some(current) = self.window.current(ctx) else {
             return;
         };
-        let pixels_per_point = ctx.pixels_per_point();
-        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
-            return;
-        }
-        let maximized = viewport.maximized.unwrap_or(false);
-        if !maximized {
-            // The frame position is what gets restored, so the measured decoration offset
-            // is removed from the client position the platform reports. Wayland reports no
-            // outer position at all, and there a known offset lets the position survive.
-            let position = match self.frame_offset {
-                Some(offset) => inner.min - offset,
-                None => viewport.outer_rect.map_or(inner.min, |outer| outer.min),
-            };
-            self.last_bounds = Some(WindowBounds {
-                x: (position.x * pixels_per_point).round() as i32,
-                y: (position.y * pixels_per_point).round() as i32,
-                width: inner.width().round() as u32,
-                height: inner.height().round() as u32,
-                maximized: false,
-            });
-        }
-        // While maximized the normal rectangle is kept, so unmaximizing and the next launch
-        // still use it.
-        let Some(normal) = self.last_bounds else {
-            return;
-        };
-        let current = WindowBounds { maximized, ..normal };
         if self.settings.window_bounds == Some(current) {
             return;
         }
         self.settings.window_bounds = Some(current);
-        self.bounds_changed_at = Some(std::time::Instant::now());
+        self.window.changed_at = Some(std::time::Instant::now());
         ctx.request_repaint_after(WINDOW_BOUNDS_SETTLE);
     }
 
     /// Write the window rectangle once it has stopped changing, or at once when the app exits.
     fn persist_window_bounds(&mut self, force: bool) {
-        let Some(changed_at) = self.bounds_changed_at else {
-            return;
-        };
-        if !force && changed_at.elapsed() < WINDOW_BOUNDS_SETTLE {
+        if !self.window.take_settled(force) {
             return;
         }
-        self.bounds_changed_at = None;
         self.write_settings();
     }
 
@@ -958,7 +1036,7 @@ impl Shell {
         self.settings.sidebar_collapsed = self.sidebar.collapsed;
         // `System` resolves against the desktop preference seen this session.
         let system_dark = self.system_dark.unwrap_or(true);
-        self.palette = Palette::for_mode(self.settings.theme.resolve(system_dark));
+        self.palette = Palette::for_setting(self.settings.theme, system_dark);
         self.write_settings();
         // New defaults and the (possibly new) theme apply to the sessions already open.
         let palette = self.palette;
@@ -995,6 +1073,7 @@ impl Shell {
                     .push(ToastKind::Error, format!("could not save secret: {error}"));
             }
         }
+        self.touch_plugin_data();
     }
 
     /// Push a saved host's settings onto the sessions already open for it.
@@ -1052,30 +1131,23 @@ impl Shell {
         };
         let mut stored = Vec::new();
         for id in PluginId::ALL {
-            for (key, _) in wassh_plugins::settings::secret_fields(id) {
-                if store.has_plugin_secret(scope, id.as_str(), key) {
-                    stored.push((id.as_str().to_owned(), key.to_owned()));
+            let fields = wassh_plugins::settings::secret_fields_for(id, self.plugin_settings_of(id));
+            for (key, _) in fields {
+                if store.has_plugin_secret(scope, id.as_str(), &key) {
+                    stored.push((id.as_str().to_owned(), key));
                 }
-            }
-        }
-        for field in self.ai_agent_secret_fields() {
-            if store.has_plugin_secret(scope, PluginId::AiAgent.as_str(), &field) {
-                stored.push((PluginId::AiAgent.as_str().to_owned(), field));
             }
         }
         stored
     }
 
-    /// Vault fields the AI agent's provider keys are filed under.
-    fn ai_agent_secret_fields(&self) -> Vec<String> {
-        self.settings
-            .plugin_settings
-            .get(PluginId::AiAgent.as_str())
-            .map(wassh_plugins::ai_agent::provider_ids)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|provider| wassh_plugins::ai_agent::provider_secret_field(&provider))
-            .collect()
+    /// The app-wide settings a plugin owns, which also name any secret it declares at
+    /// runtime (the AI agent's provider keys).
+    fn plugin_settings_of(
+        &self,
+        id: PluginId,
+    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.settings.plugin_settings.get(id.as_str())
     }
 
     /// Decrypted plugin secrets for one host, per plugin id and field key.
@@ -1092,7 +1164,8 @@ impl Shell {
             return out;
         };
         for id in PluginId::ALL {
-            for (key, app_wide) in wassh_plugins::settings::secret_fields(id) {
+            let fields = wassh_plugins::settings::secret_fields_for(id, self.plugin_settings_of(id));
+            for (key, app_wide) in fields {
                 let scope = if app_wide {
                     wassh_store::secrets::APP_SCOPE
                 } else {
@@ -1101,24 +1174,11 @@ impl Shell {
                         None => continue,
                     }
                 };
-                if let Some(value) = store.plugin_secret(scope, id.as_str(), key) {
+                if let Some(value) = store.plugin_secret(scope, id.as_str(), &key) {
                     out.entry(id.as_str().to_owned())
                         .or_default()
-                        .insert(key.to_owned(), value);
+                        .insert(key, value);
                 }
-            }
-        }
-        // The AI agent's provider keys are named after the configured providers, so
-        // they are not part of its static schema.
-        for field in self.ai_agent_secret_fields() {
-            if let Some(value) = store.plugin_secret(
-                wassh_store::secrets::APP_SCOPE,
-                PluginId::AiAgent.as_str(),
-                &field,
-            ) {
-                out.entry(PluginId::AiAgent.as_str().to_owned())
-                    .or_default()
-                    .insert(field, value);
             }
         }
         out
@@ -1129,6 +1189,7 @@ impl Shell {
         if drafts.is_empty() {
             return;
         }
+        self.touch_plugin_data();
         let Some(store) = self.secrets.as_mut() else {
             self.toasts.push(
                 ToastKind::Error,
@@ -1159,6 +1220,7 @@ impl Shell {
     /// `hosts.json` like any other setting. Anything still there is sealed on
     /// startup and removed, so an upgrade never leaves a password readable.
     fn migrate_plugin_secrets(&mut self) {
+        self.touch_plugin_data();
         let mut pending: Vec<(String, String, String, String)> = Vec::new();
         for (plugin, values) in &self.settings.plugin_settings {
             let Some(id) = PluginId::parse(plugin) else {
@@ -1186,8 +1248,13 @@ impl Shell {
                     ));
                 }
             }
-            if id == PluginId::AiAgent {
-                pending.extend(legacy_provider_keys(plugin, values));
+            for (field, text) in wassh_plugins::settings::legacy_secrets(id, values) {
+                pending.push((
+                    wassh_store::secrets::APP_SCOPE.to_owned(),
+                    plugin.clone(),
+                    field,
+                    text,
+                ));
             }
         }
         for host in &self.hosts.hosts {
@@ -1384,6 +1451,7 @@ impl Shell {
     fn save_host(&mut self, mut host: HostProfile) {
         // A plugin password belongs in the vault, never in `hosts.json`.
         strip_plugin_secrets(&mut host.plugin_settings);
+        self.touch_plugin_data();
         self.hosts.upsert(host.clone());
         self.hosts = std::mem::take(&mut self.hosts).normalized();
         // Open sessions keep the values they started with; only "Apply to sessions"
@@ -1398,6 +1466,7 @@ impl Shell {
 
     fn delete_host(&mut self, id: &str) {
         self.hosts.remove(id);
+        self.touch_plugin_data();
         if let Some(store) = self.secrets.as_mut() {
             let _ = store.set_password(id, None);
             let _ = store.set_passphrase(id, None);
@@ -1412,6 +1481,7 @@ impl Shell {
     }
 
     fn persist_hosts(&mut self) {
+        self.touch_plugin_data();
         if let Some(config) = self.config.as_mut() {
             if let Err(error) = config.hosts.set(self.hosts.clone()) {
                 self.toasts
@@ -1477,7 +1547,7 @@ impl Shell {
             }
             Command::OpenOptions => {
                 let home = home_dir();
-                let now = wassh_plugins::connection_logger::now_ms();
+                let now = wassh_core::time::now_ms();
                 self.dialogs.options = Some(self.options_state().with_backup_default(&home, now));
             }
             Command::OpenTunnels => {
@@ -1581,7 +1651,7 @@ impl Shell {
             return;
         };
         let home = home_dir();
-        let now = wassh_plugins::connection_logger::now_ms();
+        let now = wassh_core::time::now_ms();
         self.dialogs.options = Some(
             self.options_state()
                 .with_backup_default(&home, now)
@@ -1589,30 +1659,27 @@ impl Shell {
         );
     }
 
-    /// Toolbar labels of the plugins that have their own section in Options.
+    /// Toolbar labels the Plugins menu ticks and shows a gear for.
     ///
-    /// Only those get the gear in the Plugins menu: a plugin with nothing to configure has
-    /// no section to open, and a disabled one has none either.
-    fn configurable_plugin_labels(&self) -> Vec<&'static str> {
-        wassh_plugins::PluginId::UI_ORDER
-            .into_iter()
-            .filter(|id| self.settings.plugin_enabled(id.as_str()))
-            .filter(|id| !wassh_plugins::settings::app_schema(*id).is_empty())
-            .map(|id| id.manifest().toolbar_label)
-            .collect()
-    }
-
-    /// Toolbar labels of the plugins open in the active tab, so the Plugins menu
-    /// can tick them.
-    fn active_plugin_labels(&self) -> Vec<&'static str> {
-        let Some(session) = self.active.and_then(|index| self.sessions.get(index)) else {
-            return Vec::new();
-        };
-        wassh_plugins::PluginId::UI_ORDER
-            .into_iter()
-            .filter(|id| session.layout.contains(id.as_str()))
-            .map(|id| id.manifest().toolbar_label)
-            .collect()
+    /// One pass over the registry into reused buffers: the menus are drawn every frame and
+    /// the labels never change.
+    fn refresh_plugin_labels(&mut self) {
+        self.checked_labels.clear();
+        self.gear_labels.clear();
+        for id in wassh_plugins::PluginId::UI_ORDER {
+            let label = id.manifest().toolbar_label;
+            if self.settings.plugin_enabled(id.as_str())
+                && !wassh_plugins::settings::app_schema(id).is_empty()
+            {
+                self.gear_labels.push(label);
+            }
+            let open = self
+                .active()
+                .is_some_and(|session| session.layout.contains(id.as_str()));
+            if open {
+                self.checked_labels.push(label);
+            }
+        }
     }
 
     /// Open the plugin's pane in the active tab, or close it when it is already
@@ -1752,7 +1819,6 @@ impl Shell {
             results.push((index, session.pump(&term_type)));
             // Collect any finished remote-file or monitoring requests.
             session.poll_files();
-            session.poll_monitor();
             session.poll_commands();
             if session.requests_pending() {
                 ctx.request_repaint_after(Duration::from_millis(100));
@@ -1764,13 +1830,6 @@ impl Shell {
             // session settles, so the echo and the rest of a burst arrive without a wait.
             if pumped.wake {
                 self.active_until = Some(std::time::Instant::now() + ACTIVE_LINGER);
-            }
-            if let Some(title) = pumped.title
-                && self.active == Some(index)
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "{APP_NAME} — {title}"
-                )));
             }
             if pumped.bell {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
@@ -1906,13 +1965,26 @@ impl Shell {
             .unwrap_or_default();
         if query.is_empty() {
             self.find_matches = 0;
+            self.find_computed = None;
             return;
         }
-        let text = self
-            .active()
-            .map(|session| session.visible_text().to_lowercase())
-            .unwrap_or_default();
-        self.find_matches = text.matches(&query).count();
+        let Some(session) = self.active() else {
+            self.find_matches = 0;
+            return;
+        };
+        // Searching the whole visible grid is only worth doing when the text it was
+        // computed for is still the text on screen.
+        let revision = session.revision();
+        let current = self.find_computed.as_ref().is_some_and(|(id, at, cached)| {
+            id == &session.id && *at == revision && cached == &query
+        });
+        if current {
+            return;
+        }
+        let matches = session.visible_text().to_lowercase().matches(&query).count();
+        let session_id = session.id.clone();
+        self.find_matches = matches;
+        self.find_computed = Some((session_id, revision, query));
     }
 
     /// Write or restore the configuration archive, reporting the outcome as a toast.
@@ -2073,6 +2145,7 @@ impl Shell {
             }
             self.save_settings();
         }
+        let wrote_secrets = !secret_writes.is_empty();
         for (id, field, value) in secret_writes {
             let scope = plugin_secret_scope(id, &field, host_id.as_deref());
             let Some(store) = self.secrets.as_mut() else {
@@ -2089,6 +2162,9 @@ impl Shell {
                     format!("could not save {} password: {error}", id.manifest().name),
                 );
             }
+        }
+        if wrote_secrets {
+            self.touch_plugin_data();
         }
         if dirty.is_empty() {
             return;
@@ -2159,21 +2235,21 @@ impl Shell {
             return;
         }
         let palette = self.palette;
-        let session = &self.sessions[index];
-        let buttons: Vec<wassh_ui::ToolbarButton<'_>> = wassh_plugins::PluginId::UI_ORDER
-            .into_iter()
-            // Disabled plugins stay out of the strip, exactly like the original build.
-            .filter(|id| self.settings.plugin_enabled(id.as_str()))
-            .map(|id| {
-                let manifest = id.manifest();
-                wassh_ui::ToolbarButton {
-                    id: id.as_str(),
-                    label: manifest.toolbar_label,
-                    active: session.layout.contains(id.as_str()),
-                    tooltip: manifest.name,
-                }
-            })
-            .collect();
+        // The strip is the same buttons every frame, so the buffer is reused.
+        self.toolbar_buttons.clear();
+        for id in wassh_plugins::PluginId::UI_ORDER {
+            if !self.settings.plugin_enabled(id.as_str()) {
+                continue;
+            }
+            let manifest = id.manifest();
+            let open = self.sessions[index].layout.contains(id.as_str());
+            self.toolbar_buttons.push(wassh_ui::ToolbarButton {
+                id: id.as_str(),
+                label: manifest.toolbar_label,
+                active: open,
+                tooltip: manifest.name,
+            });
+        }
 
         let mut output = wassh_ui::plugin_toolbar::ToolbarOutput::default();
         egui::Panel::top("wassh-plugin-toolbar")
@@ -2184,7 +2260,7 @@ impl Shell {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                output = wassh_ui::plugin_toolbar(ui, &palette, &buttons);
+                output = wassh_ui::plugin_toolbar(ui, &palette, &self.toolbar_buttons);
             });
 
         if let Some(plugin_id) = output.dragging {
@@ -2412,13 +2488,9 @@ impl Shell {
         // borrowed, so it is taken out and put back.
         let mut drag = self.dock_drag.take();
         let mut dropped = false;
-        let plugin_values = self.plugin_values_for(index);
+        let plugin_values = self.take_plugin_values(index);
         let size_after = {
             let session = &mut self.sessions[index];
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if scroll.abs() > 0.0 {
-                session.terminal.scroll((scroll / 20.0).round() as i32);
-            }
 
             // Take the layout out so the pane callbacks can borrow the session.
             let mut layout = std::mem::take(&mut session.layout);
@@ -2460,6 +2532,7 @@ impl Shell {
         };
         self.dock_drag = drag;
         self.last_terminal_size = size_after;
+        self.plugin_values = Some(plugin_values);
         self.persist_plugin_data(index);
         if dropped {
             self.persist_tabs();
@@ -2470,9 +2543,9 @@ impl Shell {
 
     /// Ask for another frame: soon while the window is busy, later when it is idle.
     ///
-    /// egui only repaints when it is asked to, and the transports are polled from the frame
-    /// loop rather than waking it, so a slow idle cadence is what keeps a static window from
-    /// redrawing sixty times a second. Typing and fresh output switch to the active rate.
+    /// egui only repaints when it is asked to. Output and finished work wake the window on
+    /// their own (`wassh_core::wake`), so the idle cadence is only a safety net for what
+    /// cannot; typing and fresh output switch to the active rate.
     fn schedule_repaint(&mut self, ctx: &egui::Context) {
         // Working with the window means the echo is about to arrive.
         if ctx.input(|input| input_started_work(&input.events)) {
@@ -2482,6 +2555,37 @@ impl Shell {
             .active_until
             .is_some_and(|until| until > std::time::Instant::now());
         ctx.request_repaint_after(if active { ACTIVE_INTERVAL } else { IDLE_INTERVAL });
+    }
+
+    /// Keep the reconnect countdown current.
+    ///
+    /// The banner shows the seconds left, which ticks while the tab waits; the text is
+    /// rebuilt when the second or the attempt changes, not once per frame.
+    fn refresh_retry_label(&mut self, index: usize) {
+        let Some(session) = self.sessions.get(index) else {
+            self.retry_label = None;
+            return;
+        };
+        let Some(at) = session.retry_at else {
+            self.retry_label = None;
+            return;
+        };
+        let remaining = at.saturating_duration_since(std::time::Instant::now());
+        let seconds = remaining.as_secs().max(1);
+        let attempt = session.reconnect_attempt;
+        let current = self
+            .retry_label
+            .as_ref()
+            .is_some_and(|(cached_attempt, cached_seconds, _)| {
+                *cached_attempt == attempt && *cached_seconds == seconds
+            });
+        if !current {
+            self.retry_label = Some((
+                attempt,
+                seconds,
+                wassh_core::reconnect_label(attempt, remaining),
+            ));
+        }
     }
 
     fn show_session_banners(&mut self, ui: &mut egui::Ui, index: usize) {
@@ -2591,17 +2695,14 @@ impl Shell {
             }
         }
 
+        self.refresh_retry_label(index);
+        let countdown = self.retry_label.as_ref().map(|(_, _, text)| text.as_str());
         let session = &self.sessions[index];
         // While the user is typing a password the prompt is the status, like PuTTY.
         if !session.is_live() && !session.awaiting_login() {
             let status = session.status;
             let error = session.error.clone();
             let note = session.status_message.clone();
-            let countdown = session.retry_at.map(|at| {
-                let remaining = at.saturating_duration_since(std::time::Instant::now());
-                let seconds = remaining.as_secs().max(1);
-                format!("Attempt {} (in {}s)", session.reconnect_attempt, seconds)
-            });
             let can_retry = status.is_retryable() || status == SessionStatus::Closed;
             let mut retry = false;
             egui::Panel::top("wassh-status")
@@ -2637,7 +2738,7 @@ impl Shell {
                                 ),
                             );
                         }
-                        if let Some(countdown) = &countdown {
+                        if let Some(countdown) = countdown {
                             ui.label(
                                 egui::RichText::new(countdown).size(11.0).color(
                                     wassh_ui::terminal_view::to_color32(palette.warn),
@@ -2670,18 +2771,44 @@ impl Shell {
 
     /// Plugin settings that apply to the session at `index`: the app-wide values
     /// plus the ones Host settings stores for its host.
-    fn plugin_values_for(&self, index: usize) -> PluginValues {
-        let host_id = self.sessions.get(index).and_then(|session| session.host_id.clone());
-        let host = host_id
-            .as_deref()
-            .and_then(|host_id| self.hosts.host(host_id));
-        PluginValues {
-            app: self.settings.plugin_settings.clone(),
-            host: host
-                .map(|host| host.plugin_settings.clone())
-                .unwrap_or_default(),
-            secrets: self.plugin_secrets_for(host_id.as_deref()),
+    ///
+    /// Panes read this every frame, and decrypting the vault or copying the settings
+    /// maps every frame would be wasted work, so the result is kept until the settings,
+    /// the hosts or the vault change. It is moved out for the frame because the dock
+    /// needs it while the session itself is borrowed mutably; the caller puts it back.
+    fn take_plugin_values(&mut self, index: usize) -> PluginValues {
+        let Some(session) = self.sessions.get(index) else {
+            return PluginValues::default();
+        };
+        let host_id = session.host_id.as_deref();
+        let fresh = self.plugin_values_key.as_ref().is_some_and(|key| {
+            key.generation == self.data_generation
+                && key.session == session.id
+                && key.host.as_deref() == host_id
+        });
+        if !fresh {
+            let key = PluginValuesKey {
+                session: session.id.clone(),
+                host: host_id.map(str::to_owned),
+                generation: self.data_generation,
+            };
+            let values = PluginValues {
+                app: self.settings.plugin_settings.clone(),
+                host: host_id
+                    .and_then(|host_id| self.hosts.host(host_id))
+                    .map(|host| host.plugin_settings.clone())
+                    .unwrap_or_default(),
+                secrets: self.plugin_secrets_for(host_id),
+            };
+            self.plugin_values_key = Some(key);
+            self.plugin_values = Some(values);
         }
+        self.plugin_values.take().unwrap_or_default()
+    }
+
+    /// Mark everything derived from the settings, the hosts and the vault as stale.
+    fn touch_plugin_data(&mut self) {
+        self.data_generation = self.data_generation.wrapping_add(1);
     }
 
     fn show_empty_state(&mut self, ui: &mut egui::Ui) {
@@ -2727,11 +2854,24 @@ impl Shell {
     }
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        if !self.dialogs.any_open() {
+            return;
+        }
         let palette = self.palette;
         let matches = self.find_matches;
-        let hosts = self.hosts.hosts.clone();
-        self.dialogs.enabled_plugins = self.settings.enabled_plugins.clone();
-        let actions = self.dialogs.show(ctx, &palette, &hosts, matches);
+        // Only Host settings reads the host list, so the other dialogs do not clone it.
+        let hosts = if self.dialogs.host.is_some() {
+            self.hosts.hosts.clone()
+        } else {
+            Vec::new()
+        };
+        let actions = self.dialogs.show(
+            ctx,
+            &palette,
+            &hosts,
+            &self.settings.enabled_plugins,
+            matches,
+        );
         self.handle_dialog_actions(actions);
     }
 
@@ -2871,28 +3011,50 @@ impl Shell {
 
         // The saved position is applied to the real window on the first frame; until then
         // the reported geometry is not the user's.
-        let restoring = self.restore_window_position(&ctx);
+        let restoring = self.window.restore(&ctx);
         self.frame_body(ui);
-        self.learn_frame_offset(&ctx);
+        self.window.learn_offset(&ctx);
         // Until a restore has landed, the position is not the user's choice yet, so it is
         // not saved over the one being restored.
-        if !restoring && self.restore_request.is_none() {
+        if !restoring && !self.window.restoring() {
             self.track_window_bounds(&ctx);
         }
         self.persist_window_bounds(false);
     }
 
     /// The text the window's title bar shows: the app name and the active tab.
-    fn window_title(&self) -> String {
-        match self.active.and_then(|index| self.sessions.get(index)) {
-            Some(session) if !session.title.is_empty() => format!("{APP_NAME} — {}", session.title),
-            _ => APP_NAME.to_owned(),
+    ///
+    /// The header bar and the platform both read it, so it is rebuilt only when the active
+    /// tab's title changed rather than once per frame.
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let tab = self
+            .active
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| session.title.as_str())
+            .unwrap_or_default();
+        if self.title_tab == tab {
+            return;
         }
+        self.title_tab.clear();
+        self.title_tab.push_str(tab);
+        self.title.clear();
+        self.title.push_str(APP_NAME);
+        if !tab.is_empty() {
+            self.title.push_str(" — ");
+            self.title.push_str(tab);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
     }
 
     /// Everything inside the window frame.
     fn frame_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+
+        // Background threads ask for a frame through this once it is installed.
+        if !wassh_core::wake::installed() {
+            let repaint = ctx.clone();
+            wassh_core::wake::install(std::sync::Arc::new(move || repaint.request_repaint()));
+        }
 
         // egui reads Tab, Shift+Tab and the arrow keys as navigation between focusable
         // widgets, and the first widget that wants focus takes it. The terminal is the
@@ -2906,24 +3068,23 @@ impl Shell {
         self.pump(&ctx);
         self.shortcuts(&ctx);
         self.update_find_matches();
+        self.sync_window_title(&ctx);
+        self.refresh_plugin_labels();
 
         // The window chrome: the app draws its own title bar on Windows and Linux, so it is
         // painted from the palette and follows the app's theme. macOS keeps the desktop's
         // title bar, and the app only adds the menu strip under it.
-        let checked = self.active_plugin_labels();
-        let gears = self.configurable_plugin_labels();
         let state = wassh_ui::titlebar::MenuState {
             shortcuts: MENU_SHORTCUTS,
-            checked: &checked,
-            gears: &gears,
+            checked: &self.checked_labels,
+            gears: &self.gear_labels,
         };
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-        let title = self.window_title();
         let action = if cfg!(target_os = "macos") {
-            wassh_ui::show_menu_bar(ui, &self.palette, MENUS, state)
+            wassh_ui::show_menu_bar(ui, &self.palette, menus(), state)
         } else {
             wassh_ui::resize_edges(&ctx, maximized);
-            wassh_ui::show_header_bar(ui, &self.palette, &title, maximized, MENUS, state)
+            wassh_ui::show_header_bar(ui, &self.palette, &self.title, maximized, menus(), state)
         };
         match action {
             Some(wassh_ui::TitlebarAction::MenuItem(item)) => self.menu_command(&ctx, item),
@@ -2978,7 +3139,7 @@ impl Shell {
         if self.settings.theme != wassh_core::ThemeMode::System {
             return;
         }
-        self.palette = Palette::for_mode(self.settings.theme.resolve(system_dark));
+        self.palette = Palette::for_setting(self.settings.theme, system_dark);
         let palette = self.palette;
         let defaults = self.settings.session_style_defaults.clone();
         for session in &mut self.sessions {
@@ -3008,7 +3169,7 @@ impl Shell {
 /// from a host's pane, so a provider key is never filed per host.
 fn plugin_secret_scope(id: PluginId, field: &str, host_id: Option<&str>) -> String {
     let app_wide = wassh_plugins::settings::secret_scope(id, field) == Some(true)
-        || (id == PluginId::AiAgent && wassh_plugins::ai_agent::is_provider_key_field(field));
+        || wassh_plugins::settings::is_runtime_secret(id, field);
     match (app_wide, host_id) {
         (true, _) | (false, None) => wassh_store::secrets::APP_SCOPE.to_owned(),
         (false, Some(host_id)) => host_id.to_owned(),
@@ -3023,12 +3184,10 @@ fn strip_plugin_secrets(settings: &mut wassh_core::PluginSettings) {
     settings.retain(|plugin, values| {
         match PluginId::parse(plugin) {
             Some(id) => {
-                for (key, _) in wassh_plugins::settings::secret_fields(id) {
-                    values.remove(key);
+                for (key, _) in wassh_plugins::settings::secret_fields_for(id, Some(values)) {
+                    values.remove(&key);
                 }
-                if id == PluginId::AiAgent {
-                    values.remove(wassh_plugins::ai_agent::API_KEYS_KEY);
-                }
+                wassh_plugins::settings::take_legacy_secrets(id, values);
             }
             None => values.retain(|key, _| !names_a_secret(key)),
         }
@@ -3070,20 +3229,13 @@ fn take_document_secrets(
             text,
         ));
     }
-    if id == PluginId::AiAgent
-        && let Some(keys) = values
-            .remove(wassh_plugins::ai_agent::API_KEYS_KEY)
-            .and_then(|value| value.as_object().cloned())
-    {
-        for (provider, key) in keys {
-            let Some(text) = key.as_str().filter(|text| !text.is_empty()) else {
-                continue;
-            };
+    if let Some(keys) = data.as_object_mut() {
+        for (field, text) in wassh_plugins::settings::take_legacy_secrets(id, keys) {
             found.push((
                 wassh_store::secrets::APP_SCOPE.to_owned(),
                 id.as_str().to_owned(),
-                wassh_plugins::ai_agent::provider_secret_field(&provider),
-                text.to_owned(),
+                field,
+                text,
             ));
         }
     }
@@ -3123,30 +3275,6 @@ fn names_a_secret(key: &str) -> bool {
     SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
 }
 
-/// Provider API keys an earlier build kept as plain text in the settings.
-fn legacy_provider_keys(
-    plugin: &str,
-    values: &serde_json::Map<String, serde_json::Value>,
-) -> Vec<(String, String, String, String)> {
-    let Some(keys) = values
-        .get(wassh_plugins::ai_agent::API_KEYS_KEY)
-        .and_then(|value| value.as_object())
-    else {
-        return Vec::new();
-    };
-    keys.iter()
-        .filter_map(|(provider, key)| {
-            let key = key.as_str().filter(|key| !key.is_empty())?;
-            Some((
-                wassh_store::secrets::APP_SCOPE.to_owned(),
-                plugin.to_owned(),
-                wassh_plugins::ai_agent::provider_secret_field(provider),
-                key.to_owned(),
-            ))
-        })
-        .collect()
-}
-
 /// The value a [`SecretEdit`] stands for: `None` keeps what is stored.
 fn secret_value(edit: &SecretEdit) -> Option<Option<&str>> {
     match edit {
@@ -3178,7 +3306,9 @@ impl wassh_ui::DockContent for SessionPanes<'_> {
         self.measured = size;
         let snapshot = self.session.snapshot();
         let response = self.session.view.show(ui, &snapshot, &self.palette);
-        self.session.track_selection(ui, &response, &snapshot);
+        drop(snapshot);
+        self.session.track_selection(ui, &response, size);
+        self.session.scroll_from_wheel(ui, &response);
     }
 
     fn pane(&mut self, ui: &mut egui::Ui, plugin_id: &str) {
@@ -3190,7 +3320,7 @@ impl wassh_ui::DockContent for SessionPanes<'_> {
         self.session.plugin_title(plugin_id)
     }
 
-    fn pane_status(&self, plugin_id: &str) -> Option<(String, wassh_ui::dock::HeaderHealth)> {
+    fn pane_status(&self, plugin_id: &str) -> Option<(&str, wassh_ui::dock::HeaderHealth)> {
         self.session.plugin_status(plugin_id)
     }
 
@@ -3258,6 +3388,98 @@ fn consume_chord(
     consumed
 }#[cfg(test)]
 mod tests {
+    /// A command that keeps running until it is interrupted, in the shell a local tab
+    /// starts on this platform, and the line it prints as soon as it is running.
+    ///
+    /// The marker matters: an interrupt that arrives while the shell is still starting the
+    /// command is swallowed (`cmd.exe` ignores it before `ping` is up), so the test waits
+    /// for it before interrupting. `sleep` itself prints nothing, so the shell does.
+    #[cfg(unix)]
+    const BLOCKING_COMMAND: &str = "printf 'go-%s\\n' 1; sleep 60\r";
+    #[cfg(unix)]
+    const BLOCKING_MARKER: &str = "go-1";
+    /// `cmd.exe` has no `sleep`; pinging the loopback address blocks for a minute, never
+    /// reads its stdin, and prints this line once it is running.
+    #[cfg(windows)]
+    const BLOCKING_COMMAND: &str = "ping -n 61 127.0.0.1\r";
+    #[cfg(windows)]
+    const BLOCKING_MARKER: &str = "Pinging";
+
+    /// How long a test waits for its local shell to paint something.
+    const SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+    /// Poll interval while waiting for the shell.
+    const SHELL_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    /// Frames egui needs to deliver a wheel delta it smooths out over several frames.
+    const WHEEL_FRAMES: usize = 20;
+
+    /// Turn the wheel at `pos` and let egui finish delivering the smoothed delta.
+    fn wheel_at(shell: &mut Shell, ctx: &egui::Context, pos: egui::Pos2, delta: egui::Vec2) {
+        let screen = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(1280.0, 800.0),
+        ));
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: screen,
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| shell.frame(ui));
+            output.drop_without_applying_deltas();
+        };
+        frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta,
+                modifiers: egui::Modifiers::NONE,
+                source: egui::MouseWheelSource::Wheel,
+                phase: egui::TouchPhase::Move,
+            },
+        ]);
+        for _ in 0..WHEEL_FRAMES {
+            frame(vec![egui::Event::PointerMoved(pos)]);
+        }
+    }
+
+    /// Run frames until the first session's screen holds `needle`.
+    fn wait_for_text(shell: &mut Shell, ctx: &egui::Context, needle: &str, what: &str) {
+        let deadline = std::time::Instant::now() + SHELL_WAIT;
+        while !shell
+            .sessions
+            .first()
+            .is_some_and(|session| session.visible_text().contains(needle))
+        {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            run_shell(shell, ctx, 1);
+            std::thread::sleep(SHELL_POLL);
+        }
+    }
+
+    /// Wait until the local shell has painted its prompt.
+    ///
+    /// A `ConPTY` shell asks the terminal for a cursor position before it starts, so
+    /// anything typed before that is dropped — and an interrupt that arrives while the
+    /// shell is still starting ends it (`STATUS_CONTROL_C_EXIT`) instead of the command.
+    fn wait_for_the_prompt(shell: &mut Shell, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + SHELL_WAIT;
+        loop {
+            let painted = shell
+                .sessions
+                .first()
+                .is_some_and(|session| !session.visible_text().trim().is_empty());
+            run_shell(shell, ctx, 1);
+            if painted {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the local shell never painted its prompt"
+            );
+            std::thread::sleep(SHELL_POLL);
+        }
+    }
+
     /// Run one frame with `events` as input and return what the platform was asked to do.
     fn frame_with_events(
         shell: &mut Shell,
@@ -3481,48 +3703,48 @@ mod tests {
         let mut shell = Shell::new_with(Some(scratch_config()), false);
         shell.open_local();
         let ctx = egui::Context::default();
+        wait_for_the_prompt(&mut shell, &ctx);
         // Start something that will not finish on its own.
-        shell.sessions[0].send(b"sleep 60\r");
-        run_shell(&mut shell, &ctx, 3);
+        shell.sessions[0].send(BLOCKING_COMMAND.as_bytes());
+        wait_for_text(
+            &mut shell,
+            &ctx,
+            BLOCKING_MARKER,
+            "the command never started",
+        );
 
         // Ctrl+C arrives from egui as a clipboard event.
         frame_with_events(&mut shell, vec![egui::Event::Copy]);
-        run_shell(&mut shell, &ctx, 3);
 
-        // Only a shell that got `^C` reads the next line; `sleep` ignores its stdin, so
-        // without the interrupt the answer would not come for a minute.
-        shell.sessions[0].send(b"echo ready-$((1+1))\r");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut answered = false;
-        while !answered && std::time::Instant::now() < deadline {
-            run_shell(&mut shell, &ctx, 1);
-            answered = shell.sessions[0].visible_text().contains("ready-2");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(answered, "Ctrl+C never reached the shell");
+        // Only a shell that got `^C` reads the next line; the blocked command ignores its
+        // stdin, so without the interrupt the answer would not come for a minute.
+        shell.sessions[0].send(b"echo ready-two\r");
+        wait_for_text(&mut shell, &ctx, "ready-two", "Ctrl+C never reached the shell");
     }
 
+    /// Job control is a terminal-line-discipline feature: `cmd.exe` has none, so Ctrl+Z
+    /// cannot suspend a command there. Nothing else claims the key on any platform, which
+    /// `the_menu_accelerators_are_the_bindings_that_exist` covers.
+    #[cfg(unix)]
     #[test]
     fn ctrl_z_suspends_a_running_command() {
         let mut shell = Shell::new_with(Some(scratch_config()), false);
         shell.open_local();
         let ctx = egui::Context::default();
-        shell.sessions[0].send(b"sleep 60\r");
-        run_shell(&mut shell, &ctx, 3);
+        wait_for_the_prompt(&mut shell, &ctx);
+        shell.sessions[0].send(BLOCKING_COMMAND.as_bytes());
+        wait_for_text(
+            &mut shell,
+            &ctx,
+            BLOCKING_MARKER,
+            "the command never started",
+        );
 
         // Ctrl+Z is an ordinary key event; it must not be claimed by any app shortcut.
         frame_with_events(&mut shell, vec![key_event(egui::Key::Z, egui::Modifiers::CTRL)]);
-        run_shell(&mut shell, &ctx, 3);
 
-        shell.sessions[0].send(b"echo ready-$((2+2))\r");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut answered = false;
-        while !answered && std::time::Instant::now() < deadline {
-            run_shell(&mut shell, &ctx, 1);
-            answered = shell.sessions[0].visible_text().contains("ready-4");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(answered, "Ctrl+Z never reached the shell");
+        shell.sessions[0].send(b"echo ready-four\r");
+        wait_for_text(&mut shell, &ctx, "ready-four", "Ctrl+Z never reached the shell");
     }
 
     #[test]
@@ -4401,16 +4623,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        shell.restore_request = Some(egui::pos2(500.0, 300.0));
-        shell.restore_wait = 0;
+        shell.window.requested = Some(egui::pos2(500.0, 300.0));
+        shell.window.wait = 0;
         let output = ctx.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
-            shell.learn_frame_offset(&ctx);
+            shell.window.learn_offset(&ctx);
             shell.track_window_bounds(&ctx);
         });
         output.drop_without_applying_deltas();
 
-        assert_eq!(shell.frame_offset, Some(egui::vec2(4.0, 32.0)));
+        assert_eq!(shell.window.offset, Some(egui::vec2(4.0, 32.0)));
         assert_eq!(
             shell.settings.window_bounds,
             Some(WindowBounds {
@@ -4422,7 +4644,7 @@ mod tests {
             }),
             "the saved value is the frame position the restore asked for"
         );
-        assert!(shell.restore_request.is_none(), "the offset is learnt once");
+        assert!(shell.window.requested.is_none(), "the offset is learnt once");
     }
 
     #[test]
@@ -4452,14 +4674,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        shell.restore_request = Some(egui::pos2(500.0, 300.0));
-        shell.restore_wait = 0;
+        shell.window.requested = Some(egui::pos2(500.0, 300.0));
+        shell.window.wait = 0;
         let output = ctx.run_ui(input, |ui| {
             let ctx = ui.ctx().clone();
-            shell.learn_frame_offset(&ctx);
+            shell.window.learn_offset(&ctx);
         });
         output.drop_without_applying_deltas();
-        assert_eq!(shell.frame_offset, None, "a refused move teaches nothing");
+        assert_eq!(shell.window.offset, None, "a refused move teaches nothing");
     }
 
     #[test]
@@ -4791,16 +5013,19 @@ mod tests {
             .collect();
         // Every plugin that declares app-wide settings gets a gear: the monitor, the
         // scratchpad and the files pane declare none, so their rows have nothing to open.
+        shell.refresh_plugin_labels();
         assert_eq!(
-            shell.configurable_plugin_labels(),
+            shell.gear_labels,
             ["Macros", "MQTT", "AI Agent", "Conn Log", "Docker"]
         );
 
         // A disabled plugin has no section in Options, so it loses its gear too.
         shell.settings.enabled_plugins = vec!["docker-manager".to_owned()];
-        assert_eq!(shell.configurable_plugin_labels(), ["Docker"]);
+        shell.refresh_plugin_labels();
+        assert_eq!(shell.gear_labels, ["Docker"]);
         shell.settings.enabled_plugins.clear();
-        assert!(shell.configurable_plugin_labels().is_empty());
+        shell.refresh_plugin_labels();
+        assert!(shell.gear_labels.is_empty());
     }
 
     #[test]
@@ -4823,7 +5048,7 @@ mod tests {
 
     /// The labels of one menu, as the title bar offers them.
     fn menu_items(name: &str) -> &'static [&'static str] {
-        MENUS
+        menus()
             .iter()
             .find(|(menu, _)| *menu == name)
             .map(|(_, items)| *items)
@@ -4848,7 +5073,7 @@ mod tests {
         // Every advertised accelerator belongs to a row that exists, in one menu only.
         for (label, keys) in &shortcuts {
             assert!(!keys.is_empty(), "{label:?} has no accelerator");
-            let rows: Vec<&str> = MENUS
+            let rows: Vec<&str> = menus()
                 .iter()
                 .flat_map(|(_, items)| items.iter().copied())
                 .filter(|item| item == label)
@@ -4948,6 +5173,36 @@ mod tests {
             )],
         );
         assert!(shell.dialogs.options.is_some(), "Ctrl+, opens Options");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_only_the_terminal_under_the_pointer() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local();
+        shell.sessions[0].open_plugin(PluginId::Scratchpad);
+        // Scrollback without waiting on a shell: the lines go straight into the emulator.
+        let printed: String = (0..80).map(|n| format!("line-{n}\r\n")).collect();
+        shell.sessions[0].terminal.feed(printed.as_bytes());
+        let ctx = egui::Context::default();
+        let _ = run_shell(&mut shell, &ctx, 2);
+        let text = shell.sessions[0].visible_text();
+        assert!(text.contains("line-79"), "the tail is on screen");
+        assert!(!text.contains("line-30"), "the head is in the scrollback");
+
+        // A wheel turn over the plugin pane leaves the terminal where it is.
+        wheel_at(&mut shell, &ctx, egui::pos2(1000.0, 400.0), egui::vec2(0.0, 400.0));
+        assert!(
+            shell.sessions[0].visible_text().contains("line-79"),
+            "scrolling the pane moved the terminal"
+        );
+
+        // Over the terminal it scrolls back through the history.
+        wheel_at(&mut shell, &ctx, egui::pos2(400.0, 400.0), egui::vec2(0.0, 400.0));
+        let text = shell.sessions[0].visible_text();
+        assert!(
+            text.contains("line-30") && !text.contains("line-79"),
+            "the wheel did not scroll back: {text}"
+        );
     }
 
     #[test]

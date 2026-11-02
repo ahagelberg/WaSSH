@@ -19,7 +19,7 @@ use super::protocol::{
     Protocol,
 };
 use super::providers::provider_models;
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::settings::{PluginSecretDrafts, SecretDraft, secret_field_key};
 use crate::PluginId;
 
@@ -504,6 +504,64 @@ impl ProviderEditor {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.fetch = None,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+    }
+}
+
+impl crate::settings::SettingsEditor for ProviderEditor {
+    fn dialog_open(&self) -> bool {
+        self.dialog_open()
+    }
+
+    fn dialog_title(&self) -> &'static str {
+        self.dialog_title()
+    }
+
+    fn dialog_primary(&self) -> &'static str {
+        self.dialog_primary()
+    }
+
+    fn can_commit(&self) -> bool {
+        self.can_commit()
+    }
+
+    fn dialog_width(&self) -> f32 {
+        PROVIDER_DIALOG_WIDTH
+    }
+
+    fn dialog_body(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        values: &Map<String, Value>,
+        secrets: &PluginSecretDrafts,
+    ) {
+        self.dialog_body(ui, palette, values, secrets);
+    }
+
+    fn commit(&mut self, values: &mut Map<String, Value>, secrets: &mut PluginSecretDrafts) {
+        self.commit(values, secrets);
+    }
+
+    fn cancel(&mut self) {
+        self.cancel();
+    }
+
+    fn list_caption(&self) -> Option<(&'static str, &'static str)> {
+        Some((
+            "Providers",
+            "Endpoints the AI agent can chat through. API keys are sealed in the credential \
+             vault.",
+        ))
+    }
+
+    fn show_list(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        values: &mut Map<String, Value>,
+        secrets: &mut PluginSecretDrafts,
+    ) {
+        self.show(ui, palette, values, secrets);
     }
 }
 

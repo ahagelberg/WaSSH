@@ -2335,6 +2335,9 @@ mod tests {
         fn listing(&self) -> Option<&crate::files::SftpListing> {
             self.listing.as_ref()
         }
+        fn listing_revision(&self) -> u64 {
+            0
+        }
         fn is_loading(&self) -> bool {
             false
         }
@@ -2386,18 +2389,7 @@ mod tests {
         fn retry(&mut self) {}
     }
 
-    impl crate::monitor::MonitorAccess for FakeSession {
-        fn request_sample(&mut self) {}
-        fn sample(&self) -> Option<&crate::monitor::Snapshot> {
-            None
-        }
-        fn is_sampling(&self) -> bool {
-            false
-        }
-        fn last_error(&self) -> Option<&str> {
-            None
-        }
-    }
+    impl crate::monitor::MonitorAccess for FakeSession {}
 
     impl crate::command::CommandAccess for FakeSession {
         fn exec(&mut self, key: &str, command: &str) {

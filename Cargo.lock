@@ -5383,20 +5383,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "wassh-term-render"
-version = "2.0.2"
-dependencies = [
- "wassh-term",
-]
-
-[[package]]
 name = "wassh-ui"
 version = "2.0.2"
 dependencies = [
  "egui",
  "wassh-core",
  "wassh-term",
- "wassh-term-render",
 ]
 
 [[package]]

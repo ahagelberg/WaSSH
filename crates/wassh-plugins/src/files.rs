@@ -8,15 +8,15 @@
 //! looks and behaves the same either way.
 
 use egui::Ui;
+use wassh_core::HeaderHealth;
 use wassh_core::colors;
 use wassh_core::{Palette, SessionStatus};
-use wassh_ui::dock::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, MenuItem, context_menu, faded, footer, modal, small_button,
     small_button_enabled, text_input,
 };
 
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::plugin::{Plugin, PluginContext, SessionAccess};
 use crate::{PluginId, PluginManifest};
 
@@ -62,6 +62,10 @@ pub trait SftpAccess {
 
     /// The most recent completed listing, if any.
     fn listing(&self) -> Option<&SftpListing>;
+
+    /// Changes whenever [`Self::listing`] is replaced, so a pane can tell whether the copy
+    /// it holds is still current.
+    fn listing_revision(&self) -> u64;
 
     /// Whether a listing is in flight.
     fn is_loading(&self) -> bool;
@@ -438,6 +442,10 @@ pub struct Files {
     notice_seen: Option<(String, bool)>,
     /// Entries of the listing on screen, for lookups while a menu is open.
     entries: Vec<SftpEntry>,
+    /// The listing on screen, kept until the session replaces it.
+    listing: SftpListing,
+    /// Revision of [`Self::listing`], so an unchanged listing is not copied again.
+    listing_revision: u64,
     /// Paths copied with Copy/Cut, and whether Paste should move them.
     clipboard: Vec<String>,
     clipboard_cut: bool,
@@ -477,6 +485,9 @@ impl Default for Files {
             notice_at: 0.0,
             notice_seen: None,
             entries: Vec::new(),
+            listing: SftpListing::default(),
+            // No listing can carry this revision, so the first draw always copies one.
+            listing_revision: u64::MAX,
             clipboard: Vec::new(),
             clipboard_cut: false,
             viewer: None,
@@ -728,8 +739,8 @@ impl Plugin for Files {
         PluginId::Sftp.manifest()
     }
 
-    fn header_status(&self) -> Option<(String, HeaderHealth)> {
-        (!self.caption.0.is_empty()).then(|| self.caption.clone())
+    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
+        (!self.caption.0.is_empty()).then_some((self.caption.0.as_str(), self.caption.1))
     }
 
     fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
@@ -775,9 +786,8 @@ impl Plugin for Files {
             | SessionStatus::Reconnecting => ("Connecting…".to_owned(), HeaderHealth::Warn),
             _ => ("Files not connected".to_owned(), HeaderHealth::Bad),
         };
-        let listing = access.listing().cloned().unwrap_or_default();
+        let listing = self.refresh_listing(access);
         let loading = access.is_loading();
-        self.entries.clone_from(&listing.entries);
         let error = access.error().map(str::to_owned);
 
         // Files dropped on the pane are uploaded into the directory on screen.
@@ -935,6 +945,7 @@ impl Plugin for Files {
             None => {}
         }
 
+        self.listing = listing;
         context.set_value(SAVE_DIR_KEY, serde_json::Value::from(self.save_dir.clone()));
     }
 }
@@ -943,6 +954,22 @@ impl Plugin for Files {
 const NOTICE_SECONDS: f64 = 3.5;
 
 impl Files {
+    /// The listing on screen, re-read from the session only when a new one arrived.
+    ///
+    /// The copy is moved out for the frame so the pane's later work can borrow the session
+    /// mutably; `show` puts it back.
+    fn refresh_listing(&mut self, access: &mut dyn SessionAccess) -> SftpListing {
+        let revision = access.listing_revision();
+        if revision != self.listing_revision {
+            if let Some(listing) = access.listing() {
+                self.listing = listing.clone();
+                self.entries.clone_from(&self.listing.entries);
+            }
+            self.listing_revision = revision;
+        }
+        std::mem::take(&mut self.listing)
+    }
+
     /// Show a one-line result for a few seconds.
     fn set_notice(&mut self, text: String, failed: bool, now: f64) {
         self.notice = Some((text, failed));
@@ -3074,6 +3101,11 @@ mod tests {
             self.listing.as_ref()
         }
 
+        fn listing_revision(&self) -> u64 {
+            // The fake's listing never changes, so one copy is enough for the whole test.
+            0
+        }
+
         fn is_loading(&self) -> bool {
             self.loading
         }
@@ -3161,21 +3193,7 @@ mod tests {
     }
 
     // The pane is handed one access object for every capability.
-    impl crate::monitor::MonitorAccess for FakeAccess {
-        fn request_sample(&mut self) {}
-
-        fn sample(&self) -> Option<&crate::monitor::Snapshot> {
-            None
-        }
-
-        fn is_sampling(&self) -> bool {
-            false
-        }
-
-        fn last_error(&self) -> Option<&str> {
-            self.error.as_deref()
-        }
-    }
+    impl crate::monitor::MonitorAccess for FakeAccess {}
 
     impl crate::command::CommandAccess for FakeAccess {
         fn exec(&mut self, _key: &str, _command: &str) {}
@@ -3299,6 +3317,7 @@ mod tests {
                         session: Some(&mut *access),
                         events: &[],
                         pending_input: Vec::new(),
+                        repaint_after: None,
                         secrets: &EMPTY_SECRETS,
                         secret_writes: Vec::new(),
                     };
@@ -3356,6 +3375,7 @@ mod tests {
                         session: Some(&mut *access),
                         events: &[],
                         pending_input: Vec::new(),
+                        repaint_after: None,
                         secrets: &EMPTY_SECRETS,
                         secret_writes: Vec::new(),
                     };
@@ -3415,6 +3435,7 @@ mod tests {
                 session: Some(access),
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };

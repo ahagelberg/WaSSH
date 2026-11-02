@@ -30,6 +30,17 @@ pub fn format_seconds(seconds: u64) -> String {
     )
 }
 
+/// Wall-clock time in milliseconds since the Unix epoch.
+///
+/// The single clock every crate reads, so a timestamp taken on a worker thread lines up
+/// with one taken on the frame loop.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Seconds the local zone is ahead of UTC at `seconds`.
 ///
 /// Reads the zone from `TZ` (a zone name or a path) or `/etc/localtime`; a

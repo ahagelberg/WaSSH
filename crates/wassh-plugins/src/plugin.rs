@@ -5,9 +5,7 @@
 //! is loaded dynamically, so a plugin cannot outlive the build it shipped with.
 
 use egui::Ui;
-use wassh_core::{Palette, SessionStatus};
-
-use wassh_ui::dock::HeaderHealth;
+use wassh_core::{HeaderHealth, Palette, SessionStatus};
 
 use crate::{PluginId, PluginManifest};
 
@@ -32,6 +30,8 @@ pub struct PluginContext<'a> {
     pub events: &'a [wassh_core::ConnectionEvent],
     /// Bytes the plugin wants typed into the session once the pane is drawn.
     pub pending_input: Vec<u8>,
+    /// Frame cadence the pane asked for while drawing, if any.
+    pub repaint_after: Option<std::time::Duration>,
     /// Decrypted values of the plugin's `secret: true` settings fields.
     ///
     /// A pane cannot reach the credential vault itself, so the host seals those
@@ -56,6 +56,14 @@ impl PluginContext<'_> {
     /// Type a single control byte, such as a carriage return.
     pub fn send_byte(&mut self, byte: u8) {
         self.pending_input.push(byte);
+    }
+
+    /// Ask the host to draw the pane again after `after`.
+    ///
+    /// A pane that animates or waits for an answer needs frames sooner than the host's
+    /// idle cadence; the shortest request the pane makes during a frame wins.
+    pub fn request_repaint_after(&mut self, after: std::time::Duration) {
+        self.repaint_after = Some(self.repaint_after.map_or(after, |asked| asked.min(after)));
     }
 
     /// Text value stored under `key`, if any.
@@ -156,7 +164,7 @@ pub trait Plugin {
     ///
     /// The host paints it in the header strip next to the title, so a pane does
     /// not need a status row of its own. `None` leaves only the title.
-    fn header_status(&self) -> Option<(String, HeaderHealth)> {
+    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
         None
     }
 
@@ -224,7 +232,7 @@ impl Plugin for Scratchpad {
                 .add(egui::Button::new(
                     egui::RichText::new("Clear")
                         .size(11.0)
-                        .color(crate::color::to_color32(palette.text_muted)),
+                        .color(wassh_ui::to_color32(palette.text_muted)),
                 ))
                 .clicked()
             {
@@ -243,7 +251,7 @@ impl Plugin for Scratchpad {
                     }
                 ))
                 .size(11.0)
-                .color(crate::color::to_color32(palette.text_muted)),
+                .color(wassh_ui::to_color32(palette.text_muted)),
             );
         });
         ui.add_space(4.0);
@@ -255,7 +263,7 @@ impl Plugin for Scratchpad {
                     egui::TextEdit::multiline(&mut self.text)
                         .font(egui::FontId::monospace(12.0))
                         .hint_text("Notes for this session")
-                        .text_color(crate::color::to_color32(palette.text))
+                        .text_color(wassh_ui::to_color32(palette.text))
                         .desired_width(f32::INFINITY)
                         .desired_rows(20),
                 );
@@ -325,6 +333,7 @@ mod tests {
             session: None,
             events: &[],
             pending_input: Vec::new(),
+            repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
         };
@@ -343,6 +352,7 @@ mod tests {
             session: None,
             events: &[],
             pending_input: Vec::new(),
+            repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
         };

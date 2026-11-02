@@ -65,7 +65,8 @@ struct SecretFile {
 /// Encrypted secret storage.
 pub struct SecretsStore {
     path: PathBuf,
-    key: [u8; KEY_LEN],
+    /// Built once from the key file: the key schedule is not worth redoing per secret.
+    cipher: Aes256Gcm,
     file: SecretFile,
 }
 
@@ -78,6 +79,7 @@ impl SecretsStore {
             source,
         })?;
         let key = load_or_create_key(&key_file(dir))?;
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("32-byte key");
         let path = secrets_file(dir);
         let mut file: SecretFile = crate::read_json(&path)?.unwrap_or_default();
         if file.version < 2 {
@@ -85,11 +87,11 @@ impl SecretsStore {
             // as they are and are rewritten on the next save.
             file.version = 2;
         }
-        Ok(Self { path, key, file })
-    }
-
-    fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new_from_slice(&self.key).expect("32-byte key")
+        Ok(Self {
+            path,
+            cipher,
+            file,
+        })
     }
 
     fn seal(&self, plain: &str) -> Result<String, StoreError> {
@@ -101,7 +103,7 @@ impl SecretsStore {
             detail: "bad nonce length".to_owned(),
         })?;
         let sealed = self
-            .cipher()
+            .cipher
             .encrypt(&nonce, plain.as_bytes())
             .map_err(|_| StoreError::Secret {
                 detail: "encryption failed".to_owned(),
@@ -116,7 +118,7 @@ impl SecretsStore {
         let blob = STANDARD.decode(sealed).ok()?;
         let (nonce, ciphertext) = blob.split_at_checked(NONCE_LEN)?;
         let nonce = Nonce::try_from(nonce).ok()?;
-        let plain = self.cipher().decrypt(&nonce, ciphertext).ok()?;
+        let plain = self.cipher.decrypt(&nonce, ciphertext).ok()?;
         String::from_utf8(plain).ok()
     }
 

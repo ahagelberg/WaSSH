@@ -24,6 +24,9 @@ use wassh_ui::TerminalView;
 /// How many status changes one session keeps for the connection log plugin.
 const MAX_STATUS_HISTORY: usize = 200;
 
+/// Secrets map for a pane that declares none, so the context can borrow a reference.
+static NO_SECRETS: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+
 /// Credentials typed by the user for this session only.
 #[derive(Clone, Debug, Default)]
 pub struct Secrets {
@@ -35,20 +38,80 @@ pub struct Secrets {
 struct PluginPane {
     id: PluginId,
     plugin: Box<dyn Plugin>,
-    /// Stored data, loaded from `plugin-<id>.<scope>.json` on first draw, with
-    /// the plugin's settings values from Options and Host settings merged in.
-    settings: serde_json::Map<String, serde_json::Value>,
-    /// Snapshot of `settings` as last written, used to detect changes.
-    saved: serde_json::Map<String, serde_json::Value>,
-    /// Values that came from the settings dialogs rather than from the pane, so
-    /// they are not copied into the plugin's own data file.
-    seeded: serde_json::Map<String, serde_json::Value>,
-    /// Whether `settings` has been read from disk yet.
-    loaded: bool,
+    data: PluginData,
     /// Plugin secrets the pane sealed or cleared this frame, keyed by field.
     secret_writes: Vec<(String, Option<String>)>,
     /// App-wide settings the pane changed while drawing.
     app_writes: Vec<(String, serde_json::Value)>,
+}
+
+/// A pane's stored data, and which of it is not the pane's own.
+///
+/// A pane reads one flat map, but a value in it can come from three places: the pane's own
+/// `plugin-<id>.<scope>.json`, the app-wide plugin settings Options owns, or Host settings.
+/// Only the pane's own keys are written back, so the keys the dialogs supplied are kept in
+/// `from_dialogs` and stripped from the payload.
+#[derive(Default)]
+struct PluginData {
+    /// What the pane reads and writes.
+    values: serde_json::Map<String, serde_json::Value>,
+    /// `values` as last written, so an unchanged pane writes nothing.
+    written: serde_json::Map<String, serde_json::Value>,
+    /// Values the dialogs supplied, with what they supplied, rather than the file.
+    from_dialogs: serde_json::Map<String, serde_json::Value>,
+    /// Whether the file has been read yet.
+    loaded: bool,
+}
+
+impl PluginData {
+    /// Merge a stored file and the dialog values into what the pane will read.
+    fn load(
+        &mut self,
+        stored: serde_json::Map<String, serde_json::Value>,
+        id: PluginId,
+        values: &PluginValues,
+    ) {
+        let mut merged = stored;
+        let before = merged.clone();
+        // The dialogs own these values; whatever the pane wrote itself survives until a
+        // dialog field actually holds something.
+        wassh_plugins::settings::apply_to(
+            id,
+            values.app.get(id.as_str()),
+            values.host.get(id.as_str()),
+            &mut merged,
+        );
+        self.from_dialogs = merged
+            .iter()
+            .filter(|(key, value)| before.get(*key) != Some(*value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        self.written.clone_from(&merged);
+        self.values = merged;
+        self.loaded = true;
+    }
+
+    /// The payload to write, when the pane changed something the file owns.
+    fn take_changes(&mut self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        if !self.loaded || self.values == self.written {
+            return None;
+        }
+        self.written.clone_from(&self.values);
+        let mut payload = self.values.clone();
+        for (key, value) in &self.from_dialogs {
+            if payload.get(key) == Some(value) {
+                payload.remove(key);
+            }
+        }
+        Some(payload)
+    }
+
+    /// Take a value the dialogs just supplied, without letting it reach the file.
+    fn adopt(&mut self, key: &str, value: serde_json::Value) {
+        self.values.insert(key.to_owned(), value.clone());
+        self.written.insert(key.to_owned(), value.clone());
+        self.from_dialogs.insert(key.to_owned(), value);
+    }
 }
 
 /// App- and host-level plugin settings for one session: what Options stores for
@@ -137,8 +200,6 @@ pub struct Exit {
 /// Something the shell should react to after pumping a session.
 #[derive(Clone, Debug, Default)]
 pub struct Pumped {
-    /// The session changed its title via OSC.
-    pub title: Option<String>,
     /// The bell rang.
     pub bell: bool,
     /// The transport closed, and why.
@@ -211,6 +272,9 @@ pub struct SessionEntry {
     jump_error: Option<String>,
     /// A tmux/screen probe still running in the background.
     probe: Option<Receiver<wassh_ssh::Presence>>,
+    /// Render-ready snapshot of the visible grid, with the emulator revision it was taken
+    /// at, so one frame draws and searches the same copy.
+    snapshot: std::cell::RefCell<Option<(u64, ScreenSnapshot)>>,
     /// How to open the connection once the probe finishes.
     pending_open: Option<SshOpen>,
     /// Palette the terminal and plugins draw with.
@@ -219,8 +283,6 @@ pub struct SessionEntry {
     files: RemoteFiles,
     /// Status changes this session went through, for the connection log plugin.
     status_history: std::sync::Arc<Vec<wassh_core::ConnectionEvent>>,
-    /// System statistics polling for the server monitor plugin.
-    monitor: RemoteMonitor,
     /// Commands other panes asked the session to run.
     commands: RemoteCommands,
     /// Loopback forwards panes asked for (MQTT broker, and any later pane).
@@ -259,10 +321,7 @@ impl SessionEntry {
             error: None,
             terminal,
             events,
-            view: TerminalView {
-                font_size: f32::from(defaults.font_size),
-                ..TerminalView::default()
-            },
+            view: TerminalView::with_font_size(f32::from(defaults.font_size)),
             backend: Backend::Closed,
             palette: *palette,
             connection: ConnectionParams {
@@ -285,13 +344,13 @@ impl SessionEntry {
             pending_open: None,
             files: RemoteFiles::default(),
             status_history: std::sync::Arc::new(Vec::new()),
-            monitor: RemoteMonitor::default(),
             commands: RemoteCommands::default(),
             forwards: RemoteForwards::default(),
             login: None,
             suppress_close: false,
             layout: TabPluginLayout::empty(),
             panes: Vec::new(),
+            snapshot: std::cell::RefCell::new(None),
         };
         entry.apply_style(defaults);
         entry.start_local(term_type);
@@ -397,10 +456,9 @@ impl SessionEntry {
             error: None,
             terminal,
             events,
-            view: TerminalView {
-                font_size: f32::from(params.style.font_size.unwrap_or(defaults.font_size)),
-                ..TerminalView::default()
-            },
+            view: TerminalView::with_font_size(f32::from(
+                params.style.font_size.unwrap_or(defaults.font_size),
+            )),
             backend: Backend::Closed,
             palette: *palette,
             connection: params,
@@ -419,13 +477,13 @@ impl SessionEntry {
             pending_open: None,
             files: RemoteFiles::default(),
             status_history: std::sync::Arc::new(Vec::new()),
-            monitor: RemoteMonitor::default(),
             commands: RemoteCommands::default(),
             forwards: RemoteForwards::default(),
             login: None,
             suppress_close: false,
             layout: TabPluginLayout::empty(),
             panes: Vec::new(),
+            snapshot: std::cell::RefCell::new(None),
         };
         entry.apply_style(defaults);
         entry
@@ -499,6 +557,7 @@ impl SessionEntry {
                         Err(_) => wassh_ssh::Presence::Unknown,
                     };
                     let _ = tx.send(presence);
+                    wassh_core::wake::notify();
                 })
                 .ok();
             self.status = SessionStatus::Connecting;
@@ -838,8 +897,7 @@ impl SessionEntry {
                 TerminalEvent::Title(title) => {
                     pumped.wake = true;
                     if !title.trim().is_empty() {
-                        self.title = title.clone();
-                        pumped.title = Some(title);
+                        self.title = title;
                     }
                 }
                 TerminalEvent::Bell => {
@@ -884,7 +942,7 @@ impl SessionEntry {
         };
         let history = std::sync::Arc::make_mut(&mut self.status_history);
         history.push(wassh_core::ConnectionEvent {
-            at_ms: wassh_plugins::connection_logger::now_ms(),
+            at_ms: wassh_core::time::now_ms(),
             status: self.status,
             message,
         });
@@ -931,16 +989,34 @@ impl SessionEntry {
         self.send(&bytes);
     }
 
+    /// Scroll the scrollback when the wheel turns over the terminal.
+    ///
+    /// The delta is taken out of the frame's input, so a pane's own scroll area laid out
+    /// beside the terminal never sees the same turn: whoever handles the wheel consumes it.
+    pub fn scroll_from_wheel(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        if !response.contains_pointer() {
+            return;
+        }
+        let delta = ui
+            .ctx()
+            .input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta.y));
+        let (_, cell_h) = self.view.cell_size(ui);
+        let lines = (delta / cell_h).round() as i32;
+        if lines != 0 {
+            self.terminal.scroll(lines);
+        }
+    }
+
     /// Turn a click or drag across the grid into a text selection.
     pub fn track_selection(
         &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
-        snapshot: &wassh_term::ScreenSnapshot,
+        size: TerminalSize,
     ) {
         let cell = response
             .interact_pointer_pos()
-            .and_then(|pos| self.view.cell_at(ui, response.rect, snapshot, pos));
+            .and_then(|pos| self.view.cell_at(ui, response.rect, size, pos));
         if response.drag_started() {
             if let Some((row, col)) = cell {
                 self.terminal.begin_selection(row, col);
@@ -1055,22 +1131,37 @@ impl SessionEntry {
     }
 
     /// Render-ready snapshot of the visible screen.
-    pub fn snapshot(&self) -> ScreenSnapshot {
-        self.terminal.snapshot()
+    ///
+    /// The emulator only copies the grid when something changed, so the frame's draw and
+    /// the find bar share one snapshot instead of building theirs separately.
+    pub fn snapshot(&self) -> std::cell::Ref<'_, ScreenSnapshot> {
+        let revision = self.terminal.revision();
+        let stale = self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != revision);
+        if stale {
+            let fresh = self.terminal.snapshot();
+            *self.snapshot.borrow_mut() = Some((revision, fresh));
+        }
+        std::cell::Ref::map(self.snapshot.borrow(), |slot| {
+            &slot.as_ref().expect("the snapshot was just filled").1
+        })
+    }
+
+    /// Revision of the visible grid; it changes whenever the snapshot would.
+    pub fn revision(&self) -> u64 {
+        self.terminal.revision()
     }
 
     /// Plain text of the visible screen, used by the find bar.
     pub fn visible_text(&self) -> String {
         let snapshot = self.snapshot();
-        let mut text = String::with_capacity(
-            usize::from(snapshot.size.rows) * (usize::from(snapshot.size.cols) + 1),
-        );
-        for row in 0..usize::from(snapshot.size.rows) {
-            for col in 0..usize::from(snapshot.size.cols) {
-                if let Some(cell) = snapshot.cell(row, col) {
-                    text.push_str(&cell_text(cell));
-                }
-            }
+        let capacity = usize::from(snapshot.size.rows) * (usize::from(snapshot.size.cols) + 1);
+        let mut text = String::with_capacity(capacity);
+        for line in grid_lines(&snapshot) {
+            text.push_str(&line);
             text.push('\n');
         }
         text
@@ -1220,9 +1311,9 @@ impl SessionEntry {
         self.files.error = None;
     }
 
-    /// Whether a file or statistics request is still running.
+    /// Whether a file or command request is still running.
     pub fn requests_pending(&self) -> bool {
-        self.files.pending.is_some() || self.monitor.pending.is_some() || !self.commands.pending.is_empty()
+        self.files.pending.is_some() || !self.commands.pending.is_empty()
     }
 
     /// Scope this tab's plugin data is filed under: the saved host, or the tab itself.
@@ -1240,10 +1331,7 @@ impl SessionEntry {
         self.panes.push(PluginPane {
             id,
             plugin: wassh_plugins::create(id),
-            settings: serde_json::Map::new(),
-            saved: serde_json::Map::new(),
-            seeded: serde_json::Map::new(),
-            loaded: false,
+            data: PluginData::default(),
             secret_writes: Vec::new(),
             app_writes: Vec::new(),
         });
@@ -1261,7 +1349,7 @@ impl SessionEntry {
         let Some(pane) = self.panes.get_mut(slot) else {
             return;
         };
-        if pane.loaded {
+        if pane.data.loaded {
             return;
         }
         let stored = store
@@ -1269,24 +1357,7 @@ impl SessionEntry {
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
         let id = pane.id;
-        let mut settings = stored.clone();
-        let before = settings.clone();
-        // The dialogs own these values; whatever the pane wrote itself survives
-        // until a dialog field actually holds something.
-        wassh_plugins::settings::apply_to(
-            id,
-            values.app.get(id.as_str()),
-            values.host.get(id.as_str()),
-            &mut settings,
-        );
-        pane.seeded = settings
-            .iter()
-            .filter(|(key, value)| before.get(*key) != Some(*value))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        pane.saved.clone_from(&settings);
-        pane.settings = settings;
-        pane.loaded = true;
+        pane.data.load(stored, id, values);
     }
 
     /// Show `id` in this tab, docking it where its manifest asks.
@@ -1348,7 +1419,7 @@ impl SessionEntry {
     }
 
     /// State line a plugin pane wants in its header, if any.
-    pub fn plugin_status(&self, plugin_id: &str) -> Option<(String, HeaderHealth)> {
+    pub fn plugin_status(&self, plugin_id: &str) -> Option<(&str, HeaderHealth)> {
         let id = PluginId::parse(plugin_id)?;
         self.panes
             .iter()
@@ -1399,27 +1470,33 @@ impl SessionEntry {
         }
         let mut pane = self.panes.swap_remove(slot);
         let events = std::sync::Arc::clone(&self.status_history);
-        let secrets = values.secrets.get(id.as_str()).cloned().unwrap_or_default();
+        let secrets = values.secrets.get(id.as_str()).unwrap_or(&NO_SECRETS);
         let typed;
+        let repaint_after;
         {
             let mut context = PluginContext {
                 palette,
                 host_label,
                 status,
-                settings: &mut pane.settings,
+                settings: &mut pane.data.values,
                 scope,
                 session: Some(self),
                 events: &events,
                 pending_input: Vec::new(),
-                secrets: &secrets,
+                repaint_after: None,
+                secrets,
                 secret_writes: Vec::new(),
             };
             pane.plugin.show(ui, &mut context);
             typed = std::mem::take(&mut context.pending_input);
+            repaint_after = context.repaint_after;
             let writes = std::mem::take(&mut context.secret_writes);
             if !writes.is_empty() {
                 pane.secret_writes.extend(writes);
             }
+        }
+        if let Some(after) = repaint_after {
+            ui.ctx().request_repaint_after(after);
         }
         let app_writes = pane.plugin.take_app_settings();
         if !app_writes.is_empty() {
@@ -1430,11 +1507,6 @@ impl SessionEntry {
         if !typed.is_empty() {
             self.send(&typed);
         }
-    }
-
-    /// Collect a finished statistics sample.
-    pub fn poll_monitor(&mut self) {
-        self.monitor.poll();
     }
 
     /// Collect finished pane commands.
@@ -1468,9 +1540,7 @@ impl SessionEntry {
     /// It counts as supplied by the dialogs, so it stays out of the pane's file.
     pub fn adopt_app_setting(&mut self, id: PluginId, key: &str, value: serde_json::Value) {
         for pane in self.panes.iter_mut().filter(|pane| pane.id == id) {
-            pane.settings.insert(key.to_owned(), value.clone());
-            pane.saved.insert(key.to_owned(), value.clone());
-            pane.seeded.insert(key.to_owned(), value.clone());
+            pane.data.adopt(key, value.clone());
         }
     }
 
@@ -1481,19 +1551,9 @@ impl SessionEntry {
         let scope = self.plugin_scope();
         let mut dirty = Vec::new();
         for pane in &mut self.panes {
-            if !pane.loaded || pane.settings == pane.saved {
-                continue;
+            if let Some(payload) = pane.data.take_changes() {
+                dirty.push((pane.id, scope.clone(), payload));
             }
-            pane.saved.clone_from(&pane.settings);
-            // Values the dialogs supplied are not this pane's state, so they stay
-            // out of its data file.
-            let mut payload = pane.settings.clone();
-            for (key, value) in &pane.seeded {
-                if payload.get(key) == Some(value) {
-                    payload.remove(key);
-                }
-            }
-            dirty.push((pane.id, scope.clone(), payload));
         }
         dirty
     }
@@ -1502,7 +1562,7 @@ impl SessionEntry {
     /// settings values on its next draw.
     pub fn reload_pane_settings(&mut self) {
         for pane in &mut self.panes {
-            pane.loaded = false;
+            pane.data.loaded = false;
         }
     }
 
@@ -1640,8 +1700,6 @@ impl SessionEntry {
     }
 }
 
-/// How often the server monitor asks the host for statistics.
-const MONITOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 /// A finished command, kept so panes can read it on later frames.
 struct CommandResult {
     /// Output when the command ran.
@@ -1662,6 +1720,35 @@ struct RemoteCommands {
 /// What a forward request answers with: the local address, or why it failed.
 type ForwardAnswer = Result<(String, u16), String>;
 
+/// Why a forward never opened: the thread that owned it went away.
+const FORWARD_CLOSED: &str = "The forward closed before it opened.";
+
+/// Why a command never ran: the thread that owned it went away.
+const COMMAND_CLOSED: &str = "the session closed before the command finished";
+
+/// Take every answer that has arrived, leaving the rest pending.
+///
+/// Every pane request follows the same shape: a receiver per request, keyed by what the
+/// pane asked under, collected when the answer lands. A receiver whose sender went away
+/// reports `closed`, so a pane never waits on a request whose thread died.
+fn drain_answers<T>(
+    pending: &mut Vec<(String, Receiver<Result<T, String>>)>,
+    closed: &str,
+    mut landed: impl FnMut(&str, Result<T, String>),
+) {
+    pending.retain_mut(|(key, receiver)| match receiver.try_recv() {
+        Ok(answer) => {
+            landed(key, answer);
+            false
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            landed(key, Err(closed.to_owned()));
+            false
+        }
+    });
+}
+
 /// Loopback forwards panes asked for, keyed per pane.
 #[derive(Default)]
 struct RemoteForwards {
@@ -1676,177 +1763,50 @@ struct RemoteForwards {
 impl RemoteForwards {
     /// Take every answer that has arrived.
     fn poll(&mut self) {
-        let mut still_pending = Vec::new();
-        for (key, receiver) in self.pending.drain(..) {
-            match receiver.try_recv() {
-                Ok(Ok((host, port))) => {
-                    self.errors.remove(&key);
-                    self.addresses.insert(key, format!("{host}:{port}"));
-                }
-                Ok(Err(error)) => {
-                    self.errors.insert(key, error);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((key, receiver)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.errors
-                        .insert(key, "The forward closed before it opened.".to_owned());
-                }
+        let Self {
+            pending,
+            addresses,
+            errors,
+        } = self;
+        drain_answers(pending, FORWARD_CLOSED, |key, answer| match answer {
+            Ok((host, port)) => {
+                errors.remove(key);
+                addresses.insert(key.to_owned(), format!("{host}:{port}"));
             }
-        }
-        self.pending = still_pending;
+            Err(error) => {
+                errors.insert(key.to_owned(), error);
+            }
+        });
     }
 }
 
 impl RemoteCommands {
     /// Take every answer that has arrived.
     fn poll(&mut self) {
-        let mut still_running = Vec::new();
-        for (key, receiver) in self.pending.drain(..) {
-            match receiver.try_recv() {
-                Ok(Ok(output)) => {
-                    self.results.insert(
-                        key,
-                        CommandResult {
-                            output: Some(wassh_plugins::CommandOutput {
-                                stdout: output.stdout,
-                                stderr: output.stderr,
-                                code: output.exit_status,
-                            }),
-                            failure: None,
-                        },
-                    );
-                }
-                Ok(Err(error)) => {
-                    self.results.insert(
-                        key,
-                        CommandResult {
-                            output: None,
-                            failure: Some(error),
-                        },
-                    );
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => still_running.push((key, receiver)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.results.insert(
-                        key,
-                        CommandResult {
-                            output: None,
-                            failure: Some("the session closed before the command finished".to_owned()),
-                        },
-                    );
-                }
-            }
-        }
-        self.pending = still_running;
+        let Self { pending, results } = self;
+        drain_answers(pending, COMMAND_CLOSED, |key, answer| {
+            let result = match answer {
+                Ok(output) => CommandResult {
+                    output: Some(wassh_plugins::CommandOutput {
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                        code: output.exit_status,
+                    }),
+                    failure: None,
+                },
+                Err(failure) => CommandResult {
+                    output: None,
+                    failure: Some(failure),
+                },
+            };
+            results.insert(key.to_owned(), result);
+        });
     }
 
     /// Whether a command for `key` is still running.
     fn is_running(&self, key: &str) -> bool {
         self.pending.iter().any(|(running, _)| running == key)
     }
-}
-
-/// A statistics sample in flight.
-enum MonitorPending {
-    /// The shell probe's answer, parsed when it arrives.
-    Shell(std::sync::mpsc::Receiver<Result<wassh_ssh::ExecOutput, String>>),
-    /// A sample this machine read from its own operating system.
-    Native(std::sync::mpsc::Receiver<NativeSample>),
-}
-
-/// One native sample, with the counters the next one compares against.
-type NativeSample = Result<
-    (
-        wassh_plugins::Snapshot,
-        Option<wassh_plugins::monitor::Counters>,
-    ),
-    String,
->;
-
-/// System statistics polling for one session.
-#[derive(Default)]
-struct RemoteMonitor {
-    /// Probe in flight.
-    pending: Option<MonitorPending>,
-    /// When the last probe was sent, so polls keep to [`MONITOR_INTERVAL`].
-    last_sent: Option<std::time::Instant>,
-    /// Counters from the previous sample; every rate is a delta of these.
-    counters: Option<wassh_plugins::monitor::Counters>,
-    /// Newest sample.
-    sample: Option<wassh_plugins::Snapshot>,
-    /// Last failure.
-    error: Option<String>,
-}
-
-impl RemoteMonitor {
-    /// Whether a probe may start now.
-    fn due(&self) -> bool {
-        self.pending.is_none()
-            && self
-                .last_sent
-                .is_none_or(|sent| sent.elapsed() >= MONITOR_INTERVAL)
-    }
-
-    /// Take the answer of a finished probe.
-    fn poll(&mut self) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        let closed = "the session closed before the sample arrived";
-        match pending {
-            MonitorPending::Shell(receiver) => match receiver.try_recv() {
-                Ok(Ok(output)) => {
-                    let (snapshot, counters) = wassh_plugins::monitor::parse_report(
-                        &output.stdout,
-                        self.counters.take(),
-                        wassh_plugins::connection_logger::now_ms(),
-                    );
-                    self.counters = counters;
-                    self.sample = Some(snapshot);
-                    self.error = None;
-                }
-                Ok(Err(error)) => self.error = Some(error),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.pending = Some(MonitorPending::Shell(receiver));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some(closed.to_owned());
-                }
-            },
-            MonitorPending::Native(receiver) => match receiver.try_recv() {
-                Ok(Ok((snapshot, counters))) => {
-                    self.counters = counters;
-                    self.sample = Some(snapshot);
-                    self.error = None;
-                }
-                Ok(Err(error)) => self.error = Some(error),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.pending = Some(MonitorPending::Native(receiver));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some(closed.to_owned());
-                }
-            },
-        }
-    }
-}
-
-/// Read one sample of this machine on its own thread, so the frame never waits for it.
-fn sample_this_machine(
-    previous: Option<wassh_plugins::monitor::Counters>,
-) -> std::sync::mpsc::Receiver<NativeSample> {
-    let (sender, receiver) = channel();
-    let unused = sender.clone();
-    let spawned = std::thread::Builder::new()
-        .name("wassh-monitor".to_owned())
-        .spawn(move || {
-            let at_ms = wassh_plugins::connection_logger::now_ms();
-            let _ = sender.send(Ok(wassh_plugins::monitor::native_sample(previous, at_ms)));
-        });
-    if let Err(error) = spawned {
-        let _ = unused.send(Err(format!("starting the sample: {error}")));
-    }
-    receiver
 }
 
 /// What the in-flight remote-file request is for.
@@ -1929,6 +1889,9 @@ struct RemoteFiles {
     requested: Option<String>,
     /// Most recent successful listing.
     listing: Option<wassh_plugins::SftpListing>,
+    /// Bumped whenever [`Self::listing`] is replaced, so a pane can tell whether the copy
+    /// it holds is still current.
+    listing_revision: u64,
     /// Last failure.
     error: Option<String>,
     /// Result line of the last finished transfer or change.
@@ -1968,9 +1931,6 @@ const FILES_TRANSPORT_ERROR: &str = "Files are available for SSH and Local sessi
 
 /// Shown when a tab's transport cannot run a shell command.
 const COMMAND_TRANSPORT_ERROR: &str = "Commands need an SSH or local session";
-
-/// Shown when a tab's transport cannot be sampled.
-const MONITOR_TRANSPORT_ERROR: &str = "System statistics need an SSH or local session";
 
 impl RemoteFiles {
     /// Remember how a transfer ended, keeping the last few rows.
@@ -2054,6 +2014,7 @@ impl RemoteFiles {
                                 })
                                 .collect(),
                         });
+                        self.listing_revision = self.listing_revision.wrapping_add(1);
                         self.requested = Some(path);
                         None
                     }
@@ -2151,6 +2112,10 @@ impl wassh_plugins::SftpAccess for SessionEntry {
 
     fn listing(&self) -> Option<&wassh_plugins::SftpListing> {
         self.files.listing.as_ref()
+    }
+
+    fn listing_revision(&self) -> u64 {
+        self.files.listing_revision
     }
 
     fn is_loading(&self) -> bool {
@@ -2400,52 +2365,15 @@ impl wassh_plugins::SftpAccess for SessionEntry {
 }
 
 impl wassh_plugins::MonitorAccess for SessionEntry {
-    fn request_sample(&mut self) {
-        if !self.monitor.due() {
-            return;
-        }
-        self.monitor.poll();
-        // A Local tab's host is this machine: read it with the operating system's own API
-        // where there is one, and with the same shell probe an SSH host gets otherwise.
-        let pending = match &self.backend {
-            Backend::Ssh(session) => {
-                MonitorPending::Shell(session.exec(wassh_plugins::monitor::MONITOR_COMMAND))
-            }
-            _ if self.connection.kind == ConnectionType::Local => {
-                if wassh_plugins::monitor::native_supported() {
-                    MonitorPending::Native(sample_this_machine(self.monitor.counters.take()))
-                } else {
-                    MonitorPending::Shell(local_exec::exec(
-                        wassh_plugins::monitor::MONITOR_COMMAND,
-                        None,
-                    ))
-                }
-            }
-            _ => {
-                self.monitor.error = Some(MONITOR_TRANSPORT_ERROR.to_owned());
-                return;
-            }
-        };
-        self.monitor.pending = Some(pending);
-        self.monitor.last_sent = Some(std::time::Instant::now());
-        self.monitor.error = None;
-    }
-
-    fn sample(&self) -> Option<&wassh_plugins::Snapshot> {
-        self.monitor.sample.as_ref()
-    }
-
-    fn is_sampling(&self) -> bool {
-        self.monitor.pending.is_some()
-    }
-
-    fn last_error(&self) -> Option<&str> {
-        self.monitor.error.as_deref()
+    fn native_sampling(&self) -> bool {
+        // A Local tab's host is this machine, so its statistics come from the operating
+        // system itself wherever the platform has an API for them.
+        wassh_plugins::monitor::native_supported()
+            && self.connection.kind == ConnectionType::Local
     }
 
     fn native_details(&mut self, pid: u32) -> Option<Result<Vec<(String, String)>, String>> {
-        // Only a Local tab on Windows can read its own processes through the OS.
-        if !(cfg!(windows) && self.connection.kind == ConnectionType::Local) {
+        if !self.native_sampling() {
             return None;
         }
         Some(
@@ -2455,7 +2383,7 @@ impl wassh_plugins::MonitorAccess for SessionEntry {
     }
 
     fn native_stop(&mut self, pid: u32, signal: &str) -> Option<Result<(), String>> {
-        if !(cfg!(windows) && self.connection.kind == ConnectionType::Local) {
+        if !self.native_sampling() {
             return None;
         }
         Some(wassh_plugins::monitor::native_stop(pid, signal))
@@ -2534,20 +2462,13 @@ impl wassh_plugins::TcpAccess for SessionEntry {
 
 impl wassh_plugins::TerminalAccess for SessionEntry {
     fn screen_text(&self) -> String {
-        // The emulator only knows the visible grid, which is what the AI agent
-        // tools describe as "the screen".
-        let snapshot = self.terminal.snapshot();
-        let cols = usize::from(snapshot.size.cols);
-        let rows = usize::from(snapshot.size.rows);
-        let mut lines = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let mut line = String::with_capacity(cols);
-            for col in 0..cols {
-                line.push(snapshot.cell(row, col).map_or(' ', |cell| cell.ch));
-            }
-            lines.push(line.trim_end().to_owned());
-        }
-        // Drop the blank rows below the last output.
+        // The emulator only knows the visible grid, which is what the AI agent tools
+        // describe as "the screen"; trailing blanks and the empty rows below the last
+        // output are dropped, so a tool reads only what was printed.
+        let snapshot = self.snapshot();
+        let mut lines: Vec<String> = grid_lines(&snapshot)
+            .map(|line| line.trim_end().to_owned())
+            .collect();
         while lines.last().is_some_and(|line| line.is_empty()) {
             lines.pop();
         }
@@ -2650,12 +2571,19 @@ fn local_username() -> String {
         .unwrap_or_else(|_| "root".to_owned())
 }
 
-fn cell_text(cell: &CellSnapshot) -> String {
-    if cell.ch == ' ' || cell.ch == '\0' {
-        " ".to_owned()
-    } else {
-        cell.ch.to_string()
-    }
+/// The character a snapshot cell shows, with the emulator's blank for an empty cell.
+fn cell_char(cell: &CellSnapshot) -> char {
+    if cell.ch == '\0' { ' ' } else { cell.ch }
+}
+
+/// One line per visible row, in reading order.
+fn grid_lines(snapshot: &ScreenSnapshot) -> impl Iterator<Item = String> + '_ {
+    let cols = usize::from(snapshot.size.cols);
+    (0..usize::from(snapshot.size.rows)).map(move |row| {
+        (0..cols)
+            .map(move |col| snapshot.cell(row, col).map_or(' ', cell_char))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -2979,11 +2907,6 @@ mod tests {
         assert!(!entry.is_running("docker.list"));
         assert_eq!(entry.failure("docker.list"), Some(COMMAND_TRANSPORT_ERROR));
         assert!(entry.output("docker.list").is_none());
-
-        // System statistics use the same path and report the same way.
-        use wassh_plugins::MonitorAccess as _;
-        entry.request_sample();
-        assert_eq!(entry.last_error(), Some(MONITOR_TRANSPORT_ERROR));
     }
 
     /// Prints `local` on this platform's shell.
@@ -3022,24 +2945,13 @@ mod tests {
     }
 
     #[test]
-    fn a_local_session_samples_this_machine() {
+    fn a_monitor_needs_a_transport_that_can_be_sampled() {
+        // Statistics are the pane's own probe now, so the pane needs a shell to run it in.
+        let mut entry = password_entry();
         use wassh_plugins::MonitorAccess as _;
-        let mut entry = local_entry("t-local-monitor");
-        entry.request_sample();
-        let mut sample = None;
-        for _ in 0..1_000 {
-            entry.poll_monitor();
-            if let Some(current) = entry.sample() {
-                sample = Some(current.clone());
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let sample = sample.expect("a sample from this machine");
-        assert!(entry.last_error().is_none(), "{:?}", entry.last_error());
-        assert!(sample.uptime_s.is_some(), "no uptime in {sample:?}");
-        assert!(sample.memory.total.is_some(), "no memory in {sample:?}");
-        assert!(sample.disk_total.is_some(), "no disk in {sample:?}");
+        assert!(!entry.native_sampling());
+        assert!(entry.native_details(1).is_none());
+        assert!(entry.native_stop(1, "TERM").is_none());
     }
 
     #[test]
@@ -3345,7 +3257,7 @@ mod tests {
         entry.load_pane_data(slot, None, &PluginValues::default());
         assert!(entry.take_dirty_plugins().is_empty(), "no edits yet");
 
-        entry.panes[slot].settings.insert(
+        entry.panes[slot].data.values.insert(
             wassh_plugins::plugin::SCRATCHPAD_TEXT_KEY.to_owned(),
             serde_json::json!("keep me"),
         );
@@ -3380,7 +3292,7 @@ mod tests {
         );
         let slot = entry.ensure_pane(wassh_plugins::PluginId::ConnectionLogger);
         entry.load_pane_data(slot, None, &values);
-        let settings = &entry.panes[slot].settings;
+        let settings = &entry.panes[slot].data.values;
         assert_eq!(settings["enabled"], serde_json::json!(false));
         assert_eq!(settings["maxEntries"], serde_json::json!(25));
         // Those values belong to the dialog, so loading them is not an edit.
@@ -3405,7 +3317,7 @@ mod tests {
             )]),
         );
         entry.load_pane_data(slot, None, &values);
-        let providers = entry.panes[slot].settings
+        let providers = entry.panes[slot].data.values
             [wassh_plugins::ai_agent::PROVIDERS_KEY]
             .as_array()
             .expect("the pane got the configured providers");
@@ -3424,7 +3336,7 @@ mod tests {
         // A refreshed provider list comes back from the host as an app value.
         let providers = serde_json::json!([{ "id": "one", "models": ["a"] }]);
         entry.adopt_app_setting(wassh_plugins::PluginId::AiAgent, "providers", providers.clone());
-        assert_eq!(entry.panes[slot].settings["providers"], providers);
+        assert_eq!(entry.panes[slot].data.values["providers"], providers);
         assert!(
             entry.take_dirty_plugins().is_empty(),
             "adopting an app value is not an edit of the pane's own data"
@@ -3447,13 +3359,14 @@ mod tests {
         let slot = entry.ensure_pane(wassh_plugins::PluginId::DockerManager);
         entry.load_pane_data(slot, None, &values);
         assert_eq!(
-            entry.panes[slot].settings["confirmDestructive"],
+            entry.panes[slot].data.values["confirmDestructive"],
             serde_json::json!(false)
         );
 
         // The pane writes something of its own: only that is persisted.
         entry.panes[slot]
-            .settings
+            .data
+            .values
             .insert("note".to_owned(), serde_json::json!("hello"));
         let dirty = entry.take_dirty_plugins();
         assert_eq!(dirty.len(), 1);
@@ -3470,7 +3383,7 @@ mod tests {
         let mut entry = password_entry();
         let slot = entry.ensure_pane(wassh_plugins::PluginId::ConnectionLogger);
         entry.load_pane_data(slot, None, &PluginValues::default());
-        assert_eq!(entry.panes[slot].settings["maxEntries"], serde_json::json!(500));
+        assert_eq!(entry.panes[slot].data.values["maxEntries"], serde_json::json!(500));
 
         let mut values = PluginValues::default();
         values.host.insert(
@@ -3479,7 +3392,7 @@ mod tests {
         );
         entry.reload_pane_settings();
         entry.load_pane_data(slot, None, &values);
-        assert_eq!(entry.panes[slot].settings["maxEntries"], serde_json::json!(10));
+        assert_eq!(entry.panes[slot].data.values["maxEntries"], serde_json::json!(10));
     }
 
     #[test]

@@ -205,17 +205,7 @@ fn edge_strip(area: Rect, edge: DockEdge, depth: f32) -> Rect {
 ///
 /// The dock renderer borrows this once, so the terminal and the panes can share
 /// the same session state without splitting borrows.
-/// How a pane's header dot reads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HeaderHealth {
-    /// Working.
-    #[default]
-    Ok,
-    /// Busy, as in "connecting".
-    Warn,
-    /// Broken.
-    Bad,
-}
+pub use wassh_core::HeaderHealth;
 
 pub trait DockContent {
     /// Draw the terminal.
@@ -228,7 +218,7 @@ pub trait DockContent {
     fn pane_title(&self, plugin_id: &str) -> String;
 
     /// Optional state line painted at the right of the pane header.
-    fn pane_status(&self, _plugin_id: &str) -> Option<(String, HeaderHealth)> {
+    fn pane_status(&self, _plugin_id: &str) -> Option<(&str, HeaderHealth)> {
         None
     }
 
@@ -812,8 +802,8 @@ mod tests {
             "Files".to_owned()
         }
 
-        fn pane_status(&self, _plugin_id: &str) -> Option<(String, HeaderHealth)> {
-            self.status.clone()
+        fn pane_status(&self, _plugin_id: &str) -> Option<(&str, HeaderHealth)> {
+            self.status.as_ref().map(|(text, health)| (text.as_str(), *health))
         }
 
         fn pane_header_action(&self, _plugin_id: &str) -> Option<HeaderAction> {

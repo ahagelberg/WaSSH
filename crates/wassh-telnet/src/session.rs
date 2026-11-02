@@ -72,6 +72,7 @@ impl TelnetSession {
     pub fn connect(options: TelnetOptions) -> Result<Self> {
         let (command_tx, command_rx) = unbounded_channel();
         let (event_tx, event_rx) = channel();
+        let events = EventSink { events: event_tx };
         let size = (options.cols, options.rows);
 
         std::thread::Builder::new()
@@ -83,13 +84,13 @@ impl TelnetSession {
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = event_tx.send(TelnetEvent::Error(format!(
+                        let _ = events.send(TelnetEvent::Error(format!(
                             "cannot start the async runtime: {error}"
                         )));
                         return;
                     }
                 };
-                runtime.block_on(run(options, command_rx, event_tx));
+                runtime.block_on(run(options, command_rx, events));
             })
             .context("starting the Telnet thread")?;
 
@@ -130,10 +131,29 @@ impl Drop for TelnetSession {
     }
 }
 
+/// The session's event channel, with a wake for the window.
+///
+/// The shell polls the channel from its frame loop; without the wake, new output would
+/// wait for the next idle frame instead of being painted as it arrives.
+#[derive(Clone)]
+struct EventSink {
+    events: std::sync::mpsc::Sender<TelnetEvent>,
+}
+
+impl EventSink {
+    fn send(&self, event: TelnetEvent) -> Result<(), std::sync::mpsc::SendError<TelnetEvent>> {
+        let sent = self.events.send(event);
+        if sent.is_ok() {
+            wassh_core::wake::notify();
+        }
+        sent
+    }
+}
+
 async fn run(
     options: TelnetOptions,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<TelnetCommand>,
-    events: std::sync::mpsc::Sender<TelnetEvent>,
+    events: EventSink,
 ) {
     let status = |status| {
         let _ = events.send(TelnetEvent::Status(status));

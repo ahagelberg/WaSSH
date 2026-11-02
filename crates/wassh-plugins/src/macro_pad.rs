@@ -6,7 +6,7 @@ use wassh_ui::widgets::{
     Button, click_card, empty_state, field, footer, list_header, modal, text_area, text_input,
 };
 
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::plugin::{Plugin, PluginContext};
 use crate::{PluginId, PluginManifest};
 
@@ -579,6 +579,7 @@ mod tests {
                 session: None,
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };
@@ -614,6 +615,7 @@ mod tests {
                 session: None,
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };

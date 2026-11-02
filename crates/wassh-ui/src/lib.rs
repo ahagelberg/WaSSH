@@ -23,7 +23,7 @@ pub use plugin_toolbar::{ToolbarButton, plugin_toolbar};
 pub use sidebar::{SidebarAction, SidebarState, sidebar};
 pub use style::apply_visuals;
 pub use tab_bar::{TabAction, TabBarState, TabView, tab_bar};
-pub use terminal_view::TerminalView;
+pub use terminal_view::{TerminalView, to_color32, with_alpha};
 pub use titlebar::{
     CaptionStyle, TitlebarAction, caption_style, resize_edges, show_header_bar, show_menu_bar,
 };

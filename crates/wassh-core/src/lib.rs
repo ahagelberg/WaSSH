@@ -15,6 +15,7 @@ pub mod settings;
 pub mod tabs;
 pub mod theme;
 pub mod time;
+pub mod wake;
 
 pub use app::*;
 pub use colors::*;

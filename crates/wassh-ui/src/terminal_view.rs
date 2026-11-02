@@ -1,16 +1,24 @@
 //! Terminal widget: whole-cell layout and grid painting.
 //!
-//! This is the Phase 0 spike renderer. It draws per-style background runs and text runs
-//! into egui's painter, using the platform monospace font. The glyph atlas
-//! (`wassh-term-render`) replaces the text-run drawing later without changing this API.
+//! The grid is painted per style run into egui's painter, using the platform monospace font.
+
+use std::cell::Cell;
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Ui};
 use wassh_core::{Palette, Rgba};
 use wassh_term::{ScreenSnapshot, TerminalSize};
 
+/// Glyphs measured to derive one cell's width.
+const CELL_PROBE: &str = "MMMMMMMMMM";
+
 /// Converts the palette colour type to egui's.
 pub fn to_color32(color: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+}
+
+/// Converts a palette colour with a replaced alpha.
+pub fn with_alpha(color: Rgba, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r, color.g, color.b, alpha)
 }
 
 /// Stateless terminal widget; the snapshot is owned by the caller.
@@ -18,6 +26,9 @@ pub fn to_color32(color: Rgba) -> Color32 {
 pub struct TerminalView {
     pub font_size: f32,
     pub padding: f32,
+    /// Cell size measured at a given font size; the glyphs are laid out once, not once
+    /// per call, because every frame asks for the cell size several times.
+    metrics: Cell<Option<(f32, (f32, f32))>>,
 }
 
 impl Default for TerminalView {
@@ -25,25 +36,42 @@ impl Default for TerminalView {
         Self {
             font_size: 14.0,
             padding: 4.0,
+            metrics: Cell::new(None),
         }
     }
 }
 
 impl TerminalView {
+    /// A view with `font_size` chosen by the session's style.
+    pub fn with_font_size(font_size: f32) -> Self {
+        Self {
+            font_size,
+            ..Self::default()
+        }
+    }
+
     /// Character-cell size derived from the active font.
-    pub fn cell_size(ui: &Ui, font_size: f32) -> (f32, f32) {
-        let font = FontId::monospace(font_size);
-        let galley =
-            ui.painter()
-                .layout_no_wrap("MMMMMMMMMM".to_owned(), font, Color32::WHITE);
-        let width = (galley.size().x / 10.0).max(1.0);
-        let height = galley.size().y.max(1.0);
-        (width, height)
+    pub fn cell_size(&self, ui: &Ui) -> (f32, f32) {
+        if let Some((measured, cell)) = self.metrics.get()
+            && measured == self.font_size
+        {
+            return cell;
+        }
+        let font = FontId::monospace(self.font_size);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(CELL_PROBE.to_owned(), font, Color32::WHITE);
+        let cell = (
+            (galley.size().x / CELL_PROBE.len() as f32).max(1.0),
+            galley.size().y.max(1.0),
+        );
+        self.metrics.set(Some((self.font_size, cell)));
+        cell
     }
 
     /// Terminal size that fits into `available`, in whole cells.
     pub fn size_for(&self, ui: &Ui, available: egui::Vec2) -> TerminalSize {
-        let (cell_w, cell_h) = Self::cell_size(ui, self.font_size);
+        let (cell_w, cell_h) = self.cell_size(ui);
         let width = (available.x - self.padding * 2.0).max(cell_w);
         let height = (available.y - self.padding * 2.0).max(cell_h);
         TerminalSize::new(
@@ -57,10 +85,10 @@ impl TerminalView {
         &self,
         ui: &Ui,
         rect: Rect,
-        snapshot: &ScreenSnapshot,
+        size: TerminalSize,
         pos: egui::Pos2,
     ) -> Option<(usize, usize)> {
-        let (cell_w, cell_h) = Self::cell_size(ui, self.font_size);
+        let (cell_w, cell_h) = self.cell_size(ui);
         let x = pos.x - (rect.left() + self.padding);
         let y = pos.y - (rect.top() + self.padding);
         if x < 0.0 || y < 0.0 {
@@ -68,7 +96,7 @@ impl TerminalView {
         }
         let col = (x / cell_w).floor() as usize;
         let row = (y / cell_h).floor() as usize;
-        if row >= usize::from(snapshot.size.rows) || col >= usize::from(snapshot.size.cols) {
+        if row >= usize::from(size.rows) || col >= usize::from(size.cols) {
             return None;
         }
         Some((row, col))
@@ -77,7 +105,7 @@ impl TerminalView {
     /// Draw the snapshot and return the widget response.
     pub fn show(&self, ui: &mut Ui, snapshot: &ScreenSnapshot, palette: &Palette) -> egui::Response {
         let available = ui.available_size();
-        let (cell_w, cell_h) = Self::cell_size(ui, self.font_size);
+        let (cell_w, cell_h) = self.cell_size(ui);
         let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 

@@ -516,7 +516,17 @@ mod tests {
         assert_eq!(local_path("~/notes.txt"), home.join("notes.txt"));
         assert_eq!(local_path("notes.txt"), home.join("notes.txt"));
         assert_eq!(local_path(""), home);
-        assert_eq!(local_path("/etc/hosts"), PathBuf::from("/etc/hosts"));
+    }
+
+    #[test]
+    fn a_rooted_path_is_never_taken_as_relative_to_home() {
+        // `/etc/hosts` is absolute where the filesystem has a single root; on Windows it
+        // names the home directory's drive, which is still outside the home directory.
+        let hosts = local_path("/etc/hosts");
+        assert!(!hosts.starts_with(home()), "{hosts:?}");
+        assert_eq!(hosts.file_name(), Some(std::ffi::OsStr::new("hosts")));
+        #[cfg(unix)]
+        assert_eq!(hosts, PathBuf::from("/etc/hosts"));
     }
 
     #[test]
@@ -585,18 +595,16 @@ mod tests {
         assert!(!sandbox.path.join("second").exists(), "the whole tree is gone");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_reported_as_a_link() {
         let sandbox = Sandbox::new("link");
         std::fs::write(sandbox.path.join("real.txt"), b"x").expect("write");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(
             sandbox.path.join("real.txt"),
             sandbox.path.join("link.txt"),
         )
         .expect("symlink");
-        #[cfg(not(unix))]
-        return;
 
         let SftpOutcome::Listed(entries) = execute(SftpRequest::List { path: sandbox.shown() })
             .expect("listing")
@@ -747,6 +755,8 @@ mod tests {
         assert!(error.contains("nope"), "{error}");
     }
 
+    /// POSIX mode bits only exist where the platform has them.
+    #[cfg(unix)]
     #[test]
     fn a_mode_change_reaches_the_file() {
         let sandbox = Sandbox::new("mode");
@@ -757,12 +767,9 @@ mod tests {
             mode: 0o755,
         })
         .expect("chmod");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o777;
-            assert_eq!(mode, 0o755);
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

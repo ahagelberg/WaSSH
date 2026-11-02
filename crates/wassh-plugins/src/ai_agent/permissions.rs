@@ -19,7 +19,6 @@ use super::protocol::{
     TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
     TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
-use crate::PluginId;
 
 /// Live-terminal tools.
 pub const GROUP_TERMINAL: &str = "terminal";
@@ -239,14 +238,20 @@ pub const GATES: &[Gate] = &[
     },
 ];
 
+/// Prefix of every per-group permission setting.
+pub const GROUP_KEY_PREFIX: &str = "apiGroup:ai-agent:";
+
+/// Prefix of every per-tool permission setting.
+pub const METHOD_KEY_PREFIX: &str = "apiMethod:ai-agent:";
+
 /// The setting that switches a group on.
 pub fn group_key(group: &str) -> String {
-    format!("apiGroup:{}:{group}", PluginId::AiAgent.as_str())
+    format!("{GROUP_KEY_PREFIX}{group}")
 }
 
 /// The setting that holds a tool's decision.
 pub fn method_key(tool: &str) -> String {
-    format!("apiMethod:{}:{tool}", PluginId::AiAgent.as_str())
+    format!("{METHOD_KEY_PREFIX}{tool}")
 }
 
 /// The setting a tool's decision is stored under, which for a bundled tool is

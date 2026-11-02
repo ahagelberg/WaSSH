@@ -251,6 +251,30 @@ pub struct AuthPromptField {
     pub echo: bool,
 }
 
+/// The session's event channel, with a wake for the window.
+///
+/// The shell polls the channel from its frame loop; without the wake, new output would
+/// wait for the next idle frame instead of being painted as it arrives.
+#[derive(Clone)]
+pub struct EventSink {
+    events: Sender<SshEvent>,
+}
+
+impl EventSink {
+    pub fn new(events: Sender<SshEvent>) -> Self {
+        Self { events }
+    }
+
+    /// Queue `event` and ask for a frame.
+    pub fn send(&self, event: SshEvent) -> Result<(), std::sync::mpsc::SendError<SshEvent>> {
+        let sent = self.events.send(event);
+        if sent.is_ok() {
+            wassh_core::wake::notify();
+        }
+        sent
+    }
+}
+
 /// Synchronous handle to a background SSH session.
 pub struct SshSession {
     commands: UnboundedSender<SshCommand>,
@@ -265,6 +289,7 @@ impl SshSession {
     pub fn connect(options: SshOptions) -> Result<Self> {
         let (command_tx, command_rx) = unbounded_channel();
         let (event_tx, event_rx) = channel();
+        let events = EventSink::new(event_tx);
         let decision = Arc::new(Mutex::new(None));
         let auth_response = Arc::new(Mutex::new(None));
         let size = (options.cols, options.rows);
@@ -280,7 +305,7 @@ impl SshSession {
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = event_tx.send(SshEvent::Error(format!(
+                        let _ = events.send(SshEvent::Error(format!(
                             "cannot start the async runtime: {error}"
                         )));
                         return;
@@ -289,7 +314,7 @@ impl SshSession {
                 runtime.block_on(run(
                     options,
                     command_rx,
-                    event_tx,
+                    events,
                     thread_decision,
                     thread_auth,
                 ));
@@ -422,7 +447,7 @@ pub(crate) struct ClientHandler {
     policy: HostKeyPolicy,
     host: String,
     port: u16,
-    events: Sender<SshEvent>,
+    events: EventSink,
     decision: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     x11: Option<X11Config>,
     x11_requested: bool,
@@ -581,7 +606,7 @@ impl client::Handler for ClientHandler {
 async fn run(
     options: SshOptions,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<SshCommand>,
-    events: Sender<SshEvent>,
+    events: EventSink,
     decision: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     auth_response: Arc<Mutex<Option<oneshot::Sender<Vec<String>>>>>,
 ) {
@@ -620,7 +645,7 @@ async fn run(
 async fn connect_and_shell(
     options: &SshOptions,
     commands: &mut tokio::sync::mpsc::UnboundedReceiver<SshCommand>,
-    events: &Sender<SshEvent>,
+    events: &EventSink,
     status: &impl Fn(SessionStatus, Option<String>),
     decision: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     auth_response: Arc<Mutex<Option<oneshot::Sender<Vec<String>>>>>,
@@ -787,7 +812,7 @@ async fn authenticate(
     handle: &mut client::Handle<ClientHandler>,
     username: &str,
     auth: &SshAuth,
-    events: &Sender<SshEvent>,
+    events: &EventSink,
     auth_response: &Arc<Mutex<Option<oneshot::Sender<Vec<String>>>>>,
 ) -> Result<()> {
     let success = match auth {
@@ -836,7 +861,7 @@ fn make_handler(
     options: &SshOptions,
     host: &str,
     port: u16,
-    events: &Sender<SshEvent>,
+    events: &EventSink,
     decision: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     forwards: &crate::tunnels::RemoteForwards,
 ) -> ClientHandler {
@@ -844,7 +869,7 @@ fn make_handler(
         policy: options.host_key_policy.clone(),
         host: host.to_owned(),
         port,
-        events: events.clone(),
+        events: (*events).clone(),
         decision,
         x11: options.x11.clone(),
         x11_requested: false,
@@ -860,7 +885,7 @@ fn make_handler(
 async fn connect_chain(
     options: &SshOptions,
     config: &Arc<client::Config>,
-    events: &Sender<SshEvent>,
+    events: &EventSink,
     decision: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     auth_response: &Arc<Mutex<Option<oneshot::Sender<Vec<String>>>>>,
     forwards: &crate::tunnels::RemoteForwards,
@@ -944,7 +969,7 @@ async fn connect_chain(
 async fn authenticate_keyboard_interactive(
     handle: &mut client::Handle<ClientHandler>,
     username: &str,
-    events: &Sender<SshEvent>,
+    events: &EventSink,
     auth_response: &Arc<Mutex<Option<oneshot::Sender<Vec<String>>>>>,
 ) -> Result<bool> {
     use client::KeyboardInteractiveAuthResponse as Response;
@@ -1083,11 +1108,12 @@ async fn capture_async(options: SshOptions, command: String, timeout: Duration) 
             ..Default::default()
         });
         let (event_tx, _event_rx) = channel();
+        let events = EventSink::new(event_tx);
         let handler = ClientHandler {
             policy: HostKeyPolicy::AcceptNew(Arc::new(KnownHosts::in_memory())),
             host: options.host.clone(),
             port: options.port,
-            events: event_tx.clone(),
+            events: events.clone(),
             decision: Arc::new(Mutex::new(None)),
             x11: None,
             x11_requested: false,
@@ -1107,7 +1133,7 @@ async fn capture_async(options: SshOptions, command: String, timeout: Duration) 
             &mut handle,
             &options.username,
             &options.auth,
-            &event_tx,
+            &events,
             &auth_response,
         )
         .await?;

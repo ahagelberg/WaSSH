@@ -12,7 +12,7 @@ use wassh_ui::widgets::{
     slider_field, small_button, stat_row, truncating_galley_with,
 };
 
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::plugin::{Plugin, PluginContext};
 use crate::time;
 use crate::{PluginId, PluginManifest};
@@ -770,24 +770,14 @@ impl History {
 /// Remote monitoring access handed to the plugin by the session.
 /// System statistics for one session.
 ///
-/// Extends [`CommandAccess`] because the process table runs its own probes
-/// (details, signals) on the host without going through the sampler.
+/// Extends [`CommandAccess`] because the pane runs its own probes: the statistics
+/// command, and the process table's details and signals.
 pub trait MonitorAccess: crate::command::CommandAccess {
-    /// Ask for a fresh sample. Calling this every frame is fine; the session enforces the
-    /// polling cadence.
-    fn request_sample(&mut self);
-
-    /// The newest sample, once one has arrived.
-    fn sample(&self) -> Option<&Snapshot>;
-
-    /// Whether a sample is in flight.
-    fn is_sampling(&self) -> bool;
-
-    /// The last failure, if the previous poll failed.
-    ///
-    /// Named apart from [`crate::files::SftpAccess::error`] so a pane holding both
-    /// capabilities can call either one.
-    fn last_error(&self) -> Option<&str>;
+    /// Whether this host's statistics are read through the operating system rather than a
+    /// shell probe; the pane then samples it on its own thread.
+    fn native_sampling(&self) -> bool {
+        false
+    }
 
     /// Read one process's details straight from the operating system, where it has a
     /// native reader. `None` means the caller should ask the host with a shell probe.
@@ -1650,10 +1640,146 @@ impl PaneState {
     }
 }
 
+/// How often the pane asks the host for statistics.
+const MONITOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Command key the statistics probe is filed under.
+const SAMPLE_COMMAND_KEY: &str = "monitor.sample";
+
+/// One native sample, with the counters the next one compares against.
+type NativeSample = Result<(Snapshot, Option<Counters>), String>;
+
+/// A statistics probe in flight.
+enum Pending {
+    /// A shell probe, whose answer lands in the session's command slot.
+    Shell,
+    /// A sample this machine read from its own operating system.
+    Native(std::sync::mpsc::Receiver<NativeSample>),
+}
+
+/// The statistics the pane asks its host for, and the last answer.
+///
+/// The probe belongs here rather than in the session: it is this pane's command and its
+/// cadence, and the host only runs commands and reports whether it can sample natively.
+#[derive(Default)]
+struct Sampler {
+    /// Probe in flight.
+    pending: Option<Pending>,
+    /// When the last probe was sent, in milliseconds since the Unix epoch.
+    last_sent: Option<u64>,
+    /// Counters from the previous sample; every rate is a delta of these.
+    counters: Option<Counters>,
+    /// Newest sample.
+    sample: Option<Snapshot>,
+    /// Last failure.
+    error: Option<String>,
+}
+
+impl Sampler {
+    fn sample(&self) -> Option<&Snapshot> {
+        self.sample.as_ref()
+    }
+
+    fn is_sampling(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn last_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// How long until the next probe may go out.
+    fn until_due(&self) -> std::time::Duration {
+        let Some(sent) = self.last_sent else {
+            return std::time::Duration::ZERO;
+        };
+        let waited = wassh_core::time::now_ms().saturating_sub(sent);
+        MONITOR_INTERVAL.saturating_sub(std::time::Duration::from_millis(waited))
+    }
+
+    /// Send a probe when one is due.
+    fn request(&mut self, access: &mut dyn MonitorAccess) {
+        if self.pending.is_some() || !self.until_due().is_zero() {
+            return;
+        }
+        let now = wassh_core::time::now_ms();
+        self.last_sent = Some(now);
+        self.error = None;
+        self.pending = Some(if access.native_sampling() {
+            Pending::Native(sample_this_machine(self.counters.take()))
+        } else {
+            access.exec(SAMPLE_COMMAND_KEY, MONITOR_COMMAND);
+            Pending::Shell
+        });
+    }
+
+    /// Fold a finished probe into the pane's state.
+    fn poll(&mut self, access: &mut dyn MonitorAccess) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let answer = match pending {
+            Pending::Shell => {
+                if access.is_running(SAMPLE_COMMAND_KEY) {
+                    return;
+                }
+                match (access.output(SAMPLE_COMMAND_KEY), access.failure(SAMPLE_COMMAND_KEY)) {
+                    // Nothing has come back yet: that is not an empty answer.
+                    (None, None) => return,
+                    (None, Some(failure)) => Some(Err(failure.to_owned())),
+                    (Some(output), _) => Some(Ok(parse_report(
+                        &output.stdout,
+                        self.counters.take(),
+                        wassh_core::time::now_ms(),
+                    ))),
+                }
+            }
+            Pending::Native(receiver) => match receiver.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("the session closed before the sample arrived".to_owned()))
+                }
+            },
+        };
+        match answer {
+            Some(Ok((snapshot, counters))) => {
+                self.counters = counters;
+                self.sample = Some(snapshot);
+                self.error = None;
+                self.pending = None;
+            }
+            Some(Err(error)) => {
+                self.error = Some(error);
+                self.pending = None;
+            }
+            None => {}
+        }
+    }
+}
+
+/// Read one sample of this machine on its own thread, so the frame never waits for it.
+fn sample_this_machine(previous: Option<Counters>) -> std::sync::mpsc::Receiver<NativeSample> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let unused = sender.clone();
+    let spawned = std::thread::Builder::new()
+        .name("wassh-monitor".to_owned())
+        .spawn(move || {
+            let at_ms = wassh_core::time::now_ms();
+            let _ = sender.send(Ok(native_sample(previous, at_ms)));
+            wassh_core::wake::notify();
+        });
+    if let Err(error) = spawned {
+        let _ = unused.send(Err(format!("starting the sample: {error}")));
+    }
+    receiver
+}
+
 /// The Server Monitor pane.
 #[derive(Default)]
 pub struct ServerMonitor {
     state: PaneState,
+    sampler: Sampler,
 }
 
 impl Plugin for ServerMonitor {
@@ -1672,12 +1798,30 @@ impl Plugin for ServerMonitor {
             );
             return;
         };
+        self.sampler.request(access);
+        self.sampler.poll(access);
         let host_label = context.host_label.clone();
         // The section switches are the plugin's per-host settings, so the chips
         // write straight back into the dialog that owns them.
         let mut view = View::from_settings(context.settings);
         self.state.apply_settings(context.settings);
-        draw(ui, &palette, &host_label, access, &mut view, &mut self.state);
+        draw(
+            ui,
+            &palette,
+            &host_label,
+            &self.sampler,
+            access,
+            &mut view,
+            &mut self.state,
+        );
+        // The pane schedules its own frames: one when the next probe is due, and a faster
+        // poll while an answer is on the way. The host's idle cadence is a second, so a
+        // probe that waited for it would show up late.
+        context.request_repaint_after(if self.sampler.is_sampling() {
+            SAMPLE_POLL
+        } else {
+            self.sampler.until_due()
+        });
         view.persist(context);
         context.set_value(
             RANGE_KEY,
@@ -1761,20 +1905,21 @@ impl MeterColors {
     }
 }
 
+/// How long the pane waits between frames while a probe is in flight.
+const SAMPLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Draw the statistics for `access`.
 fn draw(
     ui: &mut Ui,
     palette: &Palette,
     host_label: &str,
+    sampler: &Sampler,
     access: &mut dyn MonitorAccess,
     view: &mut View,
     state: &mut PaneState,
 ) {
     let muted = to_color32(palette.text_muted);
     let colours = MeterColors::new(palette);
-    access.request_sample();
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(500));
 
     // Section chips, then the sample itself.
     ui.horizontal_wrapped(|ui| {
@@ -1812,13 +1957,13 @@ fn draw(
     }
     ui.add_space(6.0);
 
-    if let Some(error) = access.last_error() {
+    if let Some(error) = sampler.last_error() {
         banner(ui, palette, BannerKind::Warn, error);
         ui.add_space(6.0);
     }
 
-    let Some(sample) = access.sample().cloned() else {
-        let text = if access.is_sampling() {
+    let Some(sample) = sampler.sample() else {
+        let text = if sampler.is_sampling() {
             "Sampling…"
         } else {
             "Waiting for the first sample."
@@ -1828,8 +1973,8 @@ fn draw(
     };
     // One ladder entry per sample, whatever the window is set to.
     if sample.at_ms != state.last_at {
-        state.history.push(&sample);
-        state.record_processes(&sample);
+        state.history.push(sample);
+        state.record_processes(sample);
         state.last_at = sample.at_ms;
     }
 
@@ -1857,13 +2002,13 @@ fn draw(
             let width = (ui.available_width() - SCROLLBAR_GUTTER).max(140.0);
             ui.set_width(width);
             if view.gauges {
-                gauges(ui, palette, &sample, &colours, width);
+                gauges(ui, palette, sample, &colours, width);
                 ui.add_space(8.0);
                 if !sample.cores.is_empty() {
-                    cores_card(ui, palette, &sample, &colours, width);
+                    cores_card(ui, palette, sample, &colours, width);
                     ui.add_space(8.0);
                 }
-                memory_card(ui, palette, &sample, &colours, width);
+                memory_card(ui, palette, sample, &colours, width);
                 ui.add_space(8.0);
             }
             if view.history {
@@ -1872,18 +2017,18 @@ fn draw(
                 ui.add_space(8.0);
             }
             if view.network {
-                network_card(ui, palette, &sample, &colours, width);
+                network_card(ui, palette, sample, &colours, width);
                 ui.add_space(8.0);
             }
             let points = state.history.series(state.range_s, sample.at_ms);
-            disk_card(ui, palette, &points, &sample, &colours, width);
+            disk_card(ui, palette, &points, sample, &colours, width);
             ui.add_space(8.0);
             if view.status {
-                status_card(ui, palette, &sample, width);
+                status_card(ui, palette, sample, width);
                 ui.add_space(8.0);
             }
             if view.processes {
-                processes_card(ui, palette, access, &sample, state, width);
+                processes_card(ui, palette, access, sample, state, width);
                 ui.add_space(8.0);
             }
             ui.label(
@@ -3266,7 +3411,6 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     #[derive(Default)]
     struct FakeMonitor {
         sample: Option<Snapshot>,
-        requested: usize,
         sampling: bool,
         error: Option<String>,
         /// `(key, command)` pairs, in the order they were asked for.
@@ -3326,21 +3470,17 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     }
 
 
-    impl MonitorAccess for FakeMonitor {
-        fn request_sample(&mut self) {
-            self.requested += 1;
-        }
+    impl MonitorAccess for FakeMonitor {}
 
-        fn sample(&self) -> Option<&Snapshot> {
-            self.sample.as_ref()
-        }
-
-        fn is_sampling(&self) -> bool {
-            self.sampling
-        }
-
-        fn last_error(&self) -> Option<&str> {
-            self.error.as_deref()
+    /// A sampler fed from the fake's fields.
+    ///
+    /// The fake host answers no probes, so the sample the pane draws is copied in.
+    fn sampler_for(access: &FakeMonitor) -> Sampler {
+        Sampler {
+            pending: access.sampling.then_some(Pending::Shell),
+            sample: access.sample.clone(),
+            error: access.error.clone(),
+            ..Sampler::default()
         }
     }
 
@@ -3372,9 +3512,10 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         };
         let mut state = PaneState::default();
         let mut painted = Vec::new();
+        let sampler = sampler_for(access);
         for _ in 0..2 {
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                draw(ui, &palette, "dev", access, &mut view, &mut state);
+                draw(ui, &palette, "dev", &sampler, access, &mut view, &mut state);
             });
             let shapes = std::mem::take(&mut output.shapes);
             painted.clear();
@@ -3410,9 +3551,10 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
             processes: true,
             network: true,
         };
+        let sampler = sampler_for(access);
         let mut frame = |state: &mut PaneState| {
             let output = ctx.run_ui(input.clone(), |ui| {
-                draw(ui, &palette, "dev", access, &mut view, state);
+                draw(ui, &palette, "dev", &sampler, access, &mut view, state);
             });
             output.drop_without_applying_deltas();
         };
@@ -3501,15 +3643,60 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     }
 
     #[test]
-    fn the_pane_shows_the_reference_sections() {        let mut access = FakeMonitor {
+    fn the_sampler_asks_the_host_and_reads_its_answer() {
+        let mut access = FakeMonitor::default();
+        let mut sampler = Sampler::default();
+        sampler.request(&mut access);
+        // Due, so one probe went out, under the pane's own key.
+        assert_eq!(access.commands.len(), 1);
+        assert_eq!(access.commands[0].0, SAMPLE_COMMAND_KEY);
+        assert!(sampler.is_sampling());
+
+        access.answers.insert(
+            SAMPLE_COMMAND_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: REPORT.to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        sampler.poll(&mut access);
+        assert!(sampler.sample().is_some(), "the report was parsed");
+        assert!(sampler.last_error().is_none());
+
+        // The next probe waits for the interval instead of one per frame, and the pane is
+        // told when that is, so a frame arrives in time to send it.
+        sampler.request(&mut access);
+        assert_eq!(access.commands.len(), 1);
+        let wait = sampler.until_due();
+        assert!(
+            wait > std::time::Duration::ZERO && wait <= MONITOR_INTERVAL,
+            "the next probe is due in {wait:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_native_sample_reads_this_machine() {
+        let (snapshot, counters) = sample_this_machine(None)
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("an answer from the sampler thread")
+            .expect("a sample");
+        assert!(counters.is_some(), "the counters feed the next rate");
+        assert!(snapshot.uptime_s.is_some(), "no uptime in {snapshot:?}");
+        assert!(snapshot.memory.total.is_some(), "no memory in {snapshot:?}");
+        assert!(snapshot.disk_total.is_some(), "no disk in {snapshot:?}");
+    }
+
+    #[test]
+    fn the_pane_shows_the_reference_sections() {
+        let mut access = FakeMonitor {
             sample: Some(sample()),
-            requested: 0,
             sampling: false,
             error: None,
             ..FakeMonitor::default()
         };
         let painted = draw_pane(&mut access);
-        assert_eq!(access.requested, 2, "one request per frame");
         let has = |needle: &str| painted.iter().any(|text| text == needle);
         for heading in [
             "Gauges", "History", "Status", "Procs", "Net", "CPU", "Memory", "Swap", "CPU CORES",
@@ -3544,9 +3731,10 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         };
         let mut state = PaneState::default();
         let mut rows = Vec::new();
+        let sampler = sampler_for(access);
         for _ in 0..2 {
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                draw(ui, &palette, "dev", access, &mut view, &mut state);
+                draw(ui, &palette, "dev", &sampler, access, &mut view, &mut state);
             });
             let shapes = std::mem::take(&mut output.shapes);
             rows.clear();
@@ -3568,7 +3756,6 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     fn nothing_is_painted_past_the_right_edge() {
         let mut access = FakeMonitor {
             sample: Some(sample()),
-            requested: 0,
             sampling: false,
             error: None,
             ..FakeMonitor::default()
@@ -3614,9 +3801,10 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
             network: true,
         };
         let mut shapes = Vec::new();
+        let sampler = sampler_for(access);
         for _ in 0..2 {
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                draw(ui, &palette, "dev", access, &mut view, &mut state);
+                draw(ui, &palette, "dev", &sampler, access, &mut view, &mut state);
             });
             shapes = std::mem::take(&mut output.shapes)
                 .into_iter()
@@ -3666,7 +3854,6 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     fn the_cards_fill_their_row_and_line_up() {
         let mut access = FakeMonitor {
             sample: Some(sample()),
-            requested: 0,
             sampling: false,
             error: None,
             ..FakeMonitor::default()
@@ -3726,7 +3913,6 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     fn a_missing_sample_says_so() {
         let mut access = FakeMonitor {
             sample: None,
-            requested: 0,
             sampling: false,
             error: None,
             ..FakeMonitor::default()
@@ -3758,6 +3944,7 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
             session: None,
             events: &[],
             pending_input: Vec::new(),
+            repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
         };
@@ -3868,7 +4055,6 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
     fn the_core_bars_sit_on_one_baseline() {
         let mut access = FakeMonitor {
             sample: Some(sample()),
-            requested: 0,
             sampling: false,
             error: None,
             ..FakeMonitor::default()
@@ -4251,7 +4437,6 @@ ENVIRON\u{1f}HOME=/home/brainchild\n";
     fn the_time_range_is_a_slider_over_the_reference_steps() {
         let mut access = FakeMonitor {
             sample: Some(sample()),
-            requested: 0,
             sampling: false,
             error: None,
             ..FakeMonitor::default()

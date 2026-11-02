@@ -113,9 +113,11 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// Banner text shown while waiting to retry, e.g. `Attempt 3 (in 4s)`.
-pub fn reconnect_label(attempt: u32) -> String {
-    let millis = backoff_delay(attempt).as_millis() as u64;
-    let seconds = millis.div_ceil(1_000).max(1);
+///
+/// `remaining` is what is left of the wait, so the countdown ticks down rather than
+/// repeating the full backoff.
+pub fn reconnect_label(attempt: u32, remaining: Duration) -> String {
+    let seconds = remaining.as_secs().max(1);
     format!("Attempt {attempt} (in {seconds}s)")
 }
 
@@ -141,9 +143,20 @@ mod tests {
 
     #[test]
     fn label_matches_the_electron_wording() {
-        assert_eq!(reconnect_label(1), "Attempt 1 (in 1s)");
-        assert_eq!(reconnect_label(2), "Attempt 2 (in 2s)");
-        assert_eq!(reconnect_label(11), "Attempt 11 (in 600s)");
+        // The first attempt waits a second, so the banner counts down from there.
+        let first = reconnect_label(1, backoff_delay(1));
+        assert_eq!(first, "Attempt 1 (in 1s)");
+        assert_eq!(reconnect_label(2, backoff_delay(2)), "Attempt 2 (in 2s)");
+        assert_eq!(
+            reconnect_label(11, backoff_delay(11)),
+            "Attempt 11 (in 600s)"
+        );
+        // A countdown under a second still reads as one second, and a finished wait as one.
+        assert_eq!(reconnect_label(3, Duration::ZERO), "Attempt 3 (in 1s)");
+        assert_eq!(
+            reconnect_label(3, Duration::from_millis(1_400)),
+            "Attempt 3 (in 1s)"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::sync::mpsc::Receiver;
 use egui::Ui;
 use serde_json::{Value, json};
 use wassh_core::{Palette, SessionStatus};
-use wassh_ui::dock::HeaderHealth;
+use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, password_input, select_str, select_width, small_button,
     small_button_enabled, text_area,
@@ -20,10 +20,10 @@ use super::agent::{
     Agent, Phase, SUMMARY_SYSTEM_PROMPT, ToolSettings, Turn, UserMeta, history_from_json,
     history_to_json, turns_from_json, turns_to_json,
 };
-use super::permissions::{Permissions, setting_key};
+use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, PROVIDER_OPENROUTER, Protocol, ProviderConfig,
+    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
     SAFE_RULES, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
     SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
     SETTING_HOST_RAG_FOLDER, SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER,
@@ -32,12 +32,25 @@ use super::protocol::{
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
 use super::settings_ui::{PROVIDERS_KEY, provider_secret_field};
 use super::tools;
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::plugin::{Plugin, PluginContext};
 use crate::{PluginId, PluginManifest};
 
 /// Key the conversation is stored under.
 const CONVERSATION_KEY: &str = "conversation";
+/// Settings [`AiAgent::apply_settings`] derives the agent's rules and tools from, besides
+/// the per-group and per-tool permission keys it reads through [`Permissions`].
+const DERIVED_SETTINGS: &[&str] = &[
+    SETTING_DEFAULT_ALLOW_RULES,
+    SETTING_DEFAULT_DENY_RULES,
+    SETTING_HOST_ALLOW_RULES,
+    SETTING_HOST_DENY_RULES,
+    SETTING_RAG_FOLDER,
+    SETTING_RAG_PROVIDER,
+    SETTING_RAG_MODEL,
+    SETTING_HOST_RAG_FOLDER,
+    SETTING_WEB_SEARCH_PROVIDER,
+];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
 /// Gap between the provider and model dropdowns under the composer.
@@ -254,6 +267,14 @@ pub struct AiAgent {
     caption: (String, HeaderHealth),
     /// Last problem reported to the user.
     error: Option<String>,
+    /// Provider list and keys [`AiAgent::sync_providers`] last derived its state from.
+    synced_providers: Option<Value>,
+    synced_secrets: std::collections::BTreeMap<String, String>,
+    /// Setting values [`AiAgent::apply_settings`] last derived the agent's rules from;
+    /// `None` until it has run once.
+    applied: Option<serde_json::Map<String, Value>>,
+    /// Search key the agent's tools were last given.
+    applied_web_key: Option<String>,
 }
 
 impl Default for AiAgent {
@@ -279,8 +300,19 @@ impl Default for AiAgent {
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
             error: None,
+            synced_providers: None,
+            synced_secrets: std::collections::BTreeMap::new(),
+            applied: None,
+            applied_web_key: None,
         }
     }
+}
+
+/// Whether `key` is a setting the agent's rules and tools are derived from.
+fn derived_setting(key: &str) -> bool {
+    DERIVED_SETTINGS.contains(&key)
+        || key.starts_with(GROUP_KEY_PREFIX)
+        || key.starts_with(METHOD_KEY_PREFIX)
 }
 
 /// Read a settings value as trimmed text.
@@ -309,13 +341,6 @@ fn setting_rules(settings: &serde_json::Map<String, Value>, key: &str) -> Option
         _ => return None,
     };
     Some(lines)
-}
-
-/// The wall clock in milliseconds, from the system clock.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// The last `max_chars` characters of `text`.
@@ -442,6 +467,17 @@ pipe a password to sudo yourself."
     /// `web_key` is the search provider's API key, which the shell decrypts from
     /// the credential vault instead of keeping it in a settings file.
     fn apply_settings(&mut self, settings: &serde_json::Map<String, Value>, web_key: Option<&str>) {
+        if !self.settings_changed(settings) && self.applied_web_key.as_deref() == web_key {
+            return;
+        }
+        self.applied = Some(
+            settings
+                .iter()
+                .filter(|(key, _)| derived_setting(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        self.applied_web_key = web_key.map(str::to_owned);
         self.agent.app_allow = setting_rules(settings, SETTING_DEFAULT_ALLOW_RULES)
             .unwrap_or_else(|| SAFE_RULES.iter().map(|rule| (*rule).to_owned()).collect());
         self.agent.app_deny =
@@ -473,6 +509,27 @@ pipe a password to sudo yourself."
             rag_folders: folders,
             embed,
         };
+    }
+
+    /// Whether any setting the agent's rules come from changed since the last draw.
+    ///
+    /// The pane is drawn every frame, so re-deriving the rule lists, the permissions and
+    /// the tool settings every frame would only produce the same values again.
+    fn settings_changed(&self, settings: &serde_json::Map<String, Value>) -> bool {
+        let Some(applied) = &self.applied else {
+            return true;
+        };
+        let mut derived = 0usize;
+        for (key, value) in settings {
+            if !derived_setting(key) {
+                continue;
+            }
+            if applied.get(key) != Some(value) {
+                return true;
+            }
+            derived += 1;
+        }
+        derived != applied.len()
     }
 
     /// The embedding provider from the settings, when one is configured.
@@ -574,14 +631,20 @@ pipe a password to sudo yourself."
 
     /// Take the provider list and API keys from the app-wide settings and the vault.
     ///
-    /// Options owns both, so they are re-read every frame and never written back here;
-    /// the current provider and model stay per conversation. Keys arrive decrypted
+    /// Options owns both, so they are re-read whenever they change and never written back
+    /// here; the current provider and model stay per conversation. Keys arrive decrypted
     /// from the host, because a pane cannot reach the credential vault itself.
     fn sync_providers(
         &mut self,
         settings: &serde_json::Map<String, Value>,
         secrets: &std::collections::BTreeMap<String, String>,
     ) {
+        let source = settings.get(PROVIDERS_KEY);
+        if self.synced_providers.as_ref() == source && &self.synced_secrets == secrets {
+            return;
+        }
+        self.synced_providers = source.cloned();
+        self.synced_secrets.clone_from(secrets);
         let selected = self.active().map(|provider| provider.id.clone());
         self.providers = settings
             .get(PROVIDERS_KEY)
@@ -1235,8 +1298,8 @@ impl Plugin for AiAgent {
         PluginId::AiAgent.manifest()
     }
 
-    fn header_status(&self) -> Option<(String, HeaderHealth)> {
-        (!self.caption.0.is_empty()).then(|| self.caption.clone())
+    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
+        (!self.caption.0.is_empty()).then_some((self.caption.0.as_str(), self.caption.1))
     }
 
     fn take_app_settings(&mut self) -> Vec<(String, Value)> {
@@ -1253,7 +1316,7 @@ impl Plugin for AiAgent {
         self.apply_settings(context.settings, context.secret(SETTING_WEB_SEARCH_KEY));
         self.poll_models();
         self.refresh_models(context);
-        self.agent.now_ms = now_ms();
+        self.agent.now_ms = wassh_core::time::now_ms();
         self.poll_summary();
         self.poll_picker();
 
@@ -1284,14 +1347,6 @@ impl Plugin for AiAgent {
                 }
             }
         }
-        if self.agent.busy()
-            || self.summary.is_some()
-            || self.picking.is_some()
-            || self.fetch.is_some()
-        {
-            ui.ctx().request_repaint();
-        }
-
         self.caption = if self.agent.busy() || self.summary.is_some() {
             ("Thinking…".to_owned(), HeaderHealth::Warn)
         } else if context.status == SessionStatus::Connected {
@@ -1900,7 +1955,14 @@ impl Plugin for AiAgent {
             }),
         );
         context.session = session;
-        let _ = PROVIDER_OPENROUTER;
+        // A run in flight, a summary or an attachment being read all finish outside a frame.
+        if self.agent.busy()
+            || self.summary.is_some()
+            || self.picking.is_some()
+            || self.fetch.is_some()
+        {
+            context.request_repaint_after(std::time::Duration::ZERO);
+        }
     }
 }
 
@@ -1949,6 +2011,7 @@ mod tests {
                 session: None,
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets,
                 secret_writes: Vec::new(),
             };
@@ -2000,6 +2063,7 @@ mod tests {
             session: None,
             events: &[],
             pending_input: Vec::new(),
+            repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
         };
@@ -2249,7 +2313,7 @@ mod tests {
         );
         assert_eq!(
             plugin.header_status(),
-            Some((DEFAULT_CHAT_TITLE.to_owned(), HeaderHealth::Ok))
+            Some((DEFAULT_CHAT_TITLE, HeaderHealth::Ok))
         );
     }
 
@@ -2294,7 +2358,7 @@ mod tests {
         assert_eq!(plugin.agent.history.len(), 2);
         assert_eq!(
             plugin.header_status(),
-            Some(("how much disk is left".to_owned(), HeaderHealth::Ok))
+            Some(("how much disk is left", HeaderHealth::Ok))
         );
     }
 

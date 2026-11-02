@@ -13,12 +13,12 @@ use egui::{Align, Align2, Color32, FontId, Layout, Rect, Sense, Stroke, Ui, Vec2
 use serde_json::{json, Value};
 use wassh_core::{Palette, SessionStatus};
 use wassh_mqtt::{MqttEvent, MqttOptions, MqttSession};
-use wassh_ui::dock::HeaderHealth;
+use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, MenuItem, MenuState, checkbox, select, text_area, text_input,
 };
 
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use crate::plugin::{HeaderButton, Plugin, PluginContext};
 use crate::{PluginId, PluginManifest};
 
@@ -107,6 +107,10 @@ const ADD_BUTTON_HEIGHT: f32 = 26.0;
 const BLINK_MS: u64 = 500;
 /// `COPY_FEEDBACK_MS`: how long a copy button confirms.
 const COPY_FEEDBACK_MS: u64 = 1500;
+/// How often a connected pane looks for messages the broker thread pushed.
+const BROKER_POLL: Duration = Duration::from_millis(200);
+/// How often a blinking or copying topic is repainted, and how often the file picker is polled.
+const BLINK_POLL: Duration = Duration::from_millis(100);
 /// Copy button glyphs, as in the reference.
 const COPY_GLYPH: &str = "\u{29c9}";
 const COPIED_GLYPH: &str = "\u{2713}";
@@ -922,8 +926,8 @@ impl MqttAnalyser {
     }
 
     /// Drop the blink and copy markers that have expired.
-    fn tick(&mut self, ctx: &egui::Context) {
-        let now = crate::connection_logger::now_ms();
+    fn tick(&mut self, context: &mut PluginContext<'_>) {
+        let now = wassh_core::time::now_ms();
         self.blink
             .retain(|_, started| now.saturating_sub(*started) < BLINK_MS);
         if self
@@ -934,11 +938,16 @@ impl MqttAnalyser {
             self.copied = None;
         }
         if !self.blink.is_empty() || self.copied.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            context.request_repaint_after(BLINK_POLL);
+        }
+        // Messages are pushed by the broker thread, which cannot wake the window, so a
+        // connected pane keeps its own frames coming.
+        if self.session.is_some() {
+            context.request_repaint_after(BROKER_POLL);
         }
         self.poll_pick();
         if self.picking.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            context.request_repaint_after(BLINK_POLL);
         }
     }
 
@@ -972,12 +981,12 @@ impl MqttAnalyser {
 
     /// Remember that a copy button confirmed.
     fn mark_copied(&mut self, token: &str) {
-        self.copied = Some((token.to_owned(), crate::connection_logger::now_ms()));
+        self.copied = Some((token.to_owned(), wassh_core::time::now_ms()));
     }
 
     /// Whether `token`'s copy button is still showing its confirmation.
     fn copied_recently(&self, token: &str) -> bool {
-        let now = crate::connection_logger::now_ms();
+        let now = wassh_core::time::now_ms();
         self.copied
             .as_ref()
             .is_some_and(|(saved, at)| saved == token && now.saturating_sub(*at) < COPY_FEEDBACK_MS)
@@ -1162,7 +1171,7 @@ impl MqttAnalyser {
                         self.tree_dirty = true;
                         continue;
                     }
-                    let now = crate::connection_logger::now_ms();
+                    let now = wassh_core::time::now_ms();
                     let message = Message::new(topic.clone(), &payload, now, qos, retain);
                     let entry = self.topics.entry(topic.clone()).or_default();
                     push_history(entry, message);
@@ -1227,8 +1236,8 @@ impl Plugin for MqttAnalyser {
         PluginId::MqttAnalyser.manifest()
     }
 
-    fn header_status(&self) -> Option<(String, HeaderHealth)> {
-        (!self.caption.0.is_empty()).then(|| self.caption.clone())
+    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
+        (!self.caption.0.is_empty()).then_some((self.caption.0.as_str(), self.caption.1))
     }
 
     fn header_action(&self) -> Option<HeaderButton> {
@@ -1267,7 +1276,7 @@ impl Plugin for MqttAnalyser {
             self.status = Status::Unavailable("MQTT Analyser requires an SSH session".to_owned());
         }
         self.drain_events();
-        self.tick(ui.ctx());
+        self.tick(context);
         self.caption = (self.status.label(), self.status.health());
 
         // --- topics | splitter | details ---------------------------------
@@ -1355,7 +1364,7 @@ impl MqttAnalyser {
             self.lines = lines;
             return;
         }
-        let now = crate::connection_logger::now_ms();
+        let now = wassh_core::time::now_ms();
         let reveal = self.reveal.take();
         let mut clicked = None;
         let mut toggled = None;
@@ -1838,7 +1847,7 @@ impl MqttAnalyser {
             .clicked()
         {
             self.editor = Some(SavedMessage {
-                id: format!("msg-{}", crate::connection_logger::now_ms()),
+                id: format!("msg-{}", wassh_core::time::now_ms()),
                 label: NEW_MESSAGE_LABEL.to_owned(),
                 topic: self.publish_topic.trim().to_owned(),
                 payload: String::new(),
@@ -2924,6 +2933,9 @@ mod tests {
         fn listing(&self) -> Option<&crate::files::SftpListing> {
             None
         }
+        fn listing_revision(&self) -> u64 {
+            0
+        }
         fn is_loading(&self) -> bool {
             false
         }
@@ -2963,18 +2975,7 @@ mod tests {
         fn retry(&mut self) {}
     }
 
-    impl crate::monitor::MonitorAccess for FakeBroker {
-        fn request_sample(&mut self) {}
-        fn sample(&self) -> Option<&crate::monitor::Snapshot> {
-            None
-        }
-        fn is_sampling(&self) -> bool {
-            false
-        }
-        fn last_error(&self) -> Option<&str> {
-            None
-        }
-    }
+    impl crate::monitor::MonitorAccess for FakeBroker {}
 
     impl crate::command::CommandAccess for FakeBroker {
         fn exec(&mut self, _key: &str, _command: &str) {}
@@ -3041,6 +3042,7 @@ mod tests {
                 session: Some(access),
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };
@@ -3087,6 +3089,7 @@ mod tests {
                 session: Some(access),
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };
@@ -3270,6 +3273,7 @@ mod tests {
                 session: Some(&mut access),
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };
@@ -3376,6 +3380,7 @@ mod tests {
                 session: Some(&mut access),
                 events: &[],
                 pending_input: Vec::new(),
+                repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
             };
@@ -3535,7 +3540,7 @@ mod tests {
         assert_eq!(access.asked, [("broker.internal".to_owned(), 1884)]);
         assert!(matches!(plugin.status(), Status::Connecting));
         // The connection state lives in the pane header, not in a status bar.
-        assert_eq!(plugin.header_status().map(|(text, _)| text), Some("Connecting…".to_owned()));
+        assert_eq!(plugin.header_status().map(|(text, _)| text), Some("Connecting…"));
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
         assert!(texts.contains(&"TOPICS"), "tree label missing: {texts:?}");
         assert!(texts.contains(&"DETAILS"), "detail label missing: {texts:?}");
@@ -3562,9 +3567,10 @@ mod tests {
             }
             other => panic!("expected a failure, got {other:?}"),
         }
+        let label = plugin.status().label();
         assert_eq!(
             plugin.header_status(),
-            Some((plugin.status().label(), HeaderHealth::Bad))
+            Some((label.as_str(), HeaderHealth::Bad))
         );
     }
 
@@ -3598,7 +3604,7 @@ mod tests {
         assert_eq!(
             plugin.header_status(),
             Some((
-                "MQTT Analyser requires an SSH session".to_owned(),
+                "MQTT Analyser requires an SSH session",
                 HeaderHealth::Bad
             ))
         );

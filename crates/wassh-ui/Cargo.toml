@@ -11,4 +11,3 @@ description = "WaSSH egui shell, widget kit and screens"
 egui = { workspace = true }
 wassh-core = { path = "../wassh-core" }
 wassh-term = { path = "../wassh-term" }
-wassh-term-render = { path = "../wassh-term-render" }

@@ -292,6 +292,9 @@ pub struct Terminal {
     size: TerminalSize,
     palette: AnsiPalette,
     base_style: CellStyle,
+    /// Bumped whenever the visible grid or the selection changes, so a caller can keep
+    /// the snapshot it derived until the next change.
+    revision: u64,
 }
 
 impl Terminal {
@@ -317,11 +320,22 @@ impl Terminal {
             size,
             palette: ansi_palette,
             base_style: CellStyle::blank(&ansi_palette),
+            revision: 0,
         }
     }
 
     pub fn size(&self) -> TerminalSize {
         self.size
+    }
+
+    /// Number of changes made to the grid since construction.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Record a change, so cached views of the grid know they are stale.
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn palette(&self) -> &AnsiPalette {
@@ -331,11 +345,13 @@ impl Terminal {
     pub fn set_palette(&mut self, palette: &Palette) {
         self.palette = AnsiPalette::from_palette(palette);
         self.base_style = CellStyle::blank(&self.palette);
+        self.touch();
     }
 
     /// Parse bytes coming from the transport.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+        self.touch();
     }
 
     pub fn resize(&mut self, size: TerminalSize) {
@@ -347,12 +363,14 @@ impl Terminal {
             cols: usize::from(size.cols),
             rows: usize::from(size.rows),
         });
+        self.touch();
     }
 
     /// Scroll the viewport (positive scrolls up into history).
     pub fn scroll(&mut self, lines: i32) {
         use alacritty_terminal::grid::Scroll;
         self.term.scroll_display(Scroll::Delta(lines));
+        self.touch();
     }
 
     /// Start a fresh selection at a viewport cell.
@@ -361,6 +379,7 @@ impl Terminal {
             return;
         };
         self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        self.touch();
     }
 
     /// Extend the current selection to a viewport cell.
@@ -372,11 +391,13 @@ impl Terminal {
             return;
         };
         selection.update(point, Side::Right);
+        self.touch();
     }
 
     /// Drop the selection.
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
+        self.touch();
     }
 
     /// Whether anything is selected.

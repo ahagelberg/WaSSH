@@ -313,8 +313,8 @@ pub struct OptionsState {
     pub editor: Option<PluginId>,
     /// Secrets of app-wide plugin settings (`secret: true` fields).
     pub plugin_secrets: PluginSecretDrafts,
-    /// State of the AI agent's provider editor (a model fetch in flight).
-    pub ai_providers: wassh_plugins::ai_agent::ProviderEditor,
+    /// Editors of the plugin sections that own one, keyed by plugin.
+    pub editors: Vec<(PluginId, Box<dyn plugin_settings::SettingsEditor>)>,
 }
 
 impl OptionsState {
@@ -329,8 +329,23 @@ impl OptionsState {
             backup_path: String::new(),
             editor: None,
             plugin_secrets: PluginSecretDrafts::new(),
-            ai_providers: wassh_plugins::ai_agent::ProviderEditor::default(),
+            editors: PluginId::UI_ORDER
+                .into_iter()
+                .filter_map(|id| plugin_settings::settings_editor(id).map(|editor| (id, editor)))
+                .collect(),
         }
+    }
+
+    /// The editor one plugin's section owns, if it has one.
+    #[cfg(test)]
+    fn editor_mut<'a>(
+        &'a mut self,
+        id: PluginId,
+    ) -> Option<&'a mut (dyn plugin_settings::SettingsEditor + 'static)> {
+        self.editors
+            .iter_mut()
+            .find(|(plugin, _)| *plugin == id)
+            .map(|(_, editor)| editor.as_mut())
     }
 
     /// Select the section that belongs to `id`, so a gear next to a plugin opens
@@ -596,9 +611,6 @@ pub struct Dialogs {
     pub find: Option<FindState>,
     /// Edit-group dialog.
     pub group_edit: Option<GroupEditState>,
-    /// Plugin ids enabled in the app settings, so Host settings can list the
-    /// per-host fields of every enabled plugin.
-    pub enabled_plugins: Vec<String>,
 }
 
 impl Dialogs {
@@ -611,12 +623,21 @@ impl Dialogs {
             || self.palette.is_some()
     }
 
+    /// Whether anything at all is drawn, including the non-modal find bar.
+    pub fn any_open(&self) -> bool {
+        self.modal_open() || self.find.is_some()
+    }
+
     /// Draw every open dialog, returning the actions they produced.
+    ///
+    /// `enabled_plugins` comes from the app settings rather than a copy of them, so the
+    /// dialog cannot drift from what Options shows.
     pub fn show(
         &mut self,
         ctx: &Context,
         palette: &Palette,
         hosts: &[HostProfile],
+        enabled_plugins: &[String],
         find_matches: usize,
     ) -> Vec<DialogAction> {
         let mut actions = Vec::new();
@@ -633,17 +654,11 @@ impl Dialogs {
             });
             if !committed {
                 options_plugin_editor(ctx, palette, state);
-                options_provider_dialog(ctx, palette, state);
+                options_editor_dialogs(ctx, palette, state);
             }
         }
         if let Some(state) = self.host.as_mut() {
-            actions.extend(host_dialog(
-                ctx,
-                palette,
-                state,
-                hosts,
-                &self.enabled_plugins,
-            ));
+            actions.extend(host_dialog(ctx, palette, state, hosts, enabled_plugins));
         }
         if self.about {
             actions.extend(about_dialog(ctx, palette));
@@ -1093,14 +1108,14 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         backup_path,
         editor,
         plugin_secrets,
-        ai_providers,
+        editors,
         ..
     } = state;
     // Set while the section closure runs; applied once the shell returns.
     let mut open_editor = None;
-    // Dialogs the sections open on top of the settings: a plugin's own editor and the
-    // AI agent's provider draft. Escape closes the top one, not Options.
-    let sub_dialog = editor.is_some() || ai_providers.dialog_open();
+    // Dialogs the sections open on top of the settings: a plugin's own editor and its
+    // settings drafts. Escape closes the top one, not Options.
+    let sub_dialog = editor.is_some() || editors.iter().any(|(_, editor)| editor.dialog_open());
     // Plugins add one section each after the built-in ones, in plugin order, the
     // same way the original app appends them to its section list.
     let plugin_sections = app_plugin_sections(draft);
@@ -1169,7 +1184,7 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
                             palette,
                             section,
                             values,
-                            ai_providers,
+                            editors,
                             plugin_secrets,
                         );
                     }
@@ -1191,7 +1206,9 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         // A dialog on top of the settings takes the dismissal, so the settings stay open.
         ShellOutcome::Dismissed if sub_dialog => {
             *editor = None;
-            ai_providers.cancel();
+            for (_, editor) in editors.iter_mut() {
+                editor.cancel();
+            }
         }
         ShellOutcome::Cancel | ShellOutcome::Dismissed => actions.push(DialogAction::Close),
         ShellOutcome::Delete | ShellOutcome::Apply | ShellOutcome::Pending => {}
@@ -1489,80 +1506,82 @@ fn options_plugin_editor(ctx: &Context, palette: &Palette, state: &mut OptionsSt
     }
 }
 
-/// The AI agent's "add or edit a provider" dialog.
+/// The plugin editors' own dialogs, for the sections that own one.
 ///
 /// The plugin owns the draft and its fields; the frame, the title, the buttons and
-/// Escape are this app's, so the dialog behaves like every other one here and sits on
+/// Escape are this app's, so such a dialog behaves like every other one here and sits on
 /// top of Options without either dialog knowing the other.
-fn options_provider_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) {
-    if !state.ai_providers.dialog_open() {
-        return;
-    }
+fn options_editor_dialogs(ctx: &Context, palette: &Palette, state: &mut OptionsState) {
     let OptionsState {
         draft,
-        ai_providers,
+        editors,
         plugin_secrets,
         ..
     } = state;
-    let values = draft
-        .plugin_settings
-        .entry(PluginId::AiAgent.as_str().to_owned())
-        .or_default();
-    let title = ai_providers.dialog_title();
-    let primary = ai_providers.dialog_primary();
-    let can_commit = ai_providers.can_commit();
-    let mut commit = false;
-    let mut cancel = false;
-    let response = modal(
-        ctx,
-        "ai-agent-provider",
-        palette,
-        title,
-        wassh_plugins::ai_agent::PROVIDER_DIALOG_WIDTH,
-        |ui| {
-            ai_providers.dialog_body(ui, palette, values, plugin_secrets);
-            footer(ui, |ui| {
-                if small_button_enabled(ui, palette, primary, can_commit) {
-                    commit = true;
-                }
-                if small_button(ui, palette, "Cancel") {
-                    cancel = true;
-                }
-            });
-        },
-    );
-    if commit {
-        ai_providers.commit(values, plugin_secrets);
-    } else if cancel || response.dismissed {
-        ai_providers.cancel();
+    for (id, editor) in editors.iter_mut().filter(|(_, editor)| editor.dialog_open()) {
+        let values = draft
+            .plugin_settings
+            .entry(id.as_str().to_owned())
+            .or_default();
+        let title = editor.dialog_title();
+        let primary = editor.dialog_primary();
+        let can_commit = editor.can_commit();
+        let mut commit = false;
+        let mut cancel = false;
+        let response = modal(
+            ctx,
+            id.as_str(),
+            palette,
+            title,
+            editor.dialog_width(),
+            |ui| {
+                editor.dialog_body(ui, palette, values, plugin_secrets);
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, primary, can_commit) {
+                        commit = true;
+                    }
+                    if small_button(ui, palette, "Cancel") {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if commit {
+            editor.commit(values, plugin_secrets);
+        } else if cancel || response.dismissed {
+            editor.cancel();
+        }
     }
 }
 
-/// One plugin section's content: its provider list (when it has one) and its settings.
+/// One plugin section's content: the record list its editor draws (when it has one), then
+/// its settings rows.
 ///
 /// Everything is drawn inline in the global dialog; the only dialog a plugin section opens
-/// is the app's single-item editor, which the AI agent fills with an add/edit provider
-/// draft (see [`options_provider_dialog`]).
+/// is its editor's own (see [`options_editor_dialogs`]).
 fn plugin_section_rows(
     ui: &mut Ui,
     palette: &Palette,
     section: &PluginSection,
     values: &mut serde_json::Map<String, serde_json::Value>,
-    editor: &mut wassh_plugins::ai_agent::ProviderEditor,
+    editors: &mut [(PluginId, Box<dyn plugin_settings::SettingsEditor>)],
     secrets: &mut PluginSecretDrafts,
 ) {
-    if plugin_settings::draws_provider_list(section.id) {
-        row_block(ui, palette, "Providers", |ui| {
+    let editor = editors
+        .iter_mut()
+        .find(|(id, _)| *id == section.id)
+        .map(|(_, editor)| editor.as_mut());
+    if let Some(editor) = editor
+        && let Some((heading, hint)) = editor.list_caption()
+    {
+        row_block(ui, palette, heading, |ui| {
             ui.label(
-                egui::RichText::new(
-                    "Endpoints the AI agent can chat through. API keys are sealed in the \
-                     credential vault.",
-                )
-                .size(11.0)
-                .color(to_color32(palette.text_muted)),
+                egui::RichText::new(hint)
+                    .size(11.0)
+                    .color(to_color32(palette.text_muted)),
             );
             ui.add_space(6.0);
-            editor.show(ui, palette, values, secrets);
+            editor.show_list(ui, palette, values, secrets);
         });
     }
     plugin_settings_rows(
@@ -3277,11 +3296,14 @@ mod tests {
     use super::*;
     use wassh_core::{ConnectionParams, RemoteSession};
 
+    /// No plugin is enabled in the tests that do not care about plugin sections.
+    const ENABLED_NONE: &[String] = &[];
+
     /// Run one frame of the dialogs headlessly and count the painted shapes.
     fn run_frame(ctx: &Context, dialogs: &mut Dialogs) -> usize {
         let palette = Palette::dark();
         let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            dialogs.show(ctx, &palette, &[], 0);
+            dialogs.show(ctx, &palette, &[], ENABLED_NONE, 0);
         });
         let shapes = output.shapes.len();
         output.drop_without_applying_deltas();
@@ -3295,7 +3317,7 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run_pass(input, |ctx| {
-            dialogs.show(ctx, &palette, &[], 0);
+            dialogs.show(ctx, &palette, &[], ENABLED_NONE, 0);
         });
         let shapes = output.shapes.len();
         output.drop_without_applying_deltas();
@@ -3355,7 +3377,7 @@ mod tests {
                 ..Default::default()
             };
             let output = ctx.run_pass(input, |ctx| {
-                dialogs.show(ctx, &Palette::dark(), &[], 0);
+                dialogs.show(ctx, &Palette::dark(), &[], ENABLED_NONE, 0);
             });
             for clipped in &output.shapes {
                 let painted = clipped.shape.visual_bounding_rect();
@@ -3790,7 +3812,7 @@ mod tests {
                         &palette,
                         &section,
                         &mut values,
-                        &mut state.ai_providers,
+                        &mut state.editors,
                         &mut state.plugin_secrets,
                     );
                     state
@@ -3956,8 +3978,9 @@ mod tests {
         assert!(
             dialogs
                 .options
-                .as_ref()
-                .is_some_and(|state| state.ai_providers.dialog_open()),
+                .as_mut()
+                .and_then(|state| state.editor_mut(PluginId::AiAgent))
+                .is_some_and(|editor| editor.dialog_open()),
             "the draft is open"
         );
         let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
@@ -3974,8 +3997,13 @@ mod tests {
             modifiers: Default::default(),
         }];
         run_options(&ctx, &mut dialogs, size, 30.0, escape.to_vec());
-        let state = dialogs.options.as_ref().expect("Options stays open");
-        assert!(!state.ai_providers.dialog_open(), "Escape closed the draft");
+        let open = dialogs
+            .options
+            .as_mut()
+            .and_then(|state| state.editor_mut(PluginId::AiAgent))
+            .is_some_and(|editor| editor.dialog_open());
+        assert!(dialogs.options.is_some(), "Options stays open");
+        assert!(!open, "Escape closed the draft");
     }
 
     /// One Options dialog frame with a clock (the settings scroll area animates its
@@ -3995,7 +4023,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_pass(input, |ctx| {
-            let _ = dialogs.show(ctx, &palette, &[], 0);
+            let _ = dialogs.show(ctx, &palette, &[], ENABLED_NONE, 0);
         });
         let shapes = std::mem::take(&mut output.shapes);
         output.drop_without_applying_deltas();
@@ -4172,11 +4200,11 @@ mod tests {
         let palette = Palette::dark();
         let mut with_plugin = Dialogs {
             host: Some(HostState::draft(HostProfile::default(), true)),
-            enabled_plugins: vec!["docker-manager".to_owned()],
             ..Dialogs::default()
         };
+        let docker = ["docker-manager".to_owned()];
         let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
-            let actions = with_plugin.show(ctx, &palette, &[], 0);
+            let actions = with_plugin.show(ctx, &palette, &[], &docker, 0);
             assert!(actions.is_empty(), "drawing a dialog commits nothing");
         });
         // The rail lists the built-in sections plus the plugin's.
@@ -4187,7 +4215,7 @@ mod tests {
             ..Dialogs::default()
         };
         let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
-            let _ = without_plugin.show(ctx, &palette, &[], 0);
+            let _ = without_plugin.show(ctx, &palette, &[], ENABLED_NONE, 0);
         });
         assert!(!rows.iter().any(|(_, _, text)| text == "Docker"));
     }
@@ -4543,7 +4571,7 @@ mod tests {
         };
         let ctx = Context::default();
         let rows = painted_rows(&ctx, Vec2::new(900.0, 700.0), |ctx| {
-            dialogs.show(ctx, &Palette::dark(), &[], 0);
+            dialogs.show(ctx, &Palette::dark(), &[], ENABLED_NONE, 0);
         });
         let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
         assert!(texts.contains(&"work"), "chip missing: {texts:?}");

@@ -28,7 +28,7 @@ pub use protocol::{
 pub use providers::{CompletionRequest, EmbedConfig, StreamEvent, provider_models};
 pub use rules::{ApprovalScope, RuleDecision, approval_scopes, decide_command};
 pub use settings_ui::{
-    API_KEYS_KEY, PROVIDER_DIALOG_WIDTH, PROVIDERS_KEY, ProviderEditor, is_provider_key_field,
-    provider_ids, provider_secret_field,
+    API_KEYS_KEY, PROVIDERS_KEY, ProviderEditor, is_provider_key_field, provider_ids,
+    provider_secret_field,
 };
 pub use view::AiAgent;

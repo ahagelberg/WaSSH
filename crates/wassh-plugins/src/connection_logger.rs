@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use egui::Ui;
 use serde::{Deserialize, Serialize};
+use wassh_core::time::now_ms;
 use wassh_core::{ConnectionEvent, Palette, SessionStatus};
 
-use crate::color::to_color32;
+use wassh_ui::to_color32;
 use wassh_ui::widgets::{Button, fixed_inset_card, small_button};
 
 use crate::plugin::{Plugin, PluginContext};
@@ -152,14 +153,6 @@ pub fn format_duration(ms: Option<u64>) -> String {
         3600..=86_399 => format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60),
         _ => format!("{}d {}h", seconds / 86_400, (seconds % 86_400) / 3600),
     }
-}
-
-/// Wall-clock time in milliseconds.
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Which graph the pane draws.
@@ -572,7 +565,7 @@ impl Plugin for ConnectionLogger {
         ui.add_space(BLOCK_GAP);
         self.list(ui, &palette);
         // "Now" and the current duration move on their own.
-        ui.ctx().request_repaint_after(TICK);
+        context.request_repaint_after(TICK);
     }
 }
 
@@ -1520,6 +1513,7 @@ mod tests {
                     session: None,
                     events: &[],
                     pending_input: Vec::new(),
+                    repaint_after: None,
                     secrets: &secrets,
                     secret_writes: Vec::new(),
                 };

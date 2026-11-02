@@ -820,13 +820,64 @@ pub fn app_presentation(id: PluginId) -> Presentation {
     }
 }
 
-/// Whether a plugin's Options section draws a provider list above its settings.
+/// A plugin's own editor for settings that are not plain label/control rows.
 ///
-/// The AI agent's provider list is app-wide state edited in a list view, so it cannot be
-/// a label/control row. It is still part of the section — only adding a single provider
-/// opens a dialog, and the plugin's own editor draws that.
-pub fn draws_provider_list(id: PluginId) -> bool {
-    matches!(id, PluginId::AiAgent)
+/// The host draws the dialog frame, the title and the buttons, so a plugin editor behaves
+/// like the app's own dialogs; the plugin owns the draft and knows its own fields. The
+/// same value also draws the inline record list some sections need above their rows.
+pub trait SettingsEditor {
+    /// Whether a draft is open on top of the section.
+    fn dialog_open(&self) -> bool;
+
+    /// Title of the open dialog.
+    fn dialog_title(&self) -> &'static str;
+
+    /// Label of the open dialog's commit button.
+    fn dialog_primary(&self) -> &'static str;
+
+    /// Whether the open draft has all it needs to be committed.
+    fn can_commit(&self) -> bool;
+
+    /// Width of the open dialog.
+    fn dialog_width(&self) -> f32;
+
+    /// Draw the open dialog's fields.
+    fn dialog_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &wassh_core::Palette,
+        values: &Map<String, Value>,
+        secrets: &PluginSecretDrafts,
+    );
+
+    /// Commit the open draft into the section's values and secret drafts.
+    fn commit(&mut self, values: &mut Map<String, Value>, secrets: &mut PluginSecretDrafts);
+
+    /// Drop the open draft without saving.
+    fn cancel(&mut self);
+
+    /// Heading and hint of the record list this section draws above its rows.
+    fn list_caption(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
+
+    /// Draw the record list, inside the block [`SettingsEditor::list_caption`] describes.
+    fn show_list(
+        &mut self,
+        _ui: &mut egui::Ui,
+        _palette: &wassh_core::Palette,
+        _values: &mut Map<String, Value>,
+        _secrets: &mut PluginSecretDrafts,
+    ) {
+    }
+}
+
+/// A plugin's own settings editor, for the ones that have one.
+pub fn settings_editor(id: PluginId) -> Option<Box<dyn SettingsEditor>> {
+    match id {
+        PluginId::AiAgent => Some(Box::<crate::ai_agent::ProviderEditor>::default()),
+        _ => None,
+    }
 }
 
 /// Fields Options shows for a plugin, app-wide.
@@ -999,6 +1050,69 @@ pub fn secret_scope(id: PluginId, key: &str) -> Option<bool> {
         .into_iter()
         .find(|(field, _)| *field == key)
         .map(|(_, app)| app)
+}
+
+/// Every secret field `id` has for the given values: its schema's fields plus the ones it
+/// names at runtime.
+///
+/// The AI agent's API keys are filed under a field per configured provider, so the list
+/// can only be known once its settings are read. `values` are the plugin's own app-wide
+/// settings, where that list lives.
+pub fn secret_fields_for(
+    id: PluginId,
+    values: Option<&Map<String, Value>>,
+) -> Vec<(String, bool)> {
+    let mut fields: Vec<(String, bool)> = secret_fields(id)
+        .into_iter()
+        .map(|(key, app_wide)| (key.to_owned(), app_wide))
+        .collect();
+    if let (PluginId::AiAgent, Some(values)) = (id, values) {
+        for provider in crate::ai_agent::provider_ids(values) {
+            fields.push((crate::ai_agent::provider_secret_field(&provider), true));
+        }
+    }
+    fields
+}
+
+/// Whether `field` is a secret `id` names at runtime rather than in its schema.
+///
+/// Such a field is app-wide whatever values the plugin's data holds.
+pub fn is_runtime_secret(id: PluginId, field: &str) -> bool {
+    id == PluginId::AiAgent && crate::ai_agent::is_provider_key_field(field)
+}
+
+/// Credentials an earlier build kept in plain text under a key outside the schema.
+///
+/// Returned as `(vault field, plain text)` so the caller can seal them. See
+/// [`take_legacy_secrets`] for the version that also removes them.
+pub fn legacy_secrets(id: PluginId, values: &Map<String, Value>) -> Vec<(String, String)> {
+    if id != PluginId::AiAgent {
+        return Vec::new();
+    }
+    let Some(keys) = values
+        .get(crate::ai_agent::API_KEYS_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    keys.iter()
+        .filter_map(|(provider, key)| {
+            let text = key.as_str().filter(|text| !text.is_empty())?;
+            Some((
+                crate::ai_agent::provider_secret_field(provider),
+                text.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Take the credentials [`legacy_secrets`] reports out of `values`.
+pub fn take_legacy_secrets(id: PluginId, values: &mut Map<String, Value>) -> Vec<(String, String)> {
+    let found = legacy_secrets(id, values);
+    if id == PluginId::AiAgent {
+        values.remove(crate::ai_agent::API_KEYS_KEY);
+    }
+    found
 }
 
 /// Schema defaults overlaid with the configured app and host values.
@@ -1180,14 +1294,17 @@ mod tests {
         assert_eq!(app_presentation(PluginId::AiAgent), Presentation::Fields);
         assert!(!app_schema(PluginId::AiAgent).is_empty());
         // Its provider list is a list view, drawn inside the same section.
-        assert!(draws_provider_list(PluginId::AiAgent));
-        // Nothing else has one.
-        let with_list: Vec<_> = PluginId::ALL
+        assert!(
+            settings_editor(PluginId::AiAgent)
+                .is_some_and(|editor| editor.list_caption().is_some())
+        );
+        // Nothing else owns an editor.
+        let with_editor: Vec<_> = PluginId::ALL
             .into_iter()
-            .filter(|id| draws_provider_list(*id))
+            .filter(|id| settings_editor(*id).is_some())
             .map(|id| id.as_str())
             .collect();
-        assert_eq!(with_list, ["ai-agent"]);
+        assert_eq!(with_editor, ["ai-agent"]);
     }
 
     #[test]

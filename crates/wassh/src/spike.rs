@@ -561,13 +561,19 @@ impl eframe::App for SpikeApp {
             self.resize_backend(size);
         }
 
-        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-        if scroll.abs() > 0.0 {
-            self.terminal.scroll((scroll / 20.0).round() as i32);
-        }
-
         let snapshot = self.terminal.snapshot();
-        self.view.show(ui, &snapshot, &self.palette);
+        let response = self.view.show(ui, &snapshot, &self.palette);
+        drop(snapshot);
+        if response.contains_pointer() {
+            let (_, cell_h) = self.view.cell_size(ui);
+            let delta = ui
+                .ctx()
+                .input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta.y));
+            let lines = (delta / cell_h).round() as i32;
+            if lines != 0 {
+                self.terminal.scroll(lines);
+            }
+        }
 
         // Placeholder until output wakes the UI directly.
         ctx.request_repaint_after(Duration::from_millis(16));
