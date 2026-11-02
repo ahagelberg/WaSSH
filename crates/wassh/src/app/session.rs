@@ -2484,6 +2484,20 @@ impl wassh_plugins::TerminalAccess for SessionEntry {
     }
 }
 
+/// Count the open sessions attached to each saved host, in first-seen order.
+pub fn open_host_sessions<'a>(
+    sessions: impl Iterator<Item = Option<&'a str>>,
+) -> Vec<(String, usize)> {
+    let mut open: Vec<(String, usize)> = Vec::new();
+    for host in sessions.flatten() {
+        match open.iter_mut().find(|(id, _)| id == host) {
+            Some((_, count)) => *count += 1,
+            None => open.push((host.to_owned(), 1)),
+        }
+    }
+    open
+}
+
 /// Resolve the jump chain for `params`, outermost hop first.
 ///
 /// Follows `jump_host_id` through the saved hosts, refusing loops. Credentials come
@@ -3563,5 +3577,15 @@ mod tests {
             entry.status,
             SessionStatus::Connecting | SessionStatus::Connected
         ));
+    }
+
+    #[test]
+    fn open_sessions_are_counted_per_saved_host() {
+        let sessions = [Some("alpha"), None, Some("beta"), Some("alpha")];
+        assert_eq!(
+            open_host_sessions(sessions.into_iter()),
+            vec![("alpha".to_owned(), 2), ("beta".to_owned(), 1)]
+        );
+        assert!(open_host_sessions(std::iter::empty()).is_empty());
     }
 }

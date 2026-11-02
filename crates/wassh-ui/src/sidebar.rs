@@ -3,7 +3,8 @@
 //!
 //! Metrics (`.host-list`, `.host-group`,
 //! `.host-item`): 240 px wide, 8 px list padding, group cards with an 8 px radius and
-//! 6×8 padding, host rows with 6×4 padding, a 4 px colour bar and 2 px row gaps.
+//! 6×8 padding, host rows with 6×4 padding, a 4 px colour bar, a card surface and 2 px
+//! row gaps, plus a dot on hosts that have open sessions.
 
 use egui::{Align2, FontId, Id, Pos2, Rect, Sense, Ui, Vec2};
 use wassh_core::{HostGroup, HostProfile, HostsDocument, Palette, colors};
@@ -45,6 +46,16 @@ pub const DROP_INDICATOR: f32 = 2.0;
 pub const COLOR_POPOVER_WIDTH: f32 = 224.0;
 /// Swatch size inside the colour popover.
 pub const SWATCH: f32 = 24.0;
+/// Opacity of a host card's outline while the row is idle.
+const HOST_BORDER_ALPHA: f32 = 0.7;
+/// Diameter of the dot marking a host with open sessions.
+pub const SESSION_DOT: f32 = 6.0;
+/// Gap between the session dot and its count.
+const SESSION_DOT_GAP: f32 = 3.0;
+/// Text size of the session count.
+const SESSION_COUNT_SIZE: f32 = 9.0;
+/// Space kept between a host's text and its session indicator.
+const INDICATOR_GAP: f32 = 6.0;
 
 /// A user action from the sidebar.
 #[derive(Clone, Debug, PartialEq)]
@@ -130,10 +141,14 @@ pub fn host_meta(host: &HostProfile) -> String {
 }
 
 /// Draw the whole sidebar, returning the first action the user triggered.
+///
+/// `open` pairs the id of every saved host that has a live session with how many
+/// sessions point at it, so the list can mark those hosts.
 pub fn sidebar(
     ui: &mut Ui,
     palette: &Palette,
     hosts: &HostsDocument,
+    open: &[(String, usize)],
     state: &mut SidebarState,
 ) -> Option<SidebarAction> {
     let mut action = None;
@@ -250,7 +265,7 @@ pub fn sidebar(
                     ui.add_space(LIST_PADDING);
                     ui.vertical(|ui| {
                         ui.set_width(width - LIST_PADDING * 2.0);
-                        if let Some(found) = host_list(ui, palette, hosts, state) {
+                        if let Some(found) = host_list(ui, palette, hosts, open, state) {
                             action = Some(found);
                         }
                     });
@@ -291,6 +306,7 @@ fn host_list(
     ui: &mut Ui,
     palette: &Palette,
     hosts: &HostsDocument,
+    open: &[(String, usize)],
     state: &mut SidebarState,
 ) -> Option<SidebarAction> {
     let mut action = None;
@@ -309,7 +325,9 @@ fn host_list(
             continue;
         }
         shown_groups += 1;
-        if let Some(found) = group_card(ui, palette, group, &members, state, &mut drop_target) {
+        if let Some(found) =
+            group_card(ui, palette, group, &members, open, state, &mut drop_target)
+        {
             action = Some(found);
         }
     }
@@ -321,7 +339,7 @@ fn host_list(
             // Without groups the hosts are drawn as a flat list.
             for (index, host) in ungrouped.iter().enumerate() {
                 if let Some(found) =
-                    host_row(ui, palette, host, state, None, index, &mut drop_target)
+                    host_row(ui, palette, host, open, state, None, index, &mut drop_target)
                 {
                     action = Some(found);
                 }
@@ -339,7 +357,7 @@ fn host_list(
             ui.add_space(4.0);
             for (index, host) in ungrouped.iter().enumerate() {
                 if let Some(found) =
-                    host_row(ui, palette, host, state, None, index, &mut drop_target)
+                    host_row(ui, palette, host, open, state, None, index, &mut drop_target)
                 {
                     action = Some(found);
                 }
@@ -410,6 +428,7 @@ fn group_card(
     palette: &Palette,
     group: &HostGroup,
     members: &[&HostProfile],
+    open: &[(String, usize)],
     state: &mut SidebarState,
     drop_target: &mut Option<(Option<String>, usize)>,
 ) -> Option<SidebarAction> {
@@ -548,7 +567,7 @@ fn group_card(
             ui.add_space(4.0);
             for (index, host) in members.iter().enumerate() {
                 if let Some(found) =
-                    host_row(ui, palette, host, state, Some(&group.id), index, drop_target)
+                    host_row(ui, palette, host, open, state, Some(&group.id), index, drop_target)
                 {
                     action = Some(found);
                 }
@@ -574,6 +593,7 @@ fn host_row(
     ui: &mut Ui,
     palette: &Palette,
     host: &HostProfile,
+    open: &[(String, usize)],
     state: &mut SidebarState,
     group: Option<&str>,
     index: usize,
@@ -592,6 +612,10 @@ fn host_row(
 
     let backdrop = palette.bg_panel_2;
     let selected = state.is_selected(&host.id);
+    let sessions = open
+        .iter()
+        .find(|(id, _)| id == &host.id)
+        .map_or(0, |(_, count)| *count);
     let fill = if host.connection.style.tab_color.is_some() {
         colors::row_background(
             host.connection.style.tab_color,
@@ -604,18 +628,23 @@ fn host_row(
     } else {
         backdrop
     };
-    if response.hovered() || dragging || selected {
-        ui.painter()
-            .rect_filled(rect, wassh_core::RADIUS, to_color32(fill));
-        if response.hovered() && !selected {
-            ui.painter().rect_stroke(
-                rect,
-                wassh_core::RADIUS,
-                egui::Stroke::new(1.0, to_color32(palette.border)),
-                egui::StrokeKind::Inside,
-            );
-        }
-    }
+    // Every host is a card: the surface and its hairline separate it from the panel
+    // behind it and from the row above and below.
+    ui.painter()
+        .rect_filled(rect, wassh_core::RADIUS, to_color32(fill));
+    let outline = if selected {
+        to_color32(palette.accent)
+    } else if response.hovered() || dragging {
+        to_color32(palette.border)
+    } else {
+        to_color32(palette.border).gamma_multiply(HOST_BORDER_ALPHA)
+    };
+    ui.painter().rect_stroke(
+        rect,
+        wassh_core::RADIUS,
+        egui::Stroke::new(1.0, outline),
+        egui::StrokeKind::Inside,
+    );
 
     let mut left = rect.left() + HOST_PADDING.x;
     let bar = Rect::from_min_max(
@@ -630,9 +659,30 @@ fn host_row(
     ui.painter().rect_filled(bar, 2, bar_colour);
     left += ACCENT_BAR + 6.0;
 
+    // The session indicator takes its room from the right, so the text stops short of it.
+    let count_text = (sessions > 1).then(|| sessions.min(99).to_string());
+    let count_width = count_text.as_ref().map_or(0.0, |text| {
+        ui.painter()
+            .layout_no_wrap(
+                text.clone(),
+                FontId::proportional(SESSION_COUNT_SIZE),
+                to_color32(palette.text_muted),
+            )
+            .size()
+            .x
+    });
+    let indicator_width = if sessions == 0 {
+        0.0
+    } else if count_text.is_some() {
+        SESSION_DOT + SESSION_DOT_GAP + count_width + INDICATOR_GAP
+    } else {
+        SESSION_DOT + INDICATOR_GAP
+    };
+    let text_right = rect.right() - HOST_PADDING.x - indicator_width;
+
     let name_rect = Rect::from_min_max(
         Pos2::new(left, rect.top() + 3.0),
-        Pos2::new(rect.right() - HOST_PADDING.x, rect.center().y),
+        Pos2::new(text_right, rect.center().y),
     );
     let painter = ui.painter().with_clip_rect(name_rect);
     painter.text(
@@ -644,7 +694,7 @@ fn host_row(
     );
     let meta_rect = Rect::from_min_max(
         Pos2::new(left, rect.center().y),
-        Pos2::new(rect.right() - HOST_PADDING.x, rect.bottom() - 3.0),
+        Pos2::new(text_right, rect.bottom() - 3.0),
     );
     let painter = ui.painter().with_clip_rect(meta_rect);
     painter.text(
@@ -654,6 +704,26 @@ fn host_row(
         FontId::proportional(11.0),
         to_color32(palette.text_muted),
     );
+    if sessions > 0 {
+        let mut right = rect.right() - HOST_PADDING.x;
+        if let Some(text) = &count_text {
+            let galley = ui.painter().layout_no_wrap(
+                text.clone(),
+                FontId::proportional(SESSION_COUNT_SIZE),
+                to_color32(palette.text_muted),
+            );
+            let size = galley.size();
+            let pos = Pos2::new(right - size.x, rect.center().y - size.y / 2.0);
+            ui.painter()
+                .galley(pos, galley, to_color32(palette.text_muted));
+            right -= size.x + SESSION_DOT_GAP;
+        }
+        ui.painter().circle_filled(
+            Pos2::new(right - SESSION_DOT / 2.0, rect.center().y),
+            SESSION_DOT / 2.0,
+            to_color32(palette.ok),
+        );
+    }
 
     if dragging {
         ui.painter().rect_stroke(
@@ -757,7 +827,7 @@ mod tests {
         let mut action = None;
         for _ in 0..2 {
             let output = ctx.run_ui(input.clone(), |ui| {
-                action = sidebar(ui, &palette, &hosts, state);
+                action = sidebar(ui, &palette, &hosts, &[], state);
             });
             output.drop_without_applying_deltas();
         }
@@ -827,7 +897,7 @@ mod tests {
         let mut labels = Vec::new();
         for _ in 0..2 {
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                sidebar(ui, &palette, hosts, state);
+                sidebar(ui, &palette, hosts, &[], state);
             });
             let shapes = std::mem::take(&mut output.shapes);
             labels.clear();
@@ -851,7 +921,7 @@ mod tests {
         let mut labels = Vec::new();
         for _ in 0..2 {
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                sidebar(ui, &palette, hosts, state);
+                sidebar(ui, &palette, hosts, &[], state);
             });
             let shapes = std::mem::take(&mut output.shapes);
             labels.clear();
@@ -1000,13 +1070,91 @@ mod tests {
         let mut painted = 0;
         for _ in 0..2 {
             let output = ctx.run_ui(input.clone(), |ui| {
-                sidebar(ui, &palette, &hosts, &mut state);
+                sidebar(ui, &palette, &hosts, &[], &mut state);
             });
             painted = output.shapes.len();
             output.drop_without_applying_deltas();
         }
         assert!(painted > 20, "the sidebar painted only {painted} shapes");
         assert!(state.is_selected("h1"));
+    }
+
+    /// Every shape the sidebar painted, after one settled frame.
+    fn painted_shapes(
+        hosts: &HostsDocument,
+        open: &[(String, usize)],
+        state: &mut SidebarState,
+    ) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(240.0, 400.0))),
+            ..Default::default()
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                sidebar(ui, &palette, hosts, open, state);
+            });
+            shapes = std::mem::take(&mut output.shapes)
+                .into_iter()
+                .map(|clipped| clipped.shape)
+                .collect();
+            output.drop_without_applying_deltas();
+        }
+        shapes
+    }
+
+    #[test]
+    fn host_rows_are_framed_and_hosts_with_sessions_get_a_dot() {
+        let hosts = HostsDocument {
+            hosts: vec![host("alpha"), host("beta")],
+            ..Default::default()
+        }
+        .normalized();
+        let palette = Palette::dark();
+        let card_fill = to_color32(palette.bg_panel_2);
+
+        let mut state = SidebarState::new();
+        let idle = painted_shapes(&hosts, &[], &mut state);
+        let cards = idle
+            .iter()
+            .filter(|shape| matches!(shape, egui::Shape::Rect(rect) if rect.fill == card_fill))
+            .count();
+        assert!(cards >= 2, "both hosts need a card surface, got {cards}");
+        assert!(
+            !idle
+                .iter()
+                .any(|shape| matches!(shape, egui::Shape::Circle(_))),
+            "no session dot without sessions"
+        );
+
+        let mut state = SidebarState::new();
+        let open = [("alpha".to_owned(), 1)];
+        let busy = painted_shapes(&hosts, &open, &mut state);
+        let dots: Vec<&egui::Shape> = busy
+            .iter()
+            .filter(|shape| matches!(shape, egui::Shape::Circle(_)))
+            .collect();
+        assert_eq!(dots.len(), 1, "one dot for the host with a session");
+        if let egui::Shape::Circle(dot) = dots[0] {
+            assert!(
+                dot.center.x > SIDEBAR_WIDTH / 2.0,
+                "the dot sits in the text: {dot:?}"
+            );
+        }
+
+        // More than one session adds a count beside the dot.
+        let mut state = SidebarState::new();
+        let many = [("alpha".to_owned(), 3)];
+        let busy = painted_shapes(&hosts, &many, &mut state);
+        assert!(
+            busy.iter().any(|shape| match shape {
+                egui::Shape::Text(text) => text.galley.text() == "3",
+                _ => false,
+            }),
+            "the session count is not painted"
+        );
     }
 
     #[test]

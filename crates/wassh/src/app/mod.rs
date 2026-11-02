@@ -32,7 +32,9 @@ use self::dialogs::{
     tab_menu_items,
 };
 use self::quick_connect::{QuickForm, quick_connect};
-use self::session::{PluginValues, Secrets, SessionEntry, SshOpen, jump_chain};
+use self::session::{
+    PluginValues, Secrets, SessionEntry, SshOpen, jump_chain, open_host_sessions,
+};
 
 /// How long the window must stay put before its geometry is written to `settings.json`.
 const WINDOW_BOUNDS_SETTLE: Duration = Duration::from_millis(700);
@@ -2350,6 +2352,8 @@ impl Shell {
         };
         let mut action = None;
         let mut submitted = None;
+        let open =
+            open_host_sessions(self.sessions.iter().map(|entry| entry.host_id.as_deref()));
         let hosts = &self.hosts;
         let sidebar = &mut self.sidebar;
         let quick = &mut self.quick;
@@ -2366,7 +2370,7 @@ impl Shell {
                 let quick_height = if collapsed { 0.0 } else { 236.0 };
                 let list_height = (ui.available_height() - quick_height).max(80.0);
                 ui.allocate_ui(Vec2::new(width, list_height), |ui| {
-                    action = wassh_ui::sidebar(ui, &palette, hosts, sidebar);
+                    action = wassh_ui::sidebar(ui, &palette, hosts, &open, sidebar);
                 });
                 if !collapsed {
                     ui.separator();
