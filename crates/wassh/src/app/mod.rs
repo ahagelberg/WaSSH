@@ -1090,9 +1090,13 @@ impl Shell {
                 continue;
             }
             session.apply_connection(host.connection.clone(), &defaults);
+            // "Apply to sessions" makes them match the host, so a tab's own plugin
+            // values give way to the ones being pushed.
+            session.clear_plugin_overrides();
             session.reload_pane_settings();
             applied += 1;
         }
+        self.touch_plugin_data();
         applied
     }
 
@@ -1100,9 +1104,17 @@ impl Shell {
     ///
     /// Returns false when the tab is gone. Credentials stay in the tab: nothing is
     /// written to `hosts.json` or to the vault, so the saved host and its other
-    /// sessions keep their own settings.
+    /// sessions keep their own settings. Plugin values the dialog changed are kept in
+    /// the tab the same way, layered over the host's.
     fn apply_to_session(&mut self, session_id: &str, save: &HostSave) -> bool {
         let defaults = self.settings.session_style_defaults.clone();
+        let stored_plugins = self
+            .hosts
+            .host(&save.host.id)
+            .map(|host| host.plugin_settings.clone())
+            .unwrap_or_default();
+        let overrides = plugin_overrides(&stored_plugins, &save.host.plugin_settings);
+        let secret_overrides = session_secret_overrides(&save.plugin_secrets);
         let Some(session) = self
             .sessions
             .iter_mut()
@@ -1111,12 +1123,14 @@ impl Shell {
             return false;
         };
         session.apply_connection(save.host.connection.clone(), &defaults);
+        session.set_plugin_settings(overrides, secret_overrides);
         if let Some(value) = secret_value(&save.password) {
             session.secrets.password = value.unwrap_or_default().to_owned();
         }
         if let Some(value) = secret_value(&save.passphrase) {
             session.secrets.key_passphrase = value.unwrap_or_default().to_owned();
         }
+        self.touch_plugin_data();
         true
     }
 
@@ -1354,7 +1368,19 @@ impl Shell {
 
     /// Build the dialog for the session opened from a tab: Save stays on that tab.
     fn session_state(&self, host: HostProfile, session: &str) -> HostState {
-        self.dialog_state(host, false, HostTarget::Session(session.to_owned()))
+        let mut state = self.dialog_state(host, false, HostTarget::Session(session.to_owned()));
+        // A secret this tab set shows as stored: the tab holds it, not the vault.
+        if let Some(entry) = self.sessions.iter().find(|entry| entry.id == session) {
+            for (id, fields) in entry.plugin_secret_overrides() {
+                for field in fields.keys() {
+                    state
+                        .plugin_secrets
+                        .entry(self::dialogs::secret_field_key(id, field))
+                        .or_insert_with(self::dialogs::SecretDraft::stored);
+                }
+            }
+        }
+        state
     }
 
     fn dialog_state(&self, host: HostProfile, is_new: bool, target: HostTarget) -> HostState {
@@ -1531,6 +1557,11 @@ impl Shell {
                         ..HostProfile::default()
                     });
                 draft.connection = connection;
+                // Show what this tab uses, not just what the host stores.
+                if let Some(session) = self.sessions.iter().find(|session| session.id == session_id)
+                {
+                    session.with_plugin_overrides(&mut draft.plugin_settings);
+                }
                 self.dialogs.host = Some(self.session_state(draft, &session_id));
             }
             Command::SaveAsHost => {
@@ -2196,10 +2227,23 @@ impl Shell {
                     } else if wassh_plugins::settings::host_schema(id)
                         .iter()
                         .any(|field| field.key == key)
-                        && let Some(host) = host_id
+                    {
+                        // A tab with its own value keeps it: the pane's change lands in
+                        // the tab, not in the host the tab happens to share.
+                        if let Some(session) = self
+                            .sessions
+                            .get_mut(index)
+                            .filter(|session| session.has_plugin_override(id.as_str(), key))
+                        {
+                            session.set_plugin_override(id.as_str(), key, value.clone());
+                            continue;
+                        }
+                        let Some(host) = host_id
                             .as_deref()
                             .and_then(|host_id| self.hosts.host_mut(host_id))
-                    {
+                        else {
+                            continue;
+                        };
                         host.plugin_settings
                             .entry(id.as_str().to_owned())
                             .or_default()
@@ -2796,13 +2840,23 @@ impl Shell {
                 host: host_id.map(str::to_owned),
                 generation: self.data_generation,
             };
+            let mut host = host_id
+                .and_then(|host_id| self.hosts.host(host_id))
+                .map(|host| host.plugin_settings.clone())
+                .unwrap_or_default();
+            // What this tab's own Session settings changed wins over the host's values.
+            session.with_plugin_overrides(&mut host);
+            let mut secrets = self.plugin_secrets_for(host_id);
+            for (id, typed) in session.plugin_secret_overrides() {
+                secrets
+                    .entry(id.clone())
+                    .or_default()
+                    .extend(typed.iter().map(|(key, value)| (key.clone(), value.clone())));
+            }
             let values = PluginValues {
                 app: self.settings.plugin_settings.clone(),
-                host: host_id
-                    .and_then(|host_id| self.hosts.host(host_id))
-                    .map(|host| host.plugin_settings.clone())
-                    .unwrap_or_default(),
-                secrets: self.plugin_secrets_for(host_id),
+                host,
+                secrets,
             };
             self.plugin_values_key = Some(key);
             self.plugin_values = Some(values);
@@ -3286,6 +3340,52 @@ fn secret_value(edit: &SecretEdit) -> Option<Option<&str>> {
         SecretEdit::Set(value) => Some(Some(value.as_str())),
         SecretEdit::Clear => Some(None),
     }
+}
+
+/// The plugin values `draft` changes relative to what the host already stores.
+///
+/// A session dialog edits a copy of the host's values, so what it leaves alone must not
+/// become a tab-only value: only the fields the user changed go into the tab.
+fn plugin_overrides(
+    stored: &wassh_core::PluginSettings,
+    draft: &wassh_core::PluginSettings,
+) -> wassh_core::PluginSettings {
+    let mut overrides = wassh_core::PluginSettings::new();
+    for (id, values) in draft {
+        for (key, value) in values {
+            if stored.get(id).and_then(|stored| stored.get(key)) != Some(value) {
+                overrides
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(key.clone(), value.clone());
+            }
+        }
+    }
+    overrides
+}
+
+/// Plugin secrets a session dialog typed, ready to keep in the tab.
+///
+/// Keys are `"<plugin>|<field>"`, the shape [`HostSave::plugin_secrets`] uses.
+fn session_secret_overrides(
+    drafts: &PluginSecretDrafts,
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    let mut overrides: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
+    for (key, draft) in drafts {
+        let Some((plugin, field)) = key.split_once('|') else {
+            continue;
+        };
+        if let Some(Some(value)) = dialogs::plugin_secret_value(draft) {
+            overrides
+                .entry(plugin.to_owned())
+                .or_default()
+                .insert(field.to_owned(), value.to_owned());
+        }
+    }
+    overrides
 }
 
 /// Borrowed session state handed to the dock renderer.
@@ -4760,6 +4860,103 @@ mod tests {
             "192.0.2.1"
         );
         assert_eq!(shell.stored_password(Some("h1")), None);
+    }
+
+    #[test]
+    fn a_session_dialog_save_keeps_plugin_values_in_its_tab() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let mut host = HostProfile {
+            id: "h1".to_owned(),
+            name: "Dev".to_owned(),
+            ..HostProfile::default()
+        };
+        host.plugin_settings.insert(
+            "server-monitor".to_owned(),
+            [("showGauges".to_owned(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        );
+        shell.save_host(host.clone());
+
+        let open = |id: &str, shell: &mut Shell| {
+            let mut entry = crate::app::session::SessionEntry::new_local(
+                id,
+                &shell.palette,
+                &shell.settings.session_style_defaults,
+                "xterm-256color",
+                TerminalSize::new(80, 24),
+            );
+            entry.host_id = Some("h1".to_owned());
+            shell.sessions.push(entry);
+        };
+        open("tab-1", &mut shell);
+        open("tab-2", &mut shell);
+
+        // The tab's dialog changed one existing value and added a broker of its own.
+        let mut edited = host.plugin_settings.clone();
+        edited
+            .get_mut("server-monitor")
+            .expect("the host's values")
+            .insert("showGauges".to_owned(), serde_json::json!(false));
+        edited.insert(
+            "mqtt-analyser".to_owned(),
+            [("host".to_owned(), serde_json::json!("broker.internal"))]
+                .into_iter()
+                .collect(),
+        );
+        let save = HostSave {
+            host: HostProfile {
+                id: "h1".to_owned(),
+                plugin_settings: edited,
+                ..HostProfile::default()
+            },
+            password: SecretEdit::Unchanged,
+            passphrase: SecretEdit::Unchanged,
+            plugin_secrets: [(
+                dialogs::secret_field_key("mqtt-analyser", "password"),
+                dialogs::SecretDraft {
+                    draft: "s3cret".to_owned(),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(shell.apply_to_session("tab-1", &save));
+
+        // The tab reads what its dialog set, secrets included.
+        let values = shell.take_plugin_values(0);
+        assert_eq!(
+            values.host["server-monitor"]["showGauges"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            values.host["mqtt-analyser"]["host"],
+            serde_json::json!("broker.internal")
+        );
+        assert_eq!(values.secrets["mqtt-analyser"]["password"], "s3cret");
+
+        // Only what the dialog changed is the tab's own; the host keeps its values and
+        // its other tab reads them.
+        let overrides = shell.sessions[0].plugin_overrides();
+        assert_eq!(overrides.len(), 2, "{overrides:?}");
+        assert_eq!(
+            overrides["server-monitor"].len(),
+            1,
+            "an untouched field is not a tab-only value"
+        );
+        assert_eq!(
+            shell.hosts.host("h1").expect("saved host").plugin_settings["server-monitor"]
+                ["showGauges"],
+            serde_json::json!(true)
+        );
+        let other = shell.take_plugin_values(1);
+        assert_eq!(
+            other.host["server-monitor"]["showGauges"],
+            serde_json::json!(true)
+        );
+        assert!(!other.host.contains_key("mqtt-analyser"));
+        assert!(other.secrets.is_empty(), "{:?}", other.secrets);
     }
 
     #[test]

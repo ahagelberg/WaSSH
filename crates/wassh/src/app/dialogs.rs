@@ -2186,14 +2186,11 @@ fn host_dialog(
     let mut actions = Vec::new();
     let mut sections = host_sections(state.draft.connection.kind);
     let target = state.target.clone();
-    // Enabled plugins with per-host fields add a section each, after Appearance. A session
-    // dialog leaves them out: plugin settings are stored per host, and the session dialog
-    // must not write the host.
+    // Enabled plugins with per-host fields add a section each, after Appearance. A
+    // session dialog shows them too: Save keeps those values in the tab, so the saved
+    // host and its other sessions keep their own.
     let builtin_sections = sections.len();
-    let plugin_sections = match target {
-        HostTarget::Host => host_plugin_sections(enabled_plugins),
-        HostTarget::Session(_) => Vec::new(),
-    };
+    let plugin_sections = host_plugin_sections(enabled_plugins);
     sections.extend(plugin_sections.iter().map(|plug| plug.heading));
     let title = match target {
         HostTarget::Host => "Host settings",
@@ -3562,6 +3559,32 @@ mod tests {
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].heading, "Server monitor");
         assert!(host_plugin_sections(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_session_dialog_lists_the_plugin_sections() {
+        let ctx = Context::default();
+        let palette = Palette::dark();
+        let host = HostProfile {
+            id: "h1".to_owned(),
+            name: "Dev".to_owned(),
+            ..HostProfile::default()
+        };
+        for (target, expected) in [
+            (HostTarget::Host, "Host settings"),
+            (HostTarget::Session("tab-1".to_owned()), "Session settings"),
+        ] {
+            let mut state = HostState::draft(host.clone(), false).with_target(target);
+            let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
+                host_dialog(ctx, &palette, &mut state, &[], &["server-monitor".to_owned()]);
+            });
+            let has = |needle: &str| rows.iter().any(|(_, _, text)| text == needle);
+            assert!(has(expected), "{expected} is not the title");
+            assert!(
+                has("Server monitor"),
+                "the plugin section is missing from {expected}"
+            );
+        }
     }
 
     #[test]

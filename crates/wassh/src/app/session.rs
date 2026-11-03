@@ -296,6 +296,15 @@ pub struct SessionEntry {
     pub layout: TabPluginLayout,
     /// Live plugin instances, created on demand and kept for the tab's lifetime.
     panes: Vec<PluginPane>,
+    /// Host-level plugin values this tab changed in Session settings.
+    ///
+    /// Kept in the tab: the saved host and its other sessions keep their own.
+    plugin_overrides: wassh_core::PluginSettings,
+    /// Plugin secrets Session settings typed for this tab, per plugin and field key.
+    plugin_secret_overrides: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    >,
 }
 
 impl SessionEntry {
@@ -350,6 +359,8 @@ impl SessionEntry {
             suppress_close: false,
             layout: TabPluginLayout::empty(),
             panes: Vec::new(),
+            plugin_overrides: wassh_core::PluginSettings::new(),
+            plugin_secret_overrides: std::collections::BTreeMap::new(),
             snapshot: std::cell::RefCell::new(None),
         };
         entry.apply_style(defaults);
@@ -483,6 +494,8 @@ impl SessionEntry {
             suppress_close: false,
             layout: TabPluginLayout::empty(),
             panes: Vec::new(),
+            plugin_overrides: wassh_core::PluginSettings::new(),
+            plugin_secret_overrides: std::collections::BTreeMap::new(),
             snapshot: std::cell::RefCell::new(None),
         };
         entry.apply_style(defaults);
@@ -1570,6 +1583,61 @@ impl SessionEntry {
         for pane in &mut self.panes {
             pane.data.loaded = false;
         }
+    }
+
+    /// Lay this tab's plugin values over the host's, for Session settings to show.
+    pub fn with_plugin_overrides(&self, values: &mut wassh_core::PluginSettings) {
+        for (id, changed) in self.plugin_overrides() {
+            values.entry(id.clone()).or_default().extend(changed.clone());
+        }
+    }
+
+    /// The plugin values this tab set for itself.
+    pub fn plugin_overrides(&self) -> &wassh_core::PluginSettings {
+        &self.plugin_overrides
+    }
+
+    /// Plugin secrets this tab set, layered over what the vault holds.
+    pub fn plugin_secret_overrides(
+        &self,
+    ) -> &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+        &self.plugin_secret_overrides
+    }
+
+    /// Keep Session settings' plugin values in the tab, and only there.
+    pub fn set_plugin_settings(
+        &mut self,
+        values: wassh_core::PluginSettings,
+        secrets: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    ) {
+        self.plugin_overrides = values;
+        self.plugin_secret_overrides = secrets;
+        self.reload_pane_settings();
+    }
+
+    /// Forget the tab's own plugin values, so the host's apply again.
+    pub fn clear_plugin_overrides(&mut self) {
+        if self.plugin_overrides.is_empty() && self.plugin_secret_overrides.is_empty() {
+            return;
+        }
+        self.plugin_overrides.clear();
+        self.plugin_secret_overrides.clear();
+        self.reload_pane_settings();
+    }
+
+    /// Whether this tab holds its own value for one plugin setting.
+    pub fn has_plugin_override(&self, id: &str, key: &str) -> bool {
+        self.plugin_overrides
+            .get(id)
+            .is_some_and(|values| values.contains_key(key))
+    }
+
+    /// Keep a value a pane changed in the tab's own map, so it stays what the tab shows.
+    pub fn set_plugin_override(&mut self, id: &str, key: &str, value: serde_json::Value) {
+        self.plugin_overrides
+            .entry(id.to_owned())
+            .or_default()
+            .insert(key.to_owned(), value);
     }
 
     /// Restore the dock layout a tab was saved with.
