@@ -69,18 +69,22 @@ pub fn openai_body(request: &CompletionRequest) -> Value {
             ApiMessage::Assistant {
                 content,
                 tool_calls,
-            } => json!({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls
-                    .iter()
-                    .map(|call| json!({
-                        "id": call.id,
-                        "type": "function",
-                        "function": { "name": call.name, "arguments": call.arguments }
-                    }))
-                    .collect::<Vec<_>>()
-            }),
+            } => {
+                let mut assistant = json!({ "role": "assistant", "content": content });
+                if !tool_calls.is_empty() {
+                    assistant["tool_calls"] = Value::Array(
+                        tool_calls
+                            .iter()
+                            .map(|call| json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": { "name": call.name, "arguments": call.arguments }
+                            }))
+                            .collect(),
+                    );
+                }
+                assistant
+            }
         });
     }
     let mut body = json!({
@@ -750,6 +754,20 @@ mod tests {
         assert_eq!(body["messages"][3]["tool_call_id"], "c1");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn an_assistant_message_without_tools_omits_tool_calls() {
+        let mut req = request(Protocol::Openai);
+        req.messages = vec![ApiMessage::Assistant {
+            content: "Let me check that.".to_owned(),
+            tool_calls: Vec::new(),
+        }];
+
+        let body = openai_body(&req);
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["content"], "Let me check that.");
+        assert!(assistant.get("tool_calls").is_none(), "{assistant}");
     }
 
     #[test]
