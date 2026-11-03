@@ -74,11 +74,11 @@ const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// Characters shown from a queued message.
 const QUEUE_PREVIEW_MAX_CHARS: usize = 120;
 /// Most a prompt card grows to, its own controls included.
-const PROMPT_CARD_MAX_HEIGHT: f32 = 320.0;
+const PROMPT_CARD_MAX_HEIGHT: f32 = 480.0;
 /// Smallest a capped prompt card gets.
-const PROMPT_CARD_MIN_HEIGHT: f32 = 120.0;
+const PROMPT_CARD_MIN_HEIGHT: f32 = 260.0;
 /// Share of the pane a prompt card may take.
-const PROMPT_CARD_SHARE: f32 = 0.35;
+const PROMPT_CARD_SHARE: f32 = 0.60;
 /// Gap between a card's scrolling body and its fixed controls.
 const PROMPT_CARD_GAP: f32 = 8.0;
 /// Narrowest an answer field in a prompt card may get.
@@ -2667,6 +2667,7 @@ mod tests {
         // pushing the conversation and the send button out of the pane.
         let mut plugin = AiAgent::default();
         let script = format!("cd ~/app && python3 - <<'PY'\n{}\nPY", "print(1)\n".repeat(120));
+        let scopes = super::super::rules::approval_scopes(&script);
         plugin.agent.phase = Some(Phase::Approving {
             call: super::super::protocol::ApiToolCall {
                 id: "c1".to_owned(),
@@ -2674,7 +2675,7 @@ mod tests {
                 arguments: json!({ "command": script }).to_string(),
             },
             command: script.clone(),
-            scopes: super::super::rules::approval_scopes(&script),
+            scopes: scopes.clone(),
         });
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -2700,15 +2701,22 @@ mod tests {
         };
         let mut texts = Vec::new();
         let mut cards = Vec::new();
+        let mut request_viewport = None;
         // The bottom panel settles its height over a few frames.
         for _ in 0..4 {
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             texts.clear();
             cards.clear();
+            request_viewport = None;
             for clipped in std::mem::take(&mut output.shapes) {
+                let clip_rect = clipped.clip_rect;
                 match clipped.shape {
                     egui::Shape::Text(text) => {
-                        texts.push((text.pos, text.galley.text().to_owned()));
+                        let label = text.galley.text().to_owned();
+                        if label.starts_with("cd ~/app") {
+                            request_viewport = Some(clip_rect);
+                        }
+                        texts.push((text.pos, label));
                     }
                     egui::Shape::Rect(rect)
                         if rect.fill == to_color32(Palette::dark().bg_panel_2) =>
@@ -2758,10 +2766,27 @@ mod tests {
         };
         let allow = button("Allow");
         let deny = button("Deny");
-        let everything = button("Always allow every command");
-        for position in [allow, deny, everything] {
+        let always_allow: Vec<_> = texts
+            .iter()
+            .filter(|(_, text)| text.starts_with("Always allow"))
+            .collect();
+        const GLOBAL_ALWAYS_ALLOW_BUTTONS: usize = 1;
+        assert_eq!(
+            always_allow.len(),
+            scopes.len() + GLOBAL_ALWAYS_ALLOW_BUTTONS,
+            "not all approval scopes are visible: {texts:?}"
+        );
+        let request_viewport = request_viewport.expect("the request has a scroll viewport");
+        assert!(
+            card.contains(request_viewport.min) && card.contains(request_viewport.max),
+            "the request viewport left the card: {request_viewport:?} in {card:?}"
+        );
+        for position in std::iter::once(&allow)
+            .chain(std::iter::once(&deny))
+            .chain(always_allow.iter().map(|(position, _)| position))
+        {
             assert!(
-                card.contains(position) && position.y > title.y,
+                card.contains(*position),
                 "a control left the card: {position:?} in {card:?}"
             );
         }
