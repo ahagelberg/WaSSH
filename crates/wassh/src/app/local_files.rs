@@ -202,6 +202,15 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
             report.total(size_of(&local));
             copy_file(&local, &local_path(&remote), resume, report)
         }
+        SftpRequest::Write { path, content } => {
+            let target = local_path(&path);
+            let bytes = content.len() as u64;
+            report.total(bytes);
+            std::fs::write(&target, &content)
+                .map_err(|error| format!("writing {path}: {error}"))?;
+            report.add(bytes);
+            Ok(SftpOutcome::Transferred { bytes })
+        }
         SftpRequest::UploadMany { items, resume } => {
             let mut bytes = 0;
             for (local, remote) in &items {
@@ -642,6 +651,21 @@ mod tests {
         }));
         assert_eq!(pulled, payload.len() as u64);
         assert_eq!(std::fs::read(&back).expect("read"), payload);
+    }
+
+    #[test]
+    fn an_owned_write_replaces_local_file_contents() {
+        let sandbox = Sandbox::new("write");
+        let path = sandbox.at("target.txt");
+        let content = b"updated contents".to_vec();
+
+        let written = transferred(execute(SftpRequest::Write {
+            path: path.clone(),
+            content: content.clone(),
+        }));
+
+        assert_eq!(written, content.len() as u64);
+        assert_eq!(std::fs::read(sandbox.path.join("target.txt")).expect("read"), content);
     }
 
     #[test]

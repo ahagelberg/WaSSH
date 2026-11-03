@@ -44,8 +44,6 @@ pub const MARKER_TAIL_CHARS: usize = 4_000;
 pub const EXEC_KEY: &str = "ai.run_command";
 /// Key the session caches a probe under (existence checks and system reports).
 pub const PROBE_KEY: &str = "ai.probe";
-/// Distinguishes the temp files uploads are staged in.
-static STAGED_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Marker the sudo preamble prints when the password was refused.
 pub const SUDO_AUTH_FAILED_MARKER: &str = "__WASSH_SUDO_FAILED__";
 /// What the user is told when `sudo` refused the password they typed.
@@ -789,26 +787,7 @@ impl Agent {
                     );
                     return true;
                 };
-                let local = std::env::temp_dir().join(format!(
-                    "wassh-agent-{}-{}-{}.tmp",
-                    std::process::id(),
-                    STAGED_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    self.now_ms
-                ));
-                if let Err(error) = std::fs::write(&local, &content) {
-                    self.phase = None;
-                    self.settle(
-                        call,
-                        turn,
-                        format!("write {target}"),
-                        format!("Cannot stage the file: {error}"),
-                        true,
-                        session,
-                    );
-                    return true;
-                }
-                access.upload(&local.display().to_string(), &target);
-                let _ = std::fs::remove_file(&local);
+                access.write_file(&target, content.into_bytes());
                 // The upload finishes on a later frame; a diff is the answer.
                 if let Some(Turn::Tool { output, .. }) = self.turns.get_mut(turn) {
                     *output = diff
@@ -2669,6 +2648,7 @@ mod tests {
         stdin: Vec<String>,
         answers: std::collections::HashMap<String, crate::command::CommandOutput>,
         uploads: Vec<(String, String)>,
+        writes: Vec<(String, Vec<u8>)>,
         transferring: bool,
         status: Option<String>,
     }
@@ -2691,6 +2671,12 @@ mod tests {
         fn upload(&mut self, local: &str, remote: &str) {
             let body = std::fs::read_to_string(local).unwrap_or_default();
             self.uploads.push((remote.to_owned(), body));
+            self.status = Some(format!("Uploaded {remote}"));
+            self.transferring = false;
+        }
+
+        fn write_file(&mut self, remote: &str, content: Vec<u8>) {
+            self.writes.push((remote.to_owned(), content));
             self.status = Some(format!("Uploaded {remote}"));
             self.transferring = false;
         }
@@ -2855,7 +2841,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_edit_uploads_the_new_text_and_reports_the_diff() {
+    fn a_remote_edit_writes_owned_bytes_and_reports_the_diff() {
         let mut agent = Agent::new();
         let mut fake = FakeSession::default();
         // The edit resolves `translated.txt` against the working directory.
@@ -2872,15 +2858,15 @@ mod tests {
             &mut session,
         );
         agent.poll(&mut session);
-        let upload = fake.uploads.last().cloned();
+        let write = fake.writes.last().cloned();
         assert_eq!(
-            upload.as_ref().map(|(path, _)| path.as_str()),
+            write.as_ref().map(|(path, _)| path.as_str()),
             Some("/translated.txt")
         );
         assert!(
-            upload
+            write
                 .as_ref()
-                .is_some_and(|(_, body)| body.contains("TWO"))
+                .is_some_and(|(_, content)| content.as_slice() == b"one\nTWO\n")
         );
         match agent.turns.last().cloned().expect("a tool turn") {
             Turn::Tool { output, failed, .. } => {

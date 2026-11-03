@@ -2216,6 +2216,17 @@ impl wassh_plugins::SftpAccess for SessionEntry {
         );
     }
 
+    fn write_file(&mut self, remote: &str, content: Vec<u8>) {
+        self.enqueue_transfer(
+            wassh_ssh::SftpRequest::Write {
+                path: remote.to_owned(),
+                content,
+            },
+            TransferDirection::Upload,
+            remote.to_owned(),
+        );
+    }
+
     fn download(&mut self, remote: &str, local: &str) {
         if local.trim().is_empty() {
             self.files.error = Some("Type where the download should land.".to_owned());

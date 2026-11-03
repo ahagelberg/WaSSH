@@ -126,6 +126,13 @@ pub enum SftpRequest {
         /// Continue from the remote file's current size instead of restarting.
         resume: bool,
     },
+    /// Replace a remote file with owned bytes.
+    Write {
+        /// Destination path.
+        path: String,
+        /// File contents.
+        content: Vec<u8>,
+    },
     /// Create one directory.
     Mkdir {
         /// Directory to create.
@@ -267,6 +274,21 @@ pub(crate) async fn run(
                     .unwrap_or(0),
             );
             upload(&session, &local, &remote, &mut report, resume).await
+        }
+        SftpRequest::Write { path, content } => {
+            let bytes = content.len() as u64;
+            report.total(bytes);
+            let mut sink = session
+                .create(path.clone())
+                .await
+                .map_err(|error| format!("writing {path}: {error}"))?;
+            sink.write_all(&content)
+                .await
+                .map_err(|error| format!("writing {path}: {error}"))?;
+            report.add(bytes);
+            let _ = sink.sync_all().await;
+            let _ = sink.close().await;
+            Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::Mkdir { path } => {
             session

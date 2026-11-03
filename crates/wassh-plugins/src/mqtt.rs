@@ -2943,6 +2943,7 @@ mod tests {
             None
         }
         fn upload(&mut self, _local: &str, _remote: &str) {}
+        fn write_file(&mut self, _remote: &str, _content: Vec<u8>) {}
         fn download(&mut self, _remote: &str, _local: &str) {}
         fn is_transferring(&self) -> bool {
             false

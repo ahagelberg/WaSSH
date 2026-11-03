@@ -76,6 +76,9 @@ pub trait SftpAccess {
     /// Copy the local file at `local` to the remote file at `remote`.
     fn upload(&mut self, local: &str, remote: &str);
 
+    /// Replace the remote file at `remote` with these bytes.
+    fn write_file(&mut self, remote: &str, content: Vec<u8>);
+
     /// Copy the remote file at `remote` to the local file at `local`.
     fn download(&mut self, remote: &str, local: &str);
 
@@ -3117,6 +3120,8 @@ mod tests {
         fn upload(&mut self, local: &str, remote: &str) {
             self.uploads.push((local.to_owned(), remote.to_owned()));
         }
+
+        fn write_file(&mut self, _remote: &str, _content: Vec<u8>) {}
 
         fn download(&mut self, remote: &str, local: &str) {
             self.downloads.push((remote.to_owned(), local.to_owned()));
