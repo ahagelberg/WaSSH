@@ -646,11 +646,16 @@ impl AiAgent {
     }
 
     /// Build the request for the conversation as it stands.
+    ///
+    /// The history is repaired first: a run that was stopped, killed or lost in the middle
+    /// leaves a tool call the provider would reject the whole conversation over. It is done
+    /// here so every path that sends a request gets a history a provider accepts.
     fn request(
-        &self,
+        &mut self,
         settings: &serde_json::Map<String, Value>,
         host: &str,
     ) -> Option<CompletionRequest> {
+        self.agent.repair_history();
         let provider = self.active()?;
         Some(CompletionRequest {
             base_url: provider.base_url.clone(),
@@ -701,7 +706,6 @@ impl AiAgent {
             self.error = Some(error.to_owned());
             return;
         }
-        self.agent.prune_unresolved_tail();
         if let Some(request) = self.request(settings, host) {
             self.error = None;
             self.agent.start(request);

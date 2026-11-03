@@ -392,6 +392,33 @@ pub fn sse_payload(line: &str) -> Option<&str> {
     }
 }
 
+/// The HTTP agent provider calls use.
+///
+/// A 4xx/5xx answer is not turned into a bare status code: its body carries the provider's
+/// own explanation, which is what says *why* a request was rejected.
+fn agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    )
+}
+
+/// What a rejected request is reported as: the status and the provider's message.
+fn failure(status: u16, body: &str) -> String {
+    // Both wire formats file the reason under `error.message`; anything that is not JSON
+    // (a proxy's error page) is passed on as it came.
+    let message = match serde_json::from_str::<Value>(body) {
+        Ok(json) => json["error"]["message"].as_str().unwrap_or_default().to_owned(),
+        Err(_) => body.trim().to_owned(),
+    };
+    if message.is_empty() {
+        format!("Provider error {status}")
+    } else {
+        shorten(format!("Provider error {status}: {message}"))
+    }
+}
+
 /// Run one completion, reporting events to `events`.
 ///
 /// Blocking: call it from a worker thread.
@@ -401,7 +428,7 @@ pub fn complete(request: &CompletionRequest, events: &Sender<StreamEvent>) {
         Protocol::Anthropic => anthropic_body(request),
     };
     let url = join_url(&request.base_url, chat_path(request.protocol));
-    let mut http = ureq::post(&url);
+    let mut http = agent().post(&url);
     for (name, value) in headers(request) {
         http = http.header(&name, &value);
     }
@@ -413,6 +440,12 @@ pub fn complete(request: &CompletionRequest, events: &Sender<StreamEvent>) {
             return;
         }
     };
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.into_body().read_to_string().unwrap_or_default();
+        let _ = events.send(StreamEvent::Failed(failure(status, &text)));
+        return;
+    }
 
     let mut reader = response.into_body().into_reader();
     let mut openai = OpenAiStream::default();
@@ -501,7 +534,7 @@ fn describe_error(error: ureq::Error) -> String {
 /// Ask a provider for its model list.
 pub fn provider_models(provider: &ProviderConfig, api_key: &str) -> Result<Vec<String>, String> {
     let url = join_url(&provider.base_url, models_path(provider.protocol));
-    let mut http = ureq::get(&url);
+    let mut http = agent().get(&url);
     match provider.protocol {
         Protocol::Openai => {
             if !api_key.is_empty() {
@@ -513,10 +546,12 @@ pub fn provider_models(provider: &ProviderConfig, api_key: &str) -> Result<Vec<S
             http = http.header("anthropic-version", ANTHROPIC_VERSION);
         }
     }
-    let response = http.call().map_err(|error| match error {
-        ureq::Error::StatusCode(code) => format!("Provider error {code}"),
-        other => format!("Provider request failed: {other}"),
-    })?;
+    let response = http.call().map_err(describe_error)?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.into_body().read_to_string().unwrap_or_default();
+        return Err(failure(status, &text));
+    }
     let text = response
         .into_body()
         .read_to_string()
@@ -822,5 +857,30 @@ mod tests {
         assert_eq!(sse_payload("event: ping"), None);
         assert_eq!(sse_payload("data: [DONE]"), None);
         assert_eq!(sse_payload("data:   "), None);
+    }
+
+    #[test]
+    fn a_rejected_request_reports_the_provider_explanation() {
+        // OpenAI and Anthropic both wrap the reason the same way.
+        assert_eq!(
+            failure(
+                400,
+                r#"{"error":{"message":"messages.3: tool_calls must be followed by tool messages"}}"#
+            ),
+            "Provider error 400: messages.3: tool_calls must be followed by tool messages"
+        );
+        // An error page or a plain body is passed through as it came.
+        assert_eq!(
+            failure(502, "  bad gateway  "),
+            "Provider error 502: bad gateway"
+        );
+        // Nothing to add: the code alone.
+        assert_eq!(failure(401, ""), "Provider error 401");
+        assert_eq!(failure(500, "{}"), "Provider error 500");
+        // A wall of text is cut, not pasted into the transcript.
+        let long = "x".repeat(MAX_ERROR_BODY_CHARS * 2);
+        let reported = failure(400, &long);
+        assert_eq!(reported.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+        assert!(reported.ends_with('…'));
     }
 }

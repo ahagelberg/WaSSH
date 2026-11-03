@@ -68,6 +68,8 @@ pub const EMPTY_ANSWER: &str = "The model returned an empty answer.";
 pub const NOT_PERMITTED: &str = "This action is not permitted.";
 /// Said when the user turns an action down.
 pub const DENIED_BY_USER: &str = "Action denied by user.";
+/// Answer given to a tool call the user stopped before it ran.
+pub const STOPPED_BY_USER: &str = "Stopped by the user before this ran.";
 /// System prompt used when summarising a chat for a new one.
 pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarise the conversation above for a fresh agent session that must \
 continue the work. Reply with terse bullet points, at most 150 words, covering: Goal (what the user wants), \
@@ -1659,13 +1661,43 @@ impl Agent {
         self.settle(call, turn, "ask_user".to_owned(), answer, false, session);
     }
 
-    /// Stop the reply that is streaming in.
+    /// Stop whatever the run is doing.
+    ///
+    /// A tool that was in flight is answered with [`STOPPED_BY_USER`], so the history stays
+    /// one the provider accepts: an assistant turn that asked for a tool must be followed by
+    /// that tool's result, or the next request fails with a 400.
     pub fn stop(&mut self) {
-        if let Some(Phase::Streaming { turn, .. }) = self.phase.take()
-            && let Some(Turn::Assistant { stopped, .. }) = self.turns.get_mut(turn)
-        {
-            *stopped = true;
+        let Some(phase) = self.phase.take() else {
+            return;
+        };
+        // Calls the model queued but that never ran are dropped with the run.
+        self.queue.clear();
+        match phase {
+            Phase::Streaming { turn, .. } => {
+                if let Some(Turn::Assistant { stopped, .. }) = self.turns.get_mut(turn) {
+                    *stopped = true;
+                }
+            }
+            Phase::Running { call, turn, .. } | Phase::Allowing { call, turn, .. } => {
+                self.abandon_tool(call, turn)
+            }
+            Phase::Approving { call, .. } | Phase::Asking { call, .. } | Phase::Sudo { call, .. } => {
+                let turn = self.turn_for(&call);
+                self.abandon_tool(call, turn);
+            }
+            Phase::Idle => {}
         }
+    }
+
+    /// Answer a tool call that will never run, so the model sees why it stopped.
+    fn abandon_tool(&mut self, call: ApiToolCall, turn: usize) {
+        if let Some(Turn::Tool { output, .. }) = self.turns.get_mut(turn) {
+            *output = STOPPED_BY_USER.to_owned();
+        }
+        self.history.push(ApiMessage::Tool {
+            tool_call_id: call.id,
+            content: STOPPED_BY_USER.to_owned(),
+        });
     }
 
     /// Take the "model owes an answer" flag.
@@ -1683,28 +1715,31 @@ impl Agent {
             )
     }
 
-    /// Drop a reply whose tool calls never all came back, e.g. the app was closed
-    /// mid-tool. Providers reject history that answers a call it does not hold.
-    pub fn prune_unresolved_tail(&mut self) {
-        let Some(position) = self
+    /// Make the history one every provider accepts.
+    ///
+    /// An assistant turn may only name tool calls that are answered: a call left hanging —
+    /// the user stopped the run, the session died, the model asked and nothing ran — makes
+    /// the whole conversation a 400 until it is gone. The assistant's text stays, so
+    /// nothing the model already said is lost; a turn with nothing left in it goes.
+    pub fn repair_history(&mut self) {
+        let answered: std::collections::HashSet<String> = self
             .history
             .iter()
-            .rposition(|message| matches!(message, ApiMessage::Assistant { .. }))
-        else {
-            return;
-        };
-        let ApiMessage::Assistant { tool_calls, .. } = &self.history[position] else {
-            return;
-        };
-        let mut open: Vec<&str> = tool_calls.iter().map(|call| call.id.as_str()).collect();
-        for message in &self.history[position + 1..] {
-            if let ApiMessage::Tool { tool_call_id, .. } = message {
-                open.retain(|id| *id != tool_call_id);
+            .filter_map(|message| match message {
+                ApiMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        self.history.retain_mut(|message| match message {
+            ApiMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                tool_calls.retain(|call| answered.contains(&call.id));
+                !content.trim().is_empty() || !tool_calls.is_empty()
             }
-        }
-        if !open.is_empty() {
-            self.history.truncate(position);
-        }
+            _ => true,
+        });
     }
 
     /// The transcript as plain text, for summarising.
@@ -2230,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_whose_tools_never_came_back_is_dropped_before_resuming() {
+    fn a_reply_whose_tools_never_came_back_is_made_answerable_before_resuming() {
         let call = |id: &str| ApiToolCall {
             id: id.to_owned(),
             name: TOOL_RUN_COMMAND.to_owned(),
@@ -2251,24 +2286,95 @@ mod tests {
             },
         ];
         assert!(agent.can_resume(), "the model owes an answer to this run");
-        agent.prune_unresolved_tail();
-        assert_eq!(
-            agent.history.len(),
-            1,
-            "the half-answered reply is gone: {:?}",
-            agent.history
-        );
+        agent.repair_history();
+        // The answered call and its result stay; the one that never came back goes.
+        assert_eq!(agent.history.len(), 3, "{:?}", agent.history);
+        match &agent.history[1] {
+            ApiMessage::Assistant { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1, "{tool_calls:?}");
+                assert_eq!(tool_calls[0].id, "a");
+            }
+            other => panic!("expected the assistant turn, got {other:?}"),
+        }
 
+        // An assistant turn with nothing but the unanswered call disappears entirely.
         agent.history.push(ApiMessage::Assistant {
             content: String::new(),
             tool_calls: vec![call("c")],
         });
-        agent.history.push(ApiMessage::Tool {
-            tool_call_id: "c".to_owned(),
-            content: "up 3 days".to_owned(),
+        agent.repair_history();
+        assert_eq!(agent.history.len(), 3, "{:?}", agent.history);
+
+        // Text the model already wrote survives.
+        agent.history.push(ApiMessage::Assistant {
+            content: "Let me check the logs.".to_owned(),
+            tool_calls: vec![call("d")],
         });
-        agent.prune_unresolved_tail();
-        assert_eq!(agent.history.len(), 3, "a settled reply is kept");
+        agent.repair_history();
+        assert_eq!(agent.history.len(), 4, "{:?}", agent.history);
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Assistant { tool_calls, .. }) if tool_calls.is_empty()
+        ));
+    }
+
+    #[test]
+    fn stopping_a_tool_run_answers_the_call_so_the_next_request_is_valid() {
+        let mut agent = Agent::new();
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        assert!(agent.push_user("deploy", UserMeta::default()));
+        // The model asked for a tool; it is running when the user stops the run.
+        let running = ApiToolCall {
+            id: "c1".to_owned(),
+            name: TOOL_TERMINAL_WAIT.to_owned(),
+            arguments: r#"{"timeoutMs":60000}"#.to_owned(),
+        };
+        agent.turns.push(Turn::Assistant {
+            text: "Waiting.".to_owned(),
+            stopped: false,
+        });
+        agent.history.push(ApiMessage::Assistant {
+            content: "Waiting.".to_owned(),
+            tool_calls: vec![running.clone()],
+        });
+        agent.turns.push(Turn::Tool {
+            name: running.name.clone(),
+            label: call_label(&running),
+            output: String::new(),
+            failed: false,
+        });
+        agent.phase = Some(Phase::Running {
+            call: running,
+            // The user, the reply and the tool call are the transcript so far.
+            turn: 2,
+            waiting: Waiting::Terminal {
+                before: String::new(),
+                until_ms: u64::MAX,
+            },
+        });
+
+        agent.stop();
+        assert!(agent.phase.is_none(), "the run is over");
+        assert!(agent.can_resume(), "the model owes an answer");
+        match agent.history.last() {
+            Some(ApiMessage::Tool {
+                tool_call_id,
+                content,
+            }) => {
+                assert_eq!(tool_call_id, "c1");
+                assert_eq!(content, STOPPED_BY_USER);
+            }
+            other => panic!("the pending call was left unanswered: {other:?}"),
+        }
+        match agent.turns.last() {
+            Some(Turn::Tool { output, .. }) => assert_eq!(output, STOPPED_BY_USER),
+            other => panic!("the transcript does not show the stop: {other:?}"),
+        }
+        // Stopping leaves nothing that would start another request on its own.
+        assert!(!agent.take_needs_reply());
+        let mut session = session.take();
+        agent.poll(&mut session);
+        let _ = &mut session;
     }
 
     #[test]
@@ -2883,7 +2989,10 @@ mod tests {
             .map(|(_, command)| command.as_str())
             .collect();
         assert_eq!(commands.len(), 3, "{commands:?}");
-        assert!(commands[0].starts_with("grep -rnI"), "{commands:?}");
+        assert!(
+            commands[0].starts_with("if command -v rg"),
+            "{commands:?}"
+        );
         assert!(commands[0].contains("'/srv/app/src'"), "{commands:?}");
         assert!(commands[1].contains("-iname '*.rs'"), "{commands:?}");
         assert!(commands[1].contains("'/srv/app'"), "{commands:?}");
