@@ -61,6 +61,8 @@ pub const TOOL_LOCAL_READ: &str = "local_fs_read_file";
 pub const TOOL_LOCAL_WRITE: &str = "local_fs_write_file";
 /// Tool: list a local directory.
 pub const TOOL_LOCAL_LIST: &str = "local_fs_list_dir";
+/// Tool: search local files for a regular expression.
+pub const TOOL_LOCAL_GREP: &str = "local_fs_grep_search";
 /// Tool: edit a local file in place.
 pub const TOOL_LOCAL_EDIT: &str = "local_fs_edit_file";
 /// Tool: delete a file or directory on this computer.

@@ -13,9 +13,10 @@ use super::permissions::{Permission, Permissions};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
     TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
-    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT,
-    TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE,
-    TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ,
+    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
+    TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
+    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
+    TOOL_REMOTE_READ,
     TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
     TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
     TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
@@ -1754,7 +1755,9 @@ pub fn call_label(call: &ApiToolCall) -> String {
         TOOL_REMOTE_DELETE | TOOL_LOCAL_DELETE => {
             format!("delete {}", arguments["path"].as_str().unwrap_or_default())
         }
-        TOOL_DEV_GREP => format!("grep {}", arguments["pattern"].as_str().unwrap_or_default()),
+        TOOL_DEV_GREP | TOOL_LOCAL_GREP => {
+            format!("grep {}", arguments["pattern"].as_str().unwrap_or_default())
+        }
         TOOL_DEV_FIND => format!(
             "find {}",
             arguments["namePattern"].as_str().unwrap_or_default()

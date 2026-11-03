@@ -405,9 +405,9 @@ const AI_AGENT_LOCAL_FS_CHILDREN: &[SettingsField] = &[
     ),
     permission(
         "apiMethod:ai-agent:local_fs_list_dir",
-        "List files",
+        "List and search files",
         "allow",
-        "Allow the agent to list directories on your local computer.",
+        "Allow the agent to list directories and search for files or text on your local computer.",
     ),
     permission(
         "apiMethod:ai-agent:local_fs_write_file",

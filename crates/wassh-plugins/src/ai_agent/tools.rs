@@ -22,10 +22,10 @@ use serde_json::{Value, json};
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
-    TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ,
-    TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
-    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND,
-    TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
+    TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
+    TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
+    TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
     TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
@@ -53,6 +53,8 @@ pub const DEV_SEARCH_MATCHES_DEFAULT: usize = 50;
 pub const MAX_DEV_TREE_DEPTH: usize = 3;
 /// Depth `dev_find_files` searches below the directory it starts in.
 pub const MAX_DEV_FIND_DEPTH: usize = 8;
+/// Bytes inspected before a file is taken as binary text.
+const BINARY_SNIFF_BYTES: usize = 2048;
 /// Context lines a diff shows around each change by default.
 pub const DIFF_CONTEXT_LINES_DEFAULT: usize = 3;
 /// Most context lines a diff may show.
@@ -148,6 +150,11 @@ first, so use this only when run_command failed for lack of permissions.",
         description: "List a directory on this computer.",
     },
     ToolSpec {
+        name: TOOL_LOCAL_GREP,
+        description: "Search local files for a regular expression and show matching lines the way \
+ripgrep does: hidden files, dependencies and build output are skipped.",
+    },
+    ToolSpec {
         name: TOOL_LOCAL_EDIT,
         description: "Replace a block of text in a file on this computer.",
     },
@@ -202,7 +209,8 @@ and exit code.",
     },
     ToolSpec {
         name: TOOL_DEV_GREP,
-        description: "Search files on the connected host for a regular expression and show matching lines.",
+        description: "Search files on the connected host for a regular expression and show matching \
+lines, using ripgrep when the host has it.",
     },
     ToolSpec {
         name: TOOL_DEV_FIND,
@@ -363,7 +371,7 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!([]),
         ),
-        TOOL_DEV_GREP => (
+        TOOL_DEV_GREP | TOOL_LOCAL_GREP => (
             json!({
                 "pattern": string("Rust/JS regular expression to search for."),
                 "path": string("File or directory to search (default: home)."),
@@ -551,6 +559,7 @@ pub fn is_read_only(name: &str) -> bool {
             | TOOL_REMOTE_LIST
             | TOOL_LOCAL_READ
             | TOOL_LOCAL_LIST
+            | TOOL_LOCAL_GREP
             | TOOL_CURRENT_TIME
             | TOOL_RAG_SEARCH
             | TOOL_DEV_VIEW
@@ -868,6 +877,7 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
             list_dir(&path, &mut entries, 0, 0)?;
             Ok(format!("{}\n{}", path.display(), entries.join("\n")))
         }
+        TOOL_LOCAL_GREP => local_grep(args),
         TOOL_LOCAL_DELETE => local_delete(args),
         TOOL_LOCAL_MOVE => local_move(args),
         TOOL_LOCAL_MULTI_EDIT => local_multi_edit(args),
@@ -884,7 +894,9 @@ const SKIPPED_TREE_DIRS: &str =
 
 /// The shell command `dev_grep_search` runs on the connected host.
 ///
-/// `root` is already resolved against the agent's working directory.
+/// `root` is already resolved against the agent's working directory. ripgrep is
+/// preferred when the host has it — it honours `.gitignore` and is far quicker — with
+/// `grep -rnI` as the fallback so a bare system still answers.
 pub fn dev_grep_command(args: &Value, root: &str) -> String {
     let pattern = args["pattern"].as_str().unwrap_or_default();
     let case = if args["caseSensitive"].as_bool().unwrap_or(false) {
@@ -892,11 +904,15 @@ pub fn dev_grep_command(args: &Value, root: &str) -> String {
     } else {
         "-i "
     };
-    let include = args["glob"]
+    let glob = args["glob"]
         .as_str()
         .map(str::trim)
-        .filter(|glob| !glob.is_empty())
+        .filter(|glob| !glob.is_empty());
+    let include_grep = glob
         .map(|glob| format!("--include={} ", shell_quote(glob)))
+        .unwrap_or_default();
+    let include_rg = glob
+        .map(|glob| format!("-g {} ", shell_quote(glob)))
         .unwrap_or_default();
     let context = args["contextLines"]
         .as_u64()
@@ -911,11 +927,18 @@ pub fn dev_grep_command(args: &Value, root: &str) -> String {
         .as_u64()
         .map_or(DEV_SEARCH_MATCHES_DEFAULT, |value| value as usize)
         .clamp(1, MAX_DEV_GREP_MATCHES);
+    let pattern = shell_quote(pattern);
+    let root = shell_quote(root);
+    let ripgrep = format!(
+        "rg --line-number --no-heading --color never {case}{include_rg}{around}-e {pattern} {root}"
+    );
+    let grep = format!(
+        "grep -rnI {case}{include_grep}{around}--exclude-dir={{.git,node_modules,dist,build,target}} \
+         -e {pattern} {root}"
+    );
     format!(
-        "grep -rnI {case}{include}{around}--exclude-dir={{.git,node_modules,dist,build,target}} \
-         -e {} {} 2>/dev/null | head -n {limit}",
-        shell_quote(pattern),
-        shell_quote(root)
+        "if command -v rg >/dev/null 2>&1; then {ripgrep} 2>/dev/null | head -n {limit}; \
+         else {grep} 2>/dev/null | head -n {limit}; fi"
     )
 }
 
@@ -1285,7 +1308,7 @@ fn local_replace(args: &Value) -> ToolResult {
             let Ok(bytes) = std::fs::read(path) else {
                 return true;
             };
-            if bytes.iter().take(2048).any(|byte| *byte == 0) {
+            if bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0) {
                 return true;
             }
             let body = String::from_utf8_lossy(&bytes);
@@ -1325,6 +1348,85 @@ fn local_replace(args: &Value) -> ToolResult {
     }
     report.extend(failures);
     Ok(report.join("\n"))
+}
+
+/// `local_fs_grep_search`: a ripgrep-style content search over this computer.
+///
+/// Hidden entries, dependencies and build output are skipped, like ripgrep's defaults,
+/// and a match is reported as `path:line: text` with its context lines marked `-`.
+fn local_grep(args: &Value) -> ToolResult {
+    let pattern = args["pattern"].as_str().unwrap_or_default();
+    if pattern.is_empty() {
+        return Err("pattern is required.".to_owned());
+    }
+    let source = if args["caseSensitive"].as_bool().unwrap_or(false) {
+        pattern.to_owned()
+    } else {
+        format!("(?i){pattern}")
+    };
+    let regex = Regex::new(&source).map_err(|error| format!("Invalid pattern: {error}"))?;
+    let root = local_path(args["path"].as_str().unwrap_or("."));
+    let glob = args["glob"].as_str().map(str::to_owned);
+    let context = args["contextLines"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(DIFF_CONTEXT_LINES_MAX as u64) as usize;
+    let limit = args["limit"]
+        .as_u64()
+        .map_or(DEV_SEARCH_MATCHES_DEFAULT, |value| value as usize)
+        .clamp(1, MAX_DEV_GREP_MATCHES);
+    let mut hits: Vec<String> = Vec::new();
+    let mut searched = 0usize;
+    let mut visit = |path: &Path| {
+        if let Some(glob) = &glob {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !glob_matches(glob, &name) {
+                return true;
+            }
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            return true;
+        };
+        if bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0) {
+            return true;
+        }
+        searched += 1;
+        let body = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = body.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !regex.is_match(line) {
+                continue;
+            }
+            let from = index.saturating_sub(context);
+            let to = (index + context).min(lines.len().saturating_sub(1));
+            for (offset, text) in lines[from..=to].iter().enumerate() {
+                let number = from + offset + 1;
+                let separator = if from + offset == index { ':' } else { '-' };
+                hits.push(format!("{}{separator}{number}{separator}{text}", path.display()));
+            }
+            if hits.len() >= limit {
+                return false;
+            }
+        }
+        true
+    };
+    if root.is_file() {
+        visit(&root);
+    } else {
+        walk_files(&root, 0, &mut visit);
+    }
+    if hits.is_empty() {
+        return Ok(format!("No matches for {pattern} under {}.", root.display()));
+    }
+    let mut report = hits.join("\n");
+    if hits.len() >= limit {
+        report.push_str(&format!("\n[Stopped after {limit} matching lines]"));
+    }
+    report.push_str(&format!("\n[{searched} files searched]"));
+    Ok(report)
 }
 
 /// Run `local_fs_run_command` on this machine, killing it at the timeout.
@@ -1542,7 +1644,7 @@ mod tests {
     #[test]
     fn every_reference_tool_has_a_schema() {
         let schemas = specs(&Permissions::default());
-        assert_eq!(schemas.len(), 37);
+        assert_eq!(schemas.len(), 38);
         let names: Vec<&str> = schemas
             .iter()
             .map(|schema| schema["name"].as_str().unwrap())
@@ -1550,6 +1652,7 @@ mod tests {
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"run_sudo"));
         assert!(names.contains(&"dev_grep_search"));
+        assert!(names.contains(&"local_fs_grep_search"));
         assert!(names.contains(&"local_fs_run_command"));
         assert!(names.contains(&"local_fs_apply_patch"));
         assert!(names.contains(&"local_fs_replace_in_files"));
@@ -1736,6 +1839,73 @@ mod tests {
     }
 
     #[test]
+    fn a_local_grep_reports_paths_lines_and_context() {
+        let dir = std::env::temp_dir().join(format!("wassh-ai-grep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        let source = dir.join("code.rs");
+        std::fs::write(
+            &source,
+            "fn main() {\n    let value = 1;\n    run(value);\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("nested/other.rs"), "// let value = 2;\n").unwrap();
+        // ripgrep-style: dependencies and hidden files stay out of the way.
+        std::fs::write(dir.join("node_modules/dep.js"), "let value = 3;\n").unwrap();
+        std::fs::write(dir.join(".hidden.rs"), "let value = 4;\n").unwrap();
+
+        let output = run_local(
+            TOOL_LOCAL_GREP,
+            &json!({ "pattern": "let value", "path": dir.display().to_string() }),
+            0,
+        )
+        .unwrap();
+        assert!(output.contains("code.rs:2:    let value = 1;"), "{output}");
+        assert!(output.contains("other.rs:1:// let value = 2;"), "{output}");
+        assert!(!output.contains("node_modules"), "{output}");
+        assert!(!output.contains(".hidden"), "{output}");
+        assert!(output.ends_with("[2 files searched]"), "{output}");
+
+        // A glob and context lines narrow it down the way ripgrep's flags do.
+        let context = run_local(
+            TOOL_LOCAL_GREP,
+            &json!({ "pattern": "run\\(", "path": dir.display().to_string(),
+                     "glob": "code.rs", "contextLines": 1 }),
+            0,
+        )
+        .unwrap();
+        assert!(context.contains("code.rs:3:    run(value);"), "{context}");
+        assert!(context.contains("code.rs-2-    let value = 1;"), "{context}");
+        assert!(context.contains("code.rs-4-}"), "{context}");
+
+        // Case follows the flag, and a bad pattern is refused rather than guessed at.
+        assert!(
+            run_local(
+                TOOL_LOCAL_GREP,
+                &json!({ "pattern": "LET VALUE", "path": dir.display().to_string() }),
+                0
+            )
+            .unwrap()
+            .contains("let value = 1;")
+        );
+        assert!(
+            run_local(
+                TOOL_LOCAL_GREP,
+                &json!({ "pattern": "LET VALUE", "path": dir.display().to_string(),
+                         "caseSensitive": true }),
+                0
+            )
+            .unwrap()
+            .starts_with("No matches")
+        );
+        assert!(run_local(TOOL_LOCAL_GREP, &json!({ "pattern": "(" }), 0).is_err());
+        assert!(run_local(TOOL_LOCAL_GREP, &json!({}), 0).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn local_files_can_be_moved_and_deleted() {
         let dir = std::env::temp_dir().join(format!("wassh-ai-move-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1827,21 +1997,43 @@ mod tests {
     }
 
     #[test]
-    fn the_developer_tools_are_shell_lines_for_the_host() {
+    fn the_grep_command_prefers_ripgrep_and_falls_back_to_grep() {
         let grep = dev_grep_command(
             &json!({ "pattern": "fn main", "glob": "*.rs", "contextLines": 2, "limit": 7 }),
             "/srv/app",
         );
-        assert!(grep.starts_with("grep -rnI -i --include='*.rs' -C 2 "), "{grep}");
-        assert!(grep.contains("-e 'fn main' '/srv/app'"), "{grep}");
-        assert!(grep.ends_with("head -n 7"), "{grep}");
+        assert!(grep.starts_with("if command -v rg >/dev/null 2>&1; then "), "{grep}");
+        assert!(
+            grep.contains(
+                "rg --line-number --no-heading --color never -i -g '*.rs' -C 2 -e 'fn main' '/srv/app'"
+            ),
+            "{grep}"
+        );
+        assert!(
+            grep.contains(
+                "grep -rnI -i --include='*.rs' -C 2 --exclude-dir={.git,node_modules,dist,build,target} \
+                 -e 'fn main' '/srv/app'"
+            ),
+            "{grep}"
+        );
+        assert!(!grep.is_empty() && grep.matches("head -n 7").count() == 2, "{grep}");
+
+        // Case-sensitive searches pass no `-i`, and the cap is enforced both ways.
         let case = dev_grep_command(
             &json!({ "pattern": "main", "caseSensitive": true, "limit": 500 }),
             "/srv",
         );
-        assert!(case.starts_with("grep -rnI --exclude-dir"), "{case}");
-        assert!(case.ends_with(&format!("head -n {MAX_DEV_GREP_MATCHES}")), "{case}");
+        assert!(case.contains("rg --line-number --no-heading --color never -e"), "{case}");
+        assert!(case.contains("grep -rnI --exclude-dir"), "{case}");
+        assert_eq!(
+            case.matches(&format!("head -n {MAX_DEV_GREP_MATCHES}")).count(),
+            2,
+            "{case}"
+        );
+    }
 
+    #[test]
+    fn the_developer_tree_tools_are_shell_lines_for_the_host() {
         let find = dev_find_command(&json!({ "namePattern": "*.toml", "limit": 3 }), "/srv");
         assert!(find.contains("-maxdepth 8"), "{find}");
         assert!(find.contains("-iname '*.toml'"), "{find}");

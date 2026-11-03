@@ -431,7 +431,8 @@ impl AiAgent {
         self.providers.get(self.provider)
     }
 
-    /// The system prompt, as the reference builds it.
+    /// The system prompt: what the agent is connected to, the tools this session really
+    /// offers, and how to choose between them.
     fn system_prompt(&self, settings: &serde_json::Map<String, Value>, host: &str) -> String {
         let mut lines = vec![
             format!(
@@ -441,23 +442,18 @@ impl AiAgent {
             String::new(),
             "Available tools:".to_owned(),
         ];
-        for spec in tools::TOOL_SPECS {
+        // Only what the request actually sends: naming a tool this host may not call just
+        // invites the model to try it and fall back to the shell.
+        for spec in tools::TOOL_SPECS
+            .iter()
+            .filter(|spec| self.agent.permissions.offers(spec.name))
+        {
             lines.push(format!("- {}: {}", spec.name, spec.description));
         }
+        lines.push(String::new());
+        lines.push("Guidelines:".to_owned());
+        lines.extend(self.tool_guidance());
         lines.extend([
-            String::new(),
-            "Guidelines:".to_owned(),
-            "- Use run_command for shell work on the connected host, local_fs_run_command for \
-             commands on this computer (builds, tests, version control), and the terminal_* tools \
-             to drive the live shell."
-                .to_owned(),
-            "- When a task needs root, call run_sudo with the same command: it asks the user for \
-their sudo password before running. Plain run_command cannot answer sudo's prompt, and never \
-pipe a password to sudo yourself."
-                .to_owned(),
-            "- Prefer the file tools over shell commands when reading or editing files: dev_* and \
-             remote_fs_* work on the connected host, local_fs_* on this computer."
-                .to_owned(),
             "- After each command or tool call you see its actual result. Never invent output."
                 .to_owned(),
             "- Ask before doing anything destructive or ambiguous.".to_owned(),
@@ -477,6 +473,83 @@ pipe a password to sudo yourself."
             }
         }
         lines.join("\n")
+    }
+
+    /// How to choose between this session's tools, named as they are offered here.
+    ///
+    /// A family the host has switched off is not mentioned, so the agent never reads about
+    /// a capability it cannot use; a file tool that is missing is reported as such rather
+    /// than worked around with a shell command.
+    fn tool_guidance(&self) -> Vec<String> {
+        let offered = |prefix: &str| -> Vec<&'static str> {
+            tools::TOOL_SPECS
+                .iter()
+                .map(|spec| spec.name)
+                .filter(|name| name.starts_with(prefix) && self.agent.permissions.offers(name))
+                .collect()
+        };
+        let mut lines = Vec::new();
+        // The developer tools are the richer set; the plain remote ones cover what they do
+        // not, such as deleting.
+        let mut host_files = offered("dev_");
+        host_files.extend(offered("remote_fs_"));
+        if !host_files.is_empty() {
+            lines.push(format!(
+                "- Files on the connected host: {}. Read, search and change them with these \
+                 tools. Do not reach for cat, head, tail, ls, find, grep/rg, sed or awk through a \
+                 shell command: the tools are quicker, they cannot hang on a pager, and they show \
+                 the user what changed.",
+                host_files.join(", ")
+            ));
+        }
+        let local_files = offered("local_fs_");
+        if !local_files.is_empty() {
+            lines.push(format!(
+                "- Files on this computer: {}.",
+                local_files.join(", ")
+            ));
+        }
+        let shells: Vec<&str> = [
+            super::protocol::TOOL_RUN_COMMAND,
+            super::protocol::TOOL_RUN_SUDO,
+            super::protocol::TOOL_LOCAL_RUN,
+        ]
+        .into_iter()
+        .filter(|name| self.agent.permissions.offers(name))
+        .collect();
+        if !shells.is_empty() {
+            lines.push(format!(
+                "- {} {} for work no tool covers: builds, tests, services, package managers and \
+                 version control. Not for reading or editing files.",
+                shells.join(", "),
+                if shells.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        if self
+            .agent
+            .permissions
+            .offers(super::protocol::TOOL_TERMINAL_READ)
+        {
+            lines.push(
+                "- The terminal_* tools drive the live shell the user is watching; use them for \
+                 what only an interactive program can do."
+                    .to_owned(),
+            );
+        }
+        if self.agent.permissions.offers(super::protocol::TOOL_RUN_SUDO) {
+            lines.push(
+                "- When a task needs root, call run_sudo with the same command: it asks the user \
+                 for their sudo password before running. Plain run_command cannot answer sudo's \
+                 prompt, and never pipe a password to sudo yourself."
+                    .to_owned(),
+            );
+        }
+        lines.push(
+            "- If a file tool you need is not in the list above, tell the user which capability \
+             is switched off instead of doing the same job with a shell command."
+                .to_owned(),
+        );
+        lines
     }
 
     /// Rules and tool settings from the plugin data.
@@ -2818,6 +2891,51 @@ mod tests {
         assert!(!plugin.poll_models());
         assert_eq!(plugin.providers[0].models, ["kept"]);
         assert!(plugin.take_app_settings().is_empty());
+    }
+
+    #[test]
+    fn the_prompt_offers_only_the_tools_the_host_may_use() {
+        use super::super::permissions::{GROUP_LOCAL_FS, GROUP_REMOTE_FS, Permissions, group_key};
+        let prompt_for = |groups: Vec<&str>| {
+            let settings: serde_json::Map<String, Value> =
+                groups.into_iter().map(|group| (group_key(group), json!(true))).collect();
+            let mut plugin = AiAgent::default();
+            plugin.agent.permissions = Permissions::from_settings(&settings);
+            plugin.system_prompt(&serde_json::Map::new(), "dev")
+        };
+
+        // With both filesystem groups on, both families are named and the shell is not
+        // offered as a way to read files.
+        let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS]);
+        assert!(both.contains("- dev_grep_search:"), "{both}");
+        assert!(both.contains("- local_fs_grep_search:"), "{both}");
+        assert!(both.contains("Files on the connected host:"), "{both}");
+        assert!(both.contains("Files on this computer:"), "{both}");
+        assert!(
+            both.contains("Do not reach for cat, head, tail, ls, find, grep/rg, sed or awk"),
+            "{both}"
+        );
+        assert!(both.contains("Not for reading or editing files"), "{both}");
+
+        // With only the local group on, the host's tools are not advertised at all.
+        let local_only = prompt_for(vec![GROUP_LOCAL_FS]);
+        assert!(local_only.contains("- local_fs_grep_search:"), "{local_only}");
+        assert!(!local_only.contains("dev_view_file"), "{local_only}");
+        assert!(
+            !local_only.contains("Files on the connected host:"),
+            "{local_only}"
+        );
+        // …and the agent is told to say a capability is off rather than shell around it.
+        assert!(
+            local_only.contains("tell the user which capability is switched off"),
+            "{local_only}"
+        );
+
+        // A host with nothing switched on gets the shells and no file tools.
+        let bare = prompt_for(Vec::new());
+        assert!(bare.contains("- run_command:"), "{bare}");
+        assert!(!bare.contains("local_fs_read_file"), "{bare}");
+        assert!(!bare.contains("dev_view_file"), "{bare}");
     }
 
     #[test]
