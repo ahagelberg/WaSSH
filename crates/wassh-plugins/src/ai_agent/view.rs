@@ -73,12 +73,16 @@ const BADGE_TINT: f32 = 0.25;
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// Characters shown from a queued message.
 const QUEUE_PREVIEW_MAX_CHARS: usize = 120;
-/// Height a prompt card may take before its own content scrolls.
-const PROMPT_CARD_MAX_HEIGHT: f32 = 240.0;
+/// Most a prompt card grows to, its own controls included.
+const PROMPT_CARD_MAX_HEIGHT: f32 = 320.0;
 /// Smallest a capped prompt card gets.
 const PROMPT_CARD_MIN_HEIGHT: f32 = 120.0;
 /// Share of the pane a prompt card may take.
 const PROMPT_CARD_SHARE: f32 = 0.35;
+/// Gap between a card's scrolling body and its fixed controls.
+const PROMPT_CARD_GAP: f32 = 8.0;
+/// Narrowest an answer field in a prompt card may get.
+const MIN_ANSWER_WIDTH: f32 = 80.0;
 /// Characters of a command kept in a prompt card.
 const PROMPT_COMMAND_MAX_CHARS: usize = 400;
 /// Characters of a command kept in an "always allow" button's label.
@@ -1390,9 +1394,17 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
 /// Frame a prompt card so it reads as a popup over the conversation rather than as more
 /// transcript text.
 ///
-/// The body is capped: a request the model wrote a whole script into must not push the
-/// conversation and the composer out of the pane.
-fn prompt_card(ui: &mut Ui, palette: &Palette, id: &str, add: impl FnOnce(&mut Ui)) {
+/// The card is capped: a request the model wrote a whole script into must not push the
+/// conversation and the composer out of the pane. Only `body` scrolls — `controls` are
+/// drawn first in a bottom-up layout, so the buttons under the request keep their place
+/// however long the request is.
+fn prompt_card(
+    ui: &mut Ui,
+    palette: &Palette,
+    id: &str,
+    body: impl FnOnce(&mut Ui),
+    controls: impl FnOnce(&mut Ui),
+) {
     let room = (ui.available_height() * PROMPT_CARD_SHARE)
         .clamp(PROMPT_CARD_MIN_HEIGHT, PROMPT_CARD_MAX_HEIGHT);
     egui::Frame::new()
@@ -1401,11 +1413,16 @@ fn prompt_card(ui: &mut Ui, palette: &Palette, id: &str, add: impl FnOnce(&mut U
         .corner_radius(wassh_core::RADIUS)
         .inner_margin(egui::Margin::same(PROMPT_CARD_PADDING))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt(("ai-prompt-card", id))
-                .max_height(room)
-                .auto_shrink([false, true])
-                .show(ui, add);
+            ui.set_max_height(room);
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                controls(ui);
+                ui.add_space(PROMPT_CARD_GAP);
+                egui::ScrollArea::vertical()
+                    .id_salt(("ai-prompt-card", id))
+                    .max_height(ui.available_height())
+                    .auto_shrink([false, true])
+                    .show(ui, body);
+            });
         });
 }
 
@@ -1473,56 +1490,63 @@ impl AiAgent {
             _ => None,
         };
         if let Some((command, scopes)) = approval {
-            prompt_card(ui, palette, "approval", |ui| {
-                ui.label(
-                    egui::RichText::new("Run this command?")
-                        .size(12.0)
-                        .strong()
-                        .color(to_color32(palette.text)),
-                );
-                prompt_command(ui, palette, &command);
-                let mut chosen: Option<(bool, Option<usize>)> = None;
-                let mut everything = false;
-                ui.horizontal(|ui| {
-                    if Button::new("Allow")
-                        .compact()
-                        .kind(ButtonKind::Primary)
-                        .show(ui, palette)
-                        .clicked()
-                    {
-                        chosen = Some((true, None));
+            let mut chosen: Option<(bool, Option<usize>)> = None;
+            let mut everything = false;
+            prompt_card(
+                ui,
+                palette,
+                "approval",
+                |ui| {
+                    ui.label(
+                        egui::RichText::new("Run this command?")
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    prompt_command(ui, palette, &command);
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if Button::new("Allow")
+                            .compact()
+                            .kind(ButtonKind::Primary)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            chosen = Some((true, None));
+                        }
+                        if Button::new("Deny")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            chosen = Some((false, None));
+                        }
+                    });
+                    if small_button_enabled(ui, palette, "Always allow every command", true) {
+                        everything = true;
                     }
-                    if Button::new("Deny")
-                        .compact()
-                        .kind(ButtonKind::Danger)
-                        .show(ui, palette)
-                        .clicked()
-                    {
-                        chosen = Some((false, None));
+                    for (index, scope) in scopes.iter().enumerate() {
+                        let label = if scope.word_count == 0 {
+                            format!("Always allow exactly: {}", scope_label(&scope.text))
+                        } else {
+                            format!(
+                                "Always allow commands starting with: {}",
+                                scope_label(&scope.text)
+                            )
+                        };
+                        if small_button_enabled(ui, palette, &label, true) {
+                            chosen = Some((true, Some(index)));
+                        }
                     }
-                });
-                if small_button_enabled(ui, palette, "Always allow every command", true) {
-                    everything = true;
-                }
-                for (index, scope) in scopes.iter().enumerate() {
-                    let label = if scope.word_count == 0 {
-                        format!("Always allow exactly: {}", scope_label(&scope.text))
-                    } else {
-                        format!(
-                            "Always allow commands starting with: {}",
-                            scope_label(&scope.text)
-                        )
-                    };
-                    if small_button_enabled(ui, palette, &label, true) {
-                        chosen = Some((true, Some(index)));
+                    if let Some((allow, remember)) = chosen {
+                        answers.approval = Some((allow, remember, false));
+                    } else if everything {
+                        answers.approval = Some((true, None, true));
                     }
-                }
-                if let Some((allow, remember)) = chosen {
-                    answers.approval = Some((allow, remember, false));
-                } else if everything {
-                    answers.approval = Some((true, None, true));
-                }
-            });
+                },
+            );
         }
 
         // The capability card: a tool whose permission is "ask".
@@ -1531,41 +1555,48 @@ impl AiAgent {
             _ => None,
         };
         if let Some(label) = asking {
-            prompt_card(ui, palette, "permission", |ui| {
-                ui.label(
-                    egui::RichText::new("Approve action?")
-                        .size(12.0)
-                        .strong()
-                        .color(to_color32(palette.text)),
-                );
-                prompt_command(ui, palette, &label);
-                ui.horizontal(|ui| {
-                    if Button::new("Approve once")
-                        .compact()
-                        .kind(ButtonKind::Primary)
-                        .show(ui, palette)
-                        .clicked()
-                    {
-                        answers.permission = Some((true, false));
-                    }
-                    if Button::new("Deny once")
-                        .compact()
-                        .kind(ButtonKind::Danger)
-                        .show(ui, palette)
-                        .clicked()
-                    {
-                        answers.permission = Some((false, false));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if small_button_enabled(ui, palette, "Always allow", true) {
-                        answers.permission = Some((true, true));
-                    }
-                    if small_button_enabled(ui, palette, "Always deny", true) {
-                        answers.permission = Some((false, true));
-                    }
-                });
-            });
+            prompt_card(
+                ui,
+                palette,
+                "permission",
+                |ui| {
+                    ui.label(
+                        egui::RichText::new("Approve action?")
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    prompt_command(ui, palette, &label);
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if Button::new("Approve once")
+                            .compact()
+                            .kind(ButtonKind::Primary)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.permission = Some((true, false));
+                        }
+                        if Button::new("Deny once")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.permission = Some((false, false));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if small_button_enabled(ui, palette, "Always allow", true) {
+                            answers.permission = Some((true, true));
+                        }
+                        if small_button_enabled(ui, palette, "Always deny", true) {
+                            answers.permission = Some((false, true));
+                        }
+                    });
+                },
+            );
         }
 
         // The question card.
@@ -1574,37 +1605,45 @@ impl AiAgent {
             _ => None,
         };
         if let Some(text) = question {
-            prompt_card(ui, palette, "question", |ui| {
-                ui.label(
-                    egui::RichText::new(text.as_str())
-                        .size(12.0)
-                        .strong()
-                        .color(to_color32(palette.text)),
-                );
-                let room = (ui.available_width() - 8.0).max(80.0);
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(room, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_width(room);
-                        let response = text_area(ui, palette, &mut self.answer, 2, "Your answer…");
-                        if response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            && !ui.input(|input| input.modifiers.shift)
-                        {
-                            answers.answer = Some(std::mem::take(&mut self.answer));
-                        }
-                    },
-                );
-                if small_button_enabled(
-                    ui,
-                    palette,
-                    "Send answer",
-                    !self.answer.trim().is_empty(),
-                ) {
-                    answers.answer = Some(std::mem::take(&mut self.answer));
-                }
-            });
+            prompt_card(
+                ui,
+                palette,
+                "question",
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(text.as_str())
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                },
+                |ui| {
+                    let room = (ui.available_width() - PROMPT_CARD_GAP).max(MIN_ANSWER_WIDTH);
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(room, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(room);
+                            let response =
+                                text_area(ui, palette, &mut self.answer, 2, "Your answer…");
+                            if response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                && !ui.input(|input| input.modifiers.shift)
+                            {
+                                answers.answer = Some(std::mem::take(&mut self.answer));
+                            }
+                        },
+                    );
+                    if small_button_enabled(
+                        ui,
+                        palette,
+                        "Send answer",
+                        !self.answer.trim().is_empty(),
+                    ) {
+                        answers.answer = Some(std::mem::take(&mut self.answer));
+                    }
+                },
+            );
         }
 
         // The sudo card: the command that needs root, and the password for it.
@@ -1613,52 +1652,61 @@ impl AiAgent {
             .sudo_prompt()
             .map(|(command, reason)| (command.to_owned(), reason.map(str::to_owned)));
         if let Some((command, reason)) = sudo {
-            prompt_card(ui, palette, "sudo", |ui| {
-                ui.label(
-                    egui::RichText::new("Sudo password required")
-                        .size(12.0)
-                        .strong()
-                        .color(to_color32(palette.text)),
-                );
-                prompt_command(ui, palette, &command);
-                if let Some(reason) = reason {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(reason).size(11.0).color(muted)).wrap(),
+            prompt_card(
+                ui,
+                palette,
+                "sudo",
+                |ui| {
+                    ui.label(
+                        egui::RichText::new("Sudo password required")
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
                     );
-                }
-                let room = (ui.available_width() - 8.0).max(80.0);
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(room, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_width(room);
-                        let response = password_input(ui, palette, &mut self.sudo, "sudo password");
-                        if response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    prompt_command(ui, palette, &command);
+                    if let Some(reason) = reason {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(reason).size(11.0).color(muted))
+                                .wrap(),
+                        );
+                    }
+                },
+                |ui| {
+                    let room = (ui.available_width() - PROMPT_CARD_GAP).max(MIN_ANSWER_WIDTH);
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(room, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(room);
+                            let response =
+                                password_input(ui, palette, &mut self.sudo, "sudo password");
+                            if response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            {
+                                answers.sudo = Some(SudoAnswer::Run);
+                            }
+                        },
+                    );
+                    ui.horizontal(|ui| {
+                        if Button::new("Continue")
+                            .compact()
+                            .primary()
+                            .show(ui, palette)
+                            .clicked()
                         {
                             answers.sudo = Some(SudoAnswer::Run);
                         }
-                    },
-                );
-                ui.horizontal(|ui| {
-                    if Button::new("Continue")
-                        .compact()
-                        .primary()
-                        .show(ui, palette)
-                        .clicked()
-                    {
-                        answers.sudo = Some(SudoAnswer::Run);
-                    }
-                    if Button::new("Cancel")
-                        .compact()
-                        .kind(ButtonKind::Danger)
-                        .show(ui, palette)
-                        .clicked()
-                    {
-                        answers.sudo = Some(SudoAnswer::Cancel);
-                    }
-                });
-            });
+                        if Button::new("Cancel")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.sudo = Some(SudoAnswer::Cancel);
+                        }
+                    });
+                },
+            );
         }
 
         answers
@@ -2678,10 +2726,11 @@ mod tests {
             .find(|(_, text)| text == "Run this command?")
             .map(|(pos, _)| *pos)
             .expect("the approval card is drawn");
-        assert!(
-            cards.iter().any(|card| card.contains(title)),
-            "the card has no background of its own"
-        );
+        let card = cards
+            .iter()
+            .find(|card| card.contains(title))
+            .copied()
+            .expect("the card has no background of its own");
 
         // The composer is still on screen, well under the 760-point pane.
         let send = texts
@@ -2693,6 +2742,28 @@ mod tests {
         // The card itself stays a card, not a whole screen of script.
         for card in &cards {
             assert!(card.height() < 760.0 / 2.0, "the card grew to {card:?}");
+        }
+        assert!(
+            card.height() <= PROMPT_CARD_MAX_HEIGHT,
+            "the card grew past its cap: {card:?}"
+        );
+
+        // Only the command scrolls: the way to answer stays in the card, under it.
+        let button = |label: &str| {
+            texts
+                .iter()
+                .find(|(_, text)| text == label)
+                .map(|(pos, _)| *pos)
+                .unwrap_or_else(|| panic!("{label} was scrolled out of the card"))
+        };
+        let allow = button("Allow");
+        let deny = button("Deny");
+        let everything = button("Always allow every command");
+        for position in [allow, deny, everything] {
+            assert!(
+                card.contains(position) && position.y > title.y,
+                "a control left the card: {position:?} in {card:?}"
+            );
         }
     }
 
