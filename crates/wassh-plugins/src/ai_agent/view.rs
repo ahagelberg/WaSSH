@@ -62,7 +62,8 @@ const MIN_COMPOSER_WIDTH: f32 = 80.0;
 /// Gap between two entries of the transcript.
 const TURN_GAP: f32 = 8.0;
 /// Share of the pane a user message may take, like the reference's bubble.
-const USER_BUBBLE_SHARE: f32 = 0.92;
+/// Share of the pane a chat message may take.
+const MESSAGE_BUBBLE_SHARE: f32 = 0.92;
 /// Share of the accent mixed into the user bubble's background.
 const USER_BUBBLE_TINT: f32 = 0.20;
 /// Share of the accent mixed into the user bubble's border.
@@ -1133,8 +1134,7 @@ impl AiAgent {
                     }
                 }
                 Turn::Assistant { text, stopped } => {
-                    // Answers are Markdown, like the reference's react-markdown.
-                    super::markdown::render(ui, palette, text);
+                    assistant_bubble(ui, palette, text);
                     if *stopped {
                         ui.label(
                             egui::RichText::new("interrupted")
@@ -1248,7 +1248,7 @@ fn cropped_select<T: Clone + PartialEq>(
 /// A user message: a bubble against the right edge, tinted with the accent like the
 /// reference's `.ai-agent-user-text`. Clicking it rewinds the conversation to that point.
 fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bool {
-    let room = ui.available_width() * USER_BUBBLE_SHARE;
+    let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
     let fill = to_color32(wassh_core::colors::tint(
         palette.accent,
         palette.bg_panel_2,
@@ -1268,9 +1268,8 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bo
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(room);
-                    // The frame hugs the right edge; the blocks inside still stack top to
-                    // bottom rather than sharing the parent's right-to-left row.
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                    // The frame hugs the right edge while its text stays left-aligned.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         // What went out with the message, like the reference's ctx tags.
                         if meta.attachments > 0 || meta.terminal {
                             let mut tags: Vec<String> = Vec::new();
@@ -1297,6 +1296,24 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bo
         .interact(egui::Sense::click())
         .on_hover_text("Click to rewind to this message")
         .clicked()
+}
+
+/// An assistant response: Markdown in a neutral bubble against the left edge.
+fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
+    let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+        egui::Frame::new()
+            .fill(to_color32(palette.bg_panel_2))
+            .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+            .corner_radius(wassh_core::RADIUS)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(room);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    super::markdown::render(ui, palette, text);
+                });
+            });
+    });
 }
 
 /// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
@@ -1425,7 +1442,9 @@ fn prompt_card(
                     .id_salt(("ai-prompt-card", id))
                     .max_height(ui.available_height())
                     .auto_shrink([false, true])
-                    .show(ui, body);
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), body);
+                    });
             });
         });
 }
@@ -2251,6 +2270,7 @@ mod tests {
     /// Pane widths the layout tests draw at.
     const WIDE_PANE: f32 = 560.0;
     const NARROW_PANE: f32 = 120.0;
+    const PROMPT_SCROLL_TOP_TOLERANCE: f32 = 20.0;
 
     use super::super::settings_ui::{API_KEYS_KEY, provider_secret_field};
     use super::*;
@@ -2752,19 +2772,27 @@ mod tests {
         let mut texts = Vec::new();
         let mut cards = Vec::new();
         let mut request_viewport = None;
+        let mut request_position = None;
+        let mut request_title_position = None;
         // The bottom panel settles its height over a few frames.
         for _ in 0..4 {
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             texts.clear();
             cards.clear();
             request_viewport = None;
+            request_position = None;
+            request_title_position = None;
             for clipped in std::mem::take(&mut output.shapes) {
                 let clip_rect = clipped.clip_rect;
                 match clipped.shape {
                     egui::Shape::Text(text) => {
                         let label = text.galley.text().to_owned();
+                        if label == "Run this command?" {
+                            request_title_position = Some(text.pos);
+                        }
                         if label.starts_with("cd ~/app") {
                             request_viewport = Some(clip_rect);
+                            request_position = Some(text.pos);
                         }
                         texts.push((text.pos, label));
                     }
@@ -2830,6 +2858,19 @@ mod tests {
         assert!(
             card.contains(request_viewport.min) && card.contains(request_viewport.max),
             "the request viewport left the card: {request_viewport:?} in {card:?}"
+        );
+        let request_position = request_position.expect("the request is drawn");
+        let request_title_position =
+            request_title_position.expect("the request title is drawn");
+        assert!(
+            request_title_position.y >= request_viewport.top()
+                && request_title_position.y
+                    <= request_viewport.top() + PROMPT_SCROLL_TOP_TOLERANCE,
+            "request title is not at the top of its viewport: {request_title_position:?} in {request_viewport:?}"
+        );
+        assert!(
+            request_position.y > request_title_position.y,
+            "request title must precede the command: {request_title_position:?}, {request_position:?}"
         );
         for position in std::iter::once(&allow)
             .chain(std::iter::once(&deny))
@@ -3025,6 +3066,50 @@ mod tests {
         assert!(
             rows.windows(2).all(|pair| pair[0] < pair[1]),
             "the bubble must stack its blocks: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn an_assistant_response_uses_a_distinct_left_aligned_bubble() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            assistant_bubble(ui, &palette, "Agent response");
+        });
+        let mut bubble = None;
+        let mut response = None;
+        for clipped in std::mem::take(&mut output.shapes) {
+            match clipped.shape {
+                egui::Shape::Rect(rect) if rect.fill == to_color32(palette.bg_panel_2) => {
+                    bubble = Some(rect.rect);
+                }
+                egui::Shape::Text(text) if text.galley.text() == "Agent response" => {
+                    response = Some(text.pos);
+                }
+                _ => {}
+            }
+        }
+        output.drop_without_applying_deltas();
+
+        let bubble = bubble.expect("the assistant bubble has a neutral panel fill");
+        let response = response.expect("the assistant response is drawn");
+        let user_fill = to_color32(wassh_core::colors::tint(
+            palette.accent,
+            palette.bg_panel_2,
+            USER_BUBBLE_TINT,
+        ));
+        assert_ne!(to_color32(palette.bg_panel_2), user_fill);
+        assert!(bubble.left() < WIDE_PANE / 2.0, "bubble should start on the left");
+        assert!(
+            response.x >= bubble.left() && response.x < bubble.center().x,
+            "response text should be left-aligned inside its bubble: {response:?} in {bubble:?}"
         );
     }
 
