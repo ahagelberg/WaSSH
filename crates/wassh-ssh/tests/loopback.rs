@@ -132,6 +132,59 @@ impl server::Handler for ExitingServer {
     }
 }
 
+/// A server whose shell ends without naming an exit status, the way `logout`, a forced
+/// command or a plain `sh` exit can.
+#[derive(Clone)]
+struct SilentExitServer;
+
+impl server::Handler for SilentExitServer {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        Ok(if password == "secret" {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+}
+
 async fn spawn_server() -> (String, u16) {
     spawn_server_with(EchoServer).await
 }
@@ -631,6 +684,22 @@ async fn an_exit_status_means_the_shell_ended() {
         wait_for_end(&mut session).await,
         Some(wassh_ssh::SessionEnd::Exited { status: 0 }),
         "a shell that logs out must be reported as exited, not as a dropped connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_channel_means_the_shell_ended() {
+    // `logout` and forced commands end the channel without an exit status; that is still
+    // the session ending on purpose, not a dropped connection.
+    let (host, port) = spawn_server_with(SilentExitServer).await;
+    let mut session =
+        SshSession::connect(options(host, port, SshAuth::Password("secret".to_owned())))
+            .expect("spawn session");
+
+    assert_eq!(
+        wait_for_end(&mut session).await,
+        Some(wassh_ssh::SessionEnd::Closed),
+        "a closed channel must be reported as ended, not as a dropped connection"
     );
 }
 

@@ -159,10 +159,13 @@ mod tests {
     #[cfg(windows)]
     const STDIN: &str = "[Console]::In.ReadToEnd()";
 
+    /// How long a test waits for its command; a busy machine spawns a shell slowly.
+    const COMMAND_WAIT: Duration = Duration::from_secs(60);
+
     /// Collect a finished command, waiting for it like the UI does.
     fn wait(receiver: Receiver<Result<ExecOutput, String>>) -> Result<ExecOutput, String> {
         receiver
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(COMMAND_WAIT)
             .expect("the command finished")
     }
 

@@ -13,12 +13,12 @@
 use serde_json::{Map, Value};
 
 use super::protocol::{
-    TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DELETE, TOOL_DEV_DIFF, TOOL_DEV_EDIT,
-    TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_MOVE, TOOL_DEV_MULTI_EDIT,
-    TOOL_DEV_PATCH, TOOL_DEV_REPLACE, TOOL_DEV_RUN, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT,
-    TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
-    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_TERMINAL_KEYS,
-    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP,
+    TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST,
+    TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE,
+    TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT,
+    TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
+    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 /// Live-terminal tools.
@@ -154,31 +154,7 @@ pub const GATES: &[Gate] = &[
         default: Permission::Allow,
     },
     Gate {
-        tool: TOOL_DEV_VIEW,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_READ,
-        default: Permission::Allow,
-    },
-    Gate {
         tool: TOOL_LOCAL_LIST,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_LIST,
-        default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_LIST,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_LIST,
-        default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_FIND,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_LIST,
-        default: Permission::Allow,
-    },
-    Gate {
-        tool: TOOL_DEV_GREP,
         group: Some(GROUP_LOCAL_FS),
         leader: TOOL_LOCAL_LIST,
         default: Permission::Allow,
@@ -196,57 +172,81 @@ pub const GATES: &[Gate] = &[
         default: Permission::Ask,
     },
     Gate {
-        tool: TOOL_DEV_CREATE,
+        tool: TOOL_LOCAL_DELETE,
         group: Some(GROUP_LOCAL_FS),
         leader: TOOL_LOCAL_WRITE,
         default: Permission::Ask,
     },
     Gate {
-        tool: TOOL_DEV_EDIT,
+        tool: TOOL_LOCAL_MOVE,
         group: Some(GROUP_LOCAL_FS),
         leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_LOCAL_MULTI_EDIT,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_LOCAL_PATCH,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_LOCAL_REPLACE,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_LOCAL_RUN,
+        group: Some(GROUP_LOCAL_FS),
+        leader: TOOL_LOCAL_RUN,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_VIEW,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_LIST,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_LIST,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_FIND,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_LIST,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_GREP,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_LIST,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_EDIT,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_DEV_CREATE,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
         default: Permission::Ask,
     },
     Gate {
         tool: TOOL_DEV_DIFF,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_WRITE,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_DELETE,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_WRITE,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_MOVE,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_WRITE,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_MULTI_EDIT,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_WRITE,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_PATCH,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_WRITE,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_REPLACE,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_LOCAL_WRITE,
-        default: Permission::Ask,
-    },
-    Gate {
-        tool: TOOL_DEV_RUN,
-        group: Some(GROUP_LOCAL_FS),
-        leader: TOOL_DEV_RUN,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
         default: Permission::Ask,
     },
     Gate {
@@ -435,17 +435,17 @@ mod tests {
             TOOL_DEV_EDIT,
             TOOL_DEV_CREATE,
             TOOL_DEV_DIFF,
-            TOOL_DEV_DELETE,
-            TOOL_DEV_MOVE,
-            TOOL_DEV_MULTI_EDIT,
-            TOOL_DEV_PATCH,
-            TOOL_DEV_REPLACE,
-            TOOL_DEV_RUN,
             TOOL_REMOTE_WRITE,
             TOOL_REMOTE_EDIT,
             TOOL_REMOTE_DELETE,
             TOOL_LOCAL_WRITE,
             TOOL_LOCAL_EDIT,
+            TOOL_LOCAL_DELETE,
+            TOOL_LOCAL_MOVE,
+            TOOL_LOCAL_MULTI_EDIT,
+            TOOL_LOCAL_PATCH,
+            TOOL_LOCAL_REPLACE,
+            TOOL_LOCAL_RUN,
             TOOL_TERMINAL_WRITE,
             TOOL_TERMINAL_KEYS,
         ] {
@@ -464,7 +464,7 @@ mod tests {
             Some("apiMethod:ai-agent:local_fs_write_file")
         );
         assert_eq!(
-            setting_key(TOOL_DEV_DELETE).as_deref(),
+            setting_key(TOOL_LOCAL_DELETE).as_deref(),
             Some("apiMethod:ai-agent:local_fs_write_file")
         );
         assert_eq!(setting_key(TOOL_RUN_COMMAND), None);

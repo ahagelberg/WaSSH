@@ -416,7 +416,7 @@ const AI_AGENT_LOCAL_FS_CHILDREN: &[SettingsField] = &[
         "Allow the agent to create, edit, move, and delete files on your local computer.",
     ),
     permission(
-        "apiMethod:ai-agent:dev_run_command",
+        "apiMethod:ai-agent:local_fs_run_command",
         "Run commands",
         "ask",
         "Allow the agent to run shell commands on your local computer, for builds, tests and \
@@ -493,7 +493,7 @@ const AI_AGENT_LOCAL_FS_GROUP: SettingsField = group(
     "Local computer",
     false,
     "Allow the agent to read and write files and run commands on your local computer running \
-WaSSH. The dev_* tools work here; the remote_fs_* tools work on the connected host.",
+WaSSH. The local_fs_* tools work here; the dev_* and remote_fs_* tools work on the connected host.",
     AI_AGENT_LOCAL_FS_CHILDREN,
 );
 

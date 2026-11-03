@@ -685,7 +685,7 @@ mod tests {
         assert!(a.style.bold);
         assert_eq!(a.style.fg, Rgba::rgb(0xe35d6a));
         assert!(!b.style.bold);
-        assert_eq!(b.style.fg, Rgba::rgb(0xe8eaed));
+        assert_eq!(b.style.fg, Palette::dark().term_fg);
     }
 
     #[test]
@@ -694,8 +694,8 @@ mod tests {
         term.feed(b"\x1b[7mX\x1b[0m");
         let snapshot = term.snapshot();
         let cell = snapshot.cell(0, 0).unwrap();
-        assert_eq!(cell.style.fg, Rgba::rgb(0x0c0d0f));
-        assert_eq!(cell.style.bg, Rgba::rgb(0xe8eaed));
+        assert_eq!(cell.style.fg, Palette::dark().bg_term);
+        assert_eq!(cell.style.bg, Palette::dark().term_fg);
     }
 
     #[test]

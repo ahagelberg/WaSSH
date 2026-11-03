@@ -3,10 +3,16 @@
 //! The palette is the single source of truth for both themes. Keeping it in Rust lets us
 //! type-check contrast and reuse the values for native drawing.
 //!
-//! The light terminal uses the light theme's text colour: the dark theme's `#e8eaed` is
-//! unreadable on white (contrast 1.2:1).
+//! The terminal has colours of its own: a light theme must not turn the shell into a white
+//! page, so `bg_term` / `term_fg` are the same in both palettes.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Terminal background: black in every theme.
+const TERM_BACKGROUND: Rgba = Rgba::rgb(0x0c0d0f);
+
+/// Terminal text: light grey in every theme.
+const TERM_FOREGROUND: Rgba = Rgba::rgb(0xd3d3d3);
 
 /// Straight (non-premultiplied) sRGB colour.
 ///
@@ -241,15 +247,14 @@ impl Palette {
             danger: Rgba::rgb(0xe35d6a),
             ok: Rgba::rgb(0x3dd68c),
             warn: Rgba::rgb(0xf0b429),
-            bg_term: Rgba::rgb(0x0c0d0f),
-            term_fg: Rgba::rgb(0xe8eaed),
+            bg_term: TERM_BACKGROUND,
+            term_fg: TERM_FOREGROUND,
             term_selection: Rgba::hex8(0x3d8b_fd66),
             tab_active_border: Rgba::rgb(0xffffff),
         }
     }
 
-    /// Light palette. `term_fg` uses the light theme's text colour, which stays readable on
-    /// the white terminal background.
+    /// Light palette. The terminal keeps [`TERM_BACKGROUND`] and [`TERM_FOREGROUND`].
     pub const fn light() -> Self {
         Self {
             mode: ThemeMode::Light,
@@ -265,8 +270,8 @@ impl Palette {
             danger: Rgba::rgb(0xd93025),
             ok: Rgba::rgb(0x1e8e3e),
             warn: Rgba::rgb(0xc47d00),
-            bg_term: Rgba::rgb(0xffffff),
-            term_fg: Rgba::rgb(0x1b1d21),
+            bg_term: TERM_BACKGROUND,
+            term_fg: TERM_FOREGROUND,
             term_selection: Rgba::hex8(0x1a6f_e84d),
             tab_active_border: Rgba::rgb(0x000000),
         }
@@ -401,13 +406,18 @@ mod tests {
     }
 
     #[test]
-    fn light_terminal_foreground_stays_readable() {
-        // The dark foreground would be invisible on white, so the light palette must not
-        // use it.
-        let inherited = Rgba::rgb(0xe8eaed);
-        let white = Palette::light().bg_term;
-        assert!(inherited.contrast_ratio(white) < 1.5);
-        assert!(Palette::light().terminal_contrast() > 15.0);
+    fn the_terminal_keeps_its_own_colours_in_both_themes() {
+        // A light theme styles the app, not the shell: turning the terminal white would
+        // also hide every program that assumes a dark background.
+        for palette in [Palette::dark(), Palette::light()] {
+            assert_eq!(palette.bg_term, Palette::dark().bg_term);
+            assert_eq!(palette.term_fg, Palette::dark().term_fg);
+            assert!(
+                palette.terminal_contrast() >= 7.0,
+                "terminal {}",
+                palette.terminal_contrast()
+            );
+        }
     }
 
     #[test]

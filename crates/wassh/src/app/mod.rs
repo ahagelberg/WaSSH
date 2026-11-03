@@ -3061,11 +3061,11 @@ impl Shell {
         }
 
         // egui reads Tab, Shift+Tab and the arrow keys as navigation between focusable
-        // widgets, and the first widget that wants focus takes it. The terminal is the
-        // only keyboard client here, so that would hand the keys to a chrome widget and
-        // leave the terminal deaf — Tab has to reach the shell. Only a text field being
-        // edited still navigates.
-        if !ctx.text_edit_focused() {
+        // widgets, and the first widget that wants focus takes it. Outside a dialog the
+        // terminal is the only keyboard client here, so that would hand the keys to a
+        // chrome widget and leave the terminal deaf — Tab has to reach the shell. A dialog
+        // is the opposite case: there the keyboard walks its fields.
+        if !ctx.text_edit_focused() && !self.dialogs.modal_open() {
             ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
         }
 
@@ -3811,6 +3811,17 @@ mod tests {
             "a shell that exits must take its tab with it"
         );
         assert_eq!(shell.closed.len(), 1, "and stay reopenable");
+    }
+
+    /// Send `events`, let egui apply the focus change on the next pass, and read it back.
+    fn focus_step(
+        shell: &mut Shell,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Option<egui::Id> {
+        shell_rows(shell, ctx, events);
+        shell_rows(shell, ctx, Vec::new());
+        ctx.memory(|memory| memory.focused())
     }
 
     /// One shell frame, returning every painted text and its position.
@@ -5096,6 +5107,57 @@ mod tests {
                 ("Reopen closed tab", "Ctrl+Shift+T"),
             ]
         );
+    }
+
+    #[test]
+    fn tab_walks_the_focus_through_a_dialog() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.handle_command(Command::OpenOptions);
+        let ctx = egui::Context::default();
+        let _ = run_shell(&mut shell, &ctx, 3);
+        assert!(
+            ctx.memory(|memory| memory.focused()).is_none(),
+            "nothing is focused until the user asks"
+        );
+
+        // Tab keeps moving: every stop is a different control, and it stays on screen —
+        // the dialog scrolls along with the focus instead of leaving it below the fold.
+        let screen = ctx.content_rect();
+        let mut walked = Vec::new();
+        for step in 0..24 {
+            let focused = focus_step(
+                &mut shell,
+                &ctx,
+                vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+            )
+            .unwrap_or_else(|| panic!("Tab dropped the focus at step {step}"));
+            if let Some(before) = walked.last() {
+                assert_ne!(&focused, before, "Tab did not move the focus");
+            }
+            let rect = ctx.read_response(focused).expect("the focused control").rect;
+            assert!(
+                screen.contains_rect(rect),
+                "the focused control is off screen: {rect:?}"
+            );
+            walked.push(focused);
+        }
+
+        // Shift+Tab walks back through the same stops.
+        for step in 0..4 {
+            let before = *walked.last().expect("a focus");
+            let focused = focus_step(
+                &mut shell,
+                &ctx,
+                vec![key_event(egui::Key::Tab, egui::Modifiers::SHIFT)],
+            )
+            .unwrap_or_else(|| panic!("Shift+Tab dropped the focus at step {step}"));
+            assert_ne!(focused, before, "Shift+Tab did not move the focus");
+            assert!(
+                walked.contains(&focused),
+                "Shift+Tab left the dialog's controls"
+            );
+            walked.push(focused);
+        }
     }
 
     #[test]

@@ -47,6 +47,9 @@ pub enum TelnetEvent {
     Status(SessionStatus),
     Closed {
         reason: Option<String>,
+        /// True when the server ended the session (it hung up). A failure keeps the tab so
+        /// the reconnect policy can take over; a hang-up ends it, like an SSH logout.
+        by_remote: bool,
     },
     Error(String),
 }
@@ -172,7 +175,10 @@ async fn run(
                 "cannot connect to {}:{}: {error}",
                 options.host, options.port
             )));
-            let _ = events.send(TelnetEvent::Closed { reason: None });
+            let _ = events.send(TelnetEvent::Closed {
+                reason: None,
+                by_remote: false,
+            });
             return;
         }
         Err(_) => {
@@ -182,7 +188,10 @@ async fn run(
                 options.port
             )
             .to_string()));
-            let _ = events.send(TelnetEvent::Closed { reason: None });
+            let _ = events.send(TelnetEvent::Closed {
+                reason: None,
+                by_remote: false,
+            });
             return;
         }
     };
@@ -192,13 +201,18 @@ async fn run(
     let mut filter = TelnetFilter::new(options.term.clone(), options.cols, options.rows);
     let greeting = filter.start();
     if writer.write_all(&greeting).await.is_err() {
-        let _ = events.send(TelnetEvent::Closed { reason: None });
+        let _ = events.send(TelnetEvent::Closed {
+            reason: None,
+            by_remote: false,
+        });
         return;
     }
 
     status(SessionStatus::Connected);
 
     let mut buffer = vec![0u8; 16 * 1024];
+    // The server hung up: `read` returned end-of-stream rather than an error.
+    let mut by_remote = false;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -221,7 +235,10 @@ async fn run(
             }
             read = reader.read(&mut buffer) => {
                 match read {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        by_remote = true;
+                        break;
+                    }
                     Ok(count) => {
                         let data = filter.feed(&buffer[..count]);
                         let replies = filter.take_replies();
@@ -242,5 +259,8 @@ async fn run(
     }
 
     let _ = writer.shutdown().await;
-    let _ = events.send(TelnetEvent::Closed { reason: None });
+    let _ = events.send(TelnetEvent::Closed {
+        reason: None,
+        by_remote,
+    });
 }

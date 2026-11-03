@@ -12,9 +12,9 @@ use serde_json::Value;
 use super::permissions::{Permission, Permissions};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
-    TOOL_DEV_DELETE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST,
-    TOOL_DEV_MOVE, TOOL_DEV_MULTI_EDIT, TOOL_DEV_PATCH, TOOL_DEV_REPLACE, TOOL_DEV_RUN,
-    TOOL_DEV_VIEW, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE,
+    TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
+    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT,
+    TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE,
     TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ,
     TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
     TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
@@ -43,6 +43,8 @@ pub const MARKER_TAIL_CHARS: usize = 4_000;
 pub const EXEC_KEY: &str = "ai.run_command";
 /// Key the session caches a probe under (existence checks and system reports).
 pub const PROBE_KEY: &str = "ai.probe";
+/// Distinguishes the temp files uploads are staged in.
+static STAGED_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Marker the sudo preamble prints when the password was refused.
 pub const SUDO_AUTH_FAILED_MARKER: &str = "__WASSH_SUDO_FAILED__";
 /// What the user is told when `sudo` refused the password they typed.
@@ -244,12 +246,26 @@ pub enum CommandThen {
 pub enum ReadThen {
     /// Return the contents.
     Return,
+    /// Number the lines from `start` before returning them.
+    View {
+        /// First line shown, 1-based.
+        start: usize,
+        /// Most lines shown.
+        lines: usize,
+    },
     /// Replace text and write the file back.
     Edit {
         /// Text to find.
         old: String,
         /// Its replacement.
         new: String,
+    },
+    /// Diff the contents against the text the model expected.
+    Diff {
+        /// What the file should have said.
+        new: String,
+        /// Lines of context around each change.
+        context: usize,
     },
 }
 
@@ -297,6 +313,12 @@ pub struct Agent {
     pub permissions: Permissions,
     /// Set when the model owes an answer to a tool result.
     pub needs_reply: bool,
+    /// Messages the user typed while a run was in flight, in order.
+    ///
+    /// They show up in the transcript straight away but only join the provider history
+    /// once the run in front of them is done, so the model sees them after it finished
+    /// the step it was on rather than before its own reply.
+    injected: std::collections::VecDeque<(String, UserMeta)>,
     /// Clock used by the time-based tools; the view sets it every frame.
     pub now_ms: u64,
     /// The last command, kept so a refused `sudo` can be retried.
@@ -360,6 +382,7 @@ impl Agent {
     pub fn clear(&mut self) {
         self.turns.clear();
         self.history.clear();
+        self.injected.clear();
         self.phase = None;
         self.error = None;
         self.queue.clear();
@@ -380,6 +403,39 @@ impl Agent {
         self.history.push(ApiMessage::User {
             content: text.to_owned(),
         });
+        true
+    }
+
+    /// Take a message the user typed while a run was in flight.
+    ///
+    /// It appears in the transcript at once — it is part of the conversation the agent is
+    /// in the middle of — and is folded into the provider history by
+    /// [`Agent::flush_injected`] once that run is done.
+    pub fn inject_user(&mut self, text: &str, meta: UserMeta) -> bool {
+        let text = text.trim();
+        if text.is_empty() || !self.blocked() {
+            return false;
+        }
+        self.error = None;
+        self.turns.push(Turn::User {
+            text: text.to_owned(),
+            meta,
+        });
+        self.injected.push_back((text.to_owned(), meta));
+        true
+    }
+
+    /// Fold messages injected mid-run into the provider history, once nothing is running.
+    ///
+    /// Returns true when the model owes a reply to what was added.
+    pub fn flush_injected(&mut self) -> bool {
+        if self.phase.is_some() || self.injected.is_empty() {
+            return false;
+        }
+        for (text, _) in self.injected.drain(..) {
+            self.history.push(ApiMessage::User { content: text });
+        }
+        self.needs_reply = true;
         true
     }
 
@@ -580,6 +636,20 @@ impl Agent {
                         }
                         Ready::Settle(format!("read {path}"), body, false)
                     }
+                    ReadThen::View { start, lines } => {
+                        let numbered: Vec<String> = text
+                            .lines()
+                            .enumerate()
+                            .skip(start - 1)
+                            .take(lines)
+                            .map(|(index, line)| format!("{:>5}\t{line}", index + 1))
+                            .collect();
+                        let mut body = format!("{path}\n{}", numbered.join("\n"));
+                        if content.truncated {
+                            body.push_str("\n\n[Content truncated at the read limit]");
+                        }
+                        Ready::Settle(format!("read {path}"), body, false)
+                    }
                     ReadThen::Edit { old, new } => {
                         if content.truncated {
                             Ready::Settle(
@@ -595,6 +665,10 @@ impl Agent {
                                 Err(error) => Ready::Settle(format!("edit {path}"), error, true),
                             }
                         }
+                    }
+                    ReadThen::Diff { new, context } => {
+                        let change = tools::diff_texts(&text, &new, context);
+                        Ready::Settle(format!("diff {path}"), change, false)
                     }
                 }
             }
@@ -713,8 +787,9 @@ impl Agent {
                     return true;
                 };
                 let local = std::env::temp_dir().join(format!(
-                    "wassh-agent-{}-{}.tmp",
+                    "wassh-agent-{}-{}-{}.tmp",
                     std::process::id(),
+                    STAGED_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     self.now_ms
                 ));
                 if let Err(error) = std::fs::write(&local, &content) {
@@ -1067,7 +1142,7 @@ impl Agent {
                     .clamp(1_000, tools::MAX_FILE_READ_CHARS as u64);
                 self.start_read(call, turn, path, max, ReadThen::Return, session);
             }
-            TOOL_REMOTE_EDIT => {
+            TOOL_REMOTE_EDIT | TOOL_DEV_EDIT => {
                 let path =
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let old = arguments["oldText"].as_str().unwrap_or_default().to_owned();
@@ -1092,7 +1167,82 @@ impl Agent {
                     session,
                 );
             }
-            TOOL_REMOTE_WRITE => {
+            TOOL_DEV_VIEW => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let start = arguments["startLine"].as_u64().unwrap_or(1).max(1) as usize;
+                let max_lines = arguments["maxLines"]
+                    .as_u64()
+                    .map_or(tools::MAX_DEV_VIEW_LINES_DEFAULT, |value| value as usize);
+                let lines = arguments["endLine"].as_u64().map_or(max_lines, |end| {
+                    (end as usize).saturating_sub(start) + 1
+                });
+                self.start_read(
+                    call,
+                    turn,
+                    path,
+                    tools::MAX_FILE_READ_CHARS as u64,
+                    ReadThen::View { start, lines },
+                    session,
+                );
+            }
+            TOOL_DEV_DIFF => {
+                let context = arguments["contextLines"]
+                    .as_u64()
+                    .map_or(tools::DIFF_CONTEXT_LINES_DEFAULT, |value| value as usize);
+                let new = arguments["newText"]
+                    .as_str()
+                    .or_else(|| arguments["patch"].as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                if new.is_empty() {
+                    let label = call_label(&call);
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        "Pass newText or patch to diff against.".to_owned(),
+                        true,
+                        session,
+                    );
+                    return;
+                }
+                match arguments["oldText"].as_str() {
+                    // Both sides came with the call, so the file is not needed.
+                    Some(old) => {
+                        let body = tools::diff_texts(old, &new, context);
+                        let label = call_label(&call);
+                        self.settle(call, turn, label, body, false, session);
+                    }
+                    None => {
+                        let path = relative_remote(
+                            &self.cwd,
+                            arguments["path"].as_str().unwrap_or_default(),
+                        );
+                        self.start_read(
+                            call,
+                            turn,
+                            path,
+                            tools::MAX_FILE_READ_CHARS as u64,
+                            ReadThen::Diff { new, context },
+                            session,
+                        );
+                    }
+                }
+            }
+            TOOL_DEV_GREP => {
+                let root =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let command = tools::dev_grep_command(arguments, &root);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_DEV_FIND => {
+                let root =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let command = tools::dev_find_command(arguments, &root);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_WRITE | TOOL_DEV_CREATE => {
                 let path =
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let content = arguments["content"].as_str().unwrap_or_default().to_owned();
@@ -1110,9 +1260,16 @@ impl Agent {
                     session,
                 );
             }
-            TOOL_REMOTE_LIST => {
+            TOOL_REMOTE_LIST | TOOL_DEV_LIST => {
                 let path =
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                // Only the developer listing walks sub-directories, and it does that
+                // with the host's own `find`.
+                if arguments["recursive"].as_bool().unwrap_or(false) {
+                    let command = tools::dev_tree_command(arguments, &path);
+                    self.run_probe(call, turn, CommandThen::Return, command, session);
+                    return;
+                }
                 match session.as_mut() {
                     Some(access) => access.request_listing(&path),
                     None => {
@@ -1216,7 +1373,7 @@ impl Agent {
                     },
                 });
             }
-            TOOL_DEV_RUN => {
+            TOOL_LOCAL_RUN => {
                 let arguments = arguments.clone();
                 self.spawn_worker(call, turn, move || tools::run_local_command(&arguments));
             }
@@ -1594,27 +1751,28 @@ pub fn call_label(call: &ApiToolCall) -> String {
         TOOL_REMOTE_EDIT | TOOL_LOCAL_EDIT | TOOL_DEV_EDIT => {
             format!("edit {}", arguments["path"].as_str().unwrap_or_default())
         }
-        TOOL_REMOTE_DELETE => format!("delete {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_REMOTE_DELETE | TOOL_LOCAL_DELETE => {
+            format!("delete {}", arguments["path"].as_str().unwrap_or_default())
+        }
         TOOL_DEV_GREP => format!("grep {}", arguments["pattern"].as_str().unwrap_or_default()),
         TOOL_DEV_FIND => format!(
             "find {}",
             arguments["namePattern"].as_str().unwrap_or_default()
         ),
         TOOL_DEV_DIFF => format!("diff {}", arguments["path"].as_str().unwrap_or_default()),
-        TOOL_DEV_RUN => format!(
+        TOOL_LOCAL_RUN => format!(
             "local $ {}",
             arguments["command"].as_str().unwrap_or_default()
         ),
-        TOOL_DEV_DELETE => format!("delete {}", arguments["path"].as_str().unwrap_or_default()),
-        TOOL_DEV_MOVE => format!(
+        TOOL_LOCAL_MOVE => format!(
             "move {} → {}",
             arguments["path"].as_str().unwrap_or_default(),
             arguments["destination"].as_str().unwrap_or_default()
         ),
-        TOOL_DEV_MULTI_EDIT | TOOL_DEV_PATCH => {
+        TOOL_LOCAL_MULTI_EDIT | TOOL_LOCAL_PATCH => {
             format!("edit {}", arguments["path"].as_str().unwrap_or_default())
         }
-        TOOL_DEV_REPLACE => format!(
+        TOOL_LOCAL_REPLACE => format!(
             "replace {}",
             arguments["pattern"].as_str().unwrap_or_default()
         ),
@@ -1951,6 +2109,61 @@ mod tests {
         assert!(wrapped.starts_with("cd '/srv/app' >/dev/null 2>&1 || true\nls -la\n"));
         assert!(wrapped.contains("__WASSH_STATUS:%s__"));
         assert!(wrapped.contains("__WASSH_PWD:%s__"));
+    }
+
+    #[test]
+    fn a_message_injected_mid_run_joins_the_conversation_after_it() {
+        let mut agent = Agent::new();
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        assert!(agent.push_user("first", UserMeta::default()));
+        // A reply is streaming in.
+        agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        let (sender, events) = std::sync::mpsc::channel();
+        agent.phase = Some(Phase::Streaming { turn: 1, events });
+
+        // Enter during the run adds to the transcript at once …
+        assert!(agent.inject_user("and check /etc too", UserMeta::default()));
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::User { text, .. }) if text == "and check /etc too"
+        ));
+        // … but the provider history waits, so the reply under way comes first.
+        assert_eq!(agent.history.len(), 1, "history: {:?}", agent.history);
+        assert!(!agent.flush_injected(), "the run is still going");
+
+        // The run ends: the injected message is folded in behind it and owes a reply.
+        sender
+            .send(StreamEvent::Done(Completion {
+                text: "done".to_owned(),
+                ..Completion::default()
+            }))
+            .expect("the reply lands");
+        agent.poll(&mut session);
+        assert!(agent.phase.is_none());
+        assert!(agent.flush_injected());
+        assert!(
+            matches!(
+                (agent.history.get(1), agent.history.get(2)),
+                (
+                    Some(ApiMessage::Assistant { .. }),
+                    Some(ApiMessage::User { content })
+                ) if content == "and check /etc too"
+            ),
+            "history: {:?}",
+            agent.history
+        );
+        assert!(agent.needs_reply, "the model owes an answer");
+        assert!(!agent.flush_injected(), "nothing is left to fold in");
+    }
+
+    #[test]
+    fn a_message_typed_into_an_idle_conversation_is_not_an_injection() {
+        let mut agent = Agent::new();
+        assert!(!agent.inject_user("hello", UserMeta::default()));
+        assert!(agent.turns.is_empty(), "nothing was taken");
     }
 
     #[test]
@@ -2606,6 +2819,99 @@ mod tests {
         );
         assert!(output.contains("dir   nginx"), "{output}");
         assert!(output.contains("file       220  hosts"), "{output}");
+    }
+
+    #[test]
+    fn the_developer_file_tools_work_on_the_host_not_this_computer() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        let mut fake = FakeSession::default();
+        fake.contents.insert(
+            "/srv/app/main.rs".to_owned(),
+            "fn main() {\n    greet();\n}\n".to_owned(),
+        );
+
+        // Viewing numbers the lines of the host's file, resolved against the cwd.
+        let view = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_VIEW,
+            r#"{"path":"main.rs","startLine":2}"#,
+        );
+        assert!(view.starts_with("/srv/app/main.rs\n"), "{view}");
+        assert!(view.contains("    2\t    greet();"), "{view}");
+        assert!(!view.contains("fn main"), "the range starts at line 2: {view}");
+
+        // Editing writes the new text back to the host.
+        let diff = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_EDIT,
+            r#"{"path":"main.rs","oldText":"greet","newText":"hello"}"#,
+        );
+        assert!(diff.contains("+   1     hello();"), "{diff}");
+        assert_eq!(
+            fake.uploads.last().map(|(path, _)| path.as_str()),
+            Some("/srv/app/main.rs")
+        );
+    }
+
+    #[test]
+    fn the_developer_search_tools_ask_the_host() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        let mut fake = FakeSession::default();
+        run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_GREP,
+            r#"{"pattern":"fn main","path":"src"}"#,
+        );
+        run_tool(&mut agent, &mut fake, TOOL_DEV_FIND, r#"{"namePattern":"*.rs"}"#);
+        run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_LIST,
+            r#"{"path":"src","recursive":true}"#,
+        );
+        let commands: Vec<&str> = fake
+            .commands
+            .iter()
+            .map(|(_, command)| command.as_str())
+            .collect();
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands[0].starts_with("grep -rnI"), "{commands:?}");
+        assert!(commands[0].contains("'/srv/app/src'"), "{commands:?}");
+        assert!(commands[1].contains("-iname '*.rs'"), "{commands:?}");
+        assert!(commands[1].contains("'/srv/app'"), "{commands:?}");
+        assert!(commands[2].contains("-maxdepth"), "{commands:?}");
+        assert!(commands[2].contains("'/srv/app/src'"), "{commands:?}");
+    }
+
+    #[test]
+    fn a_developer_diff_reads_the_host_file_when_the_old_text_is_missing() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        let mut fake = FakeSession::default();
+        fake.contents
+            .insert("/srv/app/note.txt".to_owned(), "one\ntwo\n".to_owned());
+        let diff = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_DIFF,
+            r#"{"path":"note.txt","newText":"one\nTWO\n"}"#,
+        );
+        assert!(diff.contains("+   1 TWO"), "{diff}");
+
+        // Both sides in the call: the file is never read.
+        fake.contents.clear();
+        let both = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_DIFF,
+            r#"{"path":"note.txt","oldText":"a\n","newText":"b\n"}"#,
+        );
+        assert!(both.contains("+   0 b"), "{both}");
     }
 
     #[test]

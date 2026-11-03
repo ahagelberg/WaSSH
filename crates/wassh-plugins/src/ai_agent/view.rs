@@ -73,6 +73,18 @@ const BADGE_TINT: f32 = 0.25;
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// Characters shown from a queued message.
 const QUEUE_PREVIEW_MAX_CHARS: usize = 120;
+/// Height a prompt card may take before its own content scrolls.
+const PROMPT_CARD_MAX_HEIGHT: f32 = 240.0;
+/// Smallest a capped prompt card gets.
+const PROMPT_CARD_MIN_HEIGHT: f32 = 120.0;
+/// Share of the pane a prompt card may take.
+const PROMPT_CARD_SHARE: f32 = 0.35;
+/// Characters of a command kept in a prompt card.
+const PROMPT_COMMAND_MAX_CHARS: usize = 400;
+/// Characters of a command kept in an "always allow" button's label.
+const SCOPE_LABEL_MAX_CHARS: usize = 56;
+/// Padding inside a prompt card.
+const PROMPT_CARD_PADDING: i8 = 10;
 
 /// How long one dot of the animated "Thinking…" stays on.
 const THINKING_DOT_MS: u64 = 400;
@@ -435,16 +447,16 @@ impl AiAgent {
         lines.extend([
             String::new(),
             "Guidelines:".to_owned(),
-            "- Use run_command for shell work on the connected host, dev_run_command for commands \
-             on this computer (builds, tests, version control), and the terminal_* tools to drive \
-             the live shell."
+            "- Use run_command for shell work on the connected host, local_fs_run_command for \
+             commands on this computer (builds, tests, version control), and the terminal_* tools \
+             to drive the live shell."
                 .to_owned(),
             "- When a task needs root, call run_sudo with the same command: it asks the user for \
 their sudo password before running. Plain run_command cannot answer sudo's prompt, and never \
 pipe a password to sudo yourself."
                 .to_owned(),
             "- Prefer the file tools over shell commands when reading or editing files: dev_* and \
-             local_fs_* work on this computer, remote_fs_* on the connected host."
+             remote_fs_* work on the connected host, local_fs_* on this computer."
                 .to_owned(),
             "- After each command or tool call you see its actual result. Never invent output."
                 .to_owned(),
@@ -1284,10 +1296,10 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
     match name {
         "" | super::protocol::TOOL_RUN_COMMAND => ("SSH", palette.accent),
         super::protocol::TOOL_RUN_SUDO => ("Root", palette.danger),
-        other if other.starts_with("dev_") || other.starts_with("local_fs_") => {
-            ("Local PC", rgb(0xf0b429))
+        other if other.starts_with("dev_") || other.starts_with("remote_fs_") => {
+            ("Remote filesystem", rgb(0x3dd68c))
         }
-        other if other.starts_with("remote_fs_") => ("Remote filesystem", rgb(0x3dd68c)),
+        other if other.starts_with("local_fs_") => ("Local PC", rgb(0xf0b429)),
         super::protocol::TOOL_WEB_SEARCH => ("Search", rgb(0x38bdf8)),
         super::protocol::TOOL_WEB_FETCH => ("Web", rgb(0xa78bfa)),
         super::protocol::TOOL_CURRENT_TIME => ("Time", rgb(0xfb7185)),
@@ -1295,6 +1307,284 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
         other if other.starts_with("system_") => ("System", rgb(0x2dd4bf)),
         other if other.starts_with("terminal_") => ("Your terminal", rgb(0xf472b6)),
         _ => ("Tool", palette.text_muted),
+    }
+}
+
+/// Frame a prompt card so it reads as a popup over the conversation rather than as more
+/// transcript text.
+///
+/// The body is capped: a request the model wrote a whole script into must not push the
+/// conversation and the composer out of the pane.
+fn prompt_card(ui: &mut Ui, palette: &Palette, id: &str, add: impl FnOnce(&mut Ui)) {
+    let room = (ui.available_height() * PROMPT_CARD_SHARE)
+        .clamp(PROMPT_CARD_MIN_HEIGHT, PROMPT_CARD_MAX_HEIGHT);
+    egui::Frame::new()
+        .fill(to_color32(palette.bg_panel_2))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.accent)))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::same(PROMPT_CARD_PADDING))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(("ai-prompt-card", id))
+                .max_height(room)
+                .auto_shrink([false, true])
+                .show(ui, add);
+        });
+}
+
+/// The command a prompt card is about, cut so a whole script cannot fill the card.
+fn prompt_command(ui: &mut Ui, palette: &Palette, text: &str) {
+    let shown = if text.chars().count() <= PROMPT_COMMAND_MAX_CHARS {
+        text.to_owned()
+    } else {
+        let head: String = text.chars().take(PROMPT_COMMAND_MAX_CHARS).collect();
+        format!("{head}…")
+    };
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(shown)
+                .size(11.5)
+                .monospace()
+                .color(to_color32(palette.accent)),
+        )
+        .wrap(),
+    );
+}
+
+/// `text` cut to [`SCOPE_LABEL_MAX_CHARS`], so one "always allow" button stays a button.
+fn scope_label(text: &str) -> String {
+    if text.chars().count() <= SCOPE_LABEL_MAX_CHARS {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(SCOPE_LABEL_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
+/// What the user did with the prompt cards this frame.
+#[derive(Default)]
+struct PromptAnswers {
+    /// Approval card: (allow, scope to remember, allow every command).
+    approval: Option<(bool, Option<usize>, bool)>,
+    /// Capability card: (allow, remember the answer).
+    permission: Option<(bool, bool)>,
+    /// The question card's answer.
+    answer: Option<String>,
+    /// The sudo card.
+    sudo: Option<SudoAnswer>,
+}
+
+impl AiAgent {
+    /// The prompt cards: an approval, a capability permission, a question and a sudo
+    /// password, whichever the agent is waiting for.
+    ///
+    /// They are drawn above the composer rather than inside the transcript, so a long
+    /// command cannot push the conversation around and a request always reads as a popup
+    /// instead of more transcript text.
+    fn prompt_cards(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        muted: egui::Color32,
+    ) -> PromptAnswers {
+        let mut answers = PromptAnswers::default();
+
+        // The approval card: the command the model wants to run, and how far to allow it.
+        let approval = match &self.agent.phase {
+            Some(Phase::Approving { command, scopes, .. }) => {
+                Some((command.clone(), scopes.clone()))
+            }
+            _ => None,
+        };
+        if let Some((command, scopes)) = approval {
+            prompt_card(ui, palette, "approval", |ui| {
+                ui.label(
+                    egui::RichText::new("Run this command?")
+                        .size(12.0)
+                        .strong()
+                        .color(to_color32(palette.text)),
+                );
+                prompt_command(ui, palette, &command);
+                let mut chosen: Option<(bool, Option<usize>)> = None;
+                let mut everything = false;
+                ui.horizontal(|ui| {
+                    if Button::new("Allow")
+                        .compact()
+                        .kind(ButtonKind::Primary)
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        chosen = Some((true, None));
+                    }
+                    if Button::new("Deny")
+                        .compact()
+                        .kind(ButtonKind::Danger)
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        chosen = Some((false, None));
+                    }
+                });
+                if small_button_enabled(ui, palette, "Always allow every command", true) {
+                    everything = true;
+                }
+                for (index, scope) in scopes.iter().enumerate() {
+                    let label = if scope.word_count == 0 {
+                        format!("Always allow exactly: {}", scope_label(&scope.text))
+                    } else {
+                        format!(
+                            "Always allow commands starting with: {}",
+                            scope_label(&scope.text)
+                        )
+                    };
+                    if small_button_enabled(ui, palette, &label, true) {
+                        chosen = Some((true, Some(index)));
+                    }
+                }
+                if let Some((allow, remember)) = chosen {
+                    answers.approval = Some((allow, remember, false));
+                } else if everything {
+                    answers.approval = Some((true, None, true));
+                }
+            });
+        }
+
+        // The capability card: a tool whose permission is "ask".
+        let asking = match &self.agent.phase {
+            Some(Phase::Allowing { label, .. }) => Some(label.clone()),
+            _ => None,
+        };
+        if let Some(label) = asking {
+            prompt_card(ui, palette, "permission", |ui| {
+                ui.label(
+                    egui::RichText::new("Approve action?")
+                        .size(12.0)
+                        .strong()
+                        .color(to_color32(palette.text)),
+                );
+                prompt_command(ui, palette, &label);
+                ui.horizontal(|ui| {
+                    if Button::new("Approve once")
+                        .compact()
+                        .kind(ButtonKind::Primary)
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        answers.permission = Some((true, false));
+                    }
+                    if Button::new("Deny once")
+                        .compact()
+                        .kind(ButtonKind::Danger)
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        answers.permission = Some((false, false));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if small_button_enabled(ui, palette, "Always allow", true) {
+                        answers.permission = Some((true, true));
+                    }
+                    if small_button_enabled(ui, palette, "Always deny", true) {
+                        answers.permission = Some((false, true));
+                    }
+                });
+            });
+        }
+
+        // The question card.
+        let question = match &self.agent.phase {
+            Some(Phase::Asking { text, .. }) => Some(text.clone()),
+            _ => None,
+        };
+        if let Some(text) = question {
+            prompt_card(ui, palette, "question", |ui| {
+                ui.label(
+                    egui::RichText::new(text.as_str())
+                        .size(12.0)
+                        .strong()
+                        .color(to_color32(palette.text)),
+                );
+                let room = (ui.available_width() - 8.0).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(room, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(room);
+                        let response = text_area(ui, palette, &mut self.answer, 2, "Your answer…");
+                        if response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            && !ui.input(|input| input.modifiers.shift)
+                        {
+                            answers.answer = Some(std::mem::take(&mut self.answer));
+                        }
+                    },
+                );
+                if small_button_enabled(
+                    ui,
+                    palette,
+                    "Send answer",
+                    !self.answer.trim().is_empty(),
+                ) {
+                    answers.answer = Some(std::mem::take(&mut self.answer));
+                }
+            });
+        }
+
+        // The sudo card: the command that needs root, and the password for it.
+        let sudo = self
+            .agent
+            .sudo_prompt()
+            .map(|(command, reason)| (command.to_owned(), reason.map(str::to_owned)));
+        if let Some((command, reason)) = sudo {
+            prompt_card(ui, palette, "sudo", |ui| {
+                ui.label(
+                    egui::RichText::new("Sudo password required")
+                        .size(12.0)
+                        .strong()
+                        .color(to_color32(palette.text)),
+                );
+                prompt_command(ui, palette, &command);
+                if let Some(reason) = reason {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(reason).size(11.0).color(muted)).wrap(),
+                    );
+                }
+                let room = (ui.available_width() - 8.0).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(room, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(room);
+                        let response = password_input(ui, palette, &mut self.sudo, "sudo password");
+                        if response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            answers.sudo = Some(SudoAnswer::Run);
+                        }
+                    },
+                );
+                ui.horizontal(|ui| {
+                    if Button::new("Continue")
+                        .compact()
+                        .primary()
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        answers.sudo = Some(SudoAnswer::Run);
+                    }
+                    if Button::new("Cancel")
+                        .compact()
+                        .kind(ButtonKind::Danger)
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        answers.sudo = Some(SudoAnswer::Cancel);
+                    }
+                });
+            });
+        }
+
+        answers
     }
 }
 
@@ -1327,6 +1617,9 @@ impl Plugin for AiAgent {
 
         // Drain workers, then answer any tool result it produced.
         self.agent.poll(&mut session);
+        // A message typed during the last run joins the conversation before the next
+        // request is built, so the model sees it.
+        self.agent.flush_injected();
         if self.agent.take_needs_reply() {
             let request = self.request(context.settings, &context.host_label);
             if let Some(request) = request {
@@ -1398,12 +1691,19 @@ impl Plugin for AiAgent {
         // Everything pinned under the transcript sits in a bottom panel, so the transcript
         // gets exactly the rest of the pane and no room is left over.
         let mut submit = false;
+        // Alt+Enter queues the message for after the run instead of injecting it.
+        let mut queue = false;
         let mut command: Option<SlashCommand> = None;
+        let mut prompts = PromptAnswers::default();
         let slash = parse_slash_input(&self.draft);
         egui::Panel::bottom("ai-composer")
             .frame(egui::Frame::NONE)
             .show_separator_line(false)
             .show(ui, |ui| {
+                // A request the agent is blocked on comes first: it is the one thing the
+                // user has to answer before the run can go on.
+                prompts = self.prompt_cards(ui, palette, muted);
+
                 // A run cut off before the model answered can be picked up again.
                 if self.agent.can_resume() {
                     let mut resume = false;
@@ -1530,6 +1830,9 @@ impl Plugin for AiAgent {
                                 && !ui.input(|input| input.modifiers.shift)
                             {
                                 submit = true;
+                                // Alt turns the send into a queue, like it does in other
+                                // chat clients.
+                                queue = ui.input(|input| input.modifiers.alt);
                             }
                         },
                     );
@@ -1560,12 +1863,12 @@ impl Plugin for AiAgent {
                             egui::TextStyle::Button,
                             egui::FontId::proportional(FOOTER_TEXT_SIZE),
                         );
-                        let action = if busy {
+                        let can_send =
+                            !self.providers.is_empty() && !self.draft.trim().is_empty();
+                        let action = if busy && !can_send {
                             Button::new("Stop").compact().kind(ButtonKind::Danger)
                         } else {
-                            Button::new("Send").compact().enabled(
-                                !self.providers.is_empty() && !self.draft.trim().is_empty(),
-                            )
+                            Button::new("Send").compact().enabled(can_send)
                         };
                         if self.providers.is_empty() {
                             // The action comes first; the hint is cropped to what is left.
@@ -1608,7 +1911,7 @@ impl Plugin for AiAgent {
                     .inner
                 };
                 if action_clicked {
-                    if busy {
+                    if busy && self.draft.trim().is_empty() {
                         self.agent.stop();
                     } else {
                         submit = true;
@@ -1630,11 +1933,6 @@ impl Plugin for AiAgent {
             });
 
         // Transcript.
-        let mut approval: Option<(bool, Option<usize>, bool)> = None;
-        let mut answer: Option<String> = None;
-        let mut sudo_answer: Option<SudoAnswer> = None;
-        // A capability's permission prompt: (allow, remember the answer).
-        let mut permission: Option<(bool, bool)> = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-transcript")
             .max_height(ui.available_height())
@@ -1642,211 +1940,6 @@ impl Plugin for AiAgent {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 self.transcript(ui, palette, muted);
-
-                // The approval card.
-                let card = match &self.agent.phase {
-                    Some(Phase::Approving {
-                        command, scopes, ..
-                    }) => Some((command.clone(), scopes.clone())),
-                    _ => None,
-                };
-                if let Some((command, scopes)) = card {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Run this command?")
-                            .size(12.0)
-                            .strong()
-                            .color(to_color32(palette.text)),
-                    );
-                    ui.label(
-                        egui::RichText::new(command.as_str())
-                            .size(11.5)
-                            .monospace()
-                            .color(to_color32(palette.accent)),
-                    );
-                    let mut chosen: Option<(bool, Option<usize>)> = None;
-                    let mut everything = false;
-                    ui.horizontal(|ui| {
-                        if Button::new("Allow")
-                            .compact()
-                            .kind(ButtonKind::Primary)
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            chosen = Some((true, None));
-                        }
-                        if Button::new("Deny")
-                            .compact()
-                            .kind(ButtonKind::Danger)
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            chosen = Some((false, None));
-                        }
-                    });
-                    if small_button_enabled(ui, palette, "Always allow every command", true) {
-                        everything = true;
-                    }
-                    for (index, scope) in scopes.iter().enumerate() {
-                        let label = if scope.word_count == 0 {
-                            format!("Always allow exactly: {}", scope.text)
-                        } else {
-                            format!("Always allow commands starting with: {}", scope.text)
-                        };
-                        if small_button_enabled(ui, palette, &label, true) {
-                            chosen = Some((true, Some(index)));
-                        }
-                    }
-                    if let Some((allow, remember)) = chosen {
-                        approval = Some((allow, remember, false));
-                    } else if everything {
-                        approval = Some((true, None, true));
-                    }
-                }
-
-                // The capability card: a tool whose permission is "ask".
-                if let Some(Phase::Allowing { label, .. }) = &self.agent.phase {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Approve action?")
-                            .size(12.0)
-                            .strong()
-                            .color(to_color32(palette.text)),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(label.as_str())
-                                .size(11.5)
-                                .monospace()
-                                .color(to_color32(palette.accent)),
-                        )
-                        .wrap(),
-                    );
-                    ui.horizontal(|ui| {
-                        if Button::new("Approve once")
-                            .compact()
-                            .kind(ButtonKind::Primary)
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            permission = Some((true, false));
-                        }
-                        if Button::new("Deny once")
-                            .compact()
-                            .kind(ButtonKind::Danger)
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            permission = Some((false, false));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if small_button_enabled(ui, palette, "Always allow", true) {
-                            permission = Some((true, true));
-                        }
-                        if small_button_enabled(ui, palette, "Always deny", true) {
-                            permission = Some((false, true));
-                        }
-                    });
-                }
-
-                // The question card.
-                if let Some(Phase::Asking { text, .. }) = &self.agent.phase {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(text.as_str())
-                            .size(12.0)
-                            .strong()
-                            .color(to_color32(palette.text)),
-                    );
-                    let room = (ui.available_width() - 8.0).max(80.0);
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(room, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_width(room);
-                            let response =
-                                text_area(ui, palette, &mut self.answer, 2, "Your answer…");
-                            if response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                                && !ui.input(|input| input.modifiers.shift)
-                            {
-                                answer = Some(std::mem::take(&mut self.answer));
-                            }
-                        },
-                    );
-                    if small_button_enabled(
-                        ui,
-                        palette,
-                        "Send answer",
-                        !self.answer.trim().is_empty(),
-                    ) {
-                        answer = Some(std::mem::take(&mut self.answer));
-                    }
-                }
-
-                // The sudo card: the command that needs root, and the password for it.
-                if let Some((command, reason)) = self
-                    .agent
-                    .sudo_prompt()
-                    .map(|(c, r)| (c.to_owned(), r.map(str::to_owned)))
-                {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Sudo password required")
-                            .size(12.0)
-                            .strong()
-                            .color(to_color32(palette.text)),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(command.as_str())
-                                .size(11.5)
-                                .monospace()
-                                .color(to_color32(palette.accent)),
-                        )
-                        .wrap(),
-                    );
-                    if let Some(reason) = reason {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(reason).size(11.0).color(muted))
-                                .wrap(),
-                        );
-                    }
-                    let room = (ui.available_width() - 8.0).max(80.0);
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(room, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_width(room);
-                            let response =
-                                password_input(ui, palette, &mut self.sudo, "sudo password");
-                            if response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            {
-                                sudo_answer = Some(SudoAnswer::Run);
-                            }
-                        },
-                    );
-                    ui.horizontal(|ui| {
-                        if Button::new("Continue")
-                            .compact()
-                            .primary()
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            sudo_answer = Some(SudoAnswer::Run);
-                        }
-                        if Button::new("Cancel")
-                            .compact()
-                            .kind(ButtonKind::Danger)
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            sudo_answer = Some(SudoAnswer::Cancel);
-                        }
-                    });
-                }
 
                 if let Some(error) = &self.error {
                     ui.add(
@@ -1860,14 +1953,14 @@ impl Plugin for AiAgent {
                 }
             });
 
-        if let Some((allow, remember, everything)) = approval {
+        if let Some((allow, remember, everything)) = prompts.approval {
             if everything {
                 self.agent.approve_everything(&mut session);
             } else {
                 self.agent.approve(allow, remember, &mut session);
             }
         }
-        if let Some((allow, always)) = permission {
+        if let Some((allow, always)) = prompts.permission {
             if always
                 && let Some(Phase::Allowing { call, .. }) = &self.agent.phase
                 && let Some(key) = setting_key(&call.name)
@@ -1876,10 +1969,10 @@ impl Plugin for AiAgent {
             }
             self.agent.answer_permission(allow, &mut session);
         }
-        if let Some(answer) = answer {
+        if let Some(answer) = prompts.answer {
             self.agent.answer(&answer, &mut session);
         }
-        match sudo_answer {
+        match prompts.sudo {
             Some(SudoAnswer::Run) => {
                 let password = std::mem::take(&mut self.sudo);
                 self.agent.submit_sudo(&password, &mut session);
@@ -1918,13 +2011,16 @@ impl Plugin for AiAgent {
                 self.draft.clear();
                 self.attachments.clear();
                 self.attach_terminal = false;
-                if busy {
-                    // The reference queues a follow-up typed during a run.
+                if self.agent.blocked() && queue {
+                    // Alt+Enter holds the message back until the run is over.
                     self.queued = Some(Queued {
                         text,
                         message,
                         meta,
                     });
+                } else if self.agent.blocked() {
+                    // Anything else joins the conversation the agent is in the middle of.
+                    self.agent.inject_user(&message, meta);
                 } else {
                     self.send_message(&message, meta, context.settings, &context.host_label);
                 }
@@ -2440,6 +2536,90 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_card_stays_a_bounded_popup() {
+        // A model can ask to run a whole script. The card must stay a card: it is drawn on
+        // its own background above the composer, and the command is capped instead of
+        // pushing the conversation and the send button out of the pane.
+        let mut plugin = AiAgent::default();
+        let script = format!("cd ~/app && python3 - <<'PY'\n{}\nPY", "print(1)\n".repeat(120));
+        plugin.agent.phase = Some(Phase::Approving {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: "run_command".to_owned(),
+                arguments: json!({ "command": script }).to_string(),
+            },
+            command: script.clone(),
+            scopes: super::super::rules::approval_scopes(&script),
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut context = PluginContext {
+            palette: Palette::dark(),
+            host_label: "dev".to_owned(),
+            status: SessionStatus::Connected,
+            settings: &mut settings,
+            scope: "host-1".to_owned(),
+            session: None,
+            events: &[],
+            pending_input: Vec::new(),
+            repaint_after: None,
+            secrets: &EMPTY_SECRETS,
+            secret_writes: Vec::new(),
+        };
+        let mut texts = Vec::new();
+        let mut cards = Vec::new();
+        // The bottom panel settles its height over a few frames.
+        for _ in 0..4 {
+            let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
+            texts.clear();
+            cards.clear();
+            for clipped in std::mem::take(&mut output.shapes) {
+                match clipped.shape {
+                    egui::Shape::Text(text) => {
+                        texts.push((text.pos, text.galley.text().to_owned()));
+                    }
+                    egui::Shape::Rect(rect)
+                        if rect.fill == to_color32(Palette::dark().bg_panel_2) =>
+                    {
+                        cards.push(rect.rect);
+                    }
+                    _ => {}
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+
+        let title = texts
+            .iter()
+            .find(|(_, text)| text == "Run this command?")
+            .map(|(pos, _)| *pos)
+            .expect("the approval card is drawn");
+        assert!(
+            cards.iter().any(|card| card.contains(title)),
+            "the card has no background of its own"
+        );
+
+        // The composer is still on screen, well under the 760-point pane.
+        let send = texts
+            .iter()
+            .find(|(_, text)| text == "Send")
+            .map(|(pos, _)| *pos)
+            .expect("the send button is drawn");
+        assert!(send.y < 760.0, "the card pushed the composer away");
+        // The card itself stays a card, not a whole screen of script.
+        for card in &cards {
+            assert!(card.height() < 760.0 / 2.0, "the card grew to {card:?}");
+        }
+    }
+
+    #[test]
     fn the_question_card_asks_and_takes_an_answer() {
         let mut plugin = AiAgent::default();
         plugin.agent.phase = Some(Phase::Asking {
@@ -2922,6 +3102,150 @@ mod tests {
             plugin.agent.tools.embed.is_none(),
             "no embedding model configured"
         );
+    }
+
+    #[test]
+    fn a_message_typed_during_a_run_joins_the_conversation_instead_of_queueing() {
+        let mut settings = local_provider();
+        let (mut plugin, _worker) = busy_pane();
+        let ctx = egui::Context::default();
+        // A typed message turns the footer's Stop into Send.
+        plugin.draft = "and check /etc".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            !rows.iter().any(|(_, _, text)| text == "Stop"),
+            "Stop has no room beside a message: {rows:?}"
+        );
+        let send = rows
+            .iter()
+            .find(|(_, _, text)| text == "Send")
+            .cloned()
+            .unwrap_or_else(|| panic!("the composer has no Send button: {rows:?}"));
+
+        frame(&mut plugin, &mut settings, &ctx, click(send));
+
+        // The message joined the running conversation: it is a turn, and the provider
+        // history waits for the reply that is still coming.
+        assert!(
+            matches!(
+                plugin.agent.turns.last(),
+                Some(Turn::User { text, .. }) if text == "and check /etc"
+            ),
+            "the message was dropped: {:?}",
+            plugin.agent.turns
+        );
+        assert!(plugin.queued.is_none(), "Enter and Send inject, they queue");
+        assert_eq!(
+            plugin.agent.history.len(),
+            1,
+            "history: {:?}",
+            plugin.agent.history
+        );
+        assert!(plugin.draft.is_empty(), "the composer is ready for the next");
+    }
+
+    #[test]
+    fn alt_enter_holds_the_message_back_until_the_run_is_over() {
+        let mut settings = local_provider();
+        let (mut plugin, _worker) = busy_pane();
+        let ctx = egui::Context::default();
+        // The composer settles its height on the first frame; clicking the empty prompt
+        // is what focuses the text area for the key press.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let hint = rows
+            .iter()
+            .find(|(_, _, text)| text == "Ask the agent…")
+            .cloned()
+            .unwrap_or_else(|| panic!("the prompt has no hint: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(hint));
+        plugin.draft = "second opinion".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(alt),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: alt,
+                },
+            ],
+        );
+
+        let queued = plugin
+            .queued
+            .as_ref()
+            .unwrap_or_else(|| panic!("Alt+Enter queues the message: {:?}", plugin.agent.turns));
+        assert_eq!(queued.text, "second opinion");
+        assert!(
+            plugin.agent.turns.iter().all(
+                |turn| !matches!(turn, Turn::User { text, .. } if text.contains("second opinion"))
+            ),
+            "a queued message does not join the conversation yet: {:?}",
+            plugin.agent.turns
+        );
+        assert!(
+            frame(&mut plugin, &mut settings, &ctx, Vec::new())
+                .iter()
+                .any(|(_, _, text)| text == "Queued"),
+            "nothing shows what waits its turn"
+        );
+    }
+
+    /// The settings of a pane with one OpenAI-compatible provider that never answers.
+    fn local_provider() -> serde_json::Map<String, Value> {
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, _requests) = provider("", MODELS);
+        [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    /// A pane whose model is mid-answer; the returned sender keeps the run going.
+    fn busy_pane() -> (AiAgent, std::sync::mpsc::Sender<crate::ai_agent::StreamEvent>) {
+        let mut plugin = AiAgent::default();
+        assert!(plugin.agent.push_user("first", UserMeta::default()));
+        plugin.agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        let (worker, events) = std::sync::mpsc::channel();
+        plugin.agent.phase = Some(Phase::Streaming { turn: 1, events });
+        (plugin, worker)
+    }
+
+    /// A click in the middle of a painted text.
+    fn click(row: (i32, i32, String)) -> Vec<egui::Event> {
+        let pos = egui::Pos2::new(row.1 as f32 + 4.0, row.0 as f32 + 4.0);
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
     }
 
     #[test]

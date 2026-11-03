@@ -842,12 +842,18 @@ impl SessionEntry {
                             pumped.wake |= self.status != status;
                             self.status = status;
                         }
-                        wassh_telnet::TelnetEvent::Closed { reason } => {
+                        wassh_telnet::TelnetEvent::Closed { reason, by_remote } => {
                             pumped.wake = true;
-                            self.status = SessionStatus::Closed;
+                            // A server that hangs up ended the session; a failure keeps its
+                            // status, so the reconnect policy takes over.
+                            if by_remote {
+                                self.status = SessionStatus::Closed;
+                            } else if self.status == SessionStatus::Connected {
+                                self.status = SessionStatus::Disconnected;
+                            }
                             pumped.closed = Some(Exit {
                                 reason,
-                                from_shell: false,
+                                from_shell: by_remote,
                             });
                         }
                         wassh_telnet::TelnetEvent::Error(error) => {
@@ -3033,17 +3039,29 @@ mod tests {
         panic!("the file request never finished: {:?}", entry.error());
     }
 
+    /// How long a test waits for a command it started to come back.
+    ///
+    /// The command runs in the platform's shell (`powershell.exe` on Windows), which can
+    /// take seconds to start while the whole suite runs in parallel.
+    const COMMAND_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+    /// Poll interval while waiting for a command.
+    const COMMAND_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
     /// Poll the session until the command asked for under `key` has finished.
     fn settle_command(entry: &mut SessionEntry, key: &str) {
         use wassh_plugins::CommandAccess as _;
-        for _ in 0..2_000 {
+        let deadline = std::time::Instant::now() + COMMAND_WAIT;
+        loop {
             entry.poll_commands();
             if !entry.is_running(key) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command {key} never finished"
+            );
+            std::thread::sleep(COMMAND_POLL);
         }
-        panic!("the command {key} never finished");
     }
 
     #[test]

@@ -63,36 +63,36 @@ pub const TOOL_LOCAL_WRITE: &str = "local_fs_write_file";
 pub const TOOL_LOCAL_LIST: &str = "local_fs_list_dir";
 /// Tool: edit a local file in place.
 pub const TOOL_LOCAL_EDIT: &str = "local_fs_edit_file";
+/// Tool: delete a file or directory on this computer.
+pub const TOOL_LOCAL_DELETE: &str = "local_fs_delete_file";
+/// Tool: move or rename a file or directory on this computer.
+pub const TOOL_LOCAL_MOVE: &str = "local_fs_move_file";
+/// Tool: apply several replacements to a local file.
+pub const TOOL_LOCAL_MULTI_EDIT: &str = "local_fs_multi_edit";
+/// Tool: apply a unified diff to a local file.
+pub const TOOL_LOCAL_PATCH: &str = "local_fs_apply_patch";
+/// Tool: replace a pattern across local files.
+pub const TOOL_LOCAL_REPLACE: &str = "local_fs_replace_in_files";
+/// Tool: run a shell command on this computer.
+pub const TOOL_LOCAL_RUN: &str = "local_fs_run_command";
 /// Tool: the exact current time.
 pub const TOOL_CURRENT_TIME: &str = "get_current_time";
 /// Tool: search the knowledge base.
 pub const TOOL_RAG_SEARCH: &str = "rag_search";
-/// Tool: view a file through the editor API.
+/// Tool: view a file on the connected host.
 pub const TOOL_DEV_VIEW: &str = "dev_view_file";
-/// Tool: edit a file through the editor API.
+/// Tool: edit a file on the connected host.
 pub const TOOL_DEV_EDIT: &str = "dev_edit_file";
-/// Tool: create a file through the editor API.
+/// Tool: create a file on the connected host.
 pub const TOOL_DEV_CREATE: &str = "dev_create_file";
-/// Tool: list a directory through the editor API.
+/// Tool: list a directory on the connected host.
 pub const TOOL_DEV_LIST: &str = "dev_list_directory";
-/// Tool: grep through the editor API.
+/// Tool: grep the connected host.
 pub const TOOL_DEV_GREP: &str = "dev_grep_search";
-/// Tool: find files through the editor API.
+/// Tool: find files on the connected host.
 pub const TOOL_DEV_FIND: &str = "dev_find_files";
-/// Tool: diff a file through the editor API.
+/// Tool: diff a file on the connected host.
 pub const TOOL_DEV_DIFF: &str = "dev_diff_file";
-/// Tool: run a shell command on this computer.
-pub const TOOL_DEV_RUN: &str = "dev_run_command";
-/// Tool: delete a file or directory on this computer.
-pub const TOOL_DEV_DELETE: &str = "dev_delete_file";
-/// Tool: move or rename a file or directory on this computer.
-pub const TOOL_DEV_MOVE: &str = "dev_move_file";
-/// Tool: apply several replacements to a local file.
-pub const TOOL_DEV_MULTI_EDIT: &str = "dev_multi_edit";
-/// Tool: apply a unified diff to a local file.
-pub const TOOL_DEV_PATCH: &str = "dev_apply_patch";
-/// Tool: replace a pattern across local files.
-pub const TOOL_DEV_REPLACE: &str = "dev_replace_in_files";
 /// Tool: read the terminal screen.
 pub const TOOL_TERMINAL_READ: &str = "terminal_read";
 /// Tool: type into the terminal.

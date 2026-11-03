@@ -7,6 +7,9 @@
 //! system probes). This module keeps the same split: [`run_local`] answers
 //! immediately, [`remote_shell_command`] returns a shell line for the session to
 //! run, and the SFTP/terminal tools are driven from `agent.rs`.
+//!
+//! The `dev_*` tool family belongs to the session side: it is the reference's
+//! developer toolset for the connected host, so it reads and writes remote files.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -17,20 +20,23 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::protocol::{
-    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DELETE, TOOL_DEV_DIFF,
-    TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_MOVE, TOOL_DEV_MULTI_EDIT,
-    TOOL_DEV_PATCH, TOOL_DEV_REPLACE, TOOL_DEV_RUN, TOOL_DEV_VIEW, TOOL_LOCAL_EDIT,
-    TOOL_LOCAL_LIST, TOOL_LOCAL_READ, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
+    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
+    TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ,
+    TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
     TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND,
     TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
     TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
+use super::agent::shell_quote;
 use super::permissions::Permissions;
 
 /// Longest body a fetch may return.
 pub const MAX_FETCH_CHARS: usize = 32_000;
+/// Longest body a file read returns when the call does not say.
+pub const MAX_READ_CHARS_DEFAULT: usize = 32_000;
 /// Longest file a read tool returns.
 pub const MAX_FILE_READ_CHARS: usize = 256_000;
 /// Most entries a listing returns.
@@ -41,8 +47,12 @@ pub const MAX_DEV_VIEW_LINES_DEFAULT: usize = 300;
 pub const MAX_DEV_GREP_MATCHES: usize = 100;
 /// Most `dev_find_files` matches.
 pub const MAX_DEV_FIND_MATCHES: usize = 100;
+/// Matches those two show when the call does not say.
+pub const DEV_SEARCH_MATCHES_DEFAULT: usize = 50;
 /// Depth a recursive `dev_list_directory` walks.
 pub const MAX_DEV_TREE_DEPTH: usize = 3;
+/// Depth `dev_find_files` searches below the directory it starts in.
+pub const MAX_DEV_FIND_DEPTH: usize = 8;
 /// Context lines a diff shows around each change by default.
 pub const DIFF_CONTEXT_LINES_DEFAULT: usize = 3;
 /// Most context lines a diff may show.
@@ -142,6 +152,31 @@ first, so use this only when run_command failed for lack of permissions.",
         description: "Replace a block of text in a file on this computer.",
     },
     ToolSpec {
+        name: TOOL_LOCAL_DELETE,
+        description: "Delete a file, or a directory with recursive, on this computer.",
+    },
+    ToolSpec {
+        name: TOOL_LOCAL_MOVE,
+        description: "Move or rename a file or directory on this computer.",
+    },
+    ToolSpec {
+        name: TOOL_LOCAL_MULTI_EDIT,
+        description: "Apply several text replacements to a local file in one call.",
+    },
+    ToolSpec {
+        name: TOOL_LOCAL_PATCH,
+        description: "Apply a unified diff to a local file.",
+    },
+    ToolSpec {
+        name: TOOL_LOCAL_REPLACE,
+        description: "Replace a regular expression across local files, reporting what changes.",
+    },
+    ToolSpec {
+        name: TOOL_LOCAL_RUN,
+        description: "Run a shell command on this computer with a timeout, and return its output \
+and exit code.",
+    },
+    ToolSpec {
         name: TOOL_CURRENT_TIME,
         description: "Report the current date and time.",
     },
@@ -151,56 +186,31 @@ first, so use this only when run_command failed for lack of permissions.",
     },
     ToolSpec {
         name: TOOL_DEV_VIEW,
-        description: "View a local file with line numbers, optionally a line range.",
+        description: "View a file on the connected host with line numbers, optionally a line range.",
     },
     ToolSpec {
         name: TOOL_DEV_EDIT,
-        description: "Replace text in a local file and report the change as a diff.",
+        description: "Replace text in a file on the connected host and report the change as a diff.",
     },
     ToolSpec {
         name: TOOL_DEV_CREATE,
-        description: "Create a local file, optionally refusing to overwrite.",
+        description: "Create a file on the connected host, optionally refusing to overwrite.",
     },
     ToolSpec {
         name: TOOL_DEV_LIST,
-        description: "List a local directory, optionally as a tree.",
+        description: "List a directory on the connected host, optionally as a tree.",
     },
     ToolSpec {
         name: TOOL_DEV_GREP,
-        description: "Search local files for a regular expression and show matching lines.",
+        description: "Search files on the connected host for a regular expression and show matching lines.",
     },
     ToolSpec {
         name: TOOL_DEV_FIND,
-        description: "Find local files whose name matches a glob.",
+        description: "Find files on the connected host whose name matches a glob.",
     },
     ToolSpec {
         name: TOOL_DEV_DIFF,
-        description: "Show the difference between two versions of a local file.",
-    },
-    ToolSpec {
-        name: TOOL_DEV_RUN,
-        description: "Run a shell command on this computer with a timeout, and return its output \
-and exit code.",
-    },
-    ToolSpec {
-        name: TOOL_DEV_DELETE,
-        description: "Delete a file, or a directory with recursive, on this computer.",
-    },
-    ToolSpec {
-        name: TOOL_DEV_MOVE,
-        description: "Move or rename a file or directory on this computer.",
-    },
-    ToolSpec {
-        name: TOOL_DEV_MULTI_EDIT,
-        description: "Apply several text replacements to a local file in one call.",
-    },
-    ToolSpec {
-        name: TOOL_DEV_PATCH,
-        description: "Apply a unified diff to a local file.",
-    },
-    ToolSpec {
-        name: TOOL_DEV_REPLACE,
-        description: "Replace a regular expression across local files, reporting what changes.",
+        description: "Show the difference between two versions of a file on the connected host.",
     },
     ToolSpec {
         name: TOOL_TERMINAL_READ,
@@ -382,7 +392,7 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["path"]),
         ),
-        TOOL_DEV_RUN => (
+        TOOL_LOCAL_RUN => (
             json!({
                 "command": string("The command line to run, exactly as it would be typed."),
                 "cwd": string("Directory to run it in (default: home)."),
@@ -390,14 +400,14 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["command"]),
         ),
-        TOOL_DEV_DELETE => (
+        TOOL_LOCAL_DELETE => (
             json!({
                 "path": string("File or directory to delete."),
                 "recursive": boolean("Delete a directory and everything in it (default false).")
             }),
             json!(["path"]),
         ),
-        TOOL_DEV_MOVE => (
+        TOOL_LOCAL_MOVE => (
             json!({
                 "path": string("File or directory to move."),
                 "destination": string("Where it goes; a new name in the same folder renames it."),
@@ -405,7 +415,7 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["path", "destination"]),
         ),
-        TOOL_DEV_MULTI_EDIT => (
+        TOOL_LOCAL_MULTI_EDIT => (
             json!({
                 "path": string("File to change."),
                 "edits": json!({
@@ -424,14 +434,14 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["path", "edits"]),
         ),
-        TOOL_DEV_PATCH => (
+        TOOL_LOCAL_PATCH => (
             json!({
                 "path": string("File to patch."),
                 "patch": string("Unified diff with @@ hunks, as printed by diff -u or git diff.")
             }),
             json!(["path", "patch"]),
         ),
-        TOOL_DEV_REPLACE => (
+        TOOL_LOCAL_REPLACE => (
             json!({
                 "pattern": string("Regular expression to find."),
                 "replacement": string("Replacement text; $1, $2… refer to capture groups."),
@@ -499,6 +509,9 @@ pub fn is_tool(name: &str) -> bool {
 }
 
 /// Whether a tool needs the connected session.
+///
+/// `dev_diff_file` is left out: with both texts in the call it answers from the
+/// arguments alone, and a read it does need reports the missing session itself.
 pub fn needs_session(name: &str) -> bool {
     matches!(
         name,
@@ -509,6 +522,12 @@ pub fn needs_session(name: &str) -> bool {
             | TOOL_REMOTE_LIST
             | TOOL_REMOTE_DELETE
             | TOOL_REMOTE_EDIT
+            | TOOL_DEV_VIEW
+            | TOOL_DEV_EDIT
+            | TOOL_DEV_CREATE
+            | TOOL_DEV_LIST
+            | TOOL_DEV_GREP
+            | TOOL_DEV_FIND
             | TOOL_TERMINAL_READ
             | TOOL_TERMINAL_WRITE
             | TOOL_TERMINAL_KEYS
@@ -815,44 +834,21 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
             "local": wassh_core::time::format_local_seconds(now_ms / 1000)
         })
         .to_string()),
-        TOOL_LOCAL_READ | TOOL_DEV_VIEW => {
+        TOOL_LOCAL_READ => {
             let path = local_path(&text_argument("path").unwrap_or_default());
-            let limit = if name == TOOL_LOCAL_READ {
-                args["maxChars"]
-                    .as_u64()
-                    .map_or(32_000, |value| value as usize)
-                    .clamp(1_000, MAX_FILE_READ_CHARS)
-            } else {
-                MAX_FILE_READ_CHARS
-            };
-            let body = read_text_file(&path, limit)?;
-            if name == TOOL_DEV_VIEW {
-                let start = args["startLine"].as_u64().unwrap_or(1).max(1) as usize;
-                let max_lines = args["maxLines"]
-                    .as_u64()
-                    .map_or(MAX_DEV_VIEW_LINES_DEFAULT, |value| value as usize);
-                let end = args["endLine"]
-                    .as_u64()
-                    .map_or(start + max_lines - 1, |value| value as usize);
-                let numbered: Vec<String> = body
-                    .lines()
-                    .enumerate()
-                    .skip(start - 1)
-                    .take(end.saturating_sub(start) + 1)
-                    .map(|(index, line)| format!("{:>5}\t{line}", index + 1))
-                    .collect();
-                Ok(format!("{}\n{}", path.display(), numbered.join("\n")))
-            } else {
-                Ok(body)
-            }
+            let limit = args["maxChars"]
+                .as_u64()
+                .map_or(MAX_READ_CHARS_DEFAULT, |value| value as usize)
+                .clamp(1_000, MAX_FILE_READ_CHARS);
+            read_text_file(&path, limit)
         }
-        TOOL_LOCAL_WRITE | TOOL_DEV_CREATE => {
+        TOOL_LOCAL_WRITE => {
             let path = local_path(&text_argument("path").unwrap_or_default());
             let content = text_argument("content").unwrap_or_default();
             let overwrite = args["overwrite"].as_bool().unwrap_or(false);
             write_text_file(&path, &content, overwrite)
         }
-        TOOL_LOCAL_EDIT | TOOL_DEV_EDIT => {
+        TOOL_LOCAL_EDIT => {
             let path = local_path(&text_argument("path").unwrap_or_default());
             let old = text_argument("oldText").unwrap_or_default();
             let new = text_argument("newText").unwrap_or_default();
@@ -866,204 +862,92 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
                 diff_texts(&before, &after, DIFF_CONTEXT_LINES_DEFAULT)
             ))
         }
-        TOOL_LOCAL_LIST | TOOL_DEV_LIST => {
+        TOOL_LOCAL_LIST => {
             let path = local_path(args["path"].as_str().unwrap_or("."));
-            let recursive = args["recursive"].as_bool().unwrap_or(false);
-            let depth = args["maxDepth"]
-                .as_u64()
-                .map_or(if recursive { MAX_DEV_TREE_DEPTH } else { 0 }, |value| {
-                    value as usize
-                })
-                .min(MAX_DEV_TREE_DEPTH);
             let mut entries = Vec::new();
-            list_dir(&path, &mut entries, 0, depth)?;
+            list_dir(&path, &mut entries, 0, 0)?;
             Ok(format!("{}\n{}", path.display(), entries.join("\n")))
         }
-        TOOL_DEV_GREP => dev_grep(args),
-        TOOL_DEV_FIND => dev_find(args),
-        TOOL_DEV_DIFF => {
-            let path = local_path(&text_argument("path").unwrap_or_default());
-            let context = args["contextLines"]
-                .as_u64()
-                .map_or(DIFF_CONTEXT_LINES_DEFAULT, |value| value as usize);
-            let old = match text_argument("oldText") {
-                Some(text) => text,
-                None => read_text_file(&path, MAX_FILE_READ_CHARS)?,
-            };
-            let new = text_argument("newText")
-                .or_else(|| text_argument("patch"))
-                .ok_or_else(|| "Pass newText or patch to diff against.".to_owned())?;
-            Ok(diff_texts(&old, &new, context))
-        }
-        TOOL_DEV_DELETE => dev_delete(args),
-        TOOL_DEV_MOVE => dev_move(args),
-        TOOL_DEV_MULTI_EDIT => dev_multi_edit(args),
-        TOOL_DEV_PATCH => dev_patch(args),
-        TOOL_DEV_REPLACE => dev_replace(args),
+        TOOL_LOCAL_DELETE => local_delete(args),
+        TOOL_LOCAL_MOVE => local_move(args),
+        TOOL_LOCAL_MULTI_EDIT => local_multi_edit(args),
+        TOOL_LOCAL_PATCH => local_patch(args),
+        TOOL_LOCAL_REPLACE => local_replace(args),
+        TOOL_LOCAL_RUN => run_local_command(args),
         other => Err(format!("{other} is not a local tool.")),
     }
 }
 
-/// Match a simple `*` glob against a file name.
-pub fn glob_matches(pattern: &str, name: &str) -> bool {
-    let mut regex = String::from("^");
-    for character in pattern.chars() {
-        match character {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            other if ".*+^${}()|[]\\".contains(other) => {
-                regex.push('\\');
-                regex.push(other);
-            }
-            other => regex.push(other),
-        }
-    }
-    regex.push('$');
-    Regex::new(&regex)
-        .map(|compiled| compiled.is_match(name))
-        .unwrap_or(false)
-}
+/// Directories the search tools skip: version control, dependencies and build output.
+const SKIPPED_TREE_DIRS: &str =
+    "-not -path '*/.*' -not -path '*/node_modules*' -not -path '*/dist*' -not -path '*/build*'";
 
-/// Walk `root`, calling `visit` for every file until it returns false.
-fn walk_files(root: &Path, depth: usize, visit: &mut impl FnMut(&Path) -> bool) -> bool {
-    if depth > 6 {
-        return true;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return true;
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .collect();
-    paths.sort();
-    for path in paths {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name.starts_with('.') || name == "node_modules" || name == "target" {
-            continue;
-        }
-        if path.is_dir() {
-            if !walk_files(&path, depth + 1, visit) {
-                return false;
-            }
-        } else if !visit(&path) {
-            return false;
-        }
-    }
-    true
-}
-
-/// `dev_grep_search`.
-fn dev_grep(args: &Value) -> ToolResult {
+/// The shell command `dev_grep_search` runs on the connected host.
+///
+/// `root` is already resolved against the agent's working directory.
+pub fn dev_grep_command(args: &Value, root: &str) -> String {
     let pattern = args["pattern"].as_str().unwrap_or_default();
-    if pattern.is_empty() {
-        return Err("pattern is required.".to_owned());
-    }
-    let case_sensitive = args["caseSensitive"].as_bool().unwrap_or(false);
-    let source = if case_sensitive {
-        pattern.to_owned()
+    let case = if args["caseSensitive"].as_bool().unwrap_or(false) {
+        ""
     } else {
-        format!("(?i){pattern}")
+        "-i "
     };
-    let regex = Regex::new(&source).map_err(|error| format!("Invalid pattern: {error}"))?;
-    let root = local_path(args["path"].as_str().unwrap_or("."));
-    let glob = args["glob"].as_str().map(str::to_owned);
-    let context = args["contextLines"].as_u64().unwrap_or(0) as usize;
+    let include = args["glob"]
+        .as_str()
+        .map(str::trim)
+        .filter(|glob| !glob.is_empty())
+        .map(|glob| format!("--include={} ", shell_quote(glob)))
+        .unwrap_or_default();
+    let context = args["contextLines"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(DIFF_CONTEXT_LINES_MAX as u64);
+    let around = if context == 0 {
+        String::new()
+    } else {
+        format!("-C {context} ")
+    };
     let limit = args["limit"]
         .as_u64()
-        .map_or(50, |value| value as usize)
+        .map_or(DEV_SEARCH_MATCHES_DEFAULT, |value| value as usize)
         .clamp(1, MAX_DEV_GREP_MATCHES);
-    let mut hits: Vec<String> = Vec::new();
-    let mut searched = 0usize;
-    let mut visit = |path: &Path| {
-        if let Some(glob) = &glob {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !glob_matches(glob, &name) {
-                return true;
-            }
-        }
-        let Ok(bytes) = std::fs::read(path) else {
-            return true;
-        };
-        if bytes.iter().take(2048).any(|byte| *byte == 0) {
-            return true;
-        }
-        searched += 1;
-        let body = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = body.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
-            if !regex.is_match(line) {
-                continue;
-            }
-            let from = index.saturating_sub(context);
-            let to = (index + context).min(lines.len().saturating_sub(1));
-            for (offset, text) in lines[from..=to].iter().enumerate() {
-                let number = from + offset + 1;
-                let marker = if from + offset == index { ':' } else { '-' };
-                hits.push(format!("{}:{number}{marker}{text}", path.display()));
-            }
-            if hits.len() >= limit {
-                return false;
-            }
-        }
-        true
-    };
-    if root.is_file() {
-        visit(&root);
-    } else {
-        walk_files(&root, 0, &mut visit);
-    }
-    if hits.is_empty() {
-        return Ok(format!("No matches for {pattern} under {}", root.display()));
-    }
-    Ok(format!(
-        "{}\n\n[{} lines searched, {} matches]",
-        hits.join("\n"),
-        searched,
-        hits.len()
-    ))
+    format!(
+        "grep -rnI {case}{include}{around}--exclude-dir={{.git,node_modules,dist,build,target}} \
+         -e {} {} 2>/dev/null | head -n {limit}",
+        shell_quote(pattern),
+        shell_quote(root)
+    )
 }
 
-/// `dev_find_files`.
-fn dev_find(args: &Value) -> ToolResult {
+/// The shell command `dev_find_files` runs on the connected host.
+pub fn dev_find_command(args: &Value, root: &str) -> String {
     let pattern = args["namePattern"].as_str().unwrap_or_default();
-    if pattern.is_empty() {
-        return Err("namePattern is required.".to_owned());
-    }
-    let root = local_path(args["path"].as_str().unwrap_or("."));
     let limit = args["limit"]
         .as_u64()
-        .map_or(50, |value| value as usize)
+        .map_or(DEV_SEARCH_MATCHES_DEFAULT, |value| value as usize)
         .clamp(1, MAX_DEV_FIND_MATCHES);
-    let mut found: Vec<String> = Vec::new();
-    let mut visit = |path: &Path| {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if glob_matches(pattern, &name) {
-            found.push(path.display().to_string());
-        }
-        found.len() < limit
-    };
-    walk_files(&root, 0, &mut visit);
-    if found.is_empty() {
-        return Ok(format!(
-            "No files matching {pattern} under {}",
-            root.display()
-        ));
-    }
-    Ok(found.join("\n"))
+    format!(
+        "find {} -maxdepth {MAX_DEV_FIND_DEPTH} {SKIPPED_TREE_DIRS} -iname {} 2>/dev/null \
+         | head -n {limit}",
+        shell_quote(root),
+        shell_quote(pattern)
+    )
 }
 
-/// `dev_delete_file`.
-fn dev_delete(args: &Value) -> ToolResult {
+/// The shell command a recursive `dev_list_directory` runs on the connected host.
+pub fn dev_tree_command(args: &Value, root: &str) -> String {
+    let depth = args["maxDepth"]
+        .as_u64()
+        .unwrap_or(MAX_DEV_TREE_DEPTH as u64)
+        .min(MAX_DEV_TREE_DEPTH as u64);
+    format!(
+        "find {} -maxdepth {depth} {SKIPPED_TREE_DIRS} 2>/dev/null | head -n {MAX_DIR_ENTRIES}",
+        shell_quote(root)
+    )
+}
+
+/// `local_fs_delete_file`.
+fn local_delete(args: &Value) -> ToolResult {
     let raw = args["path"].as_str().unwrap_or_default().trim();
     if raw.is_empty() {
         return Err("path is required.".to_owned());
@@ -1089,8 +973,8 @@ fn dev_delete(args: &Value) -> ToolResult {
     Ok(format!("Deleted {}.", path.display()))
 }
 
-/// `dev_move_file`.
-fn dev_move(args: &Value) -> ToolResult {
+/// `local_fs_move_file`.
+fn local_move(args: &Value) -> ToolResult {
     let from = local_path(args["path"].as_str().unwrap_or_default());
     let to = local_path(args["destination"].as_str().unwrap_or_default());
     if args["destination"]
@@ -1146,8 +1030,8 @@ fn dev_move(args: &Value) -> ToolResult {
     Ok(format!("Moved {} to {}.", from.display(), to.display()))
 }
 
-/// `dev_multi_edit`.
-fn dev_multi_edit(args: &Value) -> ToolResult {
+/// `local_fs_multi_edit`.
+fn local_multi_edit(args: &Value) -> ToolResult {
     let path = local_path(args["path"].as_str().unwrap_or_default());
     let Some(edits) = args["edits"].as_array() else {
         return Err("edits must be an array of {oldText, newText} objects.".to_owned());
@@ -1190,8 +1074,8 @@ fn replace_every(text: &str, old: &str, new: &str) -> ToolResult {
     Ok(text.replace(old, new))
 }
 
-/// `dev_apply_patch`.
-fn dev_patch(args: &Value) -> ToolResult {
+/// `local_fs_apply_patch`.
+fn local_patch(args: &Value) -> ToolResult {
     let path = local_path(args["path"].as_str().unwrap_or_default());
     let patch = args["patch"]
         .as_str()
@@ -1311,8 +1195,60 @@ fn expect_line(lines: &[&str], index: usize, expected: &str) -> Result<(), Strin
     }
 }
 
-/// `dev_replace_in_files`.
-fn dev_replace(args: &Value) -> ToolResult {
+/// Match a simple `*` glob against a file name.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut regex = String::from("^");
+    for character in pattern.chars() {
+        match character {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            other if ".*+^${}()|[]\\".contains(other) => {
+                regex.push('\\');
+                regex.push(other);
+            }
+            other => regex.push(other),
+        }
+    }
+    regex.push('$');
+    Regex::new(&regex)
+        .map(|compiled| compiled.is_match(name))
+        .unwrap_or(false)
+}
+
+/// Walk `root`, calling `visit` for every file until it returns false.
+fn walk_files(root: &Path, depth: usize, visit: &mut impl FnMut(&Path) -> bool) -> bool {
+    if depth > 6 {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return true;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.starts_with('.') || name == "node_modules" || name == "target" {
+            continue;
+        }
+        if path.is_dir() {
+            if !walk_files(&path, depth + 1, visit) {
+                return false;
+            }
+        } else if !visit(&path) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `local_fs_replace_in_files`.
+fn local_replace(args: &Value) -> ToolResult {
     let pattern = args["pattern"].as_str().unwrap_or_default();
     if pattern.is_empty() {
         return Err("pattern is required.".to_owned());
@@ -1391,7 +1327,7 @@ fn dev_replace(args: &Value) -> ToolResult {
     Ok(report.join("\n"))
 }
 
-/// Run `dev_run_command` on this machine, killing it at the timeout.
+/// Run `local_fs_run_command` on this machine, killing it at the timeout.
 pub fn run_local_command(args: &Value) -> ToolResult {
     let command = args["command"]
         .as_str()
@@ -1614,9 +1550,9 @@ mod tests {
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"run_sudo"));
         assert!(names.contains(&"dev_grep_search"));
-        assert!(names.contains(&"dev_run_command"));
-        assert!(names.contains(&"dev_apply_patch"));
-        assert!(names.contains(&"dev_replace_in_files"));
+        assert!(names.contains(&"local_fs_run_command"));
+        assert!(names.contains(&"local_fs_apply_patch"));
+        assert!(names.contains(&"local_fs_replace_in_files"));
         assert!(names.contains(&"terminal_send_keys"));
         assert!(names.contains(&"system_memory_report"));
         assert!(names.contains(&"rag_search"));
@@ -1661,14 +1597,6 @@ mod tests {
         );
         assert_eq!(replace_once("abc", "b", "B").unwrap(), "aBc");
         assert!(replace_once("abc", "", "x").is_err());
-    }
-
-    #[test]
-    fn globs_match_file_names() {
-        assert!(glob_matches("*.rs", "main.rs"));
-        assert!(!glob_matches("*.rs", "main.rss"));
-        assert!(glob_matches("lib?.txt", "lib1.txt"));
-        assert!(!glob_matches("lib?.txt", "lib10.txt"));
     }
 
     #[test]
@@ -1725,18 +1653,14 @@ mod tests {
 
         // Editing reports the change.
         let diff = run_local(
-            TOOL_DEV_EDIT,
+            TOOL_LOCAL_EDIT,
             &json!({ "path": path, "oldText": "again", "newText": "once more" }),
             0,
         )
         .unwrap();
         assert!(diff.contains("+   0 hello once more"), "{diff}");
 
-        // Viewing numbers the lines.
-        let view = run_local(TOOL_DEV_VIEW, &json!({ "path": path }), 0).unwrap();
-        assert!(view.contains("    1\thello once more"), "{view}");
-
-        // Listing and grepping find it again.
+        // Listing finds it again.
         let list = run_local(
             TOOL_LOCAL_LIST,
             &json!({ "path": dir.display().to_string() }),
@@ -1744,20 +1668,6 @@ mod tests {
         )
         .unwrap();
         assert!(list.contains("note.txt"), "{list}");
-        let grep = run_local(
-            TOOL_DEV_GREP,
-            &json!({ "pattern": "once more", "path": dir.display().to_string() }),
-            0,
-        )
-        .unwrap();
-        assert!(grep.contains("note.txt"), "{grep}");
-        let find = run_local(
-            TOOL_DEV_FIND,
-            &json!({ "namePattern": "*.txt", "path": dir.display().to_string() }),
-            0,
-        )
-        .unwrap();
-        assert!(find.contains("note.txt"), "{find}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1792,7 +1702,7 @@ mod tests {
         let path = file.display().to_string();
         std::fs::write(&file, "alpha beta gamma\n").unwrap();
         let diff = run_local(
-            TOOL_DEV_MULTI_EDIT,
+            TOOL_LOCAL_MULTI_EDIT,
             &json!({ "path": path, "edits": [
                 { "oldText": "alpha", "newText": "ALPHA" },
                 { "oldText": "beta", "newText": "BETA", "replaceAll": true }
@@ -1808,7 +1718,7 @@ mod tests {
 
         // A later edit that cannot find its text fails the whole call.
         let error = run_local(
-            TOOL_DEV_MULTI_EDIT,
+            TOOL_LOCAL_MULTI_EDIT,
             &json!({ "path": path, "edits": [
                 { "oldText": "ALPHA", "newText": "A" },
                 { "oldText": "missing", "newText": "x" }
@@ -1834,7 +1744,7 @@ mod tests {
         let to = dir.join("nested/b.txt");
         std::fs::write(&from, "text").unwrap();
         run_local(
-            TOOL_DEV_MOVE,
+            TOOL_LOCAL_MOVE,
             &json!({ "path": from.display().to_string(), "destination": to.display().to_string() }),
             0,
         )
@@ -1845,7 +1755,7 @@ mod tests {
         // An existing destination needs overwrite, and a directory needs recursive.
         assert!(
             run_local(
-                TOOL_DEV_MOVE,
+                TOOL_LOCAL_MOVE,
                 &json!({ "path": to.display().to_string(), "destination": to.display().to_string() }),
                 0,
             )
@@ -1854,14 +1764,14 @@ mod tests {
         let nested = dir.join("nested");
         assert!(
             run_local(
-                TOOL_DEV_DELETE,
+                TOOL_LOCAL_DELETE,
                 &json!({ "path": nested.display().to_string() }),
                 0,
             )
             .is_err()
         );
         run_local(
-            TOOL_DEV_DELETE,
+            TOOL_LOCAL_DELETE,
             &json!({ "path": nested.display().to_string(), "recursive": true }),
             0,
         )
@@ -1879,7 +1789,7 @@ mod tests {
         let file = dir.join("code.rs");
         std::fs::write(&file, "let value = 1;\nlet other = 1;\n").unwrap();
         let report = run_local(
-            TOOL_DEV_REPLACE,
+            TOOL_LOCAL_REPLACE,
             &json!({ "pattern": "= 1", "replacement": "= 2", "path": dir.display().to_string(), "glob": "*.rs" }),
             0,
         )
@@ -1892,7 +1802,7 @@ mod tests {
         assert!(std::fs::read_to_string(&file).unwrap().contains("= 1"));
 
         run_local(
-            TOOL_DEV_REPLACE,
+            TOOL_LOCAL_REPLACE,
             &json!({ "pattern": "= 1", "replacement": "= 2", "path": dir.display().to_string(), "glob": "*.rs", "dryRun": false }),
             0,
         )
@@ -1914,6 +1824,35 @@ mod tests {
         let failed = run_local_command(&json!({ "command": "exit 3" })).unwrap();
         assert!(failed.contains("[exit code 3]"), "{failed}");
         assert!(run_local_command(&json!({ "command": "  " })).is_err());
+    }
+
+    #[test]
+    fn the_developer_tools_are_shell_lines_for_the_host() {
+        let grep = dev_grep_command(
+            &json!({ "pattern": "fn main", "glob": "*.rs", "contextLines": 2, "limit": 7 }),
+            "/srv/app",
+        );
+        assert!(grep.starts_with("grep -rnI -i --include='*.rs' -C 2 "), "{grep}");
+        assert!(grep.contains("-e 'fn main' '/srv/app'"), "{grep}");
+        assert!(grep.ends_with("head -n 7"), "{grep}");
+        let case = dev_grep_command(
+            &json!({ "pattern": "main", "caseSensitive": true, "limit": 500 }),
+            "/srv",
+        );
+        assert!(case.starts_with("grep -rnI --exclude-dir"), "{case}");
+        assert!(case.ends_with(&format!("head -n {MAX_DEV_GREP_MATCHES}")), "{case}");
+
+        let find = dev_find_command(&json!({ "namePattern": "*.toml", "limit": 3 }), "/srv");
+        assert!(find.contains("-maxdepth 8"), "{find}");
+        assert!(find.contains("-iname '*.toml'"), "{find}");
+        assert!(find.ends_with("head -n 3"), "{find}");
+
+        let tree = dev_tree_command(&json!({ "maxDepth": 9 }), "/srv");
+        assert!(
+            tree.contains(&format!("-maxdepth {MAX_DEV_TREE_DEPTH}")),
+            "{tree}"
+        );
+        assert!(tree.ends_with(&format!("head -n {MAX_DIR_ENTRIES}")), "{tree}");
     }
 
     #[test]
@@ -1946,8 +1885,18 @@ mod tests {
         assert!(needs_session(TOOL_RUN_COMMAND));
         assert!(needs_session(TOOL_SYSTEM_OVERVIEW));
         assert!(needs_session(TOOL_TERMINAL_READ));
+        assert!(needs_session(TOOL_DEV_VIEW));
+        assert!(needs_session(TOOL_DEV_GREP));
+        assert!(needs_session(TOOL_DEV_FIND));
+        assert!(needs_session(TOOL_DEV_LIST));
+        assert!(needs_session(TOOL_DEV_CREATE));
+        assert!(needs_session(TOOL_DEV_EDIT));
+        // A diff of two texts needs no file, and says so itself when it needs one.
+        assert!(!needs_session(TOOL_DEV_DIFF));
         assert!(!needs_session(TOOL_WEB_FETCH));
         assert!(!needs_session(TOOL_LOCAL_READ));
+        assert!(!needs_session(TOOL_LOCAL_RUN));
+        assert!(!needs_session(TOOL_LOCAL_PATCH));
         assert!(is_read_only(TOOL_REMOTE_LIST));
         assert!(!is_read_only(TOOL_REMOTE_WRITE));
         assert!(!is_read_only(TOOL_RUN_COMMAND));

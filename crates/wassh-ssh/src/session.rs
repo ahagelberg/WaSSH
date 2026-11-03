@@ -217,6 +217,11 @@ pub enum SessionEnd {
         /// The exit status the server reported.
         status: u32,
     },
+    /// The server closed the channel without naming an exit status: the shell is gone.
+    ///
+    /// A plain `exit` usually reports a status; `logout`, a forced command or a shell that
+    /// simply ends may only close the channel.
+    Closed,
     /// The transport failed or went away without the shell exiting.
     Failed,
     /// The app tore the session down.
@@ -632,12 +637,23 @@ async fn run(
                     detail: format!("{error:#}"),
                 });
             } else {
+                // A server that hangs up said the session is over, the way it does when the
+                // shell finishes; anything else is a transport failure, which keeps the tab
+                // so the reconnect policy can take over.
+                let by_server = matches!(
+                    error.downcast_ref::<russh::Error>(),
+                    Some(russh::Error::Disconnect)
+                );
                 let _ = events.send(SshEvent::Error(format!("{error:#}")));
+                let _ = events.send(SshEvent::Closed {
+                    reason: Some(format!("{error:#}")),
+                    end: if by_server {
+                        SessionEnd::Closed
+                    } else {
+                        SessionEnd::Failed
+                    },
+                });
             }
-            let _ = events.send(SshEvent::Closed {
-                reason: Some(format!("{error:#}")),
-                end: SessionEnd::Failed,
-            });
         }
     }
 }
@@ -793,8 +809,15 @@ async fn connect_and_shell(
                         end = SessionEnd::Exited { status: exit_status };
                         break;
                     }
-                    // The channel ended without an exit status: the connection dropped.
-                    Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                    // The server ended the channel: the shell is gone, whether or not it
+                    // named a status. An `exit` usually does; a `logout` or a forced
+                    // command may not. `None` below is the connection itself vanishing,
+                    // which stays a failure so the tab keeps its reconnect policy.
+                    Some(ChannelMsg::Eof | ChannelMsg::Close) => {
+                        end = SessionEnd::Closed;
+                        break;
+                    }
+                    None => break,
                     _ => {}
                 }
             }

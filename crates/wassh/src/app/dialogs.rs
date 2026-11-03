@@ -65,6 +65,10 @@ const EDITOR_CHROME: f32 = 132.0;
 const TUNNEL_PORT_WIDTH: f32 = 64.0;
 /// Smallest width a tunnel's host field keeps when the port box takes its share.
 const TUNNEL_HOST_MIN_WIDTH: f32 = 80.0;
+/// Gap between a focused control and the outline that marks it.
+const FOCUS_RING_GAP: f32 = 2.0;
+/// Width of that outline.
+const FOCUS_RING_WIDTH: f32 = 2.0;
 
 /// A group being edited in its own dialog.
 #[derive(Clone, Debug)]
@@ -721,6 +725,15 @@ enum ShellOutcome {
 }
 
 /// Draw the two-column settings panel used by Options and Host settings.
+/// Screen rect of the widget the keyboard has focused this frame.
+///
+/// Focus is egui's own; this only reads it back so a dialog can keep the focused control
+/// in view.
+fn focused_widget(ctx: &Context) -> Option<Rect> {
+    let id = ctx.memory(|memory| memory.focused())?;
+    ctx.read_response(id).map(|response| response.rect)
+}
+
 fn settings_shell(
     ctx: &Context,
     palette: &Palette,
@@ -768,8 +781,9 @@ fn settings_shell(
         .show(ctx, |ui| {
             ui.set_min_size(size);
             let rect = Rect::from_min_size(panel.min, size);
-            // Swallow clicks so they do not reach the backdrop.
-            ui.interact(rect, Id::unique(("wassh-settings-sink", id_salt)), Sense::click());
+            // Swallow clicks so they do not reach the backdrop. A plain `Sense::CLICK` —
+            // `Sense::click()` would also make this whole panel a tab stop.
+            ui.interact(rect, Id::unique(("wassh-settings-sink", id_salt)), Sense::CLICK);
 
             ui.painter().rect_filled(rect, 8.0, to_color32(palette.bg_panel));
             ui.painter().rect_stroke(
@@ -916,6 +930,11 @@ fn settings_shell(
                             }
                         });
                     });
+                    // Tab moves the focus down the dialog; follow it, so the next control
+                    // is never left below the fold.
+                    if let Some(rect) = focused_widget(ui.ctx()) {
+                        ui.scroll_to_rect(rect, Some(Align::Center));
+                    }
                     ui.add_space(16.0);
                 });
             nav.scroll_to = None;
@@ -964,6 +983,18 @@ fn settings_shell(
                 && Button::new(danger).danger().show(&mut bar, palette).clicked()
             {
                 outcome = ShellOutcome::Delete;
+            }
+
+            // Outline whatever the keyboard has focused: the hand-painted controls give no
+            // other sign of where it went. Painted last, and by the panel rather than the
+            // scrolling column, so the rail and the footer show it too.
+            if let Some(rect) = focused_widget(ui.ctx()) {
+                ui.painter().rect_stroke(
+                    rect.expand(FOCUS_RING_GAP),
+                    wassh_core::RADIUS,
+                    Stroke::new(FOCUS_RING_WIDTH, to_color32(palette.accent)),
+                    StrokeKind::Outside,
+                );
             }
         });
 
