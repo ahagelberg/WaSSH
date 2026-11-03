@@ -126,6 +126,15 @@ pub enum Turn {
     Notice(String),
 }
 
+/// A question the agent asks, with optional selectable answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentQuestion {
+    /// What the user is asked.
+    pub text: String,
+    /// Selectable answers; the pane adds a final free-text choice.
+    pub options: Vec<String>,
+}
+
 /// What the agent is doing right now.
 pub enum Phase {
     /// Waiting for the user.
@@ -168,8 +177,12 @@ pub enum Phase {
     Asking {
         /// The call being answered.
         call: ApiToolCall,
-        /// The question.
-        text: String,
+        /// Questions shown one at a time.
+        questions: Vec<AgentQuestion>,
+        /// Index of the question currently shown.
+        current: usize,
+        /// Answers recorded on earlier questions.
+        answers: Vec<String>,
     },
     /// A command needs root, so the user is asked for their password.
     Sudo {
@@ -990,16 +1003,55 @@ impl Agent {
 
         match name.as_str() {
             TOOL_ASK_USER => {
-                let text = arguments["text"]
-                    .as_str()
-                    .filter(|text| !text.trim().is_empty())
-                    .unwrap_or("The agent needs your input.")
-                    .to_owned();
+                let questions = arguments["questions"]
+                    .as_array()
+                    .map(|questions| {
+                        questions
+                            .iter()
+                            .filter_map(|question| {
+                                let text = question["question"]
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|text| !text.is_empty())?;
+                                let options = question["options"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|option| !option.is_empty())
+                                    .map(str::to_owned)
+                                    .collect();
+                                Some(AgentQuestion {
+                                    text: text.to_owned(),
+                                    options,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|questions| !questions.is_empty())
+                    .unwrap_or_else(|| {
+                        let text = arguments["text"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                            .unwrap_or("The agent needs your input.");
+                        vec![AgentQuestion {
+                            text: text.to_owned(),
+                            options: Vec::new(),
+                        }]
+                    });
+                let text = questions[0].text.clone();
                 self.turns.push(Turn::Question {
                     text: text.clone(),
                     answer: None,
                 });
-                self.phase = Some(Phase::Asking { call, text });
+                self.phase = Some(Phase::Asking {
+                    call,
+                    questions,
+                    current: 0,
+                    answers: Vec::new(),
+                });
             }
             TOOL_RUN_COMMAND => {
                 let Some(command) = arguments["command"]
@@ -1624,10 +1676,28 @@ impl Agent {
 
     /// Answer the agent's question.
     pub fn answer(&mut self, text: &str, session: Session<'_, '_>) {
-        let Some(Phase::Asking { call, .. }) = self.phase.take() else {
+        let answer = text.trim().to_owned();
+        if answer.is_empty() {
+            return;
+        }
+        let Some(Phase::Asking {
+            call,
+            questions,
+            current,
+            mut answers,
+        }) = self.phase.take()
+        else {
             return;
         };
-        let answer = text.trim().to_owned();
+        if current >= questions.len() {
+            self.phase = Some(Phase::Asking {
+                call,
+                questions,
+                current,
+                answers,
+            });
+            return;
+        }
         if let Some(Turn::Question { answer: slot, .. }) = self
             .turns
             .iter_mut()
@@ -1636,8 +1706,29 @@ impl Agent {
         {
             *slot = Some(answer.clone());
         }
+        answers.push(answer);
+        let next = current + 1;
+        if let Some(question) = questions.get(next) {
+            self.turns.push(Turn::Question {
+                text: question.text.clone(),
+                answer: None,
+            });
+            self.phase = Some(Phase::Asking {
+                call,
+                questions,
+                current: next,
+                answers,
+            });
+            return;
+        }
+        let result = questions
+            .iter()
+            .zip(answers)
+            .map(|(question, answer)| format!("{}: {}", question.text, answer))
+            .collect::<Vec<_>>()
+            .join("\n");
         let turn = self.turn_for(&call);
-        self.settle(call, turn, "ask_user".to_owned(), answer, false, session);
+        self.settle(call, turn, "ask_user".to_owned(), result, false, session);
     }
 
     /// Stop whatever the run is doing.
@@ -2482,6 +2573,48 @@ mod tests {
             other => panic!("expected a tool turn, got {other:?}"),
         }
         assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn ask_user_waits_for_every_question_before_continuing() {
+        let mut agent = Agent::new();
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_ASK_USER.to_owned(),
+                arguments: r#"{"questions":[{"question":"Which language?","options":["Rust","Go"]},{"question":"Which file?"}]}"#.to_owned(),
+            },
+            &mut session,
+        );
+
+        agent.answer("", &mut session);
+        assert!(matches!(
+            &agent.phase,
+            Some(Phase::Asking { current, .. }) if *current == 0
+        ));
+        assert!(!agent.needs_reply, "an empty answer cannot continue");
+
+        agent.answer("Rust", &mut session);
+        assert!(matches!(
+            &agent.phase,
+            Some(Phase::Asking { current, .. }) if *current == 1
+        ));
+        assert!(!agent.needs_reply, "the first answer is not the final answer");
+        assert!(matches!(
+            &agent.turns[1],
+            Turn::Question { answer: Some(answer), .. } if answer == "Rust"
+        ));
+
+        agent.answer("main.rs", &mut session);
+        assert!(!agent.asking());
+        assert!(agent.needs_reply);
+        assert!(matches!(
+            agent.turns.iter().find(|turn| matches!(turn, Turn::Tool { .. })),
+            Some(Turn::Tool { output, .. })
+                if output.contains("Which language?: Rust")
+                    && output.contains("Which file?: main.rs")
+        ));
     }
 
     #[test]

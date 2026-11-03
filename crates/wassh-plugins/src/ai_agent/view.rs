@@ -73,6 +73,7 @@ const BADGE_TINT: f32 = 0.25;
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// Characters shown from a queued message.
 const QUEUE_PREVIEW_MAX_CHARS: usize = 120;
+const QUESTION_INDEX_OFFSET: usize = 1;
 /// Most a prompt card grows to, its own controls included.
 const PROMPT_CARD_MAX_HEIGHT: f32 = 480.0;
 /// Smallest a capped prompt card gets.
@@ -275,6 +276,8 @@ pub struct AiAgent {
     summary: Option<(SummaryMode, Receiver<Result<String, String>>)>,
     /// The question composer, while `ask_user` waits.
     answer: String,
+    /// Selected answer option for the current question.
+    answer_choice: Option<usize>,
     /// The password being typed into the sudo card.
     sudo: String,
     /// Whether the stored conversation has been read back.
@@ -312,6 +315,7 @@ impl Default for AiAgent {
             app_writes: Vec::new(),
             summary: None,
             answer: String::new(),
+            answer_choice: None,
             sudo: String::new(),
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
@@ -1601,17 +1605,33 @@ impl AiAgent {
 
         // The question card.
         let question = match &self.agent.phase {
-            Some(Phase::Asking { text, .. }) => Some(text.clone()),
+            Some(Phase::Asking {
+                questions,
+                current,
+                ..
+            }) => questions
+                .get(*current)
+                .cloned()
+                .map(|question| (question, *current, questions.len())),
             _ => None,
         };
-        if let Some(text) = question {
+        if let Some((question, current, question_count)) = question {
             prompt_card(
                 ui,
                 palette,
                 "question",
                 |ui| {
                     ui.label(
-                        egui::RichText::new(text.as_str())
+                        egui::RichText::new(format!(
+                            "Question {} of {}",
+                            current + QUESTION_INDEX_OFFSET,
+                            question_count
+                        ))
+                        .size(10.0)
+                        .color(muted),
+                    );
+                    ui.label(
+                        egui::RichText::new(question.text.as_str())
                             .size(12.0)
                             .strong()
                             .color(to_color32(palette.text)),
@@ -1619,28 +1639,56 @@ impl AiAgent {
                 },
                 |ui| {
                     let room = (ui.available_width() - PROMPT_CARD_GAP).max(MIN_ANSWER_WIDTH);
+                    let free_text_index = question.options.len();
+                    let is_last = current + QUESTION_INDEX_OFFSET >= question_count;
+                    let mut answer_on_enter = false;
                     ui.allocate_ui_with_layout(
                         egui::Vec2::new(room, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(room);
-                            let response =
-                                text_area(ui, palette, &mut self.answer, 2, "Your answer…");
-                            if response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                                && !ui.input(|input| input.modifiers.shift)
-                            {
-                                answers.answer = Some(std::mem::take(&mut self.answer));
+                            if !question.options.is_empty() {
+                                for (index, option) in question.options.iter().enumerate() {
+                                    ui.radio_value(
+                                        &mut self.answer_choice,
+                                        Some(index),
+                                        option,
+                                    );
+                                }
+                                ui.radio_value(
+                                    &mut self.answer_choice,
+                                    Some(free_text_index),
+                                    "Other (write your own)",
+                                );
+                            }
+                            let free_text_selected = question.options.is_empty()
+                                || self.answer_choice == Some(free_text_index);
+                            if free_text_selected {
+                                let response =
+                                    text_area(ui, palette, &mut self.answer, 2, "Your answer…");
+                                answer_on_enter = response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                    && !ui.input(|input| input.modifiers.shift);
                             }
                         },
                     );
-                    if small_button_enabled(
-                        ui,
-                        palette,
-                        "Send answer",
-                        !self.answer.trim().is_empty(),
-                    ) {
-                        answers.answer = Some(std::mem::take(&mut self.answer));
+                    let answer = if question.options.is_empty()
+                        || self.answer_choice == Some(free_text_index)
+                    {
+                        self.answer.trim().to_owned()
+                    } else {
+                        self.answer_choice
+                            .and_then(|index| question.options.get(index))
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    if !answer.is_empty() && answer_on_enter {
+                        answers.answer = Some(answer);
+                    } else {
+                        let label = if is_last { "Continue" } else { "Next" };
+                        if small_button_enabled(ui, palette, label, !answer.is_empty()) {
+                            answers.answer = Some(answer);
+                        }
                     }
                 },
             );
@@ -2095,6 +2143,8 @@ impl Plugin for AiAgent {
             self.agent.answer_permission(allow, &mut session);
         }
         if let Some(answer) = prompts.answer {
+            self.answer.clear();
+            self.answer_choice = None;
             self.agent.answer(&answer, &mut session);
         }
         match prompts.sudo {
@@ -2801,7 +2851,12 @@ mod tests {
                 name: "ask_user".to_owned(),
                 arguments: r#"{"text":"Which file?"}"#.to_owned(),
             },
-            text: "Which file?".to_owned(),
+            questions: vec![super::super::agent::AgentQuestion {
+                text: "Which file?".to_owned(),
+                options: Vec::new(),
+            }],
+            current: 0,
+            answers: Vec::new(),
         });
         plugin.agent.turns.push(Turn::Question {
             text: "Which file?".to_owned(),
@@ -2818,7 +2873,50 @@ mod tests {
             texts.contains(&"Your answer…"),
             "answer box missing: {texts:?}"
         );
-        assert!(texts.contains(&"Send answer"), "send missing: {texts:?}");
+        assert!(texts.contains(&"Continue"), "continue missing: {texts:?}");
+    }
+
+    #[test]
+    fn a_multi_question_card_shows_choices_and_advances_one_at_a_time() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Asking {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: "ask_user".to_owned(),
+                arguments: String::new(),
+            },
+            questions: vec![
+                super::super::agent::AgentQuestion {
+                    text: "Which language?".to_owned(),
+                    options: vec!["Rust".to_owned(), "Go".to_owned()],
+                },
+                super::super::agent::AgentQuestion {
+                    text: "Which file?".to_owned(),
+                    options: Vec::new(),
+                },
+            ],
+            current: 0,
+            answers: Vec::new(),
+        });
+        plugin.agent.turns.push(Turn::Question {
+            text: "Which language?".to_owned(),
+            answer: None,
+        });
+        let mut settings = serde_json::Map::new();
+        let painted = draw(&mut plugin, &mut settings);
+        let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
+
+        for expected in [
+            "Question 1 of 2",
+            "Which language?",
+            "Rust",
+            "Go",
+            "Other (write your own)",
+            "Next",
+        ] {
+            assert!(texts.contains(&expected), "{expected} missing: {texts:?}");
+        }
+        assert!(!texts.contains(&"Continue"), "not on the final question");
     }
 
     #[test]

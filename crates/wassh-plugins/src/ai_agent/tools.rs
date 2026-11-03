@@ -107,7 +107,7 @@ first, so use this only when run_command failed for lack of permissions.",
     },
     ToolSpec {
         name: TOOL_ASK_USER,
-        description: "Ask the user a question and wait for their answer.",
+        description: "Ask the user one or more questions and wait for every answer. Questions may offer choices; the user can also choose to write a free-text answer.",
     },
     ToolSpec {
         name: TOOL_WEB_FETCH,
@@ -258,14 +258,26 @@ impl ToolSpec {
     /// The JSON schema handed to the provider.
     pub fn schema(self) -> Value {
         let (properties, required) = parameters(self.name);
-        json!({
-            "name": self.name,
-            "description": self.description,
-            "parameters": {
+        let parameters = if self.name == TOOL_ASK_USER {
+            json!({
+                "type": "object",
+                "properties": properties,
+                "anyOf": [
+                    { "required": ["questions"] },
+                    { "required": ["text"] }
+                ]
+            })
+        } else {
+            json!({
                 "type": "object",
                 "properties": properties,
                 "required": required
-            }
+            })
+        };
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "parameters": parameters
         })
     }
 }
@@ -288,8 +300,25 @@ fn parameters(name: &str) -> (Value, Value) {
             json!(["command"]),
         ),
         TOOL_ASK_USER => (
-            json!({ "text": string("The question to ask the user.") }),
-            json!(["text"]),
+            json!({
+                "text": string("Backward-compatible single question."),
+                "questions": {
+                    "type": "array",
+                    "description": "Questions to ask in sequence. The UI adds a final free-text choice to each question that has options.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": string("The question to ask."),
+                            "options": {
+                                "type": "array",
+                                "items": string("One selectable answer option.")
+                            }
+                        },
+                        "required": ["question"]
+                    }
+                }
+            }),
+            json!(["questions"]),
         ),
         TOOL_WEB_FETCH => (
             json!({
@@ -1659,6 +1688,12 @@ mod tests {
         assert!(names.contains(&"terminal_send_keys"));
         assert!(names.contains(&"system_memory_report"));
         assert!(names.contains(&"rag_search"));
+        let ask_user = schemas
+            .iter()
+            .find(|schema| schema["name"] == TOOL_ASK_USER)
+            .expect("ask_user schema");
+        assert_eq!(ask_user["parameters"]["anyOf"][0]["required"][0], "questions");
+        assert_eq!(ask_user["parameters"]["anyOf"][1]["required"][0], "text");
         // Every schema is an object with a properties map.
         for schema in &schemas {
             assert_eq!(schema["parameters"]["type"], "object", "{schema}");
