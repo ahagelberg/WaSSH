@@ -2946,7 +2946,7 @@ mod tests {
         );
         assert!(diff.contains("+   1     hello();"), "{diff}");
         assert_eq!(
-            fake.uploads.last().map(|(path, _)| path.as_str()),
+            fake.writes.last().map(|(path, _)| path.as_str()),
             Some("/srv/app/main.rs")
         );
     }
