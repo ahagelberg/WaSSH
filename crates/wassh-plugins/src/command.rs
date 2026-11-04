@@ -53,6 +53,12 @@ pub trait CommandAccess {
 
     /// Whether the command for `key` is still running.
     fn is_running(&self, key: &str) -> bool;
+
+    /// Stop the command running under `key`, so it does not keep going on the host.
+    ///
+    /// The command answers with a failure naming the stop, the same way its exit status
+    /// would arrive.
+    fn cancel(&mut self, key: &str);
 }
 
 /// TCP, forwarded through the session.

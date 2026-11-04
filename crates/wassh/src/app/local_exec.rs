@@ -9,6 +9,8 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -34,30 +36,50 @@ pub fn supported() -> bool {
 }
 
 /// Run `command` with `/bin/sh -c`, answering on a later frame.
-pub fn exec(command: &str, input: Option<&str>) -> Receiver<Result<ExecOutput, String>> {
+pub fn exec(command: &str, input: Option<&str>) -> LocalCommand {
     run_with(command, input, TIMEOUT)
+}
+
+/// A command running on this machine, and the handle to stop it.
+pub struct LocalCommand {
+    /// The answer, once the command finishes or is stopped.
+    pub output: Receiver<Result<ExecOutput, String>>,
+    /// Stops the command.
+    pub stop: LocalStop,
+}
+
+/// Stops a command running on this machine.
+#[derive(Clone)]
+pub struct LocalStop(Arc<AtomicBool>);
+
+impl LocalStop {
+    /// Ask the shell to stop: it kills the child at its next check.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Run `command` with a deadline; the timeout is a parameter so a test need not
 /// wait two minutes.
-fn run_with(
-    command: &str,
-    input: Option<&str>,
-    timeout: Duration,
-) -> Receiver<Result<ExecOutput, String>> {
+fn run_with(command: &str, input: Option<&str>, timeout: Duration) -> LocalCommand {
     let (sender, receiver) = channel();
     let unused = sender.clone();
     let command = command.to_owned();
     let input = input.map(str::to_owned);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
     let spawned = std::thread::Builder::new()
         .name("wassh-local-command".to_owned())
         .spawn(move || {
-            let _ = sender.send(run(&command, input.as_deref(), timeout));
+            let _ = sender.send(run(&command, input.as_deref(), timeout, &thread_stop));
         });
     if let Err(error) = spawned {
         let _ = unused.send(Err(format!("starting the command: {error}")));
     }
-    receiver
+    LocalCommand {
+        output: receiver,
+        stop: LocalStop(stop),
+    }
 }
 
 /// A shell that runs `command` as one line, whichever shell the platform has.
@@ -84,7 +106,12 @@ fn shell(command: &str) -> Command {
     shell
 }
 
-fn run(command: &str, input: Option<&str>, timeout: Duration) -> Result<ExecOutput, String> {
+fn run(
+    command: &str,
+    input: Option<&str>,
+    timeout: Duration,
+    stop: &AtomicBool,
+) -> Result<ExecOutput, String> {
     if !supported() {
         return Err("Local host commands need a shell on this platform.".to_owned());
     }
@@ -111,6 +138,11 @@ fn run(command: &str, input: Option<&str>, timeout: Duration) -> Result<ExecOutp
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if stop.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(wassh_ssh::STOPPED_COMMAND.to_owned());
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -159,6 +191,12 @@ mod tests {
     #[cfg(windows)]
     const STDIN: &str = "[Console]::In.ReadToEnd()";
 
+    /// A line that runs far longer than any test waits.
+    #[cfg(unix)]
+    const HANG: &str = "sleep 30";
+    #[cfg(windows)]
+    const HANG: &str = "Start-Sleep -Seconds 30";
+
     /// How long a test waits for its command; a busy machine spawns a shell slowly.
     const COMMAND_WAIT: Duration = Duration::from_secs(60);
 
@@ -171,7 +209,7 @@ mod tests {
 
     #[test]
     fn a_command_reports_its_output_and_status() {
-        let output = wait(exec(ECHO, None)).expect("output");
+        let output = wait(exec(ECHO, None).output).expect("output");
         assert_eq!(output.stdout.trim(), "hello");
         assert_eq!(output.exit_status, Some(0));
         assert!(output.stderr.is_empty());
@@ -179,7 +217,7 @@ mod tests {
 
     #[test]
     fn a_failing_command_keeps_its_output_and_exit_code() {
-        let output = wait(exec(FAIL, None)).expect("output");
+        let output = wait(exec(FAIL, None).output).expect("output");
         assert_eq!(output.exit_status, Some(3));
         assert!(output.stderr.contains("boom"), "{:?}", output.stderr);
     }
@@ -187,14 +225,29 @@ mod tests {
     #[test]
     fn stdin_reaches_the_command() {
         // The command only finishes because stdin is closed after the write.
-        let output = wait(exec(STDIN, Some("s3cret\n"))).expect("output");
+        let output = wait(exec(STDIN, Some("s3cret\n")).output).expect("output");
         assert_eq!(output.stdout.trim(), "s3cret");
+    }
+
+    #[test]
+    fn a_running_command_can_be_stopped() {
+        let started = Instant::now();
+        let job = exec(HANG, None);
+        std::thread::sleep(POLL);
+        job.stop.stop();
+        let error = wait(job.output).expect_err("a stopped command");
+        assert!(error.contains("stopped"), "{error}");
+        assert!(
+            started.elapsed() < COMMAND_WAIT,
+            "the command was not stopped"
+        );
     }
 
     #[test]
     fn a_hung_command_is_killed_at_the_deadline() {
         let started = Instant::now();
-        let error = run_with("sleep 30", None, Duration::from_millis(200))
+        let error = run_with(HANG, None, Duration::from_millis(200))
+            .output
             .recv_timeout(Duration::from_secs(10))
             .expect("an answer")
             .expect_err("a timeout");

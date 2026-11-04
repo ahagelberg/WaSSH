@@ -1887,6 +1887,8 @@ mod tests {
         fn is_running(&self, key: &str) -> bool {
             self.running.iter().any(|running| running == key)
         }
+
+        fn cancel(&mut self, _key: &str) {}
     }
 
     fn output(stdout: &str, code: Option<u32>) -> CommandOutput {

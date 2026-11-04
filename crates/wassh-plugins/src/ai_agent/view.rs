@@ -1116,7 +1116,13 @@ impl AiAgent {
     }
 
     /// Paint the transcript.
-    fn transcript(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
+    fn transcript(
+        &mut self,
+        ui: &mut Ui,
+        palette: &wassh_core::Palette,
+        muted: egui::Color32,
+        session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
+    ) {
         if self.agent.turns.is_empty() {
             let empty = if self.providers.is_empty() {
                 "No model providers configured yet. Configure one in Options."
@@ -1126,6 +1132,8 @@ impl AiAgent {
             ui.add(egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap());
         }
         let mut rewind = None;
+        let mut stop_command = false;
+        let running = self.agent.running_command();
         for (index, turn) in self.agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { text, meta } => {
@@ -1134,7 +1142,11 @@ impl AiAgent {
                     }
                 }
                 Turn::Assistant { text, stopped } => {
-                    assistant_bubble(ui, palette, text);
+                    // A reply waiting for its first token, or one that only asked for
+                    // tools, has no words to show: no bubble for it.
+                    if !text.trim().is_empty() {
+                        assistant_bubble(ui, palette, text);
+                    }
                     if *stopped {
                         ui.label(
                             egui::RichText::new("interrupted")
@@ -1149,7 +1161,15 @@ impl AiAgent {
                     label,
                     output,
                     failed,
-                } => tool_card(ui, palette, name, label, output, *failed),
+                } => stop_command |= tool_card(
+                    ui,
+                    palette,
+                    name,
+                    label,
+                    output,
+                    *failed,
+                    running == Some(index),
+                ),
                 Turn::Denied(reason) => {
                     ui.add(
                         egui::Label::new(
@@ -1221,6 +1241,9 @@ impl AiAgent {
             self.attachments.clear();
             self.attach_terminal = false;
             self.queued = None;
+        }
+        if stop_command {
+            self.agent.stop_command(session);
         }
     }
 }
@@ -1317,10 +1340,19 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
 }
 
 /// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
-/// and the output.
-fn tool_card(ui: &mut Ui, palette: &Palette, name: &str, label: &str, output: &str, failed: bool) {
+/// and the output. Returns whether its Stop button was clicked.
+fn tool_card(
+    ui: &mut Ui,
+    palette: &Palette,
+    name: &str,
+    label: &str,
+    output: &str,
+    failed: bool,
+    running: bool,
+) -> bool {
     let (badge, colour) = tool_badge(name, palette);
     let muted = to_color32(palette.text_muted);
+    let mut stop = false;
     egui::Frame::new()
         .fill(to_color32(palette.bg_input))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
@@ -1341,17 +1373,29 @@ fn tool_card(ui: &mut Ui, palette: &Palette, name: &str, label: &str, output: &s
                 );
             });
             ui.horizontal(|ui| {
-                let outcome = if failed { "failed" } else { "ok" };
+                let (outcome, colour) = if running {
+                    ("running", muted)
+                } else if failed {
+                    ("failed", to_color32(palette.danger))
+                } else {
+                    ("ok", to_color32(palette.ok))
+                };
                 ui.label(
                     egui::RichText::new(outcome)
                         .size(10.0)
                         .strong()
-                        .color(if failed {
-                            to_color32(palette.danger)
-                        } else {
-                            to_color32(palette.ok)
-                        }),
+                        .color(colour),
                 );
+                // The command is still going: offer to end it here rather than on the host.
+                if running
+                    && Button::new("Stop")
+                        .compact()
+                        .kind(ButtonKind::Danger)
+                        .show(ui, palette)
+                        .clicked()
+                {
+                    stop = true;
+                }
             });
             if output.is_empty() {
                 ui.label(egui::RichText::new("(no output)").size(11.0).color(muted));
@@ -1370,6 +1414,7 @@ fn tool_card(ui: &mut Ui, palette: &Palette, name: &str, label: &str, output: &s
                     .color(muted),
             );
         });
+    stop
 }
 
 /// One tool's pill, e.g. `SSH` or `REMOTE FILESYSTEM`.
@@ -1417,36 +1462,67 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
 ///
 /// The card is capped: a request the model wrote a whole script into must not push the
 /// conversation and the composer out of the pane. Only `body` scrolls — `controls` are
-/// drawn first in a bottom-up layout, so the buttons under the request keep their place
-/// however long the request is.
+/// measured first and drawn under it, so the buttons under the request keep their place
+/// however long the request is, and a card holding one line stays one line tall.
 fn prompt_card(
     ui: &mut Ui,
     palette: &Palette,
     id: &str,
     body: impl FnOnce(&mut Ui),
-    controls: impl FnOnce(&mut Ui),
+    mut controls: impl FnMut(&mut Ui),
 ) {
     let room = (ui.available_height() * PROMPT_CARD_SHARE)
         .clamp(PROMPT_CARD_MIN_HEIGHT, PROMPT_CARD_MAX_HEIGHT);
+    let inner_width = ui.available_width() - 2.0 * f32::from(PROMPT_CARD_PADDING);
+    let controls_height = measured_height(
+        ui,
+        egui::Id::unique(("ai-prompt-card-controls", id)),
+        inner_width,
+        room,
+        |ui| controls(ui),
+    );
     egui::Frame::new()
         .fill(to_color32(palette.bg_panel_2))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.accent)))
         .corner_radius(wassh_core::RADIUS)
         .inner_margin(egui::Margin::same(PROMPT_CARD_PADDING))
         .show(ui, |ui| {
-            ui.set_max_height(room);
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                controls(ui);
-                ui.add_space(PROMPT_CARD_GAP);
-                egui::ScrollArea::vertical()
-                    .id_salt(("ai-prompt-card", id))
-                    .max_height(ui.available_height())
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), body);
-                    });
-            });
+            let body_room = (room - controls_height - PROMPT_CARD_GAP).max(0.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("ai-prompt-card", id))
+                .max_height(body_room)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), body);
+                });
+            ui.add_space(PROMPT_CARD_GAP);
+            controls(ui);
         });
+}
+
+/// Height `content` takes at `width`, without drawing any of it and without moving `ui`'s
+/// own cursor.
+fn measured_height(
+    ui: &Ui,
+    id: egui::Id,
+    width: f32,
+    height: f32,
+    content: impl FnOnce(&mut Ui),
+) -> f32 {
+    let mut ui = Ui::new(
+        ui.ctx().clone(),
+        ui.scope_id().with(id),
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                ui.next_widget_position(),
+                egui::Vec2::new(width, height),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::Min))
+            .invisible()
+            .sizing_pass(),
+    );
+    content(&mut ui);
+    ui.min_rect().height()
 }
 
 /// The command a prompt card is about, cut so a whole script cannot fill the card.
@@ -1484,6 +1560,8 @@ struct PromptAnswers {
     approval: Option<(bool, Option<usize>, bool)>,
     /// Capability card: (allow, remember the answer).
     permission: Option<(bool, bool)>,
+    /// Capability card: allow every prompt for the rest of the session.
+    allow_session: bool,
     /// The question card's answer.
     answer: Option<String>,
     /// The sudo card.
@@ -1618,6 +1696,10 @@ impl AiAgent {
                             answers.permission = Some((false, true));
                         }
                     });
+                    // One answer for the whole session, without changing the settings.
+                    if small_button_enabled(ui, palette, "Allow all this session", true) {
+                        answers.allow_session = true;
+                    }
                 },
             );
         }
@@ -2131,7 +2213,7 @@ impl Plugin for AiAgent {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                self.transcript(ui, palette, muted);
+                self.transcript(ui, palette, muted, &mut session);
 
                 if let Some(error) = &self.error {
                     ui.add(
@@ -2152,7 +2234,9 @@ impl Plugin for AiAgent {
                 self.agent.approve(allow, remember, &mut session);
             }
         }
-        if let Some((allow, always)) = prompts.permission {
+        if prompts.allow_session {
+            self.agent.allow_everything(&mut session);
+        } else if let Some((allow, always)) = prompts.permission {
             if always
                 && let Some(Phase::Allowing { call, .. }) = &self.agent.phase
                 && let Some(key) = setting_key(&call.name)
@@ -2700,6 +2784,28 @@ mod tests {
     }
 
     #[test]
+    fn the_permission_card_offers_a_session_wide_allow() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Allowing {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_TERMINAL_WRITE.to_owned(),
+                arguments: r#"{"text":"ls"}"#.to_owned(),
+            },
+            label: "terminal_write".to_owned(),
+            turn: 0,
+        });
+        let mut settings = serde_json::Map::new();
+        let painted = draw(&mut plugin, &mut settings);
+        let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
+        assert!(texts.contains(&"Approve action?"), "card missing: {texts:?}");
+        assert!(
+            texts.contains(&"Allow all this session"),
+            "no session-wide allow: {texts:?}"
+        );
+    }
+
+    #[test]
     fn the_approval_card_names_the_command_and_offers_scopes() {
         let mut plugin = AiAgent::default();
         plugin.agent.phase = Some(Phase::Approving {
@@ -2918,6 +3024,80 @@ mod tests {
     }
 
     #[test]
+    fn a_single_line_question_card_stays_snug() {
+        // The card is capped, not padded: a question with no options must not open a
+        // popup half a pane tall with empty space under it.
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Asking {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: "ask_user".to_owned(),
+                arguments: r#"{"text":"Which file?"}"#.to_owned(),
+            },
+            questions: vec![super::super::agent::AgentQuestion {
+                text: "Which file?".to_owned(),
+                options: Vec::new(),
+            }],
+            current: 0,
+            answers: Vec::new(),
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut title = None;
+        let mut cards = Vec::new();
+        // The bottom panel settles its height over a few frames.
+        for _ in 0..4 {
+            let mut context = PluginContext {
+                palette: Palette::dark(),
+                host_label: "dev".to_owned(),
+                status: SessionStatus::Connected,
+                settings: &mut settings,
+                scope: "host-1".to_owned(),
+                session: None,
+                events: &[],
+                pending_input: Vec::new(),
+                repaint_after: None,
+                secrets: &EMPTY_SECRETS,
+                secret_writes: Vec::new(),
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
+            title = None;
+            cards.clear();
+            for clipped in std::mem::take(&mut output.shapes) {
+                match clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Which file?" => {
+                        title = Some(text.pos);
+                    }
+                    egui::Shape::Rect(rect)
+                        if rect.fill == to_color32(Palette::dark().bg_panel_2) =>
+                    {
+                        cards.push(rect.rect);
+                    }
+                    _ => {}
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+
+        let title = title.expect("the question card is drawn");
+        let card = *cards
+            .iter()
+            .find(|card| card.contains(title))
+            .expect("the card has no background of its own");
+        assert!(
+            card.height() < PROMPT_CARD_MIN_HEIGHT,
+            "the card padded itself out to {card:?}"
+        );
+    }
+
+    #[test]
     fn a_multi_question_card_shows_choices_and_advances_one_at_a_time() {
         let mut plugin = AiAgent::default();
         plugin.agent.phase = Some(Phase::Asking {
@@ -3110,6 +3290,80 @@ mod tests {
         assert!(
             response.x >= bubble.left() && response.x < bubble.center().x,
             "response text should be left-aligned inside its bubble: {response:?} in {bubble:?}"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_no_words_draws_no_bubble() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::Assistant {
+            text: "  \n".to_owned(),
+            stopped: false,
+        });
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 200.0),
+            )),
+            ..Default::default()
+        };
+        let muted = to_color32(palette.text_muted);
+        let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
+        let mut output =
+            ctx.run_ui(input, |ui| plugin.transcript(ui, &palette, muted, &mut session));
+        let mut bubbles = Vec::new();
+        for clipped in std::mem::take(&mut output.shapes) {
+            if let egui::Shape::Rect(rect) = clipped.shape
+                && rect.fill == to_color32(palette.bg_panel_2)
+            {
+                bubbles.push(rect.rect);
+            }
+        }
+        output.drop_without_applying_deltas();
+        assert!(bubbles.is_empty(), "an empty reply drew a bubble: {bubbles:?}");
+    }
+
+    #[test]
+    fn the_running_tool_card_offers_a_stop_button() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let painted = |running: bool| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(WIDE_PANE, 200.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                tool_card(
+                    ui,
+                    &palette,
+                    super::super::protocol::TOOL_RUN_COMMAND,
+                    "$ sleep 100",
+                    "",
+                    false,
+                    running,
+                );
+            });
+            let mut texts = Vec::new();
+            for clipped in std::mem::take(&mut output.shapes) {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    texts.push(text.galley.text().to_owned());
+                }
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+        assert!(
+            painted(true).contains(&"Stop".to_owned()),
+            "a running command cannot be stopped from its card"
+        );
+        assert!(
+            !painted(false).contains(&"Stop".to_owned()),
+            "a finished command still offers Stop"
         );
     }
 

@@ -7,14 +7,19 @@ use std::sync::Arc;
 
 use russh::ChannelMsg;
 use russh::client::Handle;
+use tokio::sync::Notify;
 
-use crate::session::{ClientHandler, ExecOutput};
+use crate::session::{ClientHandler, ExecOutput, STOPPED_COMMAND};
 
 /// Run `command` through the remote shell and collect its output.
+///
+/// `stop` closes the channel when it is signalled, which is how a command the user
+/// ended long before its time stops on the host.
 pub(crate) async fn run(
     handle: Arc<Handle<ClientHandler>>,
     command: String,
     input: Option<String>,
+    stop: Arc<Notify>,
 ) -> Result<ExecOutput, String> {
     let mut channel = handle
         .channel_open_session()
@@ -37,13 +42,19 @@ pub(crate) async fn run(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_status = None;
-    while let Some(message) = channel.wait().await {
-        match message {
-            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-            ChannelMsg::ExitStatus { exit_status: status } => exit_status = Some(status),
-            ChannelMsg::Eof | ChannelMsg::Close => break,
-            _ => {}
+    loop {
+        tokio::select! {
+            _ = stop.notified() => {
+                let _ = channel.close().await;
+                return Err(STOPPED_COMMAND.to_owned());
+            }
+            message = channel.wait() => match message {
+                Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+                Some(ChannelMsg::ExtendedData { data, .. }) => stderr.extend_from_slice(&data),
+                Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            },
         }
     }
     Ok(ExecOutput {

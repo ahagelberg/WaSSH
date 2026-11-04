@@ -3214,6 +3214,8 @@ mod tests {
         fn is_running(&self, _key: &str) -> bool {
             false
         }
+
+        fn cancel(&mut self, _key: &str) {}
     }
 
     impl crate::command::TcpAccess for FakeAccess {

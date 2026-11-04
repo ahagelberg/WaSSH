@@ -321,6 +321,8 @@ pub struct Agent {
     pub session_allow: Vec<String>,
     /// Rules the user refused for this session.
     pub session_deny: Vec<String>,
+    /// Set once the user allowed every prompt for the rest of this session.
+    pub allow_all: bool,
     /// Tool settings from the plugin data.
     pub tools: ToolSettings,
     /// What this host may do, read from the plugin settings.
@@ -882,12 +884,14 @@ impl Agent {
         match result {
             Err(error) => {
                 self.error = Some(error.clone());
+                self.drop_empty_reply(turn);
                 self.turns.push(Turn::Error(error));
             }
             Ok(completion) => {
                 if completion.text.is_empty() && completion.tool_calls.is_empty() {
                     // Silence here looks like the pane ignored the prompt.
                     self.error = Some(EMPTY_ANSWER.to_owned());
+                    self.drop_empty_reply(turn);
                     self.turns.push(Turn::Error(EMPTY_ANSWER.to_owned()));
                     return;
                 }
@@ -904,6 +908,8 @@ impl Agent {
                         _ => None,
                     })
                     .unwrap_or_default();
+                // A reply that only asked for tools has no words of its own to show.
+                self.drop_empty_reply(turn);
                 self.history.push(ApiMessage::Assistant {
                     content: text,
                     tool_calls: completion.tool_calls.clone(),
@@ -913,6 +919,17 @@ impl Agent {
                     self.begin_tool(next, session);
                 }
             }
+        }
+    }
+
+    /// Drop the reply turn when nothing was written into it, so the transcript shows no
+    /// empty bubble in front of the tool cards or the error that follows.
+    fn drop_empty_reply(&mut self, turn: usize) {
+        if matches!(
+            self.turns.get(turn),
+            Some(Turn::Assistant { text, .. }) if text.trim().is_empty()
+        ) {
+            self.turns.remove(turn);
         }
     }
 
@@ -930,7 +947,7 @@ impl Agent {
 
     /// Run one call, or park the agent on whatever it needs.
     fn dispatch(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
-        match self.permissions.decision(&call.name) {
+        match self.permission(&call.name) {
             Permission::Allow => {}
             Permission::Deny => {
                 self.settle(
@@ -965,6 +982,24 @@ impl Agent {
             self.run_tool(call, turn, session);
         } else {
             self.settle(call, turn, label, DENIED_BY_USER.to_owned(), false, session);
+        }
+    }
+
+    /// Allow every prompt for the rest of this session, then run the tool that asked.
+    ///
+    /// Commands ask through their own card, so the same answer covers them; what the
+    /// host refuses outright stays refused.
+    pub fn allow_everything(&mut self, session: Session<'_, '_>) {
+        self.allow_all = true;
+        self.session_allow.push(ALLOW_ALL_PATTERN.to_owned());
+        self.answer_permission(true, session);
+    }
+
+    /// The decision for `tool`, with this session's blanket answer applied.
+    fn permission(&self, tool: &str) -> Permission {
+        match self.permissions.decision(tool) {
+            Permission::Ask if self.allow_all => Permission::Allow,
+            decision => decision,
         }
     }
 
@@ -1759,6 +1794,36 @@ impl Agent {
         }
     }
 
+    /// The tool turn whose command is still running, if any.
+    pub fn running_command(&self) -> Option<usize> {
+        match &self.phase {
+            Some(Phase::Running {
+                turn,
+                waiting: Waiting::Command { .. },
+                ..
+            }) => Some(*turn),
+            _ => None,
+        }
+    }
+
+    /// Stop the command the run is waiting on, so it does not keep going on the host.
+    ///
+    /// Its answer then reads as a failure, and the model is told the command was stopped
+    /// instead of waiting for output that will never come.
+    pub fn stop_command(&mut self, session: Session<'_, '_>) {
+        let Some(Phase::Running {
+            waiting: Waiting::Command { key, .. },
+            ..
+        }) = &self.phase
+        else {
+            return;
+        };
+        let key = *key;
+        if let Some(access) = session.as_mut() {
+            access.cancel(key);
+        }
+    }
+
     /// Answer a tool call that will never run, so the model sees why it stopped.
     fn abandon_tool(&mut self, call: ApiToolCall, turn: usize) {
         if let Some(Turn::Tool { output, .. }) = self.turns.get_mut(turn) {
@@ -2113,10 +2178,17 @@ pub fn turns_from_json(items: &[Value]) -> Vec<Turn> {
                         terminal: item["terminal"].as_bool().unwrap_or(false),
                     },
                 }),
-                "assistant" => Some(Turn::Assistant {
-                    text: text(),
-                    stopped: item["stopped"].as_bool().unwrap_or(false),
-                }),
+                "assistant" => {
+                    let text = text();
+                    // A reply that only asked for tools was stored as an empty turn.
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                    Some(Turn::Assistant {
+                        text,
+                        stopped: item["stopped"].as_bool().unwrap_or(false),
+                    })
+                }
                 "tool" => Some(Turn::Tool {
                     name: item["name"].as_str().unwrap_or_default().to_owned(),
                     label: item["label"].as_str().unwrap_or_default().to_owned(),
@@ -2655,6 +2727,92 @@ mod tests {
     }
 
     #[test]
+    fn a_running_command_can_be_stopped_from_the_transcript() {
+        let mut agent = Agent::new();
+        agent.app_allow = vec!["pwd".to_owned()];
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"pwd"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        // The fake never answers, so the card is the running one.
+        assert_eq!(agent.running_command(), Some(0));
+        agent.stop_command(&mut session);
+        assert_eq!(fake.cancelled, [EXEC_KEY.to_owned()]);
+        // A finished tool has nothing to stop.
+        let mut agent = Agent::new();
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        assert_eq!(agent.running_command(), None);
+        agent.stop_command(&mut session);
+    }
+
+    #[test]
+    fn a_reply_with_nothing_to_say_leaves_no_empty_bubble() {
+        let mut agent = Agent::new();
+        agent.app_allow = vec!["pwd".to_owned()];
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "/srv/app\n__WASSH_STATUS:0__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        // A reply that only asked for a tool: the provider still needs the assistant turn,
+        // the transcript does not.
+        agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        agent.finish_reply(
+            0,
+            Ok(Completion {
+                text: String::new(),
+                tool_calls: vec![ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_COMMAND.to_owned(),
+                    arguments: r#"{"command":"pwd"}"#.to_owned(),
+                }],
+                stop_reason: None,
+            }),
+            &mut session,
+        );
+        assert!(
+            matches!(agent.turns.first(), Some(Turn::Tool { .. })),
+            "an empty assistant turn was kept: {:?}",
+            agent.turns
+        );
+        assert!(matches!(
+            agent.history.first(),
+            Some(ApiMessage::Assistant { content, .. }) if content.is_empty()
+        ));
+
+        // Whitespace alone is no more a message than nothing at all.
+        let mut agent = Agent::new();
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        agent.finish_reply(
+            0,
+            Ok(Completion {
+                text: "\n \n".to_owned(),
+                ..Completion::default()
+            }),
+            &mut session,
+        );
+        assert!(agent.turns.is_empty(), "{:?}", agent.turns);
+    }
+
+    #[test]
     fn a_denied_capability_never_runs() {
         let mut agent = Agent::new();
         agent.permissions = Permissions::from_settings(&serde_json::Map::new());
@@ -2700,6 +2858,48 @@ mod tests {
             Some(ApiMessage::Tool { content, .. }) if content == DENIED_BY_USER
         ));
         assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn allowing_everything_covers_the_rest_of_the_session() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_TERMINAL),
+            Value::Bool(true),
+        )]));
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_TERMINAL_WRITE.to_owned(),
+                arguments: r#"{"text":"ls"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(agent.allowing(), "typing into the terminal asks first");
+        agent.allow_everything(&mut session);
+        assert!(!agent.allowing());
+
+        // The next capability runs without a card...
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c2".to_owned(),
+                name: TOOL_TERMINAL_WRITE.to_owned(),
+                arguments: r#"{"text":"pwd"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.allowing(), "the session answer was forgotten");
+        // ...and so does a command that would otherwise need approval.
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c3".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"rm -rf /tmp/wassh-test"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.approving(), "commands are covered too");
     }
 
     #[test]
@@ -2779,6 +2979,8 @@ mod tests {
         commands: Vec<(String, String)>,
         /// What each `exec_input` wrote to stdin.
         stdin: Vec<String>,
+        /// Keys whose command the pane stopped.
+        cancelled: Vec<String>,
         answers: std::collections::HashMap<String, crate::command::CommandOutput>,
         uploads: Vec<(String, String)>,
         writes: Vec<(String, Vec<u8>)>,
@@ -2870,6 +3072,9 @@ mod tests {
         }
         fn is_running(&self, _key: &str) -> bool {
             false
+        }
+        fn cancel(&mut self, key: &str) {
+            self.cancelled.push(key.to_owned());
         }
     }
 

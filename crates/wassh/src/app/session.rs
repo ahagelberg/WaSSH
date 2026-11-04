@@ -1214,16 +1214,20 @@ impl SessionEntry {
         self.commands.poll();
         // A new request replaces whatever the pane read last.
         self.commands.results.remove(key);
-        let pending = match &self.backend {
-            Backend::Ssh(session) => match input {
-                Some(input) => {
-                    session.exec_with_input(command.to_owned(), Some(format!("{input}\n")))
-                }
-                None => session.exec(command.to_owned()),
-            },
+        let (pending, stop) = match &self.backend {
+            Backend::Ssh(session) => {
+                let job = match input {
+                    Some(input) => {
+                        session.exec_with_input(command.to_owned(), Some(format!("{input}\n")))
+                    }
+                    None => session.exec(command.to_owned()),
+                };
+                (job.output, CommandStop::Ssh(job.stop))
+            }
             _ if self.connection.kind == ConnectionType::Local => {
                 let stdin = input.map(|input| format!("{input}\n"));
-                local_exec::exec(command, stdin.as_deref())
+                let job = local_exec::exec(command, stdin.as_deref());
+                (job.output, CommandStop::Local(job.stop))
             }
             _ => {
                 self.commands.results.insert(
@@ -1237,6 +1241,7 @@ impl SessionEntry {
             }
         };
         self.commands.pending.push((key.to_owned(), pending));
+        self.commands.stops.push((key.to_owned(), stop));
     }
 
     /// Take the slot for a started job, so the next frames collect its answer.
@@ -1263,6 +1268,9 @@ impl SessionEntry {
             path,
         });
         self.files.status = None;
+        // The file this transfer writes is about to change, so stop answering reads of it
+        // from the snapshot taken before.
+        self.files.forget_content();
         self.start_next_transfer();
     }
 
@@ -1311,6 +1319,7 @@ impl SessionEntry {
         };
         self.adopt_job(job);
         self.files.job = Some(FileJob::Action { done });
+        self.files.forget_content();
     }
 
     fn start_file_request(&mut self, path: &str) {
@@ -1787,8 +1796,27 @@ struct CommandResult {
 struct RemoteCommands {
     /// Commands still running, with the key they were asked under.
     pending: Vec<(String, std::sync::mpsc::Receiver<Result<wassh_ssh::ExecOutput, String>>)>,
+    /// How to stop each of them.
+    stops: Vec<(String, CommandStop)>,
     /// Last result per key.
     results: std::collections::HashMap<String, CommandResult>,
+}
+
+/// How to stop a command the session is running.
+enum CommandStop {
+    /// Close the channel of a command on the remote host.
+    Ssh(wassh_ssh::ExecStop),
+    /// Kill the shell of a command on this machine.
+    Local(local_exec::LocalStop),
+}
+
+impl CommandStop {
+    fn stop(&self) {
+        match self {
+            Self::Ssh(stop) => stop.stop(),
+            Self::Local(stop) => stop.stop(),
+        }
+    }
 }
 
 /// What a forward request answers with: the local address, or why it failed.
@@ -1857,8 +1885,13 @@ impl RemoteForwards {
 impl RemoteCommands {
     /// Take every answer that has arrived.
     fn poll(&mut self) {
-        let Self { pending, results } = self;
+        let Self {
+            pending,
+            stops,
+            results,
+        } = self;
         drain_answers(pending, COMMAND_CLOSED, |key, answer| {
+            stops.retain(|(running, _)| running != key);
             let result = match answer {
                 Ok(output) => CommandResult {
                     output: Some(wassh_plugins::CommandOutput {
@@ -1881,6 +1914,13 @@ impl RemoteCommands {
     fn is_running(&self, key: &str) -> bool {
         self.pending.iter().any(|(running, _)| running == key)
     }
+
+    /// Stop the command for `key` where it runs.
+    fn cancel(&mut self, key: &str) {
+        if let Some(position) = self.stops.iter().position(|(running, _)| running == key) {
+            self.stops.remove(position).1.stop();
+        }
+    }
 }
 
 /// What the in-flight remote-file request is for.
@@ -1895,7 +1935,7 @@ enum FileJob {
     /// Resolving the login directory.
     Resolve,
     /// Reading the first bytes of `path` for the viewer.
-    Read { path: String },
+    Read { path: String, max_bytes: u64 },
     /// A tree download that becomes `archive` once it lands in `dir`.
     Zip {
         /// Temporary directory the tree is downloaded into.
@@ -1972,8 +2012,9 @@ struct RemoteFiles {
     status: Option<String>,
     /// Absolute login directory, once resolved.
     resolved: Option<String>,
-    /// Path and prefix of the file the viewer asked for.
-    content: Option<(String, wassh_plugins::files::FileContent)>,
+    /// Path, read limit and prefix of the file the viewer last read, so the pane does not
+    /// ask for it again every frame.
+    content: Option<(String, u64, wassh_plugins::files::FileContent)>,
     /// Bytes moved by the request in flight.
     progress: Option<std::sync::mpsc::Receiver<wassh_ssh::SftpProgress>>,
     /// Latest progress value, cleared when the request finishes.
@@ -2007,6 +2048,11 @@ const FILES_TRANSPORT_ERROR: &str = "Files are available for SSH and Local sessi
 const COMMAND_TRANSPORT_ERROR: &str = "Commands need an SSH or local session";
 
 impl RemoteFiles {
+    /// Forget the file that was read: a write, a change or a reload may have replaced it.
+    fn forget_content(&mut self) {
+        self.content = None;
+    }
+
     /// Remember how a transfer ended, keeping the last few rows.
     fn record(&mut self, state: TransferState, done: Option<u64>) {
         let Some((direction, path)) = self.active.clone() else {
@@ -2098,10 +2144,11 @@ impl RemoteFiles {
                     }
                     (
                         wassh_ssh::SftpOutcome::Content { data, truncated },
-                        Some(FileJob::Read { path }),
+                        Some(FileJob::Read { path, max_bytes }),
                     ) => {
                         self.content = Some((
                             path,
+                            max_bytes,
                             wassh_plugins::files::FileContent { data, truncated },
                         ));
                         None
@@ -2115,7 +2162,9 @@ impl RemoteFiles {
                         if let Some(FileJob::Action { done }) = job {
                             self.status = Some(done);
                         }
-                        // A change landed: show the directory as it is now.
+                        // A change landed: what was read of these files is stale, and the
+                        // directory is shown as it is now.
+                        self.forget_content();
                         self.requested.clone()
                     }
                     (wassh_ssh::SftpOutcome::Transferred { bytes }, job) => {
@@ -2132,6 +2181,8 @@ impl RemoteFiles {
                         if self.active.take().is_some() {
                             self.record(TransferState::Done, Some(bytes));
                         }
+                        // A transfer landing can replace a file under a reader.
+                        self.forget_content();
                         self.requested.clone()
                     }
                     // A stale answer for a request that was abandoned.
@@ -2151,6 +2202,8 @@ impl RemoteFiles {
                     }
                     self.record(TransferState::Failed, None);
                 }
+                // A failed write may still have cut the file short.
+                self.forget_content();
                 self.request = None;
                 self.job = None;
                 self.requested = None;
@@ -2181,6 +2234,8 @@ impl wassh_plugins::SftpAccess for SessionEntry {
 
     fn refresh(&mut self, path: &str) {
         self.files.requested = None;
+        // The pane asked to look again, so the file it read before is not the answer.
+        self.files.forget_content();
         self.start_file_request(path);
     }
 
@@ -2244,7 +2299,11 @@ impl wassh_plugins::SftpAccess for SessionEntry {
     }
 
     fn is_transferring(&self) -> bool {
-        // Copies, batches and archives move bytes too, so the bar tracks them.
+        // Copies, batches and archives move bytes too, so the bar tracks them. A queued
+        // transfer has not landed yet, so it counts as in flight as well.
+        if !self.files.queue.is_empty() {
+            return true;
+        }
         self.files.pending.is_some()
             && matches!(
                 self.files.job,
@@ -2335,8 +2394,10 @@ impl wassh_plugins::SftpAccess for SessionEntry {
     }
 
     fn read(&mut self, path: &str, max_bytes: u64) -> Option<wassh_plugins::files::FileContent> {
-        if let Some((cached, content)) = &self.files.content
+        // Answer only from a snapshot that holds at least as much as this read asks for.
+        if let Some((cached, limit, content)) = &self.files.content
             && cached == path
+            && *limit >= max_bytes
         {
             return Some(content.clone());
         }
@@ -2350,6 +2411,7 @@ impl wassh_plugins::SftpAccess for SessionEntry {
         self.adopt_job(job);
         self.files.job = Some(FileJob::Read {
             path: path.to_owned(),
+            max_bytes,
         });
         None
     }
@@ -2500,6 +2562,10 @@ impl wassh_plugins::CommandAccess for SessionEntry {
 
     fn is_running(&self, key: &str) -> bool {
         self.commands.is_running(key)
+    }
+
+    fn cancel(&mut self, key: &str) {
+        self.commands.cancel(key);
     }
 }
 
@@ -3020,6 +3086,27 @@ mod tests {
     #[cfg(windows)]
     const ECHO_STDIN: &str = "[Console]::In.ReadToEnd()";
 
+    /// Runs far longer than any test waits.
+    #[cfg(unix)]
+    const SLOW_LOCAL: &str = "sleep 30";
+    #[cfg(windows)]
+    const SLOW_LOCAL: &str = "Start-Sleep -Seconds 30";
+
+    #[test]
+    fn a_running_command_can_be_stopped() {
+        use wassh_plugins::CommandAccess as _;
+        let mut entry = local_entry("t-local-stop");
+
+        entry.exec("slow", SLOW_LOCAL);
+        entry.cancel("slow");
+        settle_command(&mut entry, "slow");
+
+        let failure = entry.failure("slow").expect("the command reports why");
+        assert!(failure.contains("stopped"), "{failure}");
+        // Stopping it again is harmless: nothing is left to stop.
+        entry.cancel("slow");
+    }
+
     #[test]
     fn commands_run_on_this_machine_for_a_local_session() {
         use wassh_plugins::CommandAccess as _;
@@ -3207,6 +3294,68 @@ mod tests {
         assert_eq!(std::fs::read(&back).expect("read"), b"hello");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_after_a_write_sees_the_new_bytes() {
+        // The agent edits a file by reading it, writing the change back and reading it
+        // again for the next edit. A read answered from the snapshot taken before the
+        // write would hand the next edit the old text, and its write would undo the
+        // first one.
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("stale-read");
+        let mut entry = local_entry("t-local-stale-read");
+        let path = dir.join("note.txt");
+        let remote = path.to_string_lossy().into_owned();
+        std::fs::write(&path, b"one").expect("write");
+
+        assert!(entry.read(&remote, 32).is_none());
+        settle(&mut entry);
+        let read = entry.read(&remote, 32).expect("the file is read");
+        assert_eq!(read.data, b"one");
+        // A frame of the viewer is answered from the snapshot instead of the host.
+        assert!(entry.read(&remote, 16).is_some());
+        // A bigger read is not answered by a smaller snapshot.
+        assert!(entry.read(&remote, 4096).is_none());
+        settle(&mut entry);
+
+        entry.write_file(&remote, b"two".to_vec());
+        settle(&mut entry);
+        assert_eq!(std::fs::read(&path).expect("read"), b"two");
+        assert!(entry.read(&remote, 32).is_none());
+        settle(&mut entry);
+        let read = entry.read(&remote, 32).expect("the file is read again");
+        assert_eq!(read.data, b"two", "the read answered from the old snapshot");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_transfer_forgets_the_file_it_read() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut files = RemoteFiles {
+            job: Some(FileJob::Transfer {
+                done: "Edited /home/alice/report.txt".to_owned(),
+            }),
+            pending: Some(rx),
+            content: Some((
+                "/home/alice/report.txt".to_owned(),
+                32,
+                wassh_plugins::files::FileContent {
+                    data: b"before".to_vec(),
+                    truncated: false,
+                },
+            )),
+            ..RemoteFiles::default()
+        };
+        tx.send(Ok(wassh_ssh::SftpOutcome::Transferred { bytes: 6 }))
+            .expect("send");
+
+        assert_eq!(files.poll(), None);
+        assert!(
+            files.content.is_none(),
+            "the snapshot survived the transfer that replaced the file"
+        );
     }
 
     #[test]

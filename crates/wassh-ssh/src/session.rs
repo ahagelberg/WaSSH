@@ -157,6 +157,8 @@ enum SshCommand {
         /// Text written to the command's stdin before its channel is closed.
         input: Option<String>,
         reply: std::sync::mpsc::Sender<Result<ExecOutput, String>>,
+        /// Closes the channel when the user ends the command.
+        stop: Arc<tokio::sync::Notify>,
     },
     /// Open a loopback forward to a service on the remote host.
     ForwardTcp {
@@ -173,6 +175,28 @@ pub struct SftpJob {
     /// Bytes moved as it runs.
     pub progress: std::sync::mpsc::Receiver<crate::sftp::SftpProgress>,
 }
+
+/// A one-shot command that is running, and the handle to stop it.
+pub struct ExecJob {
+    /// The answer, once the command finishes or is stopped.
+    pub output: std::sync::mpsc::Receiver<Result<ExecOutput, String>>,
+    /// Stops the command.
+    pub stop: ExecStop,
+}
+
+/// Stops a one-shot command that is still running.
+#[derive(Clone)]
+pub struct ExecStop(Arc<tokio::sync::Notify>);
+
+impl ExecStop {
+    /// Close the command's channel, which ends it on the host.
+    pub fn stop(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// Why a command has no output to report: the user ended it.
+pub const STOPPED_COMMAND: &str = "The command was stopped.";
 
 /// Events the session reports to the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,13 +412,10 @@ impl SshSession {
         }
     }
 
-    /// Run a command on the remote host, returning a receiver for its output.
+    /// Run a command on the remote host, returning a job that holds its answer.
     ///
     /// Like SFTP requests this runs on its own task, so a slow probe never blocks the shell.
-    pub fn exec(
-        &self,
-        command: impl Into<String>,
-    ) -> std::sync::mpsc::Receiver<Result<ExecOutput, String>> {
+    pub fn exec(&self, command: impl Into<String>) -> ExecJob {
         self.exec_with_input(command, None)
     }
 
@@ -405,14 +426,19 @@ impl SshSession {
         &self,
         command: impl Into<String>,
         input: Option<String>,
-    ) -> std::sync::mpsc::Receiver<Result<ExecOutput, String>> {
+    ) -> ExecJob {
         let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(tokio::sync::Notify::new());
         let _ = self.commands.send(SshCommand::Exec {
             command: command.into(),
             input,
             reply: tx,
+            stop: stop.clone(),
         });
-        rx
+        ExecJob {
+            output: rx,
+            stop: ExecStop(stop),
+        }
     }
 
     /// Ask for a loopback forward to `host:port` as seen from the remote host.
@@ -773,10 +799,11 @@ async fn connect_and_shell(
                         command,
                         input,
                         reply,
+                        stop,
                     }) => {
                         let handle = handle.clone();
                         tokio::spawn(async move {
-                            let answer = crate::exec::run(handle, command, input).await;
+                            let answer = crate::exec::run(handle, command, input, stop).await;
                             let _ = reply.send(answer);
                         });
                     }

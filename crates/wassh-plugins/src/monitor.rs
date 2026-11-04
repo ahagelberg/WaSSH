@@ -3437,6 +3437,8 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         fn is_running(&self, _key: &str) -> bool {
             false
         }
+
+        fn cancel(&mut self, _key: &str) {}
     }
 
     impl crate::command::TcpAccess for FakeMonitor {
