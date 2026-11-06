@@ -4,6 +4,7 @@
 //! [`TerminalView`] for drawing and a [`Backend`] that is either a local PTY or an SSH
 //! channel. The shell polls [`SessionEntry::pump`] every frame; nothing here blocks.
 
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
@@ -1248,7 +1249,9 @@ impl SessionEntry {
     fn adopt_job(&mut self, job: wassh_ssh::SftpJob) {
         self.files.pending = Some(job.outcome);
         self.files.progress = Some(job.progress);
+        self.files.stop = Some(job.stop);
         self.files.moved = None;
+        self.files.stop_requested = false;
     }
 
     /// Queue a transfer and start it when the current one finishes.
@@ -1258,6 +1261,16 @@ impl SessionEntry {
         direction: TransferDirection,
         path: String,
     ) {
+        self.enqueue_transfer_with_done(request, direction, path.clone(), path);
+    }
+
+    fn enqueue_transfer_with_done(
+        &mut self,
+        request: wassh_ssh::SftpRequest,
+        direction: TransferDirection,
+        path: String,
+        done: String,
+    ) {
         if !self.can_browse_files() {
             self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return;
@@ -1266,6 +1279,7 @@ impl SessionEntry {
             request,
             direction,
             path,
+            done,
         });
         self.files.status = None;
         // The file this transfer writes is about to change, so stop answering reads of it
@@ -1276,7 +1290,8 @@ impl SessionEntry {
 
     /// Start the next queued transfer, if nothing is running.
     fn start_next_transfer(&mut self) {
-        if self.files.pending.is_some() {
+        // Packing an archive holds the slot too: one request is collected per frame.
+        if self.files.pending.is_some() || self.files.pack.is_some() {
             return;
         }
         let Some(next) = self.files.queue.pop_front() else {
@@ -1288,9 +1303,7 @@ impl SessionEntry {
         self.adopt_job(job);
         self.files.request = Some(next.request);
         self.files.active = Some((next.direction, next.path.clone()));
-        self.files.job = Some(FileJob::Transfer {
-            done: next.path.clone(),
-        });
+        self.files.job = Some(FileJob::Transfer { done: next.done });
         self.files.error = None;
     }
 
@@ -1306,6 +1319,8 @@ impl SessionEntry {
             return;
         };
         self.adopt_job(job);
+        // A ZIP is a transfer like any other, so the pane shows it while it runs.
+        self.files.active = Some((TransferDirection::Zip, archive.display().to_string()));
         self.files.job = Some(FileJob::Zip { dir, archive });
         self.files.error = None;
         self.files.status = None;
@@ -1323,25 +1338,27 @@ impl SessionEntry {
     }
 
     fn start_file_request(&mut self, path: &str) {
-        // Collect whatever finished; this listing takes the slot either way.
-        self.files.poll();
+        if let Some(stop) = self.files.listing_stop.take() {
+            stop.stop();
+        }
         let Some(job) = self.file_job(wassh_ssh::SftpRequest::List {
             path: path.to_owned(),
         }) else {
             self.files.error = Some(FILES_TRANSPORT_ERROR.to_owned());
             return;
         };
-        self.adopt_job(job);
-        self.files.job = Some(FileJob::List {
-            path: path.to_owned(),
-        });
+        self.files.listing_pending = Some((path.to_owned(), job.outcome));
+        self.files.listing_stop = Some(job.stop);
         self.files.requested = Some(path.to_owned());
-        self.files.error = None;
+        self.files.listing_error = None;
     }
 
     /// Whether a file or command request is still running.
     pub fn requests_pending(&self) -> bool {
-        self.files.pending.is_some() || !self.commands.pending.is_empty()
+        self.files.listing_pending.is_some()
+            || self.files.pending.is_some()
+            || self.files.pack.is_some()
+            || !self.commands.pending.is_empty()
     }
 
     /// Scope this tab's plugin data is filed under: the saved host, or the tab itself.
@@ -1545,12 +1562,18 @@ impl SessionEntry {
 
     /// Handle one file-request cycle.
     pub fn poll_files(&mut self) {
+        self.files.poll_listing();
         match self.files.poll() {
             Some(path) => {
                 // A transfer landed: let the next queued one start, then show
                 // the directory as it is now.
                 self.start_next_transfer();
-                if self.files.pending.is_none() {
+                let already_listing = self
+                    .files
+                    .listing_pending
+                    .as_ref()
+                    .is_some_and(|(requested, _)| requested == &path);
+                if self.files.pending.is_none() && !already_listing {
                     self.start_file_request(&path);
                 } else {
                     self.files.requested = Some(path);
@@ -1926,8 +1949,6 @@ impl RemoteCommands {
 /// What the in-flight remote-file request is for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FileJob {
-    /// Listing `path`.
-    List { path: String },
     /// A transfer described by `done` once it finishes.
     Transfer { done: String },
     /// A change described by `done` once it finishes.
@@ -1945,47 +1966,225 @@ enum FileJob {
     },
 }
 
-/// Pack `dir` into `archive` and describe what happened.
-fn pack_zip(dir: &std::path::Path, archive: &std::path::Path) -> String {
-    let mut writer = wassh_store::zip::ZipWriter::new();
-    let mut files = 0;
+/// Pack `dir` into `archive` on its own thread, reporting both visible phases: adding
+/// each staged file, then writing the completed archive.
+fn spawn_pack(
+    dir: std::path::PathBuf,
+    archive: std::path::PathBuf,
+    stop: wassh_ssh::SftpStop,
+) -> (
+    std::sync::mpsc::Receiver<Result<String, String>>,
+    std::sync::mpsc::Receiver<wassh_ssh::SftpProgress>,
+) {
+    let (answers, answer) = std::sync::mpsc::channel();
+    let (progress, progress_rx) = std::sync::mpsc::channel();
+    let unused = answers.clone();
+    let packed_dir = dir.clone();
+    let worker_stop = stop.clone();
+    let spawned = std::thread::Builder::new()
+        .name("wassh-zip".to_owned())
+        .spawn(move || {
+            let packed = pack_zip(&packed_dir, &archive, Some(&progress), &worker_stop);
+            // The tree was only ever a staging copy.
+            let _ = std::fs::remove_dir_all(&packed_dir);
+            let _ = answers.send(packed);
+        });
+    if let Err(error) = spawned {
+        let _ = unused.send(Err(format!("starting the packing thread: {error}")));
+    }
+    (answer, progress_rx)
+}
+
+/// Bytes written per report while an archive lands, so the bar moves smoothly.
+const ZIP_WRITE_BLOCK: usize = 64 * 1024;
+const ZIP_SCAN_REPORT_EVERY: u64 = 64;
+
+/// Pack `dir` into `archive`, describing what was saved or why it could not be.
+///
+/// Every file under `dir` lands in the archive under its path relative to it, so the
+/// caller hands in the folder's contents and the archive holds them at its root. An
+/// empty folder still produces a readable (empty) archive. The archive is written in
+/// blocks, so the bar restarts at zero for the archive-write phase and advances as it
+/// lands instead of jumping to the end.
+fn pack_zip(
+    dir: &std::path::Path,
+    archive: &std::path::Path,
+    progress: Option<&std::sync::mpsc::Sender<wassh_ssh::SftpProgress>>,
+    stop: &wassh_ssh::SftpStop,
+) -> Result<String, String> {
+    let mut entries = Vec::new();
     let mut walk = vec![dir.to_path_buf()];
+    let mut scanned = 0;
+    let report_scan = |items| {
+        if let Some(sender) = progress {
+            let _ = sender.send(wassh_ssh::SftpProgress {
+                done: 0,
+                total: None,
+                label: None,
+                phase: wassh_ssh::SftpProgressPhase::Scanning,
+                items: Some(items),
+            });
+        }
+    };
+    report_scan(scanned);
     while let Some(next) = walk.pop() {
+        if stop.is_stopped() {
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
         let Ok(read) = std::fs::read_dir(&next) else {
             continue;
         };
         for entry in read.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk.push(path);
-                continue;
+            if stop.is_stopped() {
+                return Err(wassh_ssh::SFTP_STOPPED.to_owned());
             }
-            let Ok(data) = std::fs::read(&path) else {
+            scanned += 1;
+            if scanned.is_multiple_of(ZIP_SCAN_REPORT_EVERY) {
+                report_scan(scanned);
+            }
+            let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            let name = path
-                .strip_prefix(dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            writer.add(&name, data);
-            files += 1;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if metadata.is_dir() {
+                walk.push(path);
+            } else {
+                let name = path
+                    .strip_prefix(dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                entries.push((path, name, label, metadata.len()));
+            }
         }
     }
-    if writer.is_empty() {
-        return "Nothing to put in the archive".to_owned();
+    if !scanned.is_multiple_of(ZIP_SCAN_REPORT_EVERY) {
+        report_scan(scanned);
+    }
+    let total: u64 = entries.iter().map(|(_, _, _, size)| size).sum();
+    let names_size = entries.iter().map(|(_, name, _, _)| name.len()).sum();
+    let payload_size = usize::try_from(total)
+        .map_err(|error| format!("archive is too large to pack: {error}"))?;
+    let mut writer = wassh_store::zip::ZipWriter::with_capacity_for(
+        payload_size,
+        entries.len(),
+        names_size,
+    )
+    .map_err(|error| format!("reserving ZIP output: {error}"))?;
+    let report = |done: u64, total: u64, label: Option<String>| {
+        if let Some(sender) = progress {
+            let phase = if label.is_some() {
+                wassh_ssh::SftpProgressPhase::Packing
+            } else {
+                wassh_ssh::SftpProgressPhase::Writing
+            };
+            let _ = sender.send(wassh_ssh::SftpProgress {
+                done,
+                total: Some(total),
+                label,
+                phase,
+                items: None,
+            });
+        }
+    };
+    let mut files = 0;
+    let mut packed = 0;
+    for (index, (path, name, label, size)) in entries.into_iter().enumerate() {
+        if stop.is_stopped() {
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
+        if index == 0 {
+            report(packed, total, Some(label.clone()));
+        }
+        let data = match read_zip_entry(&path, stop) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                packed += size;
+                report(packed, total, Some(label));
+                continue;
+            }
+            Err(reason) => return Err(reason),
+        };
+        if stop.is_stopped() {
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
+        packed += data.len() as u64;
+        writer.add(&name, data);
+        if stop.is_stopped() {
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
+        files += 1;
+        report(packed, total, Some(label));
+    }
+    let bytes = writer.finish();
+    if stop.is_stopped() {
+        return Err(wassh_ssh::SFTP_STOPPED.to_owned());
     }
     if let Some(parent) = archive.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(archive, writer.finish()) {
-        Ok(()) => format!(
-            "Saved {} ({} file{})",
-            archive.display(),
-            files,
-            if files == 1 { "" } else { "s" }
-        ),
-        Err(error) => format!("Could not write {}: {error}", archive.display()),
+    let failure = |error: std::io::Error| format!("Could not write {}: {error}", archive.display());
+    let total = bytes.len() as u64;
+    let mut file = std::fs::File::create(archive).map_err(failure)?;
+    let mut written = 0;
+    report(written, total, None);
+    for block in bytes.chunks(ZIP_WRITE_BLOCK) {
+        if stop.is_stopped() {
+            drop(file);
+            let _ = std::fs::remove_file(archive);
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
+        file.write_all(block).map_err(failure)?;
+        written += block.len() as u64;
+        report(written, total, None);
+    }
+    if stop.is_stopped() {
+        drop(file);
+        let _ = std::fs::remove_file(archive);
+        return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+    }
+    file.sync_all().map_err(failure)?;
+    if stop.is_stopped() {
+        drop(file);
+        let _ = std::fs::remove_file(archive);
+        return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+    }
+    Ok(format!(
+        "Saved {} ({} file{})",
+        archive.display(),
+        files,
+        if files == 1 { "" } else { "s" }
+    ))
+}
+
+fn read_zip_entry(
+    path: &std::path::Path,
+    stop: &wassh_ssh::SftpStop,
+) -> Result<Option<Vec<u8>>, String> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let mut data = Vec::new();
+    let mut block = vec![0; ZIP_WRITE_BLOCK];
+    loop {
+        if stop.is_stopped() {
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
+        let read = match file.read(&mut block) {
+            Ok(read) => read,
+            Err(_) => return Ok(None),
+        };
+        if read == 0 {
+            return Ok(Some(data));
+        }
+        data.extend_from_slice(&block[..read]);
     }
 }
 
@@ -1995,6 +2194,15 @@ fn pack_zip(dir: &std::path::Path, archive: &std::path::Path) -> String {
 /// machine's filesystem), so the pane never needs to know which it has.
 #[derive(Default)]
 struct RemoteFiles {
+    /// Listing request, independent of transfers and other file operations.
+    listing_pending: Option<(
+        String,
+        std::sync::mpsc::Receiver<Result<wassh_ssh::SftpOutcome, String>>,
+    )>,
+    /// Stops a listing when navigation replaces it.
+    listing_stop: Option<wassh_ssh::SftpStop>,
+    /// Listing error, separate from transfer failures.
+    listing_error: Option<String>,
     /// Answer for the request in flight.
     pending: Option<std::sync::mpsc::Receiver<Result<wassh_ssh::SftpOutcome, String>>>,
     /// What the in-flight request is for.
@@ -2015,16 +2223,23 @@ struct RemoteFiles {
     /// Path, read limit and prefix of the file the viewer last read, so the pane does not
     /// ask for it again every frame.
     content: Option<(String, u64, wassh_plugins::files::FileContent)>,
+    /// Answer of the thread packing an archive, while it runs.
+    pack: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// Bytes moved by the request in flight.
     progress: Option<std::sync::mpsc::Receiver<wassh_ssh::SftpProgress>>,
     /// Latest progress value, cleared when the request finishes.
     moved: Option<wassh_ssh::SftpProgress>,
+    /// Stops the active file worker.
+    stop: Option<wassh_ssh::SftpStop>,
+    /// Whether the active download has been asked to stop.
+    stop_requested: bool,
     /// Transfers waiting their turn.
     queue: std::collections::VecDeque<QueuedTransfer>,
     /// The transfer in flight: which way it goes and the remote path.
     active: Option<(TransferDirection, String)>,
-    /// The last few finished transfers, newest last.
-    finished: Vec<wassh_plugins::files::TransferRow>,
+    /// The last few transfers that failed, newest last, so the pane can offer to resume
+    /// them.
+    failed: Vec<wassh_plugins::files::TransferRow>,
     /// Request, direction and path of the last failure, so it can be resumed.
     retryable: Option<(wassh_ssh::SftpRequest, TransferDirection, String)>,
     /// Request of the transfer in flight, kept for a retry.
@@ -2036,10 +2251,11 @@ struct QueuedTransfer {
     request: wassh_ssh::SftpRequest,
     direction: TransferDirection,
     path: String,
+    done: String,
 }
 
-/// How many finished transfers the pane keeps showing.
-const FINISHED_TRANSFERS: usize = 6;
+/// How many failed transfers the pane keeps offering to resume.
+const FAILED_TRANSFERS: usize = 6;
 
 /// Shown when a tab has neither an SFTP connection nor a local filesystem.
 const FILES_TRANSPORT_ERROR: &str = "Files are available for SSH and Local sessions";
@@ -2053,38 +2269,87 @@ impl RemoteFiles {
         self.content = None;
     }
 
-    /// Remember how a transfer ended, keeping the last few rows.
-    fn record(&mut self, state: TransferState, done: Option<u64>) {
-        let Some((direction, path)) = self.active.clone() else {
+    fn poll_listing(&mut self) {
+        let Some((path, receiver)) = self.listing_pending.take() else {
             return;
         };
-        let total = self.moved.and_then(|moved| moved.total);
-        let row = wassh_plugins::files::TransferRow {
-            direction,
-            path,
-            done: done.or_else(|| self.moved.map(|moved| moved.done)).unwrap_or(0),
-            total,
-            state,
-        };
-        self.finished.push(row);
-        while self.finished.len() > FINISHED_TRANSFERS {
-            self.finished.remove(0);
+        match receiver.try_recv() {
+            Ok(Ok(wassh_ssh::SftpOutcome::Listed(entries))) => {
+                self.listing = Some(SftpListing {
+                    path: path.clone(),
+                    entries: entries
+                        .into_iter()
+                        .map(|entry| SftpEntry {
+                            name: entry.name,
+                            path: entry.path,
+                            is_dir: entry.is_dir,
+                            is_link: entry.is_link,
+                            size: entry.size,
+                            modified: entry.modified,
+                            permissions: entry.permissions,
+                        })
+                        .collect(),
+                });
+                self.listing_revision = self.listing_revision.wrapping_add(1);
+                self.requested = Some(path);
+                self.listing_error = None;
+                self.listing_stop = None;
+            }
+            Ok(Ok(_)) => {
+                self.listing_error = Some("the listing request returned an unexpected result".to_owned());
+                self.listing_stop = None;
+            }
+            Ok(Err(error)) => {
+                self.listing_error = Some(error);
+                self.listing_stop = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.listing_pending = Some((path, receiver));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.listing_error = Some("the listing ended without a response".to_owned());
+                self.listing_stop = None;
+            }
         }
     }
 
-    /// Rows the pane lists: finished ones, then the one running, then the queue.
+    /// Remember how a transfer ended, keeping the last few rows.
+    fn record(&mut self) {
+        let Some((direction, path)) = self.active.clone() else {
+            return;
+        };
+        let row = wassh_plugins::files::TransferRow {
+            direction,
+            path,
+            done: self.moved.as_ref().map(|moved| moved.done).unwrap_or(0),
+            total: self.moved.as_ref().and_then(|moved| moved.total),
+            progress_text: self.scan_progress_text(),
+            state: TransferState::Failed,
+        };
+        self.failed.push(row);
+        while self.failed.len() > FAILED_TRANSFERS {
+            self.failed.remove(0);
+        }
+    }
+
+    /// Rows the pane lists: the failures worth resuming, then the one running, then the
+    /// queue.
     fn rows(&self) -> Vec<wassh_plugins::files::TransferRow> {
-        let mut rows = self.finished.clone();
-        if let Some((direction, path)) = &self.active {
+        let mut rows = self.failed.clone();
+        if !self.stop_requested
+            && let Some((direction, path)) = &self.active
+        {
             let (done, total) = self
                 .moved
+                .as_ref()
                 .map(|moved| (moved.done, moved.total))
                 .unwrap_or((0, None));
             rows.push(wassh_plugins::files::TransferRow {
                 direction: *direction,
-                path: path.clone(),
+                path: self.running_message(path),
                 done,
                 total,
+                progress_text: self.scan_progress_text(),
                 state: TransferState::Running,
             });
         }
@@ -2094,50 +2359,114 @@ impl RemoteFiles {
                 path: queued.path.clone(),
                 done: 0,
                 total: None,
+                progress_text: None,
                 state: TransferState::Queued,
             });
         }
         rows
     }
 
+    /// What the running row says.
+    ///
+    /// An archive is two steps, so the row names the one it is in: the files being
+    /// packed, then the archive being downloaded.
+    fn running_message(&self, path: &str) -> String {
+        let archive = std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_owned());
+        if self.pack.is_some() {
+            return match self.moved.as_ref() {
+                Some(progress) => match progress.phase {
+                    wassh_ssh::SftpProgressPhase::Scanning => "Scanning files".to_owned(),
+                    wassh_ssh::SftpProgressPhase::Packing => format!(
+                        "Packing {}",
+                        progress.label.as_deref().unwrap_or("files")
+                    ),
+                    wassh_ssh::SftpProgressPhase::Writing => format!("Downloading {archive}"),
+                    wassh_ssh::SftpProgressPhase::Transfer => "Downloading files".to_owned(),
+                },
+                None => "Packing files".to_owned(),
+            };
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(direction, _)| *direction == TransferDirection::Zip)
+        {
+            if self
+                .moved
+                .as_ref()
+                .is_some_and(|progress| progress.phase == wassh_ssh::SftpProgressPhase::Scanning)
+            {
+                return "Scanning files".to_owned();
+            }
+            return self
+                .moved
+                .as_ref()
+                .and_then(|progress| progress.label.as_deref())
+                .map(|name| format!("Downloading {name}"))
+                .unwrap_or_else(|| "Downloading files".to_owned());
+        }
+        let is_tree_download = self
+            .request
+            .as_ref()
+            .is_some_and(|request| matches!(request, wassh_ssh::SftpRequest::DownloadTree { .. }));
+        if self
+            .moved
+            .as_ref()
+            .is_some_and(|progress| progress.phase == wassh_ssh::SftpProgressPhase::Scanning)
+            || (is_tree_download && self.moved.is_none())
+        {
+            return "Scanning files".to_owned();
+        }
+        if is_tree_download {
+            return self
+                .moved
+                .as_ref()
+                .and_then(|progress| progress.label.as_deref())
+                .map(|name| format!("Downloading {name}"))
+                .unwrap_or_else(|| "Downloading files".to_owned());
+        }
+        path.to_owned()
+    }
+
+    /// Alternate right-column text while the byte total is not known yet.
+    fn scan_progress_text(&self) -> Option<String> {
+        self.moved.as_ref().and_then(|progress| {
+            (progress.phase == wassh_ssh::SftpProgressPhase::Scanning)
+                .then(|| progress.items.map(|items| format!("{items} items inspected")))
+                .flatten()
+        })
+    }
+
     /// Take the answer of a finished request.
     ///
     /// Returns the directory to list again when a transfer landed in it.
     fn poll(&mut self) -> Option<String> {
-        // Whatever the last block reported is the value the bar shows.
-        if let Some(progress) = &self.progress {
-            for value in progress.try_iter() {
-                self.moved = Some(value);
-            }
+        self.take_progress();
+        if self.pack.is_some() {
+            return self.poll_pack();
         }
         let receiver = self.pending.take()?;
-        self.progress = None;
-        self.moved = None;
-        match receiver.try_recv() {
+        let answer = receiver.try_recv();
+        let answered = !matches!(answer, Err(std::sync::mpsc::TryRecvError::Empty));
+        if answered {
+            // The request is over: its bar has nothing left to show.
+            self.progress = None;
+            self.moved = None;
+            let completed_before_stop = matches!(&answer, Ok(Ok(_)))
+                && !matches!(self.job, Some(FileJob::Zip { .. }));
+            if self.stop_requested && !completed_before_stop {
+                self.finish_cancelled();
+                return None;
+            }
+        }
+        match answer {
             Ok(Ok(outcome)) => {
                 let job = self.job.take();
                 self.error = None;
                 match (outcome, job) {
-                    (wassh_ssh::SftpOutcome::Listed(entries), Some(FileJob::List { path })) => {
-                        self.listing = Some(SftpListing {
-                            path: path.clone(),
-                            entries: entries
-                                .into_iter()
-                                .map(|entry| SftpEntry {
-                                    name: entry.name,
-                                    path: entry.path,
-                                    is_dir: entry.is_dir,
-                                    is_link: entry.is_link,
-                                    size: entry.size,
-                                    modified: entry.modified,
-                                    permissions: entry.permissions,
-                                })
-                                .collect(),
-                        });
-                        self.listing_revision = self.listing_revision.wrapping_add(1);
-                        self.requested = Some(path);
-                        None
-                    }
                     (wassh_ssh::SftpOutcome::RealPath(path), _) => {
                         self.resolved = Some(path);
                         None
@@ -2154,8 +2483,13 @@ impl RemoteFiles {
                         None
                     }
                     (wassh_ssh::SftpOutcome::Transferred { .. }, Some(FileJob::Zip { dir, archive })) => {
-                        self.status = Some(pack_zip(&dir, &archive));
-                        let _ = std::fs::remove_dir_all(&dir);
+                        // The tree is here; the archive is written on its own thread, so
+                        // the bar sweeps again while it packs instead of the pane freezing.
+                        let stop = self.stop.clone().unwrap_or_default();
+                        let (answer, progress) = spawn_pack(dir, archive, stop);
+                        self.pack = Some(answer);
+                        self.progress = Some(progress);
+                        self.moved = None;
                         None
                     }
                     (wassh_ssh::SftpOutcome::Done, job) => {
@@ -2178,9 +2512,12 @@ impl RemoteFiles {
                             "{done} ({})",
                             wassh_plugins::files::format_size(bytes)
                         ));
-                        if self.active.take().is_some() {
-                            self.record(TransferState::Done, Some(bytes));
-                        }
+                        // A transfer that landed leaves no row behind: the list is for what
+                        // is still going and what went wrong.
+                        self.active = None;
+                        self.stop = None;
+                        self.stop_requested = false;
+                        self.request = None;
                         // A transfer landing can replace a file under a reader.
                         self.forget_content();
                         self.requested.clone()
@@ -2191,22 +2528,23 @@ impl RemoteFiles {
             }
             Ok(Err(error)) => {
                 self.error = Some(error);
-                if self.active.take().is_some() {
+                if self.active.is_some() {
+                    self.record();
                     // Keep the request so the pane can resume it.
                     if let Some(FileJob::Transfer { .. }) = self.job
                         && let Some(request) = self.request.clone()
-                        && let Some(failed) = self.finished.last()
+                        && let Some(failed) = self.failed.last()
                     {
-                        self.retryable =
-                            Some((request, failed.direction, failed.path.clone()));
+                        self.retryable = Some((request, failed.direction, failed.path.clone()));
                     }
-                    self.record(TransferState::Failed, None);
+                    self.active = None;
                 }
                 // A failed write may still have cut the file short.
                 self.forget_content();
                 self.request = None;
                 self.job = None;
-                self.requested = None;
+                self.stop = None;
+                self.stop_requested = false;
                 None
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -2215,12 +2553,92 @@ impl RemoteFiles {
                 None
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.error = Some("the session closed before the listing arrived".to_owned());
+                self.error = Some("the file operation ended without a response".to_owned());
                 self.job = None;
-                self.requested = None;
                 None
             }
         }
+    }
+
+    /// Collect what the progress channel last reported: the value the bar shows.
+    ///
+    /// It is kept until the request answers, so the bar keeps moving meanwhile.
+    fn take_progress(&mut self) {
+        if let Some(progress) = &self.progress {
+            for value in progress.try_iter() {
+                self.moved = Some(value);
+            }
+        }
+    }
+
+    /// Take the answer of the thread packing an archive.
+    fn poll_pack(&mut self) -> Option<String> {
+        let answers = self.pack.take()?;
+        let answer = answers.try_recv();
+        // The last block may not have been read yet, and the row it closes shows it.
+        self.take_progress();
+        match answer {
+            Ok(Ok(saved)) => {
+                self.finish_pack(None);
+                self.status = Some(saved);
+                None
+            }
+            Ok(Err(reason)) => {
+                if self.stop_requested {
+                    self.finish_cancelled();
+                } else {
+                    self.finish_pack(Some(reason));
+                }
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pack = Some(answers);
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if self.stop_requested {
+                    self.finish_cancelled();
+                } else {
+                    self.finish_pack(Some("the archive was not written".to_owned()));
+                }
+                None
+            }
+        }
+    }
+
+    /// Close the archive's row and its bar, keeping a row when it failed.
+    fn finish_pack(&mut self, failure: Option<String>) {
+        if failure.is_some() {
+            self.record();
+        }
+        self.active = None;
+        self.progress = None;
+        self.moved = None;
+        self.stop = None;
+        self.stop_requested = false;
+        self.job = None;
+        self.request = None;
+        self.error = failure;
+    }
+
+    fn finish_cancelled(&mut self) {
+        let direction = self.active.as_ref().map(|(direction, _)| *direction);
+        if self.pack.is_none()
+            && let Some(FileJob::Zip { dir, .. }) = &self.job
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        self.finish_pack(None);
+        self.status = Some(
+            match direction {
+                Some(TransferDirection::Upload) => "Upload stopped",
+                Some(TransferDirection::Download) => "Download stopped",
+                Some(TransferDirection::Zip) => "ZIP download stopped",
+                Some(TransferDirection::Copy) => "Copy stopped",
+                None => "Transfer stopped",
+            }
+            .to_owned(),
+        );
     }
 }
 
@@ -2248,11 +2666,16 @@ impl wassh_plugins::SftpAccess for SessionEntry {
     }
 
     fn is_loading(&self) -> bool {
-        self.files.pending.is_some()
+        self.files.listing_pending.is_some()
+            || self.files.pending.is_some()
+            || self.files.pack.is_some()
     }
 
     fn error(&self) -> Option<&str> {
-        self.files.error.as_deref()
+        self.files
+            .listing_error
+            .as_deref()
+            .or(self.files.error.as_deref())
     }
 
     fn upload(&mut self, local: &str, remote: &str) {
@@ -2299,9 +2722,9 @@ impl wassh_plugins::SftpAccess for SessionEntry {
     }
 
     fn is_transferring(&self) -> bool {
-        // Copies, batches and archives move bytes too, so the bar tracks them. A queued
-        // transfer has not landed yet, so it counts as in flight as well.
-        if !self.files.queue.is_empty() {
+        // Copies, batches, archives and the packing of one move bytes too, so the bar
+        // tracks them. A queued transfer has not landed yet, so it counts as well.
+        if !self.files.queue.is_empty() || self.files.pack.is_some() {
             return true;
         }
         self.files.pending.is_some()
@@ -2401,7 +2824,7 @@ impl wassh_plugins::SftpAccess for SessionEntry {
         {
             return Some(content.clone());
         }
-        if self.files.pending.is_some() {
+        if self.files.pending.is_some() || self.files.pack.is_some() {
             return None;
         }
         let job = self.file_job(wassh_ssh::SftpRequest::Read {
@@ -2446,11 +2869,20 @@ impl wassh_plugins::SftpAccess for SessionEntry {
     }
 
     fn progress(&self) -> Option<(u64, Option<u64>)> {
-        self.files.moved.map(|moved| (moved.done, moved.total))
+        self.files.moved.as_ref().map(|moved| (moved.done, moved.total))
     }
 
     fn transfers(&self) -> Vec<wassh_plugins::files::TransferRow> {
         self.files.rows()
+    }
+
+    fn stop_transfer(&mut self) {
+        if self.files.active.is_some()
+            && let Some(stop) = &self.files.stop
+        {
+            self.files.stop_requested = true;
+            stop.stop();
+        }
     }
 
     fn retry(&mut self) {
@@ -2469,13 +2901,14 @@ impl wassh_plugins::SftpAccess for SessionEntry {
     }
 
     fn download_tree(&mut self, items: Vec<String>, dir: &str) {
-        let count = items.len();
-        self.start_file_action(
+        // A tree download is a transfer like any other, so the pane shows it in its list.
+        self.enqueue_transfer(
             wassh_ssh::SftpRequest::DownloadTree {
                 items,
                 dir: std::path::PathBuf::from(dir),
             },
-            format!("Downloaded {count} item(s)"),
+            TransferDirection::Download,
+            dir.to_owned(),
         );
     }
 
@@ -2494,13 +2927,19 @@ impl wassh_plugins::SftpAccess for SessionEntry {
 
     fn copy_many(&mut self, items: Vec<(String, String)>, move_items: bool) {
         let count = items.len();
-        self.start_file_action(
+        self.enqueue_transfer_with_done(
             wassh_ssh::SftpRequest::CopyMany {
                 items,
                 // The copy is streamed through this machine: SFTP has no
                 // server-side copy.
                 scratch: std::env::temp_dir().join(format!("wassh-copy-{count}.tmp")),
                 move_items,
+            },
+            TransferDirection::Copy,
+            if move_items {
+                format!("Moving {count} item(s)")
+            } else {
+                format!("Copying {count} item(s)")
             },
             if move_items {
                 format!("Moved {count} item(s)")
@@ -2756,6 +3195,11 @@ mod tests {
     use super::*;
     use wassh_core::SessionStyleDefaults;
 
+    const ZIP_PROGRESS_TEST_BYTES: u64 = 7;
+    const ZIP_PROGRESS_TEST_ARCHIVE_BYTES: u64 = 120;
+    const TREE_SCAN_TEST_ITEMS: u64 = 128;
+    const ZIP_SCAN_TEST_ITEMS: u64 = 2;
+
     #[test]
     fn a_local_shell_that_exits_ends_the_session_on_purpose() {
         // The shell is replaced with one that logs out immediately, like typing `exit`.
@@ -2807,54 +3251,57 @@ mod tests {
             request: wassh_ssh::SftpRequest::RealPath { path: ".".to_owned() },
             direction: TransferDirection::Upload,
             path: "/srv/second".to_owned(),
+            done: "/srv/second".to_owned(),
         });
         files.queue.push_back(QueuedTransfer {
             request: wassh_ssh::SftpRequest::RealPath { path: ".".to_owned() },
             direction: TransferDirection::Upload,
             path: "/srv/third".to_owned(),
+            done: "/srv/third".to_owned(),
         });
         let rows = files.rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.state == TransferState::Queued));
         assert_eq!(rows[0].path, "/srv/second");
 
-        // A finished transfer stays at the top, then the running one, then the
+        // A failure worth resuming stays at the top, then the running one, then the
         // queue — the order the pane paints them in.
-        files.active = Some((TransferDirection::Upload, "/srv/running".to_owned()));
+        files.active = Some((TransferDirection::Upload, "/srv/failed".to_owned()));
         files.moved = None;
-        files.record(TransferState::Done, Some(10));
+        files.record();
         files.active = Some((TransferDirection::Upload, "/srv/running".to_owned()));
         let rows = files.rows();
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(
             paths,
-            ["/srv/running", "/srv/running", "/srv/second", "/srv/third"]
+            ["/srv/failed", "/srv/running", "/srv/second", "/srv/third"]
         );
         assert_eq!(rows[1].state, TransferState::Running);
-        assert_eq!(rows[0].state, TransferState::Done);
+        assert_eq!(rows[0].state, TransferState::Failed);
     }
 
     #[test]
-    fn only_the_last_few_finished_transfers_are_kept() {
+    fn only_the_last_few_failures_are_kept() {
         let mut files = RemoteFiles::default();
-        for index in 0..FINISHED_TRANSFERS + 3 {
+        for index in 0..FAILED_TRANSFERS + 3 {
             files.active = Some((TransferDirection::Upload, format!("job {index}")));
-            files.record(TransferState::Done, Some(1));
+            files.record();
         }
         files.active = None;
         let rows = files.rows();
-        assert_eq!(rows.len(), FINISHED_TRANSFERS);
+        assert_eq!(rows.len(), FAILED_TRANSFERS);
         assert_eq!(rows[0].path, "job 3");
     }
 
     #[test]
     fn a_failed_transfer_is_worth_resuming() {
         let mut files = RemoteFiles::default();
-        files.finished.push(wassh_plugins::files::TransferRow {
+        files.failed.push(wassh_plugins::files::TransferRow {
             direction: TransferDirection::Upload,
             path: "/srv/big.iso".to_owned(),
             done: 4096,
             total: Some(65_536),
+            progress_text: None,
             state: TransferState::Failed,
         });
         assert!(
@@ -3248,6 +3695,95 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_download_runs_as_a_transfer() {
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("tree-src");
+        std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        std::fs::write(dir.join("a.txt"), b"one").expect("write");
+        std::fs::write(dir.join("sub").join("b.txt"), b"two").expect("write");
+        let target = temp_dir("tree-out");
+        let mut entry = local_entry("t-local-tree");
+
+        entry.download_tree(
+            vec![dir.to_string_lossy().into_owned()],
+            &target.to_string_lossy(),
+        );
+        // The pane lists it like any other transfer, so the download is visible.
+        assert!(
+            entry
+                .transfers()
+                .iter()
+                .any(|row| row.direction == TransferDirection::Download),
+            "the tree download is not in the transfer list"
+        );
+        settle(&mut entry);
+
+        assert!(entry.error().is_none(), "{:?}", entry.error());
+        let copied = target.join(dir.file_name().expect("a folder name"));
+        assert_eq!(std::fs::read(copied.join("a.txt")).expect("read"), b"one");
+        assert_eq!(
+            std::fs::read(copied.join("sub").join("b.txt")).expect("read"),
+            b"two"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn a_local_session_zips_a_folder() {
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("zip-src");
+        std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        std::fs::write(dir.join("a.txt"), b"one").expect("write");
+        std::fs::write(dir.join("sub").join("b.txt"), b"two").expect("write");
+        // A link inside the folder points back at it: packing must not follow it.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).expect("link");
+        let archive = temp_dir("zip-out").join("out.zip");
+        let mut entry = local_entry("t-local-zip");
+
+        // The pane hands over the folder's entries, so the archive holds them at its root.
+        let items: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read")
+            .flatten()
+            .map(|child| child.path().to_string_lossy().into_owned())
+            .collect();
+        entry.download_zip(items, &archive.to_string_lossy());
+        settle(&mut entry);
+
+        assert!(entry.error().is_none(), "{:?}", entry.error());
+        let bytes = std::fs::read(&archive).expect("the archive was written");
+        let names: Vec<String> = wassh_plugins::files::zip_entries(&bytes)
+            .expect("a readable archive")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"a.txt".to_owned()), "{names:?}");
+        assert!(names.contains(&"sub/b.txt".to_owned()), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.starts_with("loop")),
+            "the link was packed: {names:?}"
+        );
+
+        // An empty folder still produces a readable archive.
+        let empty = temp_dir("zip-empty");
+        let empty_archive = temp_dir("zip-empty-out").join("empty.zip");
+        entry.download_zip(Vec::new(), &empty_archive.to_string_lossy());
+        settle(&mut entry);
+        assert!(
+            empty_archive.is_file(),
+            "an empty folder wrote no archive: {:?}",
+            entry.transfer_status()
+        );
+
+        for dir in [&dir, &empty, archive.parent().expect("a parent")] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let _ = std::fs::remove_dir_all(empty_archive.parent().expect("a parent"));
+    }
+
+    #[test]
     fn a_local_session_browses_this_machine() {
         use wassh_plugins::SftpAccess as _;
         let mut entry = local_entry("t-local-browse");
@@ -3413,6 +3949,339 @@ mod tests {
     }
 
     #[test]
+    fn a_zip_shows_the_step_it_is_in_while_it_runs() {
+        let dir = temp_dir("zip-row");
+        std::fs::write(dir.join("a.txt"), b"one").expect("write");
+        let archive = temp_dir("zip-row-out").join("out.zip");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let mut files = RemoteFiles {
+            active: Some((TransferDirection::Zip, archive.display().to_string())),
+            job: Some(FileJob::Zip {
+                dir: dir.clone(),
+                archive: archive.clone(),
+            }),
+            pending: Some(rx),
+            progress: Some(progress_rx),
+            ..RemoteFiles::default()
+        };
+        progress_tx
+            .send(wassh_ssh::SftpProgress {
+                done: 3,
+                total: Some(3),
+                label: Some("a.txt".to_owned()),
+                phase: wassh_ssh::SftpProgressPhase::Transfer,
+                items: None,
+            })
+            .expect("send");
+        // While the files are fetched the row names the file being downloaded.
+        assert_eq!(files.poll(), None);
+        let rows = files.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direction, TransferDirection::Zip);
+        assert_eq!(rows[0].state, TransferState::Running);
+        assert_eq!(rows[0].path, "Downloading a.txt");
+
+        tx.send(Ok(wassh_ssh::SftpOutcome::Transferred { bytes: 3 }))
+            .expect("send");
+        assert_eq!(files.poll(), None);
+        // Once the pack thread starts, it begins with packing status before switching
+        // to the archive-write message.
+        let rows = files.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].path.starts_with("Packing ") || rows[0].path == "Packing files");
+        // The pane keeps polling; the pack thread answers on a later frame.
+        for _ in 0..2_000 {
+            let _ = files.poll();
+            if files.pack.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(archive.is_file(), "no archive was written: {:?}", files.error);
+        assert!(files.error.is_none(), "{:?}", files.error);
+        assert!(
+            files.status.as_deref().is_some_and(|line| line.contains("out.zip")),
+            "{:?}",
+            files.status
+        );
+        // A saved archive needs no row: the bar goes away with the job.
+        assert!(files.rows().is_empty(), "{:?}", files.rows());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(archive.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn zip_row_names_the_packing_and_archive_write_phases() {
+        let archive = std::path::PathBuf::from("C:/downloads/out.zip");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut files = RemoteFiles {
+            job: Some(FileJob::Zip {
+                dir: std::path::PathBuf::from("C:/temp/staging"),
+                archive: archive.clone(),
+            }),
+            pack: Some(receiver),
+            active: Some((TransferDirection::Zip, archive.display().to_string())),
+            moved: Some(wassh_ssh::SftpProgress {
+                done: 3,
+                total: Some(7),
+                label: Some("a.txt".to_owned()),
+                phase: wassh_ssh::SftpProgressPhase::Packing,
+                items: None,
+            }),
+            ..RemoteFiles::default()
+        };
+
+        assert_eq!(files.rows()[0].path, "Packing a.txt");
+        files.moved = Some(wassh_ssh::SftpProgress {
+            done: 0,
+            total: Some(ZIP_PROGRESS_TEST_ARCHIVE_BYTES),
+            label: None,
+            phase: wassh_ssh::SftpProgressPhase::Writing,
+            items: None,
+        });
+        let row = &files.rows()[0];
+        assert_eq!(row.path, "Downloading out.zip");
+        assert_eq!(row.done, 0, "the second phase must start from zero");
+
+        drop(sender);
+    }
+
+    #[test]
+    fn a_tree_scan_names_the_work_and_shows_items_inspected() {
+        let files = RemoteFiles {
+            request: Some(wassh_ssh::SftpRequest::DownloadTree {
+                items: vec!["/srv/docs".to_owned()],
+                dir: std::path::PathBuf::from("C:/downloads"),
+            }),
+            active: Some((TransferDirection::Download, "/downloads/docs".to_owned())),
+            moved: Some(wassh_ssh::SftpProgress {
+                done: 0,
+                total: None,
+                label: None,
+                phase: wassh_ssh::SftpProgressPhase::Scanning,
+                items: Some(TREE_SCAN_TEST_ITEMS),
+            }),
+            ..RemoteFiles::default()
+        };
+
+        let row = files.rows().remove(0);
+        assert_eq!(row.path, "Scanning files");
+        assert_eq!(row.progress_text.as_deref(), Some("128 items inspected"));
+        assert_eq!(row.total, None, "a scan must not invent a byte total");
+    }
+
+    #[test]
+    fn navigating_during_a_zip_scan_keeps_the_transfer_count() {
+        use wassh_plugins::SftpAccess as _;
+        let mut entry = local_entry("t-local-zip-navigation");
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        progress_tx
+            .send(wassh_ssh::SftpProgress {
+                done: 0,
+                total: None,
+                label: None,
+                phase: wassh_ssh::SftpProgressPhase::Scanning,
+                items: Some(TREE_SCAN_TEST_ITEMS),
+            })
+            .expect("send scan progress");
+        let staging = temp_dir("zip-navigation-staging");
+        let browser_dir = temp_dir("zip-navigation-browser");
+        entry.files.pending = Some(answer_rx);
+        entry.files.progress = Some(progress_rx);
+        entry.files.stop = Some(wassh_ssh::SftpStop::default());
+        entry.files.request = Some(wassh_ssh::SftpRequest::DownloadTree {
+            items: vec!["/srv/docs".to_owned()],
+            dir: staging.clone(),
+        });
+        entry.files.job = Some(FileJob::Zip {
+            dir: staging,
+            archive: std::path::PathBuf::from("C:/downloads/docs.zip"),
+        });
+        entry.files.active = Some((TransferDirection::Zip, "C:/downloads/docs.zip".to_owned()));
+
+        entry.request_listing(&browser_dir.display().to_string());
+        entry.poll_files();
+
+        let rows = entry.transfers();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "Scanning files");
+        assert_eq!(rows[0].progress_text.as_deref(), Some("128 items inspected"));
+        assert!(entry.files.pending.is_some(), "navigation replaced the transfer job");
+        assert_eq!(entry.files.requested.as_deref(), Some(browser_dir.to_str().expect("path")));
+
+        drop(answer_tx);
+        for _ in 0..1_000 {
+            entry.poll_files();
+            if entry.files.listing_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = std::fs::remove_dir_all(&browser_dir);
+    }
+
+    #[test]
+    fn stopping_any_transfer_signals_its_worker_and_hides_its_row() {
+        use wassh_plugins::SftpAccess as _;
+        let mut entry = local_entry("t-local-stop-transfer");
+        for direction in [
+            TransferDirection::Upload,
+            TransferDirection::Download,
+            TransferDirection::Zip,
+            TransferDirection::Copy,
+        ] {
+            let stop = wassh_ssh::SftpStop::default();
+            entry.files.active = Some((direction, "/downloads/docs".to_owned()));
+            entry.files.stop = Some(stop.clone());
+            entry.files.stop_requested = false;
+
+            entry.stop_transfer();
+
+            assert!(stop.is_stopped(), "{direction:?} worker was not signalled");
+            assert!(entry.files.stop_requested);
+            assert!(entry.transfers().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_copy_batch_has_a_stoppable_transfer_row() {
+        use wassh_plugins::SftpAccess as _;
+        let dir = temp_dir("copy-stop-row");
+        let source = dir.join("source.txt");
+        let target = dir.join("target.txt");
+        std::fs::write(&source, b"content").expect("write");
+        let mut entry = local_entry("t-local-copy-stop-row");
+
+        entry.copy_many(
+            vec![(source.display().to_string(), target.display().to_string())],
+            false,
+        );
+
+        let rows = entry.transfers();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direction, TransferDirection::Copy);
+        assert_eq!(rows[0].path, format!("Copying {} item(s)", rows.len()));
+        entry.stop_transfer();
+        assert!(entry.files.stop_requested);
+        assert!(entry.files.stop.as_ref().is_some_and(|stop| stop.is_stopped()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn packing_reports_each_file_then_restarts_for_the_archive() {
+        let dir = temp_dir("zip-progress");
+        std::fs::write(dir.join("a.txt"), b"one").expect("write");
+        std::fs::write(dir.join("b.txt"), b"two!").expect("write");
+        let archive = temp_dir("zip-progress-out").join("out.zip");
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        pack_zip(
+            &dir,
+            &archive,
+            Some(&sender),
+            &wassh_ssh::SftpStop::default(),
+        )
+        .expect("archive written");
+        drop(sender);
+
+        let reports: Vec<_> = receiver.try_iter().collect();
+        let scanning: Vec<_> = reports
+            .iter()
+            .filter(|report| report.phase == wassh_ssh::SftpProgressPhase::Scanning)
+            .collect();
+        assert_eq!(scanning.last().and_then(|report| report.items), Some(ZIP_SCAN_TEST_ITEMS));
+        assert!(scanning.iter().all(|report| report.total.is_none()));
+        let packing: Vec<_> = reports
+            .iter()
+            .filter(|report| report.phase == wassh_ssh::SftpProgressPhase::Packing)
+            .collect();
+        assert!(
+            reports.iter().position(|report| report.phase == wassh_ssh::SftpProgressPhase::Scanning)
+                < reports.iter().position(|report| report.phase == wassh_ssh::SftpProgressPhase::Packing),
+            "packing started before the scan finished: {reports:?}"
+        );
+        assert!(
+            packing.iter().any(|report| report.label.as_deref() == Some("a.txt")),
+            "a.txt was not reported: {reports:?}"
+        );
+        assert!(
+            packing.iter().any(|report| report.label.as_deref() == Some("b.txt")),
+            "b.txt was not reported: {reports:?}"
+        );
+        assert_eq!(
+            packing.last().map(|report| report.done),
+            Some(ZIP_PROGRESS_TEST_BYTES)
+        );
+
+        let writing: Vec<_> = reports
+            .iter()
+            .filter(|report| report.phase == wassh_ssh::SftpProgressPhase::Writing)
+            .collect();
+        assert_eq!(writing.first().map(|report| report.done), Some(0));
+        let finished = writing.last().expect("archive write progress");
+        assert_eq!(finished.done, finished.total.expect("known archive size"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(archive.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn stopping_zip_packing_does_not_leave_an_archive() {
+        let dir = temp_dir("zip-stopped");
+        std::fs::write(dir.join("a.txt"), b"content").expect("write");
+        let archive = temp_dir("zip-stopped-out").join("out.zip");
+        let stop = wassh_ssh::SftpStop::default();
+        stop.stop();
+
+        let result = pack_zip(&dir, &archive, None, &stop);
+
+        assert_eq!(result, Err(wassh_ssh::SFTP_STOPPED.to_owned()));
+        assert!(!archive.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(archive.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn progress_keeps_moving_while_a_transfer_runs() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let mut files = RemoteFiles {
+            job: Some(FileJob::Transfer {
+                done: "/home/alice/report.txt".to_owned(),
+            }),
+            pending: Some(rx),
+            progress: Some(progress_rx),
+            ..RemoteFiles::default()
+        };
+
+        progress_tx
+            .send(wassh_ssh::SftpProgress {
+                done: 512,
+                total: Some(1024),
+                label: None,
+                phase: wassh_ssh::SftpProgressPhase::Transfer,
+                items: None,
+            })
+            .expect("send");
+        assert_eq!(files.poll(), None);
+        assert_eq!(
+            files.moved.as_ref().map(|moved| moved.done),
+            Some(512),
+            "the pane has nothing to draw the bar from"
+        );
+
+        tx.send(Ok(wassh_ssh::SftpOutcome::Transferred { bytes: 512 }))
+            .expect("send");
+        files.poll();
+        assert!(files.moved.is_none(), "a finished transfer keeps progress");
+    }
+
+    #[test]
     fn a_finished_transfer_reports_its_size_and_reloads_the_directory() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut files = RemoteFiles {
@@ -3441,10 +4310,7 @@ mod tests {
     fn a_listing_answer_fills_the_browser() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut files = RemoteFiles {
-            job: Some(FileJob::List {
-                path: "/etc".to_owned(),
-            }),
-            pending: Some(rx),
+            listing_pending: Some(("/etc".to_owned(), rx)),
             ..RemoteFiles::default()
         };
         tx.send(Ok(wassh_ssh::SftpOutcome::Listed(vec![
@@ -3460,7 +4326,7 @@ mod tests {
         ])))
         .expect("send");
 
-        assert_eq!(files.poll(), None);
+        files.poll_listing();
         let listing = files.listing.expect("a listing");
         assert_eq!(listing.path, "/etc");
         assert_eq!(listing.entries.len(), 1);

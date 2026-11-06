@@ -150,6 +150,7 @@ enum SshCommand {
         request: crate::sftp::SftpRequest,
         reply: std::sync::mpsc::Sender<Result<crate::sftp::SftpOutcome, String>>,
         progress: std::sync::mpsc::Sender<crate::sftp::SftpProgress>,
+        stop: crate::sftp::SftpStop,
     },
     /// A one-shot remote command; the answer arrives on `reply`.
     Exec {
@@ -174,6 +175,8 @@ pub struct SftpJob {
     pub outcome: std::sync::mpsc::Receiver<Result<crate::sftp::SftpOutcome, String>>,
     /// Bytes moved as it runs.
     pub progress: std::sync::mpsc::Receiver<crate::sftp::SftpProgress>,
+    /// Stops the request.
+    pub stop: crate::sftp::SftpStop,
 }
 
 /// A one-shot command that is running, and the handle to stop it.
@@ -401,14 +404,17 @@ impl SshSession {
     pub fn sftp(&self, request: crate::sftp::SftpRequest) -> SftpJob {
         let (tx, rx) = std::sync::mpsc::channel();
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let stop = crate::sftp::SftpStop::default();
         let _ = self.commands.send(SshCommand::Sftp {
             request,
             reply: tx,
             progress: progress_tx,
+            stop: stop.clone(),
         });
         SftpJob {
             outcome: rx,
             progress: progress_rx,
+            stop,
         }
     }
 
@@ -788,10 +794,27 @@ async fn connect_and_shell(
                         request,
                         reply,
                         progress,
+                        stop,
                     }) => {
                         let handle = handle.clone();
                         tokio::spawn(async move {
-                            let answer = crate::sftp::run(handle, request, Some(progress)).await;
+                            let scratch = match &request {
+                                crate::sftp::SftpRequest::CopyMany {
+                                    scratch,
+                                    move_items: false,
+                                    ..
+                                } => Some(scratch.clone()),
+                                _ => None,
+                            };
+                            let answer = tokio::select! {
+                                answer = crate::sftp::run(handle, request, Some(progress)) => answer,
+                                _ = stop.cancelled() => Err(crate::sftp::SFTP_STOPPED.to_owned()),
+                            };
+                            if matches!(&answer, Err(error) if error == crate::sftp::SFTP_STOPPED)
+                                && let Some(scratch) = scratch
+                            {
+                                let _ = tokio::fs::remove_file(scratch).await;
+                            }
                             let _ = reply.send(answer);
                         });
                     }

@@ -5,12 +5,45 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use russh::client::Handle;
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::session::ClientHandler;
+
+/// Stops a file request running on an SSH or local worker.
+#[derive(Clone, Debug, Default)]
+pub struct SftpStop(Arc<SftpStopState>);
+
+#[derive(Debug, Default)]
+struct SftpStopState {
+    stopped: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl SftpStop {
+    /// Ask the worker to stop.
+    pub fn stop(&self) {
+        self.0.stopped.store(true, Ordering::Release);
+        self.0.notify.notify_one();
+    }
+
+    /// Whether a stop has been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.0.stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        if !self.is_stopped() {
+            self.0.notify.notified().await;
+        }
+    }
+}
+
+/// Error returned when the user stops a file request.
+pub const SFTP_STOPPED: &str = "File transfer stopped by the user.";
 
 /// One directory entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,20 +64,42 @@ pub struct SftpEntry {
     pub permissions: Option<u32>,
 }
 
-/// How far a request has got.
+/// Kind of work represented by a progress report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SftpProgressPhase {
+    /// Moving file bytes.
+    #[default]
+    Transfer,
+    /// Enumerating a tree before moving it.
+    Scanning,
+    /// Adding a staged file to an archive.
+    Packing,
+    /// Writing the completed archive.
+    Writing,
+}
+
+/// How far a request has got.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SftpProgress {
     /// Bytes moved so far.
     pub done: u64,
     /// Bytes to move in total, when the request knows up front.
     pub total: Option<u64>,
+    /// File being moved right now, for the pane's row.
+    pub label: Option<String>,
+    /// Kind of work represented by this report.
+    pub phase: SftpProgressPhase,
+    /// Number of tree entries seen while scanning.
+    pub items: Option<u64>,
 }
 
 impl SftpProgress {
     /// Completion from 0 to 1, when the total is known.
     pub fn fraction(&self) -> Option<f32> {
         match self.total {
-            Some(total) if total > 0 => Some((self.done as f64 / total as f64).clamp(0.0, 1.0) as f32),
+            Some(total) if total > 0 => {
+                Some((self.done as f64 / total as f64).clamp(0.0, 1.0) as f32)
+            }
             _ => None,
         }
     }
@@ -56,6 +111,9 @@ struct Report {
     sender: Option<std::sync::mpsc::Sender<SftpProgress>>,
     done: u64,
     total: Option<u64>,
+    label: Option<String>,
+    phase: SftpProgressPhase,
+    items: Option<u64>,
 }
 
 impl Report {
@@ -64,18 +122,42 @@ impl Report {
             sender,
             done: 0,
             total: None,
+            label: None,
+            phase: SftpProgressPhase::Transfer,
+            items: None,
         }
     }
 
-    /// Announce the total, so the bar can be determinate from the start.
-    fn total(&mut self, total: u64) {
-        self.total = Some(total);
+    /// Say which file the request is moving now.
+    fn saying(&mut self, name: &str) {
+        self.phase = SftpProgressPhase::Transfer;
+        self.items = None;
+        self.label = Some(name.to_owned());
         self.send();
     }
 
-    /// Start counting from `offset` bytes that are already in place.
-    fn skip(&mut self, offset: u64) {
-        self.done = offset;
+    /// Report how many entries have been inspected so far.
+    fn scanning(&mut self, items: u64) {
+        self.phase = SftpProgressPhase::Scanning;
+        self.items = Some(items);
+        self.label = None;
+        self.send();
+    }
+
+    /// Add `bytes` to what this request has to move.
+    ///
+    /// A request states its whole size before the first byte moves, so one bar covers
+    /// the whole job instead of restarting for every file in it.
+    fn total(&mut self, bytes: u64) {
+        self.phase = SftpProgressPhase::Transfer;
+        self.items = None;
+        *self.total.get_or_insert(0) += bytes;
+        self.send();
+    }
+
+    /// Count `bytes` that are already in place, as a resumed transfer starts there.
+    fn skip(&mut self, bytes: u64) {
+        self.done += bytes;
         self.send();
     }
 
@@ -90,6 +172,9 @@ impl Report {
             let _ = sender.send(SftpProgress {
                 done: self.done,
                 total: self.total,
+                label: self.label.clone(),
+                phase: self.phase,
+                items: self.items,
             });
         }
     }
@@ -227,6 +312,8 @@ pub enum SftpOutcome {
 
 /// Size of a single read/write block.
 const BLOCK: usize = 64 * 1024;
+/// Tree scans report periodically rather than once per entry.
+const SCAN_REPORT_EVERY: u64 = 64;
 
 /// Run `request` over a fresh SFTP channel.
 pub(crate) async fn run(
@@ -259,7 +346,13 @@ pub(crate) async fn run(
             local,
             resume,
         } => {
-            report.total(session.metadata(remote.clone()).await.map(|meta| meta.size.unwrap_or(0)).unwrap_or(0));
+            report.total(
+                session
+                    .metadata(remote.clone())
+                    .await
+                    .map(|meta| meta.size.unwrap_or(0))
+                    .unwrap_or(0),
+            );
             download(&session, &remote, &local, &mut report, resume).await
         }
         SftpRequest::Upload {
@@ -317,14 +410,16 @@ pub(crate) async fn run(
         }
         SftpRequest::Read { path, max_bytes } => read(&session, &path, max_bytes).await,
         SftpRequest::UploadMany { items, resume } => {
+            let mut total = 0;
+            for (local, _) in &items {
+                total += tokio::fs::metadata(local)
+                    .await
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+            }
+            report.total(total);
             let mut bytes = 0;
             for (local, remote) in &items {
-                report.total(
-                    tokio::fs::metadata(local)
-                        .await
-                        .map(|meta| meta.len())
-                        .unwrap_or(0),
-                );
                 if let SftpOutcome::Transferred { bytes: moved } =
                     upload(&session, local, remote, &mut report, resume).await?
                 {
@@ -334,6 +429,15 @@ pub(crate) async fn run(
             Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::DownloadMany { items, resume } => {
+            let mut total = 0;
+            for (remote, _) in &items {
+                total += session
+                    .metadata(remote.clone())
+                    .await
+                    .map(|meta| meta.size.unwrap_or(0))
+                    .unwrap_or(0);
+            }
+            report.total(total);
             let mut bytes = 0;
             for (remote, local) in &items {
                 if let SftpOutcome::Transferred { bytes: moved } =
@@ -345,18 +449,52 @@ pub(crate) async fn run(
             Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::DownloadTree { items, dir } => {
+            // Measure the tree from the listings first, so the bar covers all of it from
+            // the first file, then copy it in one pass.
+            let mut files = Vec::new();
+            let mut scanned = 0;
+            report.scanning(scanned);
             for item in &items {
-                download_tree(&session, item, &dir, &mut report).await?;
+                measure_tree(
+                    &session,
+                    item,
+                    &dir,
+                    &mut files,
+                    &mut report,
+                    &mut scanned,
+                    None,
+                )
+                .await?;
             }
-            Ok(SftpOutcome::Transferred {
-                bytes: report.done,
-            })
+            report.total(files.iter().map(|(_, _, size)| *size).sum());
+            let mut bytes = 0;
+            for (remote, local, _) in &files {
+                if let SftpOutcome::Transferred { bytes: moved } =
+                    download(&session, remote, local, &mut report, false).await?
+                {
+                    bytes += moved;
+                }
+            }
+            Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::CopyMany {
             items,
             scratch,
             move_items,
         } => {
+            if !move_items {
+                // A copy streams each file down and back up, so the bar covers both
+                // directions of the whole batch.
+                let mut total = 0;
+                for (from, _) in &items {
+                    total += session
+                        .metadata(from.clone())
+                        .await
+                        .map(|meta| meta.size.unwrap_or(0))
+                        .unwrap_or(0);
+                }
+                report.total(total * 2);
+            }
             let mut bytes = 0;
             for (from, to) in &items {
                 if move_items {
@@ -466,44 +604,86 @@ async fn read(session: &SftpSession, path: &str, max_bytes: u64) -> Result<SftpO
     })
 }
 
-/// Fetch `remote` into `dir`, keeping its name; directories are walked.
-async fn download_tree(
+/// Last segment of a slash-separated path.
+fn base_name(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("download")
+}
+
+/// Collect every file under `remote` as `(remote, local, size)`, keeping its name under
+/// `dir`; directories are created as the walk goes.
+///
+/// A directory's listing carries each entry's type and size, so measuring a tree costs
+/// one call per directory rather than one per file. Links are skipped: they point at
+/// something else on the host, which is not part of the tree being copied.
+async fn measure_tree(
     session: &SftpSession,
     remote: &str,
     dir: &std::path::Path,
+    files: &mut Vec<(String, std::path::PathBuf, u64)>,
     report: &mut Report,
+    scanned: &mut u64,
+    entry_metadata: Option<(bool, u64)>,
 ) -> Result<(), String> {
-    let name = remote
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("download");
-    let target = dir.join(name);
-    let metadata = session
-        .metadata(remote.to_owned())
-        .await
-        .map_err(|error| format!("reading {remote}: {error}"))?;
-    if !metadata.is_dir() {
-        download(session, remote, &target, report, false).await?;
+    let target = dir.join(base_name(remote));
+    let (is_dir, size) = match entry_metadata {
+        Some(metadata) => metadata,
+        None => {
+            let metadata = session
+                .symlink_metadata(remote.to_owned())
+                .await
+                .map_err(|error| format!("reading {remote}: {error}"))?;
+            if metadata.is_symlink() {
+                return Ok(());
+            }
+            (metadata.is_dir(), metadata.size.unwrap_or(0))
+        }
+    };
+    if !is_dir {
+        files.push((remote.to_owned(), target, size));
         return Ok(());
     }
     tokio::fs::create_dir_all(&target)
         .await
         .map_err(|error| format!("creating {}: {error}", target.display()))?;
-    let mut children: Vec<String> = Vec::new();
+    let mut children: Vec<(String, bool, u64)> = Vec::new();
     let directory = session
         .read_dir(remote.to_owned())
         .await
         .map_err(|error| format!("listing {remote}: {error}"))?;
     for entry in directory {
-        if entry.file_name() == "." || entry.file_name() == ".." {
+        if entry.file_type().is_symlink() {
             continue;
         }
-        children.push(entry.path());
+        children.push((
+            entry.path(),
+            entry.file_type().is_dir(),
+            entry.metadata().len(),
+        ));
+        *scanned += 1;
+        if (*scanned).is_multiple_of(SCAN_REPORT_EVERY) {
+            report.scanning(*scanned);
+        }
     }
-    children.sort();
-    for child in children {
-        Box::pin(download_tree(session, &child, &target, report)).await?;
+    report.scanning(*scanned);
+    children.sort_by(|left, right| left.0.cmp(&right.0));
+    for (child, is_dir, size) in children {
+        if is_dir {
+            Box::pin(measure_tree(
+                session,
+                &child,
+                &target,
+                files,
+                report,
+                scanned,
+                Some((is_dir, size)),
+            ))
+            .await?;
+        } else {
+            files.push((child.clone(), target.join(base_name(&child)), size));
+        }
     }
     Ok(())
 }
@@ -531,7 +711,7 @@ async fn download(
         .await
         .map(|meta| meta.size.unwrap_or(0))
         .unwrap_or(0);
-    report.total(size);
+    report.saying(base_name(remote));
 
     // Resume only when the local file is a genuine prefix of the remote one.
     let have = if resume {
@@ -561,7 +741,6 @@ async fn download(
         report.skip(have);
         file
     } else {
-        report.skip(0);
         tokio::fs::File::create(local)
             .await
             .map_err(|error| format!("writing {}: {error}", local.display()))?
@@ -591,8 +770,6 @@ async fn upload(
         .await
         .map(|meta| meta.len())
         .unwrap_or(0);
-    report.total(size);
-
     // Append to what the host already holds, when that is a prefix of ours.
     let have = if resume {
         session
@@ -613,8 +790,7 @@ async fn upload(
         session
             .open_with_flags(
                 remote.to_owned(),
-                russh_sftp::protocol::OpenFlags::WRITE
-                    | russh_sftp::protocol::OpenFlags::APPEND,
+                russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::APPEND,
             )
             .await
             .map_err(|error| format!("writing {remote}: {error}"))?
@@ -645,11 +821,7 @@ enum TransferError {
 }
 
 /// Stream every byte of `source` into `sink`, returning the count.
-async fn copy<R, W>(
-    source: &mut R,
-    sink: &mut W,
-    report: &mut Report,
-) -> Result<u64, TransferError>
+async fn copy<R, W>(source: &mut R, sink: &mut W, report: &mut Report) -> Result<u64, TransferError>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -785,7 +957,9 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut report = Report::default();
         assert_eq!(
-            copy(&mut source, &mut sink, &mut report).await.expect("copy"),
+            copy(&mut source, &mut sink, &mut report)
+                .await
+                .expect("copy"),
             0
         );
         assert!(sink.is_empty());

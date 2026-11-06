@@ -15,24 +15,31 @@ const VERSION: u16 = 20;
 const METHOD_STORE: u16 = 0;
 /// Largest comment the end record can hold.
 const MAX_COMMENT: usize = 65_535;
+/// Bytes in a local file header without its name or data.
+const LOCAL_HEADER_SIZE: usize = 30;
+/// Bytes in a central directory header without its name.
+const CENTRAL_HEADER_SIZE: usize = 46;
+/// Bytes in the end-of-central-directory record without a comment.
+const END_RECORD_SIZE: usize = 22;
 
 /// CRC-32 (IEEE) of `data`.
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in data {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    crc32fast::hash(data)
 }
 
-/// Builds an archive in memory.
+/// An entry's central-directory metadata; its contents are already in `ZipWriter::out`.
+struct DirectoryEntry {
+    name: String,
+    crc: u32,
+    size: u32,
+    offset: u32,
+}
+
+/// Builds an archive in one buffer, serializing each entry as it is added.
 #[derive(Default)]
 pub struct ZipWriter {
-    entries: Vec<(String, Vec<u8>)>,
+    out: Vec<u8>,
+    entries: Vec<DirectoryEntry>,
 }
 
 impl ZipWriter {
@@ -41,9 +48,48 @@ impl ZipWriter {
         Self::default()
     }
 
+    /// Reserve an archive for known payload and entry sizes.
+    pub fn with_capacity_for(
+        payload_size: usize,
+        entry_count: usize,
+        names_size: usize,
+    ) -> Result<Self, std::collections::TryReserveError> {
+        let output_size = payload_size
+            .saturating_add(entry_count.saturating_mul(LOCAL_HEADER_SIZE))
+            .saturating_add(names_size);
+        let mut out = Vec::new();
+        out.try_reserve_exact(output_size)?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(entry_count)?;
+        Ok(Self { out, entries })
+    }
+
     /// Add `data` under `name` (forward slashes; directories are implied by the name).
     pub fn add(&mut self, name: &str, data: Vec<u8>) {
-        self.entries.push((name.to_owned(), data));
+        let name_bytes = name.as_bytes();
+        let crc = crc32(&data);
+        let size = data.len() as u32;
+        let offset = self.out.len() as u32;
+
+        push_u32(&mut self.out, LOCAL_HEADER);
+        push_u16(&mut self.out, VERSION);
+        push_u16(&mut self.out, 0); // flags
+        push_u16(&mut self.out, METHOD_STORE);
+        push_u16(&mut self.out, 0); // modification time
+        push_u16(&mut self.out, 0); // modification date
+        push_u32(&mut self.out, crc);
+        push_u32(&mut self.out, size);
+        push_u32(&mut self.out, size);
+        push_u16(&mut self.out, name_bytes.len() as u16);
+        push_u16(&mut self.out, 0); // extra length
+        self.out.extend_from_slice(name_bytes);
+        self.out.extend_from_slice(&data);
+        self.entries.push(DirectoryEntry {
+            name: name.to_owned(),
+            crc,
+            size,
+            offset,
+        });
     }
 
     /// Number of files added so far.
@@ -56,32 +102,16 @@ impl ZipWriter {
         self.entries.is_empty()
     }
 
-    /// Serialise the archive.
-    pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut directory = Vec::new();
-
-        for (name, data) in &self.entries {
-            let name_bytes = name.as_bytes();
-            let crc = crc32(data);
-            let offset = out.len() as u32;
-
-            // Local file header.
-            push_u32(&mut out, LOCAL_HEADER);
-            push_u16(&mut out, VERSION);
-            push_u16(&mut out, 0); // flags
-            push_u16(&mut out, METHOD_STORE);
-            push_u16(&mut out, 0); // modification time
-            push_u16(&mut out, 0); // modification date
-            push_u32(&mut out, crc);
-            push_u32(&mut out, data.len() as u32);
-            push_u32(&mut out, data.len() as u32);
-            push_u16(&mut out, name_bytes.len() as u16);
-            push_u16(&mut out, 0); // extra length
-            out.extend_from_slice(name_bytes);
-            out.extend_from_slice(data);
-
-            // Central directory entry.
+    /// Serialise the central directory and return the archive.
+    pub fn finish(mut self) -> Vec<u8> {
+        let directory_size = self
+            .entries
+            .iter()
+            .map(|entry| CENTRAL_HEADER_SIZE + entry.name.len())
+            .sum();
+        let mut directory = Vec::with_capacity(directory_size);
+        for entry in &self.entries {
+            let name_bytes = entry.name.as_bytes();
             push_u32(&mut directory, CENTRAL_HEADER);
             push_u16(&mut directory, VERSION); // made by
             push_u16(&mut directory, VERSION); // needed
@@ -89,33 +119,32 @@ impl ZipWriter {
             push_u16(&mut directory, METHOD_STORE);
             push_u16(&mut directory, 0);
             push_u16(&mut directory, 0);
-            push_u32(&mut directory, crc);
-            push_u32(&mut directory, data.len() as u32);
-            push_u32(&mut directory, data.len() as u32);
+            push_u32(&mut directory, entry.crc);
+            push_u32(&mut directory, entry.size);
+            push_u32(&mut directory, entry.size);
             push_u16(&mut directory, name_bytes.len() as u16);
             push_u16(&mut directory, 0); // extra
             push_u16(&mut directory, 0); // comment
             push_u16(&mut directory, 0); // disk
             push_u16(&mut directory, 0); // internal attributes
             push_u32(&mut directory, 0); // external attributes
-            push_u32(&mut directory, offset);
+            push_u32(&mut directory, entry.offset);
             directory.extend_from_slice(name_bytes);
         }
 
-        let directory_offset = out.len() as u32;
+        let directory_offset = self.out.len() as u32;
         let directory_size = directory.len() as u32;
-        out.extend_from_slice(&directory);
-
-        // End of central directory.
-        push_u32(&mut out, END_OF_DIRECTORY);
-        push_u16(&mut out, 0); // this disk
-        push_u16(&mut out, 0); // disk with the directory
-        push_u16(&mut out, self.entries.len() as u16);
-        push_u16(&mut out, self.entries.len() as u16);
-        push_u32(&mut out, directory_size);
-        push_u32(&mut out, directory_offset);
-        push_u16(&mut out, 0); // comment length
-        out
+        self.out.reserve(directory.len() + END_RECORD_SIZE);
+        self.out.extend_from_slice(&directory);
+        push_u32(&mut self.out, END_OF_DIRECTORY);
+        push_u16(&mut self.out, 0); // this disk
+        push_u16(&mut self.out, 0); // disk with the directory
+        push_u16(&mut self.out, self.entries.len() as u16);
+        push_u16(&mut self.out, self.entries.len() as u16);
+        push_u32(&mut self.out, directory_size);
+        push_u32(&mut self.out, directory_offset);
+        push_u16(&mut self.out, 0); // comment length
+        self.out
     }
 }
 
@@ -163,7 +192,7 @@ pub fn read(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
             .get(cursor + 46..cursor + 46 + name_length)
             .ok_or("truncated name")?;
         let name = String::from_utf8_lossy(name_bytes).into_owned();
-        cursor += 46 + name_length + extra_length + comment_length;
+        cursor += CENTRAL_HEADER_SIZE + name_length + extra_length + comment_length;
 
         if method != METHOD_STORE {
             return Err(format!("{name}: compressed entries are not supported"));
@@ -173,7 +202,7 @@ pub fn read(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
         let local_name = read_u16(bytes, local_offset + 26).ok_or("truncated header")? as usize;
         let local_extra = read_u16(bytes, local_offset + 28).ok_or("truncated header")? as usize;
-        let start = local_offset + 30 + local_name + local_extra;
+        let start = local_offset + LOCAL_HEADER_SIZE + local_name + local_extra;
         let data = bytes
             .get(start..start + size)
             .ok_or_else(|| format!("{name}: truncated data"))?
@@ -188,11 +217,11 @@ pub fn read(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// Find the end-of-central-directory record, which may be followed by a comment.
 fn find_end_record(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 22 {
+    if bytes.len() < END_RECORD_SIZE {
         return None;
     }
-    let start = bytes.len().saturating_sub(22 + MAX_COMMENT);
-    (start..=bytes.len() - 22)
+    let start = bytes.len().saturating_sub(END_RECORD_SIZE + MAX_COMMENT);
+    (start..=bytes.len() - END_RECORD_SIZE)
         .rev()
         .find(|offset| read_u32(bytes, *offset) == Some(END_OF_DIRECTORY))
 }

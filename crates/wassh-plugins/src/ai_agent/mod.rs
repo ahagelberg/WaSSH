@@ -5,7 +5,7 @@
 //! `permissions.ts`, and the pane mirrors the reference view.
 
 mod agent;
-mod markdown;
+pub(crate) mod markdown;
 mod permissions;
 mod protocol;
 mod providers;

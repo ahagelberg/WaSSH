@@ -26,6 +26,9 @@ pub use session::{
     AuthPromptField, ExecJob, ExecOutput, ExecStop, HostKeyPolicy, JumpHop, STOPPED_COMMAND,
     SessionEnd, SftpJob, SshAuth, SshEvent, SshOptions, SshSession, capture as capture_command,
 };
-pub use sftp::{SftpEntry, SftpOutcome, SftpProgress, SftpRequest, format_size};
+pub use sftp::{
+    SFTP_STOPPED, SftpEntry, SftpOutcome, SftpProgress, SftpProgressPhase, SftpRequest, SftpStop,
+    format_size,
+};
 pub use tunnels::{RemoteForwards, TunnelRequest, remote_forwards};
 pub use x11::X11Config;

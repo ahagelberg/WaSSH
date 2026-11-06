@@ -14,10 +14,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, channel};
 
-use wassh_ssh::{SftpEntry, SftpJob, SftpOutcome, SftpProgress, SftpRequest};
+use wassh_ssh::{SftpEntry, SftpJob, SftpOutcome, SftpProgress, SftpProgressPhase, SftpRequest};
 
 /// Size of one read/write block, matching the SFTP transfer path.
 const BLOCK: usize = 64 * 1024;
+/// Tree scans report periodically rather than once per entry.
+const SCAN_REPORT_EVERY: u64 = 64;
 
 /// The user's home directory.
 pub fn home() -> PathBuf {
@@ -45,16 +47,22 @@ pub fn spawn(request: SftpRequest) -> SftpJob {
     let (outcome_tx, outcome) = channel();
     let (progress_tx, progress) = channel();
     let unused = outcome_tx.clone();
+    let stop = wassh_ssh::SftpStop::default();
+    let worker_stop = stop.clone();
     let spawned = std::thread::Builder::new()
         .name("wassh-local-files".to_owned())
         .spawn(move || {
             let mut report = Report::new(Some(progress_tx));
-            let _ = outcome_tx.send(run(request, &mut report));
+            let _ = outcome_tx.send(run(request, &mut report, &worker_stop));
         });
     if let Err(error) = spawned {
         let _ = unused.send(Err(format!("starting the file worker: {error}")));
     }
-    SftpJob { outcome, progress }
+    SftpJob {
+        outcome,
+        progress,
+        stop,
+    }
 }
 
 /// The local filesystem path a pane path means.
@@ -112,6 +120,9 @@ struct Report {
     sender: Option<Sender<SftpProgress>>,
     done: u64,
     total: Option<u64>,
+    label: Option<String>,
+    phase: SftpProgressPhase,
+    items: Option<u64>,
 }
 
 impl Report {
@@ -120,18 +131,42 @@ impl Report {
             sender,
             done: 0,
             total: None,
+            label: None,
+            phase: SftpProgressPhase::Transfer,
+            items: None,
         }
     }
 
-    /// Announce the total, so the bar can be determinate from the start.
-    fn total(&mut self, total: u64) {
-        self.total = Some(total);
+    /// Say which file the request is moving now.
+    fn saying(&mut self, name: &str) {
+        self.phase = SftpProgressPhase::Transfer;
+        self.items = None;
+        self.label = Some(name.to_owned());
         self.send();
     }
 
-    /// Start counting from `offset` bytes that are already in place.
-    fn skip(&mut self, offset: u64) {
-        self.done = offset;
+    /// Report how many entries have been inspected so far.
+    fn scanning(&mut self, items: u64) {
+        self.phase = SftpProgressPhase::Scanning;
+        self.items = Some(items);
+        self.label = None;
+        self.send();
+    }
+
+    /// Add `bytes` to what this request has to move.
+    ///
+    /// A request states its whole size before the first byte moves, so one bar covers
+    /// the whole job instead of restarting for every file in it.
+    fn total(&mut self, bytes: u64) {
+        self.phase = SftpProgressPhase::Transfer;
+        self.items = None;
+        *self.total.get_or_insert(0) += bytes;
+        self.send();
+    }
+
+    /// Count `bytes` that are already in place, as a resumed transfer starts there.
+    fn skip(&mut self, bytes: u64) {
+        self.done += bytes;
         self.send();
     }
 
@@ -146,6 +181,9 @@ impl Report {
             let _ = sender.send(SftpProgress {
                 done: self.done,
                 total: self.total,
+                label: self.label.clone(),
+                phase: self.phase,
+                items: self.items,
             });
         }
     }
@@ -156,10 +194,15 @@ impl Report {
 enum TransferError {
     Read(std::io::Error),
     Write(std::io::Error),
+    Stopped,
 }
 
 /// Run one request against this machine's filesystem.
-fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String> {
+fn run(
+    request: SftpRequest,
+    report: &mut Report,
+    stop: &wassh_ssh::SftpStop,
+) -> Result<SftpOutcome, String> {
     match request {
         SftpRequest::List { path } => list(&path),
         SftpRequest::RealPath { path } => canonical(&path).map(SftpOutcome::RealPath),
@@ -192,7 +235,7 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
         } => {
             let source = local_path(&remote);
             report.total(size_of(&source));
-            copy_file(&source, &local, resume, report)
+            copy_file(&source, &local, resume, report, stop)
         }
         SftpRequest::Upload {
             local,
@@ -200,7 +243,7 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
             resume,
         } => {
             report.total(size_of(&local));
-            copy_file(&local, &local_path(&remote), resume, report)
+            copy_file(&local, &local_path(&remote), resume, report, stop)
         }
         SftpRequest::Write { path, content } => {
             let target = local_path(&path);
@@ -212,11 +255,12 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
             Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::UploadMany { items, resume } => {
+            let total: u64 = items.iter().map(|(local, _)| size_of(local)).sum();
+            report.total(total);
             let mut bytes = 0;
             for (local, remote) in &items {
-                report.total(size_of(local));
                 if let SftpOutcome::Transferred { bytes: moved } =
-                    copy_file(local, &local_path(remote), resume, report)?
+                    copy_file(local, &local_path(remote), resume, report, stop)?
                 {
                     bytes += moved;
                 }
@@ -224,12 +268,16 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
             Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::DownloadMany { items, resume } => {
+            let total: u64 = items
+                .iter()
+                .map(|(remote, _)| size_of(&local_path(remote)))
+                .sum();
+            report.total(total);
             let mut bytes = 0;
             for (remote, local) in &items {
                 let source = local_path(remote);
-                report.total(size_of(&source));
                 if let SftpOutcome::Transferred { bytes: moved } =
-                    copy_file(&source, local, resume, report)?
+                    copy_file(&source, local, resume, report, stop)?
                 {
                     bytes += moved;
                 }
@@ -237,9 +285,21 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
             Ok(SftpOutcome::Transferred { bytes })
         }
         SftpRequest::DownloadTree { items, dir } => {
-            let mut bytes = 0;
+            // Walk the tree first, so the bar covers all of it from the start.
+            let mut files = Vec::new();
+            let mut scanned = 0;
+            report.scanning(scanned);
             for item in &items {
-                bytes += download_tree(item, &dir, report)?;
+                collect_tree(item, &dir, &mut files, report, &mut scanned, stop)?;
+            }
+            report.total(files.iter().map(|(_, _, size)| *size).sum());
+            let mut bytes = 0;
+            for (source, target, _) in &files {
+                if let SftpOutcome::Transferred { bytes: moved } =
+                    copy_file(source, target, false, report, stop)?
+                {
+                    bytes += moved;
+                }
             }
             Ok(SftpOutcome::Transferred { bytes })
         }
@@ -248,8 +308,18 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
         SftpRequest::CopyMany {
             items, move_items, ..
         } => {
+            if !move_items {
+                let total: u64 = items
+                    .iter()
+                    .map(|(from, _)| size_of(&local_path(from)))
+                    .sum();
+                report.total(total);
+            }
             let mut bytes = 0;
             for (from, to) in &items {
+                if stop.is_stopped() {
+                    return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+                }
                 let source = local_path(from);
                 let target = local_path(to);
                 if move_items {
@@ -258,7 +328,7 @@ fn run(request: SftpRequest, report: &mut Report) -> Result<SftpOutcome, String>
                     continue;
                 }
                 if let SftpOutcome::Transferred { bytes: moved } =
-                    copy_file(&source, &target, false, report)?
+                    copy_file(&source, &target, false, report, stop)?
                 {
                     bytes += moved;
                 }
@@ -369,34 +439,58 @@ fn remove_tree(path: &Path) -> Result<(), String> {
     std::fs::remove_dir(path).map_err(|error| format!("deleting {shown}: {error}"))
 }
 
-/// Copy `source` into `dir`, keeping its name; directories are walked.
+/// Collect every file under `item` as `(source, target, size)`, keeping its name under
+/// `dir`; directories are created as the walk goes.
 ///
-/// Returns the bytes moved, so a tree of files shows its real size.
-fn download_tree(item: &str, dir: &Path, report: &mut Report) -> Result<u64, String> {
+/// Links are skipped: they point at something else on this machine, which is not part
+/// of the tree being copied.
+fn collect_tree(
+    item: &str,
+    dir: &Path,
+    files: &mut Vec<(PathBuf, PathBuf, u64)>,
+    report: &mut Report,
+    scanned: &mut u64,
+    stop: &wassh_ssh::SftpStop,
+) -> Result<(), String> {
+    if stop.is_stopped() {
+        return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+    }
     let source = local_path(item);
+    let Ok(meta) = std::fs::symlink_metadata(&source) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
     let name = source
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_owned());
     let target = dir.join(&name);
-    let is_dir = std::fs::symlink_metadata(&source)
-        .is_ok_and(|meta| meta.is_dir());
-    if !is_dir {
-        return match copy_file(&source, &target, false, report)? {
-            SftpOutcome::Transferred { bytes } => Ok(bytes),
-            _ => Ok(0),
-        };
+    if !meta.is_dir() {
+        files.push((source, target, meta.len()));
+        return Ok(());
     }
     std::fs::create_dir_all(&target)
         .map_err(|error| format!("creating {}: {error}", display(&target)))?;
     let read = std::fs::read_dir(&source).map_err(|error| format!("listing {item}: {error}"))?;
-    let mut children: Vec<PathBuf> = read.flatten().map(|entry| entry.path()).collect();
-    children.sort();
-    let mut bytes = 0;
-    for child in children {
-        bytes += download_tree(&display(&child), &target, report)?;
+    let mut children = Vec::new();
+    for entry in read.flatten() {
+        if stop.is_stopped() {
+            return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+        }
+        children.push(entry.path());
+        *scanned += 1;
+        if (*scanned).is_multiple_of(SCAN_REPORT_EVERY) {
+            report.scanning(*scanned);
+        }
     }
-    Ok(bytes)
+    report.scanning(*scanned);
+    children.sort();
+    for child in children {
+        collect_tree(&display(&child), &target, files, report, scanned, stop)?;
+    }
+    Ok(())
 }
 
 /// Copy one file, optionally continuing a partial copy that is already there.
@@ -405,11 +499,18 @@ fn copy_file(
     target: &Path,
     resume: bool,
     report: &mut Report,
+    stop: &wassh_ssh::SftpStop,
 ) -> Result<SftpOutcome, String> {
+    if stop.is_stopped() {
+        return Err(wassh_ssh::SFTP_STOPPED.to_owned());
+    }
     let mut from =
         File::open(source).map_err(|error| format!("reading {}: {error}", display(source)))?;
     let size = from.metadata().map(|meta| meta.len()).unwrap_or(0);
-    report.total(size);
+    report.saying(&match source.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => display(source),
+    });
     if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("creating {}: {error}", display(parent)))?;
@@ -437,16 +538,22 @@ fn copy_file(
     .map_err(|error| format!("writing {}: {error}", display(target)))?;
     report.skip(have);
 
-    let bytes = copy(&mut from, &mut to, report).map_err(|error| match error {
+    let bytes = copy(&mut from, &mut to, report, stop).map_err(|error| match error {
         TransferError::Read(error) => format!("reading {}: {error}", display(source)),
         TransferError::Write(error) => format!("writing {}: {error}", display(target)),
+        TransferError::Stopped => wassh_ssh::SFTP_STOPPED.to_owned(),
     })?;
     let _ = to.sync_all();
     Ok(SftpOutcome::Transferred { bytes })
 }
 
 /// Stream every byte of `source` into `sink`, returning the count.
-fn copy<R, W>(source: &mut R, sink: &mut W, report: &mut Report) -> Result<u64, TransferError>
+fn copy<R, W>(
+    source: &mut R,
+    sink: &mut W,
+    report: &mut Report,
+    stop: &wassh_ssh::SftpStop,
+) -> Result<u64, TransferError>
 where
     R: Read,
     W: Write,
@@ -454,6 +561,9 @@ where
     let mut buffer = vec![0u8; BLOCK];
     let mut bytes = 0u64;
     loop {
+        if stop.is_stopped() {
+            return Err(TransferError::Stopped);
+        }
         let read = source.read(&mut buffer).map_err(TransferError::Read)?;
         if read == 0 {
             break;
@@ -508,7 +618,11 @@ mod tests {
     }
 
     fn execute(request: SftpRequest) -> Result<SftpOutcome, String> {
-        run(request, &mut Report::new(None))
+        run(
+            request,
+            &mut Report::new(None),
+            &wassh_ssh::SftpStop::default(),
+        )
     }
 
     fn transferred(outcome: Result<SftpOutcome, String>) -> u64 {
@@ -713,6 +827,112 @@ mod tests {
             std::fs::read(target.path.join("docs").join("inner").join("b.txt")).expect("read"),
             b"b"
         );
+    }
+
+    #[test]
+    fn a_stopped_tree_download_does_not_start_copying() {
+        let sandbox = Sandbox::new("tree-stopped");
+        std::fs::create_dir_all(sandbox.path.join("docs")).expect("mkdir");
+        std::fs::write(sandbox.path.join("docs").join("a.txt"), b"content").expect("write");
+        let target = Sandbox::new("tree-stopped-target");
+        let stop = wassh_ssh::SftpStop::default();
+        stop.stop();
+
+        let result = run(
+            SftpRequest::DownloadTree {
+                items: vec![sandbox.at("docs")],
+                dir: target.path.clone(),
+            },
+            &mut Report::new(None),
+            &stop,
+        );
+
+        assert_eq!(result, Err(wassh_ssh::SFTP_STOPPED.to_owned()));
+        assert!(!target.path.join("docs").exists());
+    }
+
+    #[test]
+    fn a_stopped_upload_or_copy_does_not_touch_its_destination() {
+        let sandbox = Sandbox::new("transfer-stopped");
+        let source = sandbox.path.join("source.txt");
+        std::fs::write(&source, b"content").expect("write");
+        let upload_target = sandbox.path.join("upload.txt");
+        let copy_target = sandbox.path.join("copy.txt");
+        let move_target = sandbox.path.join("move.txt");
+        let requests = [
+            SftpRequest::Upload {
+                local: source.clone(),
+                remote: display(&upload_target),
+                resume: false,
+            },
+            SftpRequest::CopyMany {
+                items: vec![(display(&source), display(&copy_target))],
+                scratch: sandbox.path.join("scratch"),
+                move_items: false,
+            },
+            SftpRequest::CopyMany {
+                items: vec![(display(&source), display(&move_target))],
+                scratch: sandbox.path.join("scratch"),
+                move_items: true,
+            },
+        ];
+
+        for request in requests {
+            let stop = wassh_ssh::SftpStop::default();
+            stop.stop();
+            assert_eq!(
+                run(request, &mut Report::new(None), &stop),
+                Err(wassh_ssh::SFTP_STOPPED.to_owned())
+            );
+        }
+
+        assert!(!upload_target.exists());
+        assert!(!copy_target.exists());
+        assert!(!move_target.exists());
+        assert!(source.is_file());
+    }
+
+    #[test]
+    fn a_tree_download_reports_one_total_for_the_whole_tree() {
+        let sandbox = Sandbox::new("tree-progress");
+        std::fs::create_dir_all(sandbox.path.join("docs")).expect("mkdir");
+        std::fs::write(sandbox.path.join("docs").join("a.txt"), b"one").expect("write");
+        std::fs::write(sandbox.path.join("docs").join("b.txt"), b"two").expect("write");
+        let target = Sandbox::new("tree-progress-target");
+
+        let (sender, progress) = channel();
+        let mut report = Report::new(Some(sender));
+        let outcome = run(
+            SftpRequest::DownloadTree {
+                items: vec![sandbox.at("docs")],
+                dir: target.path.clone(),
+            },
+            &mut report,
+            &wassh_ssh::SftpStop::default(),
+        );
+        assert_eq!(transferred(outcome), 6);
+
+        let reports: Vec<SftpProgress> = progress.try_iter().collect();
+        assert!(!reports.is_empty(), "nothing was reported");
+        let scans: Vec<_> = reports
+            .iter()
+            .filter(|report| report.phase == SftpProgressPhase::Scanning)
+            .collect();
+        assert_eq!(scans.last().and_then(|report| report.items), Some(2));
+        assert!(scans.iter().all(|report| report.total.is_none()));
+        let transfers: Vec<_> = reports
+            .iter()
+            .filter(|report| report.phase == SftpProgressPhase::Transfer)
+            .collect();
+        assert!(!transfers.is_empty(), "no byte progress followed the scan");
+        assert!(transfers.iter().all(|report| report.total == Some(6)));
+        // The byte bar only moves forward, ending at the full total.
+        let mut last = 0;
+        for report in &transfers {
+            assert!(report.done >= last, "the bar went backwards: {reports:?}");
+            last = report.done;
+        }
+        assert_eq!(last, 6);
     }
 
     #[test]

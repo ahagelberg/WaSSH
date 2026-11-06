@@ -16,9 +16,9 @@ use wassh_ui::widgets::{
     small_button_enabled, text_input,
 };
 
-use wassh_ui::to_color32;
 use crate::plugin::{Plugin, PluginContext, SessionAccess};
 use crate::{PluginId, PluginManifest};
+use wassh_ui::to_color32;
 
 /// One row of the remote directory listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +133,9 @@ pub trait SftpAccess {
     /// The transfer list: finished, running, then queued.
     fn transfers(&self) -> Vec<TransferRow>;
 
+    /// Stop the active file transfer.
+    fn stop_transfer(&mut self) {}
+
     /// Run the failed transfer again, continuing where it stopped.
     fn retry(&mut self);
 }
@@ -197,6 +200,8 @@ pub struct TransferRow {
     pub done: u64,
     /// Bytes in total, when known.
     pub total: Option<u64>,
+    /// Alternate amount text for non-byte progress such as scanned entries.
+    pub progress_text: Option<String>,
     /// Where it is in its life.
     pub state: TransferState,
 }
@@ -205,7 +210,9 @@ impl TransferRow {
     /// Completion from 0 to 1, when the total is known.
     pub fn fraction(&self) -> Option<f32> {
         match self.total {
-            Some(total) if total > 0 => Some((self.done as f64 / total as f64).clamp(0.0, 1.0) as f32),
+            Some(total) if total > 0 => {
+                Some((self.done as f64 / total as f64).clamp(0.0, 1.0) as f32)
+            }
             _ => None,
         }
     }
@@ -285,8 +292,9 @@ pub const VIEW_BYTES: u64 = 256 * 1024;
 /// Archives are read whole (the central directory sits at the end), so they get
 /// a far bigger cap than a text preview.
 pub const ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
-/// Files up to this many lines are drawn without a scroll view.
-const VIEW_INLINE_LINES: usize = 30;
+const VIEWER_MIN_CONTENT_HEIGHT: f32 = 320.0;
+const VIEWER_MAX_CONTENT_HEIGHT: f32 = 640.0;
+const VIEWER_MODAL_CHROME_HEIGHT: f32 = 180.0;
 
 /// Settings key for the directory the save dialog starts in.
 const SAVE_DIR_KEY: &str = "saveDir";
@@ -320,8 +328,17 @@ pub struct Viewer {
     pub name: String,
     /// Size the file reports, so the header can say "text · 1.0 KB of 4.0 KB".
     pub total: Option<u64>,
-    /// Whether the hex dump is shown instead of the text.
-    pub hex: bool,
+    /// An explicitly selected view; `None` chooses a mode from the file type.
+    pub mode: Option<ViewerMode>,
+}
+
+/// A file viewer presentation mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewerMode {
+    #[default]
+    Plain,
+    Markdown,
+    Hex,
 }
 
 /// What a click in the pane asked for.
@@ -372,6 +389,11 @@ enum NativeDialog {
         /// Remote paths that go into it.
         items: Vec<String>,
     },
+    /// Save the chosen items into one folder.
+    Folder {
+        /// Remote paths that are fetched into it.
+        items: Vec<String>,
+    },
 }
 
 /// What a dialog thread answered.
@@ -404,6 +426,17 @@ const fn native_dialogs_enabled() -> bool {
     !cfg!(test)
 }
 
+/// What the pane is asking the user for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveKind {
+    /// One file, under the typed name.
+    File,
+    /// One archive, under the typed name.
+    Archive,
+    /// Every marked item, into the chosen folder under its own name.
+    Folder,
+}
+
 /// A download that is waiting for the user to say where it lands.
 ///
 /// There is no default destination: nothing is written until the save dialog is
@@ -412,14 +445,12 @@ const fn native_dialogs_enabled() -> bool {
 struct SaveRequest {
     /// Remote paths being saved.
     items: Vec<String>,
-    /// Save `items` as one ZIP instead of copying them one by one.
-    zip: bool,
+    /// What the dialog is collecting.
+    kind: SaveKind,
     /// Directory the browser shows.
     dir: String,
-    /// Name the file (or archive) gets.
+    /// Name the file (or archive) gets; unused for a folder.
     name: String,
-    /// Folders that were selected but cannot be copied file by file.
-    skipped: Vec<String>,
 }
 
 /// Where the browser is looking, and what it remembers between frames.
@@ -463,10 +494,6 @@ pub struct Files {
     save: Option<SaveRequest>,
     /// Native dialog in flight.
     native: Option<PendingDialog>,
-    /// Remote files still waiting for their own save dialog, as (remote, name).
-    save_queue: std::collections::VecDeque<(String, String)>,
-    /// Folders that were selected but cannot be copied file by file.
-    skipped_folders: Vec<String>,
     /// Directory the save dialog last used, remembered between saves.
     save_dir: String,
     /// Local files chosen in the picker, ready to upload.
@@ -498,8 +525,6 @@ impl Default for Files {
             pending_zip: None,
             save: None,
             native: None,
-            save_queue: std::collections::VecDeque::new(),
-            skipped_folders: Vec::new(),
             save_dir: String::new(),
             picker_selected: Vec::new(),
             caption: (String::new(), HeaderHealth::Bad),
@@ -558,7 +583,10 @@ impl Files {
         match (from, to) {
             (Some(from), Some(to)) => {
                 let (low, high) = if from <= to { (from, to) } else { (to, from) };
-                self.selected = visible[low..=high].iter().map(|entry| (*entry).to_owned()).collect();
+                self.selected = visible[low..=high]
+                    .iter()
+                    .map(|entry| (*entry).to_owned())
+                    .collect();
             }
             _ => self.select_only(path),
         }
@@ -650,7 +678,9 @@ pub fn parse_mode(text: &str) -> Option<u32> {
     {
         return None;
     }
-    u32::from_str_radix(trimmed, 8).ok().map(|mode| mode & 0o7777)
+    u32::from_str_radix(trimmed, 8)
+        .ok()
+        .map(|mode| mode & 0o7777)
 }
 
 /// A name a file may be given: not empty, no separator, not a relative link.
@@ -706,12 +736,14 @@ fn compare_names(left: &str, right: &str) -> std::cmp::Ordering {
                 if a.is_ascii_digit() && b.is_ascii_digit() {
                     // Compare whole runs of digits as numbers.
                     let mut left_number = String::new();
-                    while let Some(digit) = left_chars.peek().copied().filter(char::is_ascii_digit) {
+                    while let Some(digit) = left_chars.peek().copied().filter(char::is_ascii_digit)
+                    {
                         left_number.push(digit);
                         left_chars.next();
                     }
                     let mut right_number = String::new();
-                    while let Some(digit) = right_chars.peek().copied().filter(char::is_ascii_digit) {
+                    while let Some(digit) = right_chars.peek().copied().filter(char::is_ascii_digit)
+                    {
                         right_number.push(digit);
                         right_chars.next();
                     }
@@ -812,7 +844,11 @@ impl Plugin for Files {
             if !items.is_empty() {
                 let count = items.len();
                 access.upload_many(items);
-                self.set_notice(format!("Uploading {count} file{}", plural(count)), false, now);
+                self.set_notice(
+                    format!("Uploading {count} file{}", plural(count)),
+                    false,
+                    now,
+                );
             }
         }
 
@@ -843,7 +879,8 @@ impl Plugin for Files {
             .max_height(table_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if let Some(clicked) = self.table(ui, &palette, &listing, loading, error.as_deref()) {
+                if let Some(clicked) = self.table(ui, &palette, &listing, loading, error.as_deref())
+                {
                     intent = Some(clicked);
                 }
             });
@@ -908,7 +945,7 @@ impl Plugin for Files {
                 access.refresh(&path);
             }
             Some(Intent::Refresh) => access.refresh(&self.path.clone()),
-            Some(Intent::Download) => self.begin_download(access, &listing),
+            Some(Intent::Download) => self.begin_download(access),
             Some(Intent::View(path)) => {
                 let total = self
                     .entries
@@ -919,7 +956,7 @@ impl Plugin for Files {
                     name: file_name(&path).unwrap_or(&path).to_owned(),
                     path,
                     total,
-                    hex: false,
+                    mode: None,
                 });
             }
             Some(Intent::Copy) => {
@@ -930,13 +967,16 @@ impl Plugin for Files {
             }
             Some(Intent::Paste) => self.paste(access),
             Some(Intent::Zip) => {
-                let items = if self.selected.is_empty() {
-                    vec![self.path.clone()]
-                } else {
+                // The marked files, or every entry of the folder on screen: either way
+                // they land at the archive root, not under a folder of their own.
+                let selection = !self.selected.is_empty();
+                let items = if selection {
                     self.selected.clone()
+                } else {
+                    self.folder_zip_items()
                 };
                 let root = self.zip_root();
-                self.begin_zip(items, root);
+                self.begin_zip(items, root, selection);
             }
             Some(Intent::PickUpload) => {
                 if native_dialogs_enabled() {
@@ -985,12 +1025,6 @@ impl Files {
         let mut intent = None;
         let has_selection = !self.selected.is_empty();
         let single = self.selected.len() == 1;
-        let files: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|entry| !entry.is_dir && self.is_selected(&entry.path))
-            .map(|entry| entry.path.clone())
-            .collect();
         let at_root = parent_path(&self.path).is_none();
         let add = |intent: &mut Option<Intent>, wanted: Intent| {
             *intent = Some(wanted);
@@ -1051,7 +1085,8 @@ impl Files {
                 self.dialog = Some(FileDialog::Delete { targets });
             }
             toolbar_separator(ui, palette);
-            if small_button_enabled(ui, palette, "⬇ Download", connected && !files.is_empty()) {
+            // Folders travel with the files, each under its own name.
+            if small_button_enabled(ui, palette, "⬇ Download", connected && has_selection) {
                 add(&mut intent, Intent::Download);
             }
             // The reference calls this "⬇ Download ZIP" and it covers the
@@ -1069,12 +1104,7 @@ impl Files {
         let mut intent = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(
-                egui::RichText::new("PATH")
-                    .size(11.0)
-                    .color(muted)
-                    .strong(),
-            );
+            ui.label(egui::RichText::new("PATH").size(11.0).color(muted).strong());
             if small_button(ui, palette, "/") {
                 intent = Some("/".to_owned());
             }
@@ -1127,9 +1157,8 @@ impl Files {
         ];
         for entry in &listing.entries {
             let link_mark = if entry.is_link { " →" } else { "" };
-            name_need = name_need.max(
-                icon_width + measure(&cell_font, &format!("{}{link_mark}", entry.name)) + 8.0,
-            );
+            name_need = name_need
+                .max(icon_width + measure(&cell_font, &format!("{}{link_mark}", entry.name)) + 8.0);
             narrow[0] = narrow[0].max(measure(&mono_font, &size_cell(entry)));
             narrow[1] = narrow[1].max(measure(&mono_font, &mode_symbolic(entry)));
             narrow[2] = narrow[2].max(measure(&mono_font, &date_cell(entry)));
@@ -1146,21 +1175,22 @@ impl Files {
         let heading_top = ui.cursor().top();
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            for (index, (label, right_aligned)) in
-                [
-                    ("Name", false),
-                    ("Size", true),
-                    ("Permissions", false),
-                    ("Modified", false),
-                ]
-                    .into_iter()
-                    .enumerate()
+            for (index, (label, right_aligned)) in [
+                ("Name", false),
+                ("Size", true),
+                ("Permissions", false),
+                ("Modified", false),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 if widths[index] <= 0.0 {
                     continue;
                 }
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::Vec2::new(widths[index], HEADING_HEIGHT), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::Vec2::new(widths[index], HEADING_HEIGHT),
+                    egui::Sense::hover(),
+                );
                 let painter = ui.painter();
                 let caption = ellipsize(painter, label, heading_font.clone(), widths[index] - 8.0);
                 let used = measure(&heading_font, &caption);
@@ -1352,11 +1382,20 @@ impl Files {
     }
 
     /// Context menu, with the reference's items for a row or the empty space.
-    fn context_menu(&mut self, ui: &mut Ui, palette: &Palette, listing: &SftpListing) -> Option<Intent> {
+    fn context_menu(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        listing: &SftpListing,
+    ) -> Option<Intent> {
         let (position, path) = self.menu.clone()?;
-        let entry = path
-            .as_ref()
-            .and_then(|path| listing.entries.iter().find(|entry| &entry.path == path).cloned());
+        let entry = path.as_ref().and_then(|path| {
+            listing
+                .entries
+                .iter()
+                .find(|entry| &entry.path == path)
+                .cloned()
+        });
 
         // One action per item, `None` for a separator, so the chosen index maps
         // straight onto what to do.
@@ -1374,17 +1413,37 @@ impl Files {
         match &entry {
             Some(row) => {
                 if row.is_dir {
-                    push(&mut items, &mut actions, "📂 Open", MenuAction::Open(row.path.clone()));
+                    push(
+                        &mut items,
+                        &mut actions,
+                        "📂 Open",
+                        MenuAction::Open(row.path.clone()),
+                    );
                 }
                 push(&mut items, &mut actions, "⧉ Copy", MenuAction::Copy);
                 if !row.is_dir {
-                    push(&mut items, &mut actions, "👁 View", MenuAction::View(row.path.clone()));
+                    push(
+                        &mut items,
+                        &mut actions,
+                        "👁 View",
+                        MenuAction::View(row.path.clone()),
+                    );
                     push(&mut items, &mut actions, "⬇ Download", MenuAction::Download);
                 } else {
-                    push(&mut items, &mut actions, "⬇ Download as ZIP", MenuAction::ZipSelection);
+                    push(
+                        &mut items,
+                        &mut actions,
+                        "⬇ Download as ZIP",
+                        MenuAction::ZipSelection,
+                    );
                 }
                 push(&mut items, &mut actions, "✎ Rename", MenuAction::Rename);
-                push(&mut items, &mut actions, "🔒 Permissions", MenuAction::Permissions);
+                push(
+                    &mut items,
+                    &mut actions,
+                    "🔒 Permissions",
+                    MenuAction::Permissions,
+                );
                 items.push(MenuItem::Separator);
                 actions.push(None);
                 items.push(MenuItem::danger("🗑 Delete"));
@@ -1394,8 +1453,18 @@ impl Files {
                 if !self.clipboard.is_empty() {
                     push(&mut items, &mut actions, "▣ Paste", MenuAction::Paste);
                 }
-                push(&mut items, &mut actions, "+ New folder", MenuAction::NewFolder);
-                push(&mut items, &mut actions, "⬆ Upload files…", MenuAction::Upload);
+                push(
+                    &mut items,
+                    &mut actions,
+                    "+ New folder",
+                    MenuAction::NewFolder,
+                );
+                push(
+                    &mut items,
+                    &mut actions,
+                    "⬆ Upload files…",
+                    MenuAction::Upload,
+                );
                 push(
                     &mut items,
                     &mut actions,
@@ -1407,9 +1476,8 @@ impl Files {
         }
 
         let chosen = context_menu(ui, palette, position, &items);
-        let dismissed = ui.input(|input| {
-            input.pointer.primary_clicked() || input.key_pressed(egui::Key::Escape)
-        });
+        let dismissed = ui
+            .input(|input| input.pointer.primary_clicked() || input.key_pressed(egui::Key::Escape));
         let Some(choice) = chosen else {
             if dismissed {
                 self.menu = None;
@@ -1446,7 +1514,7 @@ impl Files {
                         vec![row.path.clone()]
                     };
                     let root = file_name(&row.path).unwrap_or("archive").to_owned();
-                    self.begin_zip(items, root);
+                    self.begin_zip(items, root, true);
                 }
                 None
             }
@@ -1489,7 +1557,7 @@ impl Files {
             Some(MenuAction::Upload) => Some(Intent::PickUpload),
             Some(MenuAction::ZipFolder) => {
                 let root = file_name(&self.path).unwrap_or("archive").to_owned();
-                self.begin_zip(vec![self.path.clone()], root);
+                self.begin_zip(self.folder_zip_items(), root, false);
                 None
             }
             Some(MenuAction::Refresh) => Some(Intent::Refresh),
@@ -1510,6 +1578,7 @@ impl Files {
         }
         let muted = to_color32(palette.text_muted);
         let mut retry = false;
+        let mut stop = false;
         egui::Frame::NONE
             .fill(to_color32(palette.bg_panel_2))
             .inner_margin(egui::Margin {
@@ -1530,50 +1599,78 @@ impl Files {
                         TransferState::Failed => to_color32(palette.danger),
                         _ => to_color32(palette.text),
                     };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(row.direction.label())
-                                .size(11.0)
-                                .color(colour),
-                        );
-                        let amount = match (row.state, row.total) {
-                            (TransferState::Failed, _) => "failed".to_owned(),
-                            (TransferState::Queued, _) => "queued".to_owned(),
-                            (_, Some(total)) if total > 0 => format!(
-                                "{} / {}",
-                                format_entry_size(row.done),
-                                format_entry_size(total)
-                            ),
-                            _ => format_entry_size(row.done),
-                        };
-                        let font = egui::FontId::proportional(11.0);
-                        let amount_width = ui
-                            .painter()
-                            .layout_no_wrap(amount.clone(), font, muted)
-                            .size()
-                            .x;
-                        let used = ui.cursor().min.x;
-                        let room = (ui.clip_rect().right() - used - amount_width - CELL_GAP)
-                            .max(24.0);
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(room, 0.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&row.path).size(11.0).color(muted),
-                                    )
-                                    .truncate(),
+                    let row_size = egui::vec2(
+                        ui.max_rect().width(),
+                        Button::new("Stop").compact().size(ui).y,
+                    );
+                    ui.allocate_ui_with_layout(
+                        row_size,
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(row_size.x);
+                            let can_stop = row.state == TransferState::Running;
+                            let inline_message = row.direction == TransferDirection::Zip
+                                && row.state == TransferState::Running;
+                            if !inline_message {
+                                ui.label(
+                                    egui::RichText::new(row.direction.label())
+                                        .size(11.0)
+                                        .color(colour),
                                 );
-                            },
-                        );
-                        ui.label(egui::RichText::new(amount).size(11.0).color(muted));
-                        if row.state == TransferState::Failed
-                            && small_button(ui, palette, "Retry")
-                        {
-                            retry = true;
-                        }
-                    });
+                            }
+                            let amount = row.progress_text.clone().unwrap_or_else(|| match (row.state, row.total) {
+                                (TransferState::Failed, _) => "failed".to_owned(),
+                                (TransferState::Queued, _) => "queued".to_owned(),
+                                (_, Some(total)) if total > 0 => format!(
+                                    "{} / {}",
+                                    format_entry_size(row.done),
+                                    format_entry_size(total)
+                                ),
+                                _ => format_entry_size(row.done),
+                            });
+                            let text = ui
+                                .painter()
+                                .layout_no_wrap(amount.clone(), egui::FontId::proportional(11.0), muted)
+                                .size();
+                            let stop_size = can_stop.then(|| Button::new("Stop").compact().size(ui));
+                            let gap = ui.spacing().item_spacing.x;
+                            let path_right = stop_size
+                                .map(|size| ui.max_rect().right() - size.x - gap)
+                                .unwrap_or_else(|| ui.max_rect().right());
+                            let room = (path_right - ui.cursor().min.x - text.x - gap).max(24.0);
+                            // The message sits on the same baseline as the rest of the row.
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(room, text.y),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.path).size(11.0).color(muted),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            ui.label(egui::RichText::new(amount).size(11.0).color(muted));
+                            if row.state == TransferState::Failed && small_button(ui, palette, "Retry")
+                            {
+                                retry = true;
+                            }
+                            if let Some(size) = stop_size {
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        ui.max_rect().right() - size.x,
+                                        ui.max_rect().center().y - size.y / 2.0,
+                                    ),
+                                    size,
+                                );
+                                let mut stop_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                                if small_button(&mut stop_ui, palette, "Stop") {
+                                    stop = true;
+                                }
+                            }
+                        },
+                    );
                     let track = ui.available_width();
                     let (rect, _) = ui.allocate_exact_size(
                         egui::Vec2::new(track, TRANSFER_TRACK_HEIGHT),
@@ -1584,26 +1681,46 @@ impl Files {
                         TRANSFER_TRACK_HEIGHT / 2.0,
                         faded(palette.border, 0.55),
                     );
-                    let fraction = row.fraction().unwrap_or(0.0);
-                    if fraction > 0.0 {
+                    let fill = match row.fraction() {
+                        Some(fraction) if fraction > 0.0 => {
+                            Some((rect.left(), rect.width() * fraction))
+                        }
+                        // With no total to divide by, a segment sweeps the track so a job
+                        // of unknown length still shows it is moving.
+                        None if row.state == TransferState::Running => {
+                            let width = rect.width() * INDETERMINATE_FILL;
+                            let cycle =
+                                (ui.input(|input| input.time) as f32 / SWEEP_SECONDS).fract();
+                            ui.ctx().request_repaint();
+                            Some((rect.left() + cycle * (rect.width() - width), width))
+                        }
+                        _ => None,
+                    };
+                    if let Some((left, width)) = fill {
                         let filled = egui::Rect::from_min_size(
-                            rect.min,
-                            egui::Vec2::new(rect.width() * fraction, rect.height()),
-                        );
-                        ui.painter().rect_filled(
-                            filled,
-                            TRANSFER_TRACK_HEIGHT / 2.0,
-                            if row.state == TransferState::Failed {
-                                to_color32(palette.danger)
-                            } else {
-                                to_color32(palette.accent)
-                            },
-                        );
+                            egui::pos2(left, rect.top()),
+                            egui::Vec2::new(width, rect.height()),
+                        )
+                        .intersect(rect);
+                        if filled.width() > 0.0 {
+                            ui.painter().rect_filled(
+                                filled,
+                                TRANSFER_TRACK_HEIGHT / 2.0,
+                                if row.state == TransferState::Failed {
+                                    to_color32(palette.danger)
+                                } else {
+                                    to_color32(palette.accent)
+                                },
+                            );
+                        }
                     }
                 }
             });
         if retry {
             access.retry();
+        }
+        if stop {
+            access.stop_transfer();
         }
     }
 
@@ -1683,6 +1800,33 @@ impl Files {
         });
     }
 
+    /// Ask the desktop where the marked items should land.
+    fn spawn_folder(&mut self, items: Vec<String>) {
+        if self.native.is_some() {
+            return;
+        }
+        let (sender, answers) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let dir = self.save_dir.clone();
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("Download to folder");
+            if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
+                dialog = dialog.set_directory(&dir);
+            }
+            let path = dialog.pick_folder();
+            let _ = sender.send(Answer {
+                files: Vec::new(),
+                path,
+                elapsed: started.elapsed(),
+            });
+        });
+        self.native = Some(PendingDialog {
+            answers,
+            kind: NativeDialog::Folder { items },
+            started,
+        });
+    }
+
     /// Ask the desktop where the archive should be written.
     fn spawn_archive(&mut self, items: Vec<String>, name: String, title: &'static str) {
         if self.native.is_some() {
@@ -1751,91 +1895,69 @@ impl Files {
                     remember_dir(&mut self.save_dir, path);
                     access.download(&remote, &path.to_string_lossy());
                 } else if no_portal {
-                    // Fall back to the pane's own dialog for whatever is left.
-                    self.save_queue.push_front((
-                        remote.clone(),
-                        file_name(&remote).unwrap_or("download").to_owned(),
-                    ));
-                    self.start_save_fallback();
-                    return;
+                    let name = file_name(&remote).unwrap_or("download").to_owned();
+                    self.save = Some(SaveRequest {
+                        items: vec![remote],
+                        kind: SaveKind::File,
+                        dir: self.save_start(),
+                        name,
+                    });
                 }
-                self.next_save();
             }
             NativeDialog::Archive { items } => {
                 if let Some(path) = answer.path {
                     remember_dir(&mut self.save_dir, &path);
-                    self.pending_zip = Some((items, with_zip_suffix(path)));
+                    let archive = with_zip_suffix(path);
+                    self.pending_zip = Some((items, archive));
                 } else if no_portal {
                     let name = with_zip_suffix(std::path::PathBuf::from(archive_name(&self.path)));
                     self.save = Some(SaveRequest {
                         items,
-                        zip: true,
+                        kind: SaveKind::Archive,
                         dir: self.save_start(),
                         name: file_name(&name).unwrap_or("archive.zip").to_owned(),
-                        skipped: Vec::new(),
+                    });
+                }
+            }
+            NativeDialog::Folder { items } => {
+                if let Some(path) = answer.path {
+                    remember_dir(&mut self.save_dir, &path);
+                    self.send_downloads(access, items, &path.to_string_lossy());
+                } else if no_portal {
+                    self.save = Some(SaveRequest {
+                        items,
+                        kind: SaveKind::Folder,
+                        dir: self.save_start(),
+                        name: String::new(),
                     });
                 }
             }
         }
     }
 
-    /// Start the save dialog for the next queued file, if any.
-    fn next_save(&mut self) {
-        let Some((remote, name)) = self.save_queue.pop_front() else {
-            return;
-        };
-        if native_dialogs_enabled() {
-            self.spawn_save(remote, name);
-        } else {
-            self.save_queue.push_front((remote, name));
-            self.start_save_fallback();
-        }
-    }
-
-    /// Hand the rest of the batch to the pane's own dialog.
-    fn start_save_fallback(&mut self) {
-        let items: Vec<String> = self
-            .save_queue
-            .iter()
-            .map(|(remote, _)| remote.clone())
-            .collect();
-        self.save_queue.clear();
-        if items.is_empty() {
-            return;
-        }
-        let name = if items.len() == 1 {
-            file_name(&items[0]).unwrap_or("download").to_owned()
-        } else {
-            String::new()
-        };
-        self.save = Some(SaveRequest {
-            items,
-            zip: false,
-            dir: self.save_start(),
-            name,
-            skipped: std::mem::take(&mut self.skipped_folders),
-        });
-    }
-
-    /// Ask where the selected files should be saved.
+    /// Ask once where the marked items should land, then fetch them all there.
     ///
-    /// One dialog per file, like the reference's download loop; nothing is
-    /// written until a path is chosen.
-    fn begin_download(&mut self, access: &mut dyn SessionAccess, listing: &SftpListing) {
+    /// Files and folders both travel, each under its own name.
+    fn begin_download(&mut self, access: &mut dyn SessionAccess) {
         if self.selected.is_empty() {
-            access.report_problem("Select a file to download.");
+            access.report_problem("Select a file or folder to download.");
             return;
         }
-        let (files, skipped) = download_plan(&listing.entries, &self.selected);
-        self.skipped_folders = skipped;
-        if files.is_empty() {
-            // Nothing but folders: an archive is the only way to save them.
-            let root = self.zip_root();
-            self.begin_zip(self.selected.clone(), root);
-            return;
+        self.begin_folder_download(self.selected.clone());
+    }
+
+    /// Ask once where `items` should land, then fetch them there.
+    fn begin_folder_download(&mut self, items: Vec<String>) {
+        if native_dialogs_enabled() {
+            self.spawn_folder(items);
+        } else {
+            self.save = Some(SaveRequest {
+                items,
+                kind: SaveKind::Folder,
+                dir: self.save_start(),
+                name: String::new(),
+            });
         }
-        self.save_queue = files.into();
-        self.next_save();
     }
 
     /// Ask where a single remote path should be saved.
@@ -1846,18 +1968,20 @@ impl Files {
             .find(|entry| entry.path == path)
             .is_some_and(|entry| entry.is_dir);
         if is_dir {
-            let root = file_name(&path).unwrap_or("archive").to_owned();
-            self.begin_zip(vec![path], root);
+            // A folder is fetched whole, keeping its name.
+            self.begin_folder_download(vec![path]);
             return;
         }
-        self.save_queue.clear();
-        self.skipped_folders.clear();
+        let name = file_name(&path).unwrap_or("download").to_owned();
         if native_dialogs_enabled() {
-            self.spawn_save(path.clone(), file_name(&path).unwrap_or("download").to_owned());
+            self.spawn_save(path, name);
         } else {
-            self.save_queue
-                .push_back((path.clone(), file_name(&path).unwrap_or("download").to_owned()));
-            self.start_save_fallback();
+            self.save = Some(SaveRequest {
+                items: vec![path],
+                kind: SaveKind::File,
+                dir: self.save_start(),
+                name,
+            });
         }
     }
 
@@ -1888,12 +2012,23 @@ impl Files {
         format!("{folder}-{}-files", self.selected.len())
     }
 
+    /// Every entry of the folder on screen, for a ZIP of the folder's contents.
+    fn folder_zip_items(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     /// Ask where a ZIP of `items` should be written.
-    fn begin_zip(&mut self, items: Vec<String>, root: String) {
-        let title = if items.len() == 1 && items[0] == self.path {
-            "Save folder as ZIP"
-        } else {
+    ///
+    /// `selection` only picks the dialog's title: the archive itself holds the items
+    /// at its root either way.
+    fn begin_zip(&mut self, items: Vec<String>, root: String, selection: bool) {
+        let title = if selection {
             "Save selection as ZIP"
+        } else {
+            "Save folder as ZIP"
         };
         let name = format!("{root}.zip");
         if native_dialogs_enabled() {
@@ -1901,12 +2036,21 @@ impl Files {
         } else {
             self.save = Some(SaveRequest {
                 items,
-                zip: true,
+                kind: SaveKind::Archive,
                 dir: self.save_start(),
                 name,
-                skipped: Vec::new(),
             });
         }
+    }
+
+    /// Fetch `items` into `dir`, keeping their names.
+    fn send_downloads(&mut self, access: &mut dyn SessionAccess, items: Vec<String>, dir: &str) {
+        let count = items.len();
+        access.download_tree(items, dir);
+        self.notice = Some((
+            format!("Downloading {count} item{} → {dir}", plural(count)),
+            false,
+        ));
     }
 
     /// Start the transfer the save dialog asked for.
@@ -1920,40 +2064,31 @@ impl Files {
             return;
         }
         self.save_dir.clone_from(&dir);
-        if request.zip {
-            let mut name = request.name.trim().to_owned();
-            if name.is_empty() {
-                name = "archive.zip".to_owned();
+        match request.kind {
+            SaveKind::Folder => self.send_downloads(access, request.items, &dir),
+            SaveKind::Archive => {
+                let mut name = request.name.trim().to_owned();
+                if name.is_empty() {
+                    name = "archive.zip".to_owned();
+                }
+                if !name.to_lowercase().ends_with(".zip") {
+                    name.push_str(".zip");
+                }
+                let archive = join_local(&dir, &name);
+                self.pending_zip = Some((request.items, archive));
             }
-            if !name.to_lowercase().ends_with(".zip") {
-                name.push_str(".zip");
+            SaveKind::File => {
+                let Some(remote) = request.items.first() else {
+                    return;
+                };
+                let name = request.name.trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                let local = join_local(&dir, &name);
+                access.download(remote, &local);
+                self.notice = Some((format!("Downloading {name} → {dir}"), false));
             }
-            let archive = join_local(&dir, &name);
-            self.notice = Some((format!("Building {archive}…"), false));
-            self.pending_zip = Some((request.items, archive));
-            return;
-        }
-
-        let single = request.items.len() == 1;
-        let mut queued = 0;
-        for remote in &request.items {
-            let name = if single {
-                request.name.trim().to_owned()
-            } else {
-                file_name(remote).unwrap_or_default().to_owned()
-            };
-            if name.is_empty() {
-                continue;
-            }
-            let local = join_local(&dir, &name);
-            access.download(remote, &local);
-            queued += 1;
-        }
-        if queued > 0 {
-            self.notice = Some((
-                format!("Downloading {queued} file{} → {dir}", plural(queued)),
-                false,
-            ));
         }
     }
 
@@ -1966,13 +2101,12 @@ impl Files {
         let mut go: Option<String> = None;
         let mut close = false;
         let mut confirm = false;
-        let single = request.items.len() == 1;
         let mut folders = local_entries(&request.dir);
         folders.retain(|entry| entry.is_dir);
-        let title = if request.zip {
-            "Save as ZIP"
-        } else {
-            "Save download"
+        let title = match request.kind {
+            SaveKind::File => "Save download",
+            SaveKind::Archive => "Save as ZIP",
+            SaveKind::Folder => "Download to folder",
         };
         let response = modal(
             ui.ctx(),
@@ -2022,35 +2156,25 @@ impl Files {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Name").size(11.0).color(muted));
-                    if request.zip || single {
-                        text_input(ui, palette, &mut request.name, "file name");
-                    } else {
+                    if request.kind == SaveKind::Folder {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new("each file keeps its own name")
+                                egui::RichText::new("each item keeps its own name")
                                     .size(11.0)
                                     .color(muted),
                             )
                             .truncate(),
                         );
+                    } else {
+                        text_input(ui, palette, &mut request.name, "file name");
                     }
                 });
-                if !request.skipped.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Folders are saved as an archive, not copied: {}",
-                            request.skipped.join(", ")
-                        ))
-                        .size(11.0)
-                        .color(to_color32(palette.text_muted)),
-                    );
-                }
                 footer(ui, |ui| {
                     if small_button_enabled(ui, palette, "Cancel", true) {
                         close = true;
                     }
                     let ready = !request.dir.trim().is_empty()
-                        && (!request.name.trim().is_empty() || (!request.zip && !single));
+                        && (request.kind == SaveKind::Folder || !request.name.trim().is_empty());
                     if small_button_enabled(ui, palette, "Save", ready) {
                         confirm = true;
                     }
@@ -2079,7 +2203,9 @@ impl Files {
         let items: Vec<(String, String)> = self
             .clipboard
             .iter()
-            .filter_map(|from| file_name(from).map(|name| (from.clone(), join_remote(&self.path, name))))
+            .filter_map(|from| {
+                file_name(from).map(|name| (from.clone(), join_remote(&self.path, name)))
+            })
             .collect();
         if items.is_empty() {
             access.report_problem("Nothing has been copied.");
@@ -2090,7 +2216,11 @@ impl Files {
         self.notice = Some((
             format!(
                 "{} {} item{}",
-                if self.clipboard_cut { "Moving" } else { "Copying" },
+                if self.clipboard_cut {
+                    "Moving"
+                } else {
+                    "Copying"
+                },
                 count,
                 plural(count)
             ),
@@ -2105,9 +2235,7 @@ impl Files {
     /// Open the local browser that chooses the files to upload.
     fn open_picker(&mut self) {
         self.picker_selected.clear();
-        self.picker = Some(
-            std::env::var("HOME").unwrap_or_else(|_| "/".to_owned()),
-        );
+        self.picker = Some(std::env::var("HOME").unwrap_or_else(|_| "/".to_owned()));
     }
 
     /// The local file browser behind "⬆ Upload…".
@@ -2129,7 +2257,10 @@ impl Files {
         let mut chosen = self.picker_selected.clone();
         let mut entries = local_entries(&directory);
         entries.sort_by(|left, right| {
-            right.is_dir.cmp(&left.is_dir).then_with(|| left.name.cmp(&right.name))
+            right
+                .is_dir
+                .cmp(&left.is_dir)
+                .then_with(|| left.name.cmp(&right.name))
         });
         let response = modal(
             ui.ctx(),
@@ -2139,10 +2270,8 @@ impl Files {
             dialog_width(ui, 560.0),
             |ui| {
                 ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&directory).size(11.0).color(muted),
-                    )
-                    .truncate(),
+                    egui::Label::new(egui::RichText::new(&directory).size(11.0).color(muted))
+                        .truncate(),
                 );
                 ui.add_space(4.0);
                 // Without a minimum the centred dialog hands the list only a
@@ -2186,9 +2315,7 @@ impl Files {
                             }
                         }
                         if entries.is_empty() {
-                            ui.label(
-                                egui::RichText::new("Empty folder").size(12.0).color(muted),
-                            );
+                            ui.label(egui::RichText::new("Empty folder").size(12.0).color(muted));
                         }
                     });
                 ui.add_space(6.0);
@@ -2243,9 +2370,34 @@ impl Files {
         } else {
             VIEW_BYTES
         };
+        let available_viewer_height =
+            (ui.ctx().content_rect().height() - VIEWER_MODAL_CHROME_HEIGHT).max(0.0);
+        let viewer_content_height = available_viewer_height
+            .min(VIEWER_MAX_CONTENT_HEIGHT)
+            .max(available_viewer_height.min(VIEWER_MIN_CONTENT_HEIGHT));
         let content = access.read(&viewer.path, cap);
+        let archive_entries = content.as_ref().and_then(|content| {
+            if is_zip(&viewer.name) && !content.truncated {
+                zip_entries(&content.data)
+            } else {
+                None
+            }
+        });
+        let default_mode = if archive_entries.is_some() {
+            ViewerMode::Plain
+        } else if content
+            .as_ref()
+            .is_some_and(|content| looks_binary(&content.data))
+        {
+            ViewerMode::Hex
+        } else if is_markdown_file(&viewer.name) {
+            ViewerMode::Markdown
+        } else {
+            ViewerMode::Plain
+        };
+        let mut mode = viewer.mode.unwrap_or(default_mode);
+        let mut mode_selected = false;
         let mut close = false;
-        let mut flip = false;
         let mut download = false;
         let response = modal(
             ui.ctx(),
@@ -2255,10 +2407,8 @@ impl Files {
             dialog_width(ui, 720.0),
             |ui| {
                 ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&viewer.path).size(11.0).color(muted),
-                    )
-                    .truncate(),
+                    egui::Label::new(egui::RichText::new(&viewer.path).size(11.0).color(muted))
+                        .truncate(),
                 );
                 if let Some(content) = &content {
                     let kind = if looks_binary(&content.data) {
@@ -2266,7 +2416,8 @@ impl Files {
                     } else {
                         "text"
                     };
-                    let mut meta = format!("{kind} · {}", format_entry_size(content.data.len() as u64));
+                    let mut meta =
+                        format!("{kind} · {}", format_entry_size(content.data.len() as u64));
                     if let Some(total) = viewer.total
                         && total > content.data.len() as u64
                     {
@@ -2274,6 +2425,18 @@ impl Files {
                     }
                     ui.label(egui::RichText::new(meta).size(11.0).color(muted));
                 }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    mode_selected |= ui
+                        .radio_value(&mut mode, ViewerMode::Plain, "Plain")
+                        .clicked();
+                    mode_selected |= ui
+                        .radio_value(&mut mode, ViewerMode::Markdown, "Markdown")
+                        .clicked();
+                    mode_selected |= ui
+                        .radio_value(&mut mode, ViewerMode::Hex, "Hex")
+                        .clicked();
+                });
                 ui.add_space(4.0);
                 match &content {
                     None => {
@@ -2296,12 +2459,10 @@ impl Files {
                             ui.label(egui::RichText::new(banner).size(11.0).color(muted));
                         }
                         // An archive shows its contents instead of a hex dump.
-                        let entries = if is_zip(&viewer.name) && !content.truncated {
-                            zip_entries(&content.data)
-                        } else {
-                            None
-                        };
-                        if let Some(entries) = entries {
+                        if let Some(entries) = archive_entries
+                            .as_ref()
+                            .filter(|_| viewer.mode.is_none() && !mode_selected)
+                        {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} entr{}",
@@ -2313,10 +2474,10 @@ impl Files {
                             );
                             egui::ScrollArea::vertical()
                                 .id_salt("wassh-archive-viewer")
-                                .max_height(360.0)
+                                .max_height(viewer_content_height)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    for entry in &entries {
+                                    for entry in entries {
                                         ui.horizontal(|ui| {
                                             ui.label(
                                                 egui::RichText::new(if entry.is_dir {
@@ -2354,36 +2515,35 @@ impl Files {
                         } else if content.data.is_empty() {
                             ui.label(egui::RichText::new("File is empty").size(12.0).color(muted));
                         } else {
-                            let body = if viewer.hex || binary {
+                            let body = if mode == ViewerMode::Hex {
                                 hex_dump(&content.data)
                             } else {
                                 viewer_text(&content.data)
                             };
                             let label = |ui: &mut Ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&body)
-                                            .monospace()
-                                            .size(11.0)
-                                            .color(to_color32(palette.text)),
-                                    )
-                                    .selectable(true),
-                                );
+                                if mode == ViewerMode::Markdown {
+                                    crate::ai_agent::markdown::render(ui, palette, &body);
+                                } else {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&body)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(to_color32(palette.text)),
+                                        )
+                                        .selectable(true),
+                                    );
+                                }
                             };
-                            // A short file is drawn in place; only a long one
-                            // needs a scroll view around it.
-                            if body.lines().count() <= VIEW_INLINE_LINES {
-                                label(ui);
-                            } else {
-                                egui::ScrollArea::both()
-                                    .id_salt("wassh-file-viewer")
-                                    .max_height(360.0)
-                                    .auto_shrink([false, false])
-                                    .show(ui, label);
-                            }
-                            if binary && !viewer.hex {
+                            egui::ScrollArea::both()
+                                .id_salt("wassh-file-viewer")
+                                .min_scrolled_height(viewer_content_height)
+                                .max_height(viewer_content_height)
+                                .auto_shrink([false, false])
+                                .show(ui, label);
+                            if binary && mode != ViewerMode::Hex {
                                 ui.label(
-                                    egui::RichText::new("Binary file, shown as a hex dump")
+                                    egui::RichText::new("Binary file, shown as text")
                                         .size(11.0)
                                         .color(muted),
                                 );
@@ -2398,10 +2558,6 @@ impl Files {
                     if small_button_enabled(ui, palette, "Download", true) {
                         download = true;
                     }
-                    if small_button_enabled(ui, palette, if viewer.hex { "Text" } else { "Hex" }, true)
-                    {
-                        flip = true;
-                    }
                 });
             },
         );
@@ -2409,8 +2565,8 @@ impl Files {
             self.viewer = None;
             return;
         }
-        if flip && let Some(viewer) = self.viewer.as_mut() {
-            viewer.hex = !viewer.hex;
+        if mode_selected && let Some(viewer) = self.viewer.as_mut() {
+            viewer.mode = Some(mode);
         }
         if download {
             self.begin_download_one(viewer.path.clone());
@@ -2448,64 +2604,64 @@ impl Files {
             title,
             dialog_width(ui, 460.0),
             |ui| {
-            match &mut draft {
-                FileDialog::NewFolder { name } => {
-                    ui.label(egui::RichText::new("NAME").size(11.0).color(muted));
-                    ui.add_space(4.0);
-                    text_input(ui, palette, name, "new folder");
-                }
-                FileDialog::Rename { path, name } => {
-                    ui.label(egui::RichText::new(path.as_str()).size(11.0).color(muted));
-                    ui.add_space(4.0);
-                    text_input(ui, palette, name, "new name");
-                }
-                FileDialog::Permissions { path, mode } => {
-                    ui.label(egui::RichText::new(path.as_str()).size(11.0).color(muted));
-                    ui.add_space(4.0);
-                    text_input(ui, palette, mode, "644");
-                    ui.label(
-                        egui::RichText::new("Octal mode, e.g. 644, 755, 700")
-                            .size(11.0)
-                            .color(muted),
-                    );
-                }
-                FileDialog::Delete { targets } => {
-                    let count = targets.len();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Delete {count} item{}? This cannot be undone.",
-                            plural(count)
-                        ))
-                        .size(12.0),
-                    );
-                    ui.add_space(4.0);
-                    for (path, _) in targets.iter().take(12) {
+                match &mut draft {
+                    FileDialog::NewFolder { name } => {
+                        ui.label(egui::RichText::new("NAME").size(11.0).color(muted));
+                        ui.add_space(4.0);
+                        text_input(ui, palette, name, "new folder");
+                    }
+                    FileDialog::Rename { path, name } => {
+                        ui.label(egui::RichText::new(path.as_str()).size(11.0).color(muted));
+                        ui.add_space(4.0);
+                        text_input(ui, palette, name, "new name");
+                    }
+                    FileDialog::Permissions { path, mode } => {
+                        ui.label(egui::RichText::new(path.as_str()).size(11.0).color(muted));
+                        ui.add_space(4.0);
+                        text_input(ui, palette, mode, "644");
                         ui.label(
-                            egui::RichText::new(file_name(path).unwrap_or(path))
+                            egui::RichText::new("Octal mode, e.g. 644, 755, 700")
                                 .size(11.0)
                                 .color(muted),
                         );
                     }
+                    FileDialog::Delete { targets } => {
+                        let count = targets.len();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Delete {count} item{}? This cannot be undone.",
+                                plural(count)
+                            ))
+                            .size(12.0),
+                        );
+                        ui.add_space(4.0);
+                        for (path, _) in targets.iter().take(12) {
+                            ui.label(
+                                egui::RichText::new(file_name(path).unwrap_or(path))
+                                    .size(11.0)
+                                    .color(muted),
+                            );
+                        }
+                    }
                 }
-            }
-            footer(ui, |ui| {
-                if small_button_enabled(ui, palette, "Cancel", true) {
-                    cancel = true;
-                }
-                let ready = match &draft {
-                    FileDialog::NewFolder { name } => valid_name(name),
-                    FileDialog::Rename { name, .. } => valid_name(name),
-                    FileDialog::Permissions { mode, .. } => parse_mode(mode).is_some(),
-                    FileDialog::Delete { .. } => true,
-                };
-                let label = match &draft {
-                    FileDialog::Delete { .. } => "Delete",
-                    _ => "OK",
-                };
-                if small_button_enabled(ui, palette, label, ready) {
-                    confirm = true;
-                }
-            });
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, "Cancel", true) {
+                        cancel = true;
+                    }
+                    let ready = match &draft {
+                        FileDialog::NewFolder { name } => valid_name(name),
+                        FileDialog::Rename { name, .. } => valid_name(name),
+                        FileDialog::Permissions { mode, .. } => parse_mode(mode).is_some(),
+                        FileDialog::Delete { .. } => true,
+                    };
+                    let label = match &draft {
+                        FileDialog::Delete { .. } => "Delete",
+                        _ => "OK",
+                    };
+                    if small_button_enabled(ui, palette, label, ready) {
+                        confirm = true;
+                    }
+                });
             },
         );
 
@@ -2537,10 +2693,7 @@ impl Files {
                 if let Some(bits) = parse_mode(&mode) {
                     access.chmod(&path, bits);
                     self.notice = Some((
-                        format!(
-                            "Mode {bits:03o} on {}",
-                            file_name(&path).unwrap_or(&path)
-                        ),
+                        format!("Mode {bits:03o} on {}", file_name(&path).unwrap_or(&path)),
                         false,
                     ));
                 }
@@ -2634,6 +2787,10 @@ pub fn column_widths(content: f32, name_need: f32, narrow: &[f32; 3]) -> [f32; 4
 const DIALOG_LIST_HEIGHT: f32 = 320.0;
 /// Height of a transfer's progress track.
 const TRANSFER_TRACK_HEIGHT: f32 = 4.0;
+/// Share of the track covered by the sweep of a job whose size is not known yet.
+const INDETERMINATE_FILL: f32 = 0.3;
+/// Seconds one sweep of that unknown-length segment takes.
+const SWEEP_SECONDS: f32 = 1.4;
 /// Height one transfer row takes, including its track and the gap after it.
 const TRANSFER_ROW_HEIGHT: f32 = 28.0;
 /// Transfer rows shown at once; the list scrolls past this.
@@ -2686,8 +2843,11 @@ fn cell_paint(
 /// The `sftp-toolbar-sep` divider between toolbar groups.
 fn toolbar_separator(ui: &mut Ui, palette: &Palette) {
     let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(1.0, 18.0), egui::Sense::hover());
-    ui.painter()
-        .vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, to_color32(palette.border)));
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        egui::Stroke::new(1.0, to_color32(palette.border)),
+    );
     ui.add_space(4.0);
 }
 
@@ -2738,11 +2898,7 @@ fn paint_notice(ui: &mut Ui, palette: &Palette, area: egui::Rect, message: &str,
         to_color32(palette.text)
     };
     let galley = {
-        let mut job = egui::text::LayoutJob::simple_singleline(
-            message.to_owned(),
-            font,
-            colour,
-        );
+        let mut job = egui::text::LayoutJob::simple_singleline(message.to_owned(), font, colour);
         job.wrap = egui::text::TextWrapping::truncate_at_width((area.width() - 40.0).max(40.0));
         ui.painter().layout_job(job)
     };
@@ -2758,11 +2914,8 @@ fn paint_notice(ui: &mut Ui, palette: &Palette, area: egui::Rect, message: &str,
         egui::Stroke::new(1.0, to_color32(palette.border)),
         egui::StrokeKind::Inside,
     );
-    ui.painter().galley(
-        rect.center() - galley.size() / 2.0,
-        galley,
-        colour,
-    );
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, colour);
 }
 
 /// A message centred in `area` — the reference's `.sftp-empty` block.
@@ -2810,7 +2963,6 @@ pub fn mode_symbolic(entry: &SftpEntry) -> String {
     text
 }
 
-
 /// `—` for a directory, otherwise the size.
 fn size_cell(entry: &SftpEntry) -> String {
     if entry.is_dir {
@@ -2820,35 +2972,12 @@ fn size_cell(entry: &SftpEntry) -> String {
     }
 }
 
-
 /// `YYYY-MM-DD HH:MM`, or `—`.
 fn date_cell(entry: &SftpEntry) -> String {
     entry
         .modified
         .map(format_timestamp)
         .unwrap_or_else(|| "—".to_owned())
-}
-
-/// Files the selection should save, as (remote path, suggested name), plus the
-/// folders that cannot be copied file by file.
-pub fn download_plan(entries: &[SftpEntry], selected: &[String]) -> (Vec<(String, String)>, Vec<String>) {
-    let mut files = Vec::new();
-    let mut skipped = Vec::new();
-    for path in selected {
-        let is_dir = entries
-            .iter()
-            .find(|entry| &entry.path == path)
-            .is_some_and(|entry| entry.is_dir);
-        if is_dir {
-            skipped.push(file_name(path).unwrap_or(path).to_owned());
-        } else {
-            files.push((
-                path.clone(),
-                file_name(path).unwrap_or("download").to_owned(),
-            ));
-        }
-    }
-    (files, skipped)
 }
 
 /// `<root>.zip` for a folder or selection.
@@ -2892,6 +3021,15 @@ pub fn viewer_text(bytes: &[u8]) -> String {
         Err(_) => bytes.iter().map(|byte| *byte as char).collect(),
     };
     text.trim_end_matches(['\n', '\r']).to_owned()
+}
+
+fn is_markdown_file(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md")
+                || extension.eq_ignore_ascii_case("markdown")
+        })
 }
 
 /// A `hexdump -C`-style dump: offset, sixteen bytes, then their characters.
@@ -3058,6 +3196,7 @@ mod tests {
     /// No secret settings in these tests: panes read them through the context.
     static EMPTY_SECRETS: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    const TRANSFER_STOP_TEST_CLICK_INSET: f32 = 2.0;
 
     use super::*;
 
@@ -3087,6 +3226,7 @@ mod tests {
         transferring: bool,
         rows: Vec<TransferRow>,
         retried: usize,
+        stop_count: usize,
         screen: String,
         typed: String,
     }
@@ -3192,6 +3332,10 @@ mod tests {
             self.rows.clone()
         }
 
+        fn stop_transfer(&mut self) {
+            self.stop_count += 1;
+        }
+
         fn retry(&mut self) {
             self.retried += 1;
         }
@@ -3247,7 +3391,6 @@ mod tests {
             false
         }
     }
-
 
     /// A click and release at `pos`.
     fn press(pos: egui::Pos2) -> Vec<egui::Event> {
@@ -3310,7 +3453,11 @@ mod tests {
                         egui::Vec2::new(width, 900.0),
                     )),
                     time: Some(self.time),
-                    events: if pass == 0 { Vec::new() } else { events.clone() },
+                    events: if pass == 0 {
+                        Vec::new()
+                    } else {
+                        events.clone()
+                    },
                     ..Default::default()
                 };
                 let mut settings = serde_json::Map::new();
@@ -3362,7 +3509,11 @@ mod tests {
                         egui::Vec2::new(520.0, 900.0),
                     )),
                     time: Some(self.time),
-                    events: if pass == 0 { Vec::new() } else { events.clone() },
+                    events: if pass == 0 {
+                        Vec::new()
+                    } else {
+                        events.clone()
+                    },
                     hovered_files: (0..hovered)
                         .map(|index| egui::HoveredFile {
                             mime: "text/plain".to_owned(),
@@ -3409,7 +3560,10 @@ mod tests {
                 Some((_, pos)) => *pos,
                 None => panic!(
                     "{label} was not painted; the pane shows {:?}",
-                    texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>()
+                    texts
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
                 ),
             }
         }
@@ -3421,6 +3575,17 @@ mod tests {
 
     /// Draw two frames and return the painted text.
     fn draw(plugin: &mut Files, access: &mut FakeAccess) -> Vec<String> {
+        draw_shapes(plugin, access)
+            .into_iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Draw two frames and return the shapes painted last.
+    fn draw_shapes(plugin: &mut Files, access: &mut FakeAccess) -> Vec<egui::Shape> {
         let ctx = egui::Context::default();
         let palette = Palette::dark();
         let mut settings = serde_json::Map::new();
@@ -3450,9 +3615,7 @@ mod tests {
             let shapes = std::mem::take(&mut output.shapes);
             painted.clear();
             for clipped in shapes {
-                if let egui::Shape::Text(text) = clipped.shape {
-                    painted.push(text.galley.text().to_owned());
-                }
+                painted.push(clipped.shape);
             }
             output.drop_without_applying_deltas();
         }
@@ -3489,7 +3652,10 @@ mod tests {
         draw(&mut plugin, &mut access);
         assert_eq!(access.resolved, ["."]);
         assert_eq!(plugin.current_path(), "/home/dev");
-        assert_eq!(access.requested.first().map(String::as_str), Some("/home/dev"));
+        assert_eq!(
+            access.requested.first().map(String::as_str),
+            Some("/home/dev")
+        );
     }
 
     #[test]
@@ -3503,8 +3669,14 @@ mod tests {
         let has = |needle: &str| painted.iter().any(|text| text == needle);
         assert!(has("Name"), "headings missing from {painted:?}");
         assert!(has("Size"));
-        assert!(has("Permissions"), "the mode column is the permission string");
-        assert!(has("Modified"), "the reference calls the last column Modified");
+        assert!(
+            has("Permissions"),
+            "the mode column is the permission string"
+        );
+        assert!(
+            has("Modified"),
+            "the reference calls the last column Modified"
+        );
         assert!(has("2.0 KB"));
         // One column, one spelling: the symbolic permissions, never the octal.
         assert!(!has("755"), "no octal duplicate: {painted:?}");
@@ -3538,7 +3710,11 @@ mod tests {
         let row = pointer.find(&mut plugin, &mut access, "readme.txt");
         plugin.selected = vec!["/home/dev/readme.txt".to_owned()];
 
-        pointer.frame(&mut plugin, &mut access, vec![egui::Event::PointerMoved(row)]);
+        pointer.frame(
+            &mut plugin,
+            &mut access,
+            vec![egui::Event::PointerMoved(row)],
+        );
         pointer.frame(
             &mut plugin,
             &mut access,
@@ -3585,7 +3761,11 @@ mod tests {
         plugin.selected = vec!["/home/dev/readme.txt".to_owned()];
 
         // Hover the row, then press Delete: the dialog opens, nothing is deleted.
-        pointer.frame(&mut plugin, &mut access, vec![egui::Event::PointerMoved(row)]);
+        pointer.frame(
+            &mut plugin,
+            &mut access,
+            vec![egui::Event::PointerMoved(row)],
+        );
         pointer.frame(
             &mut plugin,
             &mut access,
@@ -3655,10 +3835,13 @@ mod tests {
         let mut plugin = Files::default();
         let mut access = FakeAccess {
             listing: Some(listing()),
-            contents: [("/home/dev/readme.txt".to_owned(), FileContent {
-                data: b"hello".to_vec(),
-                truncated: false,
-            })]
+            contents: [(
+                "/home/dev/readme.txt".to_owned(),
+                FileContent {
+                    data: b"hello".to_vec(),
+                    truncated: false,
+                },
+            )]
             .into_iter()
             .collect(),
             ..FakeAccess::default()
@@ -3696,7 +3879,12 @@ mod tests {
         pointer.click(&mut plugin, &mut access, a);
         let b = pointer.find(&mut plugin, &mut access, "📄 b.txt");
         pointer.click(&mut plugin, &mut access, b);
-        assert_eq!(plugin.picker_selected.len(), 2, "{:?}", plugin.picker_selected);
+        assert_eq!(
+            plugin.picker_selected.len(),
+            2,
+            "{:?}",
+            plugin.picker_selected
+        );
 
         // The footer button sends them into the current folder.
         let upload = pointer.find(&mut plugin, &mut access, "Upload (2)");
@@ -3759,7 +3947,10 @@ mod tests {
 
     #[test]
     fn parent_paths_climb_to_the_root() {
-        assert_eq!(parent_path("/home/alice/file"), Some("/home/alice".to_owned()));
+        assert_eq!(
+            parent_path("/home/alice/file"),
+            Some("/home/alice".to_owned())
+        );
         assert_eq!(parent_path("/home"), Some("/".to_owned()));
         assert_eq!(parent_path("/"), None);
         assert_eq!(parent_path(""), None);
@@ -3781,8 +3972,14 @@ mod tests {
 
     #[test]
     fn remote_paths_join_with_one_separator() {
-        assert_eq!(join_remote("/home/alice", "report.txt"), "/home/alice/report.txt");
-        assert_eq!(join_remote("/home/alice/", "report.txt"), "/home/alice/report.txt");
+        assert_eq!(
+            join_remote("/home/alice", "report.txt"),
+            "/home/alice/report.txt"
+        );
+        assert_eq!(
+            join_remote("/home/alice/", "report.txt"),
+            "/home/alice/report.txt"
+        );
         assert_eq!(join_remote("", "report.txt"), "/report.txt");
         assert_eq!(join_remote("/", "report.txt"), "/report.txt");
     }
@@ -3800,7 +3997,11 @@ mod tests {
     #[test]
     fn modes_are_octal_and_validated() {
         assert_eq!(octal_mode(0o644), "644");
-        assert_eq!(octal_mode(0o100_644), "644", "the file-type bits are dropped");
+        assert_eq!(
+            octal_mode(0o100_644),
+            "644",
+            "the file-type bits are dropped"
+        );
         assert_eq!(parse_mode("644"), Some(0o644));
         assert_eq!(parse_mode(" 755 "), Some(0o755));
         assert_eq!(parse_mode("0o700"), Some(0o700));
@@ -3865,11 +4066,11 @@ mod tests {
             ..FakeAccess::default()
         };
         draw(&mut plugin, &mut access);
-        plugin.begin_zip(vec![plugin.path.clone()], plugin.zip_root());
+        plugin.begin_zip(vec![plugin.path.clone()], plugin.zip_root(), false);
         // Nothing is written until the dialog is confirmed.
         assert!(access.zips.is_empty(), "no archive before a destination");
         let request = plugin.save.clone().expect("a save dialog");
-        assert!(request.zip);
+        assert_eq!(request.kind, SaveKind::Archive);
         assert_eq!(request.name, "dev.zip");
 
         plugin.save.as_mut().unwrap().dir = "/tmp".to_owned();
@@ -3913,7 +4114,7 @@ mod tests {
             "/home/dev/readme.txt".to_owned(),
             "/home/dev/.hidden".to_owned(),
         ];
-        plugin.begin_zip(plugin.selected.clone(), plugin.zip_root());
+        plugin.begin_zip(plugin.selected.clone(), plugin.zip_root(), true);
         // The folder on screen (`dev`) plus how many were picked.
         assert_eq!(plugin.save.as_ref().unwrap().name, "dev-3-files.zip");
         plugin.save.as_mut().unwrap().dir = "/tmp".to_owned();
@@ -3933,7 +4134,7 @@ mod tests {
     fn a_typed_archive_name_gets_its_extension() {
         let mut plugin = Files::default();
         let mut access = FakeAccess::default();
-        plugin.begin_zip(vec!["/home/dev".to_owned()], "dev".to_owned());
+        plugin.begin_zip(vec!["/home/dev".to_owned()], "dev".to_owned(), true);
         let request = plugin.save.as_mut().unwrap();
         request.dir = "/tmp".to_owned();
         request.name = "backup".to_owned();
@@ -3942,6 +4143,29 @@ mod tests {
             plugin.pending_zip.clone().expect("an archive path").1,
             "/tmp/backup.zip"
         );
+    }
+
+    #[test]
+    fn a_folder_zip_packs_its_contents_not_the_folder() {
+        // Nothing marked: the archive of `/home/dev` holds `readme.txt` at its root
+        // rather than a `dev/` wrapper around everything.
+        let mut plugin = Files::default();
+        let mut access = FakeAccess {
+            listing: Some(listing()),
+            ..FakeAccess::default()
+        };
+        draw(&mut plugin, &mut access);
+        assert!(plugin.selected.is_empty());
+        let items = plugin.folder_zip_items();
+        assert!(
+            items.contains(&"/home/dev/readme.txt".to_owned()),
+            "{items:?}"
+        );
+        assert!(
+            !items.contains(&plugin.path),
+            "the folder itself is in the archive: {items:?}"
+        );
+        assert_eq!(plugin.zip_root(), "dev");
     }
 
     #[test]
@@ -3959,16 +4183,146 @@ mod tests {
             path: "/srv/big.iso".to_owned(),
             done: 1024,
             total: Some(2048),
+            progress_text: None,
             state: TransferState::Running,
         }];
         let painted = draw(&mut plugin, &mut access);
         assert!(
             painted.iter().any(|text| text == "1.0 KB / 2.0 KB"),
-            "{painted:?}"
+            "the amount is not shown: {painted:?}"
         );
         assert!(
             painted.iter().any(|text| text == "/srv/big.iso"),
             "{painted:?}"
+        );
+    }
+
+    #[test]
+    fn every_running_transfer_can_be_stopped_from_its_row() {
+        for direction in [
+            TransferDirection::Upload,
+            TransferDirection::Download,
+            TransferDirection::Zip,
+            TransferDirection::Copy,
+        ] {
+            let mut plugin = Files::default();
+            let mut access = FakeAccess {
+                listing: Some(listing()),
+                transferring: true,
+                rows: vec![TransferRow {
+                    direction,
+                    path: "/srv/big.iso".to_owned(),
+                    state: TransferState::Running,
+                    ..TransferRow::default()
+                }],
+                ..FakeAccess::default()
+            };
+            let mut pointer = PointerHarness::new();
+            let shapes = draw_shapes(&mut plugin, &mut access);
+            let track_right = shapes
+                .into_iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(rect)
+                        if (rect.rect.height() - TRANSFER_TRACK_HEIGHT).abs() < 1.0 =>
+                    {
+                        Some(rect.rect.right())
+                    }
+                    _ => None,
+                })
+                .max_by(f32::total_cmp)
+                .expect("transfer track");
+
+            let stop = pointer.find(&mut plugin, &mut access, "Stop");
+            pointer.click(
+                &mut plugin,
+                &mut access,
+                egui::pos2(track_right - TRANSFER_STOP_TEST_CLICK_INSET, stop.y),
+            );
+
+            assert_eq!(
+                access.stop_count,
+                1,
+                "{direction:?} row ignored Stop at track right={track_right}, label={stop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transfer_row_keeps_its_text_on_one_line() {
+        let mut plugin = Files::default();
+        let mut access = FakeAccess {
+            listing: Some(listing()),
+            transferring: true,
+            rows: vec![TransferRow {
+                direction: TransferDirection::Zip,
+                path: "Packing readme.txt".to_owned(),
+                done: 512,
+                total: None,
+                progress_text: None,
+                state: TransferState::Running,
+            }],
+            ..FakeAccess::default()
+        };
+        let expected = ["Packing readme.txt", "512 B"];
+        let mut tops = Vec::new();
+        for shape in draw_shapes(&mut plugin, &mut access) {
+            let egui::Shape::Text(text) = shape else {
+                continue;
+            };
+            let painted = text.galley.text().to_owned();
+            if expected.contains(&painted.as_str()) {
+                // The same labels are painted elsewhere; the row is the last of each.
+                tops.retain(|(other, _)| other != &painted);
+                tops.push((painted, text.pos.y));
+            }
+        }
+        assert_eq!(tops.len(), 2, "the row is not painted: {tops:?}");
+        let (_, first) = tops[0];
+        for (text, top) in &tops {
+            assert!(
+                (top - first).abs() < 1.0,
+                "{text} is off the row's baseline: {tops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_of_unknown_length_still_shows_a_moving_bar() {
+        let mut plugin = Files::default();
+        let mut access = FakeAccess {
+            listing: Some(listing()),
+            transferring: true,
+            rows: vec![TransferRow {
+                direction: TransferDirection::Zip,
+                path: "Packing readme.txt".to_owned(),
+                done: 512,
+                total: None,
+                progress_text: None,
+                state: TransferState::Running,
+            }],
+            ..FakeAccess::default()
+        };
+        let accent = to_color32(Palette::dark().accent);
+        let mut track = None;
+        let mut sweep = None;
+        for shape in draw_shapes(&mut plugin, &mut access) {
+            let egui::Shape::Rect(rect) = shape else {
+                continue;
+            };
+            if (rect.rect.height() - TRANSFER_TRACK_HEIGHT).abs() > 1.0 {
+                continue;
+            }
+            if rect.fill == accent {
+                sweep = Some(rect.rect);
+            } else {
+                track = Some(rect.rect);
+            }
+        }
+        let sweep = sweep.expect("no bar is drawn for a job whose size is not known yet");
+        let track = track.expect("no track is drawn");
+        assert!(
+            (sweep.width() - track.width() * INDETERMINATE_FILL).abs() < 1.0,
+            "the sweep does not cover its share of the track: {sweep:?} in {track:?}"
         );
     }
 
@@ -4078,6 +4432,7 @@ mod tests {
                     path: "/srv/a.txt".to_owned(),
                     done: 2048,
                     total: Some(2048),
+                    progress_text: None,
                     state: TransferState::Done,
                 },
                 TransferRow {
@@ -4085,6 +4440,7 @@ mod tests {
                     path: "/srv/b.txt".to_owned(),
                     done: 512,
                     total: Some(4096),
+                    progress_text: None,
                     state: TransferState::Running,
                 },
                 TransferRow {
@@ -4092,6 +4448,7 @@ mod tests {
                     path: "/srv/c.txt".to_owned(),
                     done: 0,
                     total: None,
+                    progress_text: None,
                     state: TransferState::Failed,
                 },
             ],
@@ -4101,8 +4458,14 @@ mod tests {
         let has = |needle: &str| painted.iter().any(|text| text.contains(needle));
         // Direction, remote path and amount, like the reference's list.
         assert!(painted.iter().any(|text| text == "⬆ Upload"), "{painted:?}");
-        assert!(painted.iter().any(|text| text == "⬇ Download"), "{painted:?}");
-        assert!(painted.iter().any(|text| text == "/srv/a.txt"), "{painted:?}");
+        assert!(
+            painted.iter().any(|text| text == "⬇ Download"),
+            "{painted:?}"
+        );
+        assert!(
+            painted.iter().any(|text| text == "/srv/a.txt"),
+            "{painted:?}"
+        );
         assert!(has("512 B / 4.0 KB"), "{painted:?}");
         assert!(has("failed"), "{painted:?}");
         assert!(painted.iter().any(|text| text == "Retry"), "{painted:?}");
@@ -4125,7 +4488,10 @@ mod tests {
     #[test]
     fn hex_dumps_look_like_hexdump_c() {
         let dump = hex_dump(b"hello world");
-        assert!(dump.starts_with("00000000  68 65 6c 6c 6f 20 77 6f  72 6c 64  "), "{dump}");
+        assert!(
+            dump.starts_with("00000000  68 65 6c 6c 6f 20 77 6f  72 6c 64  "),
+            "{dump}"
+        );
         assert!(dump.contains("|hello world|"), "{dump}");
         // Non-printing bytes become dots in the character column.
         assert!(hex_dump(&[0x00, 0x41]).contains("|.A|"));
@@ -4159,7 +4525,10 @@ mod tests {
         assert_eq!(
             access.copies,
             [(
-                vec![("/srv/report.txt".to_owned(), "/home/dev/report.txt".to_owned())],
+                vec![(
+                    "/srv/report.txt".to_owned(),
+                    "/home/dev/report.txt".to_owned()
+                )],
                 false
             )]
         );
@@ -4182,7 +4551,10 @@ mod tests {
         assert_eq!(
             access.copies,
             [(
-                vec![("/srv/report.txt".to_owned(), "/home/dev/report.txt".to_owned())],
+                vec![(
+                    "/srv/report.txt".to_owned(),
+                    "/home/dev/report.txt".to_owned()
+                )],
                 true
             )]
         );
@@ -4208,13 +4580,87 @@ mod tests {
             name: "readme.txt".to_owned(),
             path: "/home/dev/readme.txt".to_owned(),
             total: Some(2048),
-            hex: false,
+            mode: None,
         });
-        let painted = draw(&mut plugin, &mut access);
+        let text: Vec<(String, egui::Pos2)> = draw_shapes(&mut plugin, &mut access)
+            .into_iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_owned(), text.pos)),
+                _ => None,
+            })
+            .collect();
         assert!(
-            painted.iter().any(|text| text == "hello\nworld"),
-            "{painted:?}"
+            text.iter().any(|(painted, _)| painted == "hello\nworld"),
+            "{text:?}"
         );
+        let content_top = text
+            .iter()
+            .find(|(painted, _)| painted == "hello\nworld")
+            .expect("file content")
+            .1
+            .y;
+        let footer_top = text
+            .iter()
+            .rev()
+            .find(|(painted, _)| painted == "Download")
+            .expect("viewer footer")
+            .1
+            .y;
+        assert!(
+            footer_top - content_top >= VIEWER_MIN_CONTENT_HEIGHT * 0.75,
+            "the text area is still too short: {content_top} to {footer_top}"
+        );
+    }
+
+    #[test]
+    fn the_viewer_renders_markdown_files() {
+        assert!(is_markdown_file("README.MD"));
+        assert!(is_markdown_file("notes.markdown"));
+        assert!(!is_markdown_file("notes.md.txt"));
+
+        let mut plugin = Files::default();
+        let mut access = FakeAccess {
+            listing: Some(listing()),
+            ..FakeAccess::default()
+        };
+        access.contents.insert(
+            "/home/dev/readme.md".to_owned(),
+            FileContent {
+                data: b"# Heading\n\nA **bold** note.\n".to_vec(),
+                truncated: false,
+            },
+        );
+        plugin.viewer = Some(Viewer {
+            name: "readme.md".to_owned(),
+            path: "/home/dev/readme.md".to_owned(),
+            total: None,
+            mode: None,
+        });
+        let text: Vec<String> = draw_shapes(&mut plugin, &mut access)
+            .into_iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let heading_index = text
+            .iter()
+            .position(|painted| painted == "Heading")
+            .expect("rendered heading");
+        for mode in ["Plain", "Markdown", "Hex"] {
+            assert!(
+                text.iter()
+                    .position(|painted| painted == mode)
+                    .is_some_and(|index| index < heading_index),
+                "{mode} control was missing or below the document: {text:?}"
+            );
+        }
+        assert!(text.iter().any(|painted| painted == "Heading"), "{text:?}");
+        assert!(
+            text.iter().any(|painted| painted == "A bold note."),
+            "{text:?}"
+        );
+        assert!(!text.iter().any(|painted| painted.contains("**")), "{text:?}");
     }
 
     #[test]
@@ -4235,14 +4681,14 @@ mod tests {
             name: "blob.bin".to_owned(),
             path: "/home/dev/blob.bin".to_owned(),
             total: None,
-            hex: false,
+            mode: None,
         });
         let painted = draw(&mut plugin, &mut access);
         assert!(
             painted.iter().any(|text| text.contains("00000000")),
             "{painted:?}"
         );
-        assert!(painted.iter().any(|text| text.contains("done as a hex dump") || text.contains("hex dump")), "{painted:?}");
+        assert!(painted.iter().any(|text| text == "Hex"), "{painted:?}");
     }
 
     #[test]
@@ -4259,7 +4705,10 @@ mod tests {
         plugin.send_uploads(&mut access, vec!["/tmp/notes.txt".to_owned()], 0.0);
         assert_eq!(
             access.upload_batches.last().cloned().unwrap_or_default(),
-            [("/tmp/notes.txt".to_owned(), "/home/dev/docs/notes.txt".to_owned())]
+            [(
+                "/tmp/notes.txt".to_owned(),
+                "/home/dev/docs/notes.txt".to_owned()
+            )]
         );
         // Dropping files behaves the same way.
         let items: Vec<(String, String)> = ["/tmp/a.txt", "/tmp/b.txt"]
@@ -4289,7 +4738,10 @@ mod tests {
         plugin.send_uploads(&mut access, vec!["/tmp/notes.txt".to_owned()], 0.0);
         assert_eq!(
             access.upload_batches.last().cloned().unwrap_or_default(),
-            [("/tmp/notes.txt".to_owned(), "/home/dev/notes.txt".to_owned())]
+            [(
+                "/tmp/notes.txt".to_owned(),
+                "/home/dev/notes.txt".to_owned()
+            )]
         );
         assert!(plugin.notice.is_some());
 
@@ -4383,50 +4835,7 @@ mod tests {
     }
 
     #[test]
-    fn a_download_plan_names_every_file_and_reports_folders() {
-        let entries = listing().entries;
-        let (files, skipped) = download_plan(
-            &entries,
-            &[
-                "/home/dev/docs".to_owned(),
-                "/home/dev/readme.txt".to_owned(),
-                "/srv/blob.bin".to_owned(),
-            ],
-        );
-        assert_eq!(
-            files,
-            [
-                ("/home/dev/readme.txt".to_owned(), "readme.txt".to_owned()),
-                ("/srv/blob.bin".to_owned(), "blob.bin".to_owned()),
-            ]
-        );
-        assert_eq!(skipped, ["docs"]);
-    }
-
-    #[test]
-    fn every_file_in_a_batch_gets_its_own_save_step() {
-        let mut plugin = Files::default();
-        let mut access = FakeAccess {
-            listing: Some(listing()),
-            ..FakeAccess::default()
-        };
-        draw(&mut plugin, &mut access);
-        plugin.selected = vec![
-            "/home/dev/readme.txt".to_owned(),
-            "/home/dev/docs".to_owned(),
-        ];
-        let listing = listing();
-        plugin.begin_download(&mut access, &listing);
-        // Without OS dialogs the pane asks once for the whole batch, but the
-        // plan itself is one entry per file (checked above).
-        let request = plugin.save.clone().expect("the fallback dialog");
-        assert_eq!(request.items, ["/home/dev/readme.txt"]);
-        assert_eq!(request.skipped, ["docs"]);
-        assert!(plugin.save_queue.is_empty(), "the queue moved into the dialog");
-    }
-
-    #[test]
-    fn downloading_asks_where_to_save_and_skips_folders() {
+    fn downloading_asks_once_for_the_whole_selection() {
         let mut plugin = Files::default();
         let mut access = FakeAccess {
             listing: Some(listing()),
@@ -4437,24 +4846,33 @@ mod tests {
             "/home/dev/docs".to_owned(),
             "/home/dev/readme.txt".to_owned(),
         ];
-        let listing = listing();
-        plugin.begin_download(&mut access, &listing);
+        plugin.begin_download(&mut access);
 
-        // A destination has to be chosen: nothing moves before that.
-        assert!(access.downloads.is_empty(), "no default download path");
+        // One dialog for the batch, folders included; nothing moves before it.
+        assert!(access.trees.is_empty(), "no default download path");
         let request = plugin.save.clone().expect("a save dialog");
-        assert_eq!(request.items, ["/home/dev/readme.txt"]);
-        assert_eq!(request.name, "readme.txt", "the name is filled in");
-        assert_eq!(request.skipped, ["docs"], "folders are not copied");
+        assert_eq!(request.kind, SaveKind::Folder);
+        assert_eq!(
+            request.items,
+            ["/home/dev/docs", "/home/dev/readme.txt"],
+            "the whole selection travels"
+        );
 
         plugin.save.as_mut().unwrap().dir = "/tmp".to_owned();
         plugin.confirm_save(&mut access);
         assert_eq!(
-            access.downloads,
-            [("/home/dev/readme.txt".to_owned(), "/tmp/readme.txt".to_owned())]
+            access.trees,
+            [(
+                vec![
+                    "/home/dev/docs".to_owned(),
+                    "/home/dev/readme.txt".to_owned()
+                ],
+                "/tmp".to_owned()
+            )]
         );
+        assert!(access.downloads.is_empty(), "no dialog per file");
         let (notice, failed) = plugin.notice.clone().expect("a notice");
-        assert!(notice.contains("Downloading 1 file"), "{notice}");
+        assert!(notice.contains("Downloading 2 items"), "{notice}");
         assert!(!failed);
         assert_eq!(plugin.save_dir, "/tmp", "the folder is remembered");
     }
@@ -4467,17 +4885,21 @@ mod tests {
             ..FakeAccess::default()
         };
         let mut pointer = PointerHarness::new();
-        plugin.selected = vec!["/home/dev/readme.txt".to_owned()];
-        let listing = listing();
-        plugin.begin_download(&mut access, &listing);
+        plugin.begin_download_one("/home/dev/readme.txt".to_owned());
         plugin.save.as_mut().unwrap().dir = "/tmp".to_owned();
 
         let texts = pointer.frame(&mut plugin, &mut access, Vec::new());
         let painted: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
         assert!(painted.contains(&"Save download"), "{painted:?}");
         assert!(painted.contains(&"Name"), "{painted:?}");
-        assert!(painted.contains(&"readme.txt"), "the name is prefilled: {painted:?}");
-        assert!(painted.iter().any(|text| text.contains("/tmp")), "{painted:?}");
+        assert!(
+            painted.contains(&"readme.txt"),
+            "the name is prefilled: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|text| text.contains("/tmp")),
+            "{painted:?}"
+        );
         assert!(painted.contains(&"Save"), "{painted:?}");
         assert!(access.downloads.is_empty());
 
@@ -4486,7 +4908,10 @@ mod tests {
         pointer.click(&mut plugin, &mut access, save);
         assert_eq!(
             access.downloads,
-            [("/home/dev/readme.txt".to_owned(), "/tmp/readme.txt".to_owned())]
+            [(
+                "/home/dev/readme.txt".to_owned(),
+                "/tmp/readme.txt".to_owned()
+            )]
         );
         assert!(plugin.save.is_none(), "the dialog closes");
     }
@@ -4499,10 +4924,12 @@ mod tests {
             ..FakeAccess::default()
         };
         plugin.selected = vec!["/home/dev/readme.txt".to_owned()];
-        let listing = listing();
-        plugin.begin_download(&mut access, &listing);
+        plugin.begin_download(&mut access);
         plugin.save = None;
-        assert!(access.downloads.is_empty());
+        assert!(
+            access.trees.is_empty(),
+            "nothing is fetched without a folder"
+        );
         assert!(plugin.notice.is_none());
     }
 
@@ -4522,46 +4949,24 @@ mod tests {
     }
 
     #[test]
-    fn several_downloads_keep_their_own_names() {
+    fn a_selection_of_files_keeps_their_own_names() {
         let mut plugin = Files::default();
         let mut access = FakeAccess::default();
         plugin.selected = vec!["/srv/a.txt".to_owned(), "/srv/b.txt".to_owned()];
-        plugin.begin_download(&mut access, &SftpListing {
-            path: "/srv".to_owned(),
-            entries: vec![
-                SftpEntry {
-                    name: "a.txt".to_owned(),
-                    path: "/srv/a.txt".to_owned(),
-                    is_dir: false,
-                    is_link: false,
-                    size: 1,
-                    modified: None,
-                    permissions: None,
-                },
-                SftpEntry {
-                    name: "b.txt".to_owned(),
-                    path: "/srv/b.txt".to_owned(),
-                    is_dir: false,
-                    is_link: false,
-                    size: 1,
-                    modified: None,
-                    permissions: None,
-                },
-            ],
-        });
+        plugin.begin_download(&mut access);
         plugin.save.as_mut().unwrap().dir = "/tmp".to_owned();
         plugin.confirm_save(&mut access);
         assert_eq!(
-            access.downloads,
-            [
-                ("/srv/a.txt".to_owned(), "/tmp/a.txt".to_owned()),
-                ("/srv/b.txt".to_owned(), "/tmp/b.txt".to_owned()),
-            ]
+            access.trees,
+            [(
+                vec!["/srv/a.txt".to_owned(), "/srv/b.txt".to_owned()],
+                "/tmp".to_owned()
+            )]
         );
     }
 
     #[test]
-    fn a_folder_only_selection_falls_back_to_a_zip() {
+    fn a_folder_selection_is_downloaded_as_a_folder() {
         let mut plugin = Files::default();
         let mut access = FakeAccess {
             listing: Some(listing()),
@@ -4569,12 +4974,17 @@ mod tests {
         };
         draw(&mut plugin, &mut access);
         plugin.selected = vec!["/home/dev/docs".to_owned()];
-        let listing = listing();
-        plugin.begin_download(&mut access, &listing);
-        let request = plugin.save.expect("a save dialog");
-        assert!(request.zip, "there is no file to copy a folder to");
+        plugin.begin_download(&mut access);
+        let request = plugin.save.clone().expect("a save dialog");
+        assert_eq!(request.kind, SaveKind::Folder, "no archive for a folder");
         assert_eq!(request.items, ["/home/dev/docs"]);
-        assert_eq!(request.name, "docs.zip");
+
+        plugin.save.as_mut().unwrap().dir = "/tmp".to_owned();
+        plugin.confirm_save(&mut access);
+        assert_eq!(
+            access.trees,
+            [(vec!["/home/dev/docs".to_owned()], "/tmp".to_owned())]
+        );
         assert!(access.downloads.is_empty());
     }
 }
