@@ -10,8 +10,8 @@ use std::sync::mpsc::{Receiver, channel};
 
 use super::{local_exec, local_files};
 use wassh_core::{
-    AuthMethod, ConnectionParams, ConnectionType, DockEdge, DockPlacement, Palette, ReconnectMode,
-    SessionStatus, SessionStyleDefaults, TabPluginLayout,
+    AuthMethod, ConnectionParams, ConnectionType, DockEdge, DockPlacement, Palette, SessionStatus,
+    SessionStyleDefaults, TabPluginLayout,
 };
 use wassh_plugins::files::{TransferDirection, TransferState};
 use wassh_ui::dock::HeaderHealth;
@@ -309,62 +309,23 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
-    /// Spawn a local shell tab.
+    /// Spawn a local shell tab, belonging to the built-in local terminal host.
     pub fn new_local(
         id: impl Into<String>,
         palette: &Palette,
         defaults: &SessionStyleDefaults,
         term_type: &str,
         size: TerminalSize,
+        params: ConnectionParams,
     ) -> Self {
-        let (events_tx, events) = channel();
-        let terminal = Terminal::new(
-            size,
-            defaults.scrollback as usize,
-            events_tx,
+        let mut entry = Self::prepare(
+            id,
             palette,
+            defaults,
+            size,
+            params,
+            Some(wassh_core::LOCAL_HOST_ID.to_owned()),
         );
-        let mut entry = Self {
-            id: id.into(),
-            title: "Local terminal".to_owned(),
-            status: SessionStatus::Connecting,
-            error: None,
-            terminal,
-            events,
-            view: TerminalView::with_font_size(f32::from(defaults.font_size)),
-            backend: Backend::Closed,
-            palette: *palette,
-            connection: ConnectionParams {
-                kind: ConnectionType::Local,
-                reconnect: ReconnectMode::None,
-                ..ConnectionParams::default()
-            },
-            host_id: None,
-            host_key_prompt: None,
-            auth_prompt: None,
-            exit_reported: false,
-            secrets: Secrets::default(),
-            status_message: None,
-            reconnect_attempt: 0,
-            retry_at: None,
-            command_override: None,
-            jumps: Vec::new(),
-            jump_error: None,
-            probe: None,
-            pending_open: None,
-            files: RemoteFiles::default(),
-            status_history: std::sync::Arc::new(Vec::new()),
-            commands: RemoteCommands::default(),
-            forwards: RemoteForwards::default(),
-            login: None,
-            suppress_close: false,
-            layout: TabPluginLayout::empty(),
-            panes: Vec::new(),
-            plugin_overrides: wassh_core::PluginSettings::new(),
-            plugin_secret_overrides: std::collections::BTreeMap::new(),
-            snapshot: std::cell::RefCell::new(None),
-        };
-        entry.apply_style(defaults);
         entry.start_local(term_type);
         entry
     }
@@ -3322,9 +3283,11 @@ mod tests {
             &SessionStyleDefaults::default(),
             "xterm-256color",
             TerminalSize::new(80, 24),
+            local_params(),
         );
         assert!(entry.is_live(), "status was {:?}", entry.status);
         assert_eq!(entry.title, "Local terminal");
+        assert_eq!(entry.host_id.as_deref(), Some(wassh_core::LOCAL_HOST_ID));
     }
 
     #[test]
@@ -3481,6 +3444,7 @@ mod tests {
             &SessionStyleDefaults::default(),
             "xterm-256color",
             TerminalSize::new(80, 24),
+            local_params(),
         );
         // A local shell starts up and stays connected.
         entry.pump("xterm-256color");
@@ -3611,6 +3575,14 @@ mod tests {
         assert!(result.failure.is_none());
     }
 
+    /// Parameters a local tab opens with.
+    fn local_params() -> ConnectionParams {
+        ConnectionParams {
+            kind: ConnectionType::Local,
+            ..ConnectionParams::default()
+        }
+    }
+
     /// A local tab, with a shell of its own.
     fn local_entry(id: &str) -> SessionEntry {
         SessionEntry::new_local(
@@ -3619,6 +3591,7 @@ mod tests {
             &SessionStyleDefaults::default(),
             "xterm-256color",
             TerminalSize::new(80, 24),
+            local_params(),
         )
     }
 
@@ -4548,6 +4521,7 @@ mod tests {
             &SessionStyleDefaults::default(),
             "xterm-256color",
             TerminalSize::new(80, 24),
+            local_params(),
         );
         entry.connection.kind = ConnectionType::Serial;
         entry.connection.serial.path = "/dev/wassh-missing".to_owned();

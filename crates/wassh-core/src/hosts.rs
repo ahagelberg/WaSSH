@@ -2,9 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::connection::ConnectionParams;
+use crate::connection::{ConnectionParams, ConnectionType};
 use crate::settings::PluginSettings;
 use crate::theme::Rgba;
+
+/// Id of the built-in host every local terminal tab belongs to.
+pub const LOCAL_HOST_ID: &str = "local";
+
+/// Name shown for the built-in host until the user renames it.
+pub const LOCAL_HOST_NAME: &str = "Local terminal";
 
 /// A sidebar group.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,12 +39,32 @@ pub struct HostProfile {
 }
 
 impl HostProfile {
+    /// The built-in host local terminal tabs belong to.
+    pub fn local() -> Self {
+        Self {
+            id: LOCAL_HOST_ID.to_owned(),
+            name: LOCAL_HOST_NAME.to_owned(),
+            connection: ConnectionParams {
+                kind: ConnectionType::Local,
+                ..ConnectionParams::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Whether this is the built-in local terminal host.
+    pub fn is_local(&self) -> bool {
+        self.id == LOCAL_HOST_ID
+    }
+
     /// Name shown in the sidebar; falls back to the endpoint when unnamed.
     pub fn display_name(&self) -> &str {
-        if self.name.trim().is_empty() {
-            self.connection.host.as_str()
-        } else {
+        if !self.name.trim().is_empty() {
             self.name.as_str()
+        } else if self.connection.kind == ConnectionType::Local {
+            LOCAL_HOST_NAME
+        } else {
+            self.connection.host.as_str()
         }
     }
 
@@ -71,9 +97,15 @@ pub struct HostsDocument {
 
 impl HostsDocument {
     /// Remove duplicates and dangling references, then normalise every connection.
+    ///
+    /// The local terminal host is added here when missing, so it is always present
+    /// in the document and in the sidebar.
     pub fn normalized(mut self) -> Self {
         let mut seen_hosts = std::collections::HashSet::new();
         self.hosts.retain(|host| !host.id.is_empty() && seen_hosts.insert(host.id.clone()));
+        if !self.hosts.iter().any(HostProfile::is_local) {
+            self.hosts.insert(0, HostProfile::local());
+        }
 
         let mut seen_groups = std::collections::HashSet::new();
         self.groups
@@ -82,6 +114,12 @@ impl HostsDocument {
         let known_group_ids: std::collections::HashSet<_> =
             self.groups.iter().map(|group| group.id.clone()).collect();
         for host in &mut self.hosts {
+            // The built-in host is a local terminal in the ungrouped list, whatever
+            // the document says it was saved as.
+            if host.is_local() {
+                host.connection.kind = ConnectionType::Local;
+                host.group_id = None;
+            }
             let group_id = host.group_id.clone();
             if let Some(group_id) = group_id
                 && !known_group_ids.contains(&group_id)
@@ -113,6 +151,9 @@ impl HostsDocument {
             .collect();
         self.ungrouped_host_ids
             .retain(|id| !grouped.contains(id));
+        // The local terminal is pinned first so it never moves or gets lost in a group.
+        self.ungrouped_host_ids.retain(|id| id != LOCAL_HOST_ID);
+        self.ungrouped_host_ids.insert(0, LOCAL_HOST_ID.to_owned());
         self
     }
 
@@ -162,7 +203,13 @@ impl HostsDocument {
     }
 
     /// Remove a host, its organisation entries and any jump-host references to it.
+    ///
+    /// The built-in local terminal host is never removed: it returns `None` and the
+    /// document keeps it.
     pub fn remove(&mut self, id: &str) -> Option<HostProfile> {
+        if id == LOCAL_HOST_ID {
+            return None;
+        }
         let index = self.hosts.iter().position(|host| host.id == id)?;
         let removed = self.hosts.remove(index);
         self.ungrouped_host_ids.retain(|existing| existing != id);
@@ -204,7 +251,10 @@ mod tests {
         .normalized();
         assert_eq!(doc.host("a").unwrap().group_id, None);
         assert_eq!(doc.host("b").unwrap().group_id.as_deref(), Some("g1"));
-        assert_eq!(doc.ungrouped_host_ids, vec!["a".to_owned()]);
+        assert_eq!(
+            doc.ungrouped_host_ids,
+            vec![LOCAL_HOST_ID.to_owned(), "a".to_owned()]
+        );
     }
 
     #[test]
@@ -228,7 +278,7 @@ mod tests {
             ..Default::default()
         }
         .normalized();
-        assert_eq!(doc.hosts.len(), 1);
+        assert_eq!(doc.hosts.len(), 2);
         assert_eq!(doc.groups.len(), 1);
     }
 
@@ -242,7 +292,12 @@ mod tests {
         .normalized();
         assert_eq!(
             doc.ungrouped_host_ids,
-            vec!["b".to_owned(), "a".to_owned(), "c".to_owned()]
+            vec![
+                LOCAL_HOST_ID.to_owned(),
+                "b".to_owned(),
+                "a".to_owned(),
+                "c".to_owned()
+            ]
         );
     }
 
@@ -260,7 +315,50 @@ mod tests {
             ..Default::default()
         }
         .normalized();
-        assert_eq!(doc.ungrouped_host_ids, vec!["a".to_owned()]);
+        assert_eq!(
+            doc.ungrouped_host_ids,
+            vec![LOCAL_HOST_ID.to_owned(), "a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_local_terminal_host_is_always_present() {
+        let doc = HostsDocument::default().normalized();
+        let local = doc.host(LOCAL_HOST_ID).expect("built-in host");
+        assert_eq!(local.connection.kind, ConnectionType::Local);
+        assert_eq!(local.display_name(), LOCAL_HOST_NAME);
+        assert_eq!(doc.ungrouped_host_ids, vec![LOCAL_HOST_ID.to_owned()]);
+    }
+
+    #[test]
+    fn the_local_terminal_host_keeps_its_identity() {
+        let mut impostor = host(LOCAL_HOST_ID, Some("g1"));
+        impostor.connection.kind = ConnectionType::Ssh;
+        impostor.connection.host = "example.com".to_owned();
+        let doc = HostsDocument {
+            groups: vec![HostGroup {
+                id: "g1".to_owned(),
+                name: "Prod".to_owned(),
+                color: None,
+                collapsed: false,
+            }],
+            hosts: vec![impostor],
+            ungrouped_host_ids: vec!["x".to_owned()],
+            ..Default::default()
+        }
+        .normalized();
+        let local = doc.host(LOCAL_HOST_ID).expect("built-in host");
+        assert_eq!(local.connection.kind, ConnectionType::Local);
+        assert_eq!(local.connection.host, "");
+        assert_eq!(local.group_id, None);
+        assert_eq!(doc.ungrouped_host_ids, vec![LOCAL_HOST_ID.to_owned()]);
+    }
+
+    #[test]
+    fn the_local_terminal_host_cannot_be_removed() {
+        let mut doc = HostsDocument::default().normalized();
+        assert!(doc.remove(LOCAL_HOST_ID).is_none());
+        assert!(doc.host(LOCAL_HOST_ID).is_some());
     }
 
     #[test]

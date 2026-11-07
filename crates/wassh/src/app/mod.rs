@@ -695,6 +695,7 @@ impl Shell {
                     &self.settings.session_style_defaults,
                     &self.settings.term_type,
                     self.last_terminal_size,
+                    self.local_params(),
                 );
                 self.sessions.push(entry);
                 if let (Some(session), Some(layout)) =
@@ -866,8 +867,20 @@ impl Shell {
             &self.settings.session_style_defaults,
             &self.settings.term_type,
             self.last_terminal_size,
+            self.local_params(),
         );
         self.push_session(entry);
+    }
+
+    /// Parameters a new local tab opens with: the built-in host's style, as a local shell.
+    fn local_params(&self) -> ConnectionParams {
+        let mut params = self
+            .hosts
+            .host(wassh_core::LOCAL_HOST_ID)
+            .map(|host| host.connection.clone())
+            .unwrap_or_default();
+        params.kind = ConnectionType::Local;
+        params.normalized()
     }
 
     /// Open an SSH tab whose password is typed into the terminal itself.
@@ -1493,7 +1506,10 @@ impl Shell {
     }
 
     fn delete_host(&mut self, id: &str) {
-        self.hosts.remove(id);
+        // The built-in local terminal host is never removed by `hosts.remove`.
+        if self.hosts.remove(id).is_none() {
+            return;
+        }
         self.touch_plugin_data();
         if let Some(store) = self.secrets.as_mut() {
             let _ = store.set_password(id, None);
@@ -2476,13 +2492,16 @@ impl Shell {
                 self.persist_hosts();
             }
             wassh_ui::SidebarAction::HostContext(id, (x, y)) => {
-                let items = vec![
+                let mut items = vec![
                     MenuItem::new("Connect"),
                     MenuItem::new("Edit host…"),
                     MenuItem::new("Duplicate host"),
-                    MenuItem::separator(),
-                    MenuItem::danger("Delete host"),
                 ];
+                // The built-in local terminal host cannot be deleted.
+                if !self.hosts.host(&id).is_some_and(HostProfile::is_local) {
+                    items.push(MenuItem::separator());
+                    items.push(MenuItem::danger("Delete host"));
+                }
                 self.menu.open_at(Pos2::new(x as f32, y as f32), items);
                 self.menu_target = Some(format!("host:{id}"));
             }
@@ -4596,6 +4615,7 @@ mod tests {
             &shell.settings.session_style_defaults,
             "xterm-256color",
             TerminalSize::new(80, 24),
+            shell.local_params(),
         );
         entry.host_id = Some("h1".to_owned());
         shell.sessions.push(entry);
@@ -4818,6 +4838,7 @@ mod tests {
                 &shell.settings.session_style_defaults,
                 "xterm-256color",
                 TerminalSize::new(80, 24),
+                shell.local_params(),
             );
             entry.host_id = Some("h1".to_owned());
             entry.connection = host.connection.clone();
@@ -4885,6 +4906,7 @@ mod tests {
                 &shell.settings.session_style_defaults,
                 "xterm-256color",
                 TerminalSize::new(80, 24),
+                shell.local_params(),
             );
             entry.host_id = Some("h1".to_owned());
             shell.sessions.push(entry);
@@ -5030,21 +5052,33 @@ mod tests {
 
         shell.duplicate_host("host-2");
 
-        let ids: Vec<_> = shell.hosts.hosts.iter().map(|host| host.id.as_str()).collect();
+        let copy_id = shell
+            .hosts
+            .hosts
+            .iter()
+            .find(|host| host.name == "Beta (copy)")
+            .map(|host| host.id.clone())
+            .expect("copy saved");
         let names: Vec<_> = shell
             .hosts
             .hosts
             .iter()
+            .filter(|host| !host.is_local())
             .map(|host| host.name.as_str())
             .collect();
         assert_eq!(names, ["Alpha", "Beta", "Beta (copy)"]);
-        // The ungrouped order matches the document order.
+        // The ungrouped order matches the document order, after the built-in host.
         assert_eq!(
             shell.hosts.ungrouped_host_ids,
-            ["host-1", "host-2", ids[2]]
+            [
+                wassh_core::LOCAL_HOST_ID.to_owned(),
+                "host-1".to_owned(),
+                "host-2".to_owned(),
+                copy_id.clone(),
+            ]
         );
 
-        let copy = &shell.hosts.hosts[2];
+        let copy = shell.hosts.host(&copy_id).expect("copy saved");
         assert_ne!(copy.id, "host-2", "the copy gets a fresh id");
         assert_eq!(copy.connection.host, "host-2.example.com");
         assert_eq!(copy.connection.port, 2222);
@@ -5052,7 +5086,7 @@ mod tests {
         assert_eq!(copy.group_id, None);
         // It is on disk too.
         let stored = shell.config.as_ref().expect("config").hosts.get();
-        assert_eq!(stored.hosts.len(), 3);
+        assert_eq!(stored.hosts.len(), 4);
     }
 
     #[test]
@@ -5076,7 +5110,10 @@ mod tests {
             .map(|host| host.name.as_str())
             .collect();
         assert_eq!(members, ["Alpha", "Alpha (copy)", "Beta"]);
-        assert!(shell.hosts.ungrouped_host_ids.is_empty());
+        assert_eq!(
+            shell.hosts.ungrouped_host_ids,
+            [wassh_core::LOCAL_HOST_ID.to_owned()]
+        );
     }
 
     #[test]
@@ -5084,7 +5121,8 @@ mod tests {
         let mut shell = Shell::new_with(Some(scratch_config()), false);
         shell.save_host(host("host-1", "Alpha", None));
         shell.duplicate_host("nope");
-        assert_eq!(shell.hosts.hosts.len(), 1);
+        assert_eq!(shell.hosts.hosts.len(), 2);
+        assert!(shell.hosts.host("nope").is_none());
     }
 
     #[test]

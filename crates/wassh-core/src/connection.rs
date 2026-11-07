@@ -404,6 +404,8 @@ impl ConnectionParams {
                 self.port = 0;
                 self.username.clear();
                 self.auth = AuthMethod::None;
+                // A local shell has no transport to dial again.
+                self.reconnect = ReconnectMode::None;
             }
             ConnectionType::Serial => {
                 self.port = 0;

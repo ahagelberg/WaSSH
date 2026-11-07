@@ -137,7 +137,12 @@ impl SidebarState {
 
 /// Subtitle for a host row: `user@host:port`, `host:port` or the serial description.
 pub fn host_meta(host: &HostProfile) -> String {
-    host.connection.subtitle()
+    // The built-in local terminal's name already says what it is.
+    if host.is_local() {
+        String::new()
+    } else {
+        host.connection.subtitle()
+    }
 }
 
 /// Draw the whole sidebar, returning the first action the user triggered.
@@ -737,8 +742,9 @@ fn host_row(
         );
     }
 
-    // Track drag progress to compute the drop slot under the pointer.
-    if response.drag_started() {
+    // Track drag progress to compute the drop slot under the pointer. The built-in
+    // local terminal stays where it is, so it does not start a drag.
+    if response.drag_started() && !host.is_local() {
         state.drag = Some(HostDrag {
             host: host.id.clone(),
             active: false,
@@ -932,6 +938,21 @@ mod tests {
             output.drop_without_applying_deltas();
         }
         labels
+    }
+
+    #[test]
+    fn the_local_terminal_row_shows_its_name_once() {
+        let hosts = HostsDocument::default().normalized();
+        let mut state = SidebarState::new();
+        let labels = painted_text(&egui::Context::default(), &hosts, &mut state);
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| *label == "Local terminal")
+                .count(),
+            1,
+            "labels were {labels:?}"
+        );
     }
 
     #[test]

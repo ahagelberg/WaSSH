@@ -150,7 +150,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use wassh_core::{ConnectionParams, ConnectionType, HostProfile};
+    use wassh_core::{ConnectionParams, ConnectionType, HostProfile, LOCAL_HOST_ID};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -200,7 +200,8 @@ mod tests {
         );
         let hosts = config.hosts.get();
         assert_eq!(
-            hosts.hosts[0].plugin_settings["docker-manager"]["socketPath"],
+            hosts.host("h1").expect("saved host").plugin_settings["docker-manager"]
+                ["socketPath"],
             serde_json::json!("/run/docker.sock")
         );
         // The file uses the camelCase key the Electron app writes.
@@ -251,7 +252,10 @@ mod tests {
         let config = Config::open(&dir).unwrap();
         assert_eq!(config.settings.get().theme, wassh_core::ThemeMode::Light);
         assert!(config.settings.get().plugin_enabled("sftp"));
-        assert!(config.hosts.get().hosts.is_empty());
+        // A fresh document holds only the built-in local terminal host.
+        let hosts = config.hosts.get();
+        assert_eq!(hosts.hosts.len(), 1);
+        assert!(hosts.host(LOCAL_HOST_ID).is_some());
         assert!(config.tabs.get().is_empty());
         fs::remove_dir_all(&dir).ok();
     }
@@ -328,7 +332,20 @@ mod tests {
         let reloaded = Config::open(&dir).unwrap();
         let host = reloaded.hosts.get().host("h1").expect("host saved");
         assert_eq!(host.connection.port, 22);
-        assert_eq!(reloaded.hosts.get().ungrouped_host_ids, vec!["h1".to_owned()]);
+        assert_eq!(
+            reloaded.hosts.get().ungrouped_host_ids,
+            vec![LOCAL_HOST_ID.to_owned(), "h1".to_owned()]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_local_terminal_host_survives_a_delete() {
+        let dir = scratch();
+        let mut config = Config::open(&dir).unwrap();
+        config.delete_host(LOCAL_HOST_ID).unwrap();
+        let reloaded = Config::open(&dir).unwrap();
+        assert!(reloaded.hosts.get().host(LOCAL_HOST_ID).is_some());
         fs::remove_dir_all(&dir).ok();
     }
 

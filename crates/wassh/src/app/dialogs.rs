@@ -528,7 +528,7 @@ impl HostState {
 
     /// Whether the dialog deletes a host rather than discarding a draft.
     pub fn can_delete(&self) -> bool {
-        self.target == HostTarget::Host && self.saved
+        self.target == HostTarget::Host && self.saved && !self.draft.is_local()
     }
 
     /// Record which secrets are already stored for this host.
@@ -2351,6 +2351,15 @@ fn host_connection(
         );
     }
     row(ui, palette, "Type", None, |ui| {
+        // The built-in local terminal host is a local shell by definition.
+        if draft.is_local() {
+            ui.label(
+                egui::RichText::new("Local terminal")
+                    .size(12.0)
+                    .color(to_color32(palette.text_muted)),
+            );
+            return;
+        }
         let options = [
             (ConnectionType::Ssh, "SSH"),
             (ConnectionType::Telnet, "Telnet"),
@@ -2578,7 +2587,9 @@ fn host_advanced(
                     draft.connection.jump_host_id = None;
                 }
                 for host in hosts {
-                    if host.id == draft.id {
+                    // A host is reached from the session it jumps through, so the
+                    // local terminal cannot be one.
+                    if host.id == draft.id || host.connection.kind == ConnectionType::Local {
                         continue;
                     }
                     let selected = current.as_deref() == Some(host.id.as_str());
