@@ -28,7 +28,7 @@ pub use chart::line_chart;
 pub use meter::{RING_STROKE, bar_meter, faded, ring_gauge, segmented_bar};
 pub use checkbox::checkbox;
 pub use color::{color_picker_button, hex_color_input, parse_hex_draft, rgba_from_color32};
-pub use field::{field, password_input, search_input, text_area, text_input};
+pub use field::{field, password_input, search_input, text_area, text_area_with_id, text_input};
 pub use menu::{MenuItem, MenuState, context_menu};
 pub use modal::{ModalResponse, footer, modal};
 pub use number::{clamp_value, number_input};

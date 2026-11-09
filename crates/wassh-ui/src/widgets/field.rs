@@ -54,13 +54,39 @@ pub fn text_area(
     rows: usize,
     placeholder: &str,
 ) -> Response {
-    let edit = egui::TextEdit::multiline(text)
+    add_text_area(ui, palette, text, rows, placeholder, None)
+}
+
+/// Multi-line text input with an explicit widget id that survives parent layout changes.
+pub fn text_area_with_id(
+    ui: &mut Ui,
+    palette: &Palette,
+    text: &mut String,
+    rows: usize,
+    placeholder: &str,
+    id: egui::Id,
+) -> Response {
+    add_text_area(ui, palette, text, rows, placeholder, Some(id))
+}
+
+fn add_text_area(
+    ui: &mut Ui,
+    palette: &Palette,
+    text: &mut String,
+    rows: usize,
+    placeholder: &str,
+    id: Option<egui::Id>,
+) -> Response {
+    let mut edit = egui::TextEdit::multiline(text)
         .hint_text(placeholder)
         .background_color(to_color32(palette.bg_input))
         .text_color(to_color32(palette.text))
         .margin(egui::Margin::symmetric(8, 6))
         .desired_rows(rows)
         .desired_width(f32::INFINITY);
+    if let Some(id) = id {
+        edit = edit.id(id);
+    }
     ui.add(edit)
 }
 

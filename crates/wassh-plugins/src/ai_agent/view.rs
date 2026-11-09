@@ -13,7 +13,7 @@ use wassh_core::{Palette, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, password_input, select_str, select_width, small_button,
-    small_button_enabled, text_area,
+    small_button_enabled, text_area, text_area_with_id,
 };
 
 use super::agent::{
@@ -259,6 +259,8 @@ pub struct AiAgent {
     keys: std::collections::BTreeMap<String, String>,
     /// What the user is typing.
     draft: String,
+    /// Stable identity so conditional prompt cards cannot unset composer focus.
+    composer_id: egui::Id,
     /// A message typed while a run was in flight, sent when it ends.
     queued: Option<Queued>,
     /// Files attached to the next message.
@@ -307,6 +309,7 @@ impl Default for AiAgent {
             model: String::new(),
             keys: std::collections::BTreeMap::new(),
             draft: String::new(),
+            composer_id: egui::Id::unique("ai-agent-composer"),
             queued: None,
             attachments: Vec::new(),
             attach_terminal: false,
@@ -2097,8 +2100,14 @@ impl Plugin for AiAgent {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(room);
-                            let response =
-                                text_area(ui, palette, &mut self.draft, 2, "Ask the agent…");
+                            let response = text_area_with_id(
+                                ui,
+                                palette,
+                                &mut self.draft,
+                                2,
+                                "Ask the agent…",
+                                self.composer_id,
+                            );
                             if response.has_focus()
                                 && ui.input(|input| input.key_pressed(egui::Key::Enter))
                                 && !ui.input(|input| input.modifiers.shift)
@@ -3021,6 +3030,59 @@ mod tests {
             "answer box missing: {texts:?}"
         );
         assert!(texts.contains(&"Continue"), "continue missing: {texts:?}");
+    }
+
+    #[test]
+    fn a_question_card_preserves_composer_focus() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let (y, x, _) = rows
+            .iter()
+            .find(|(_, _, text)| text == "Ask the agent…")
+            .expect("composer placeholder");
+        let position = egui::Pos2::new(*x as f32 + 5.0, *y as f32 + 5.0);
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        let composer_focus = ctx.memory(|memory| memory.focused());
+        assert!(composer_focus.is_some(), "the composer did not gain focus");
+
+        plugin.agent.phase = Some(Phase::Asking {
+            call: super::super::protocol::ApiToolCall {
+                id: "focus-test".to_owned(),
+                name: "ask_user".to_owned(),
+                arguments: r#"{"text":"Which file?"}"#.to_owned(),
+            },
+            questions: vec![super::super::agent::AgentQuestion {
+                text: "Which file?".to_owned(),
+                options: Vec::new(),
+            }],
+            current: 0,
+            answers: Vec::new(),
+        });
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        assert_eq!(ctx.memory(|memory| memory.focused()), composer_focus);
     }
 
     #[test]
