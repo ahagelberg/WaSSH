@@ -458,7 +458,7 @@ impl AiAgent {
         // invites the model to try it and fall back to the shell.
         for spec in tools::TOOL_SPECS
             .iter()
-            .filter(|spec| self.agent.permissions.offers(spec.name))
+            .filter(|spec| self.agent.offers_tool(spec.name))
         {
             lines.push(format!("- {}: {}", spec.name, spec.description));
         }
@@ -497,7 +497,7 @@ impl AiAgent {
             tools::TOOL_SPECS
                 .iter()
                 .map(|spec| spec.name)
-                .filter(|name| name.starts_with(prefix) && self.agent.permissions.offers(name))
+                .filter(|name| name.starts_with(prefix) && self.agent.offers_tool(name))
                 .collect()
         };
         let mut lines = Vec::new();
@@ -527,7 +527,7 @@ impl AiAgent {
             super::protocol::TOOL_LOCAL_RUN,
         ]
         .into_iter()
-        .filter(|name| self.agent.permissions.offers(name))
+        .filter(|name| self.agent.offers_tool(name))
         .collect();
         if !shells.is_empty() {
             lines.push(format!(
@@ -537,18 +537,14 @@ impl AiAgent {
                 if shells.len() == 1 { "is" } else { "are" }
             ));
         }
-        if self
-            .agent
-            .permissions
-            .offers(super::protocol::TOOL_TERMINAL_READ)
-        {
+        if self.agent.offers_tool(super::protocol::TOOL_TERMINAL_READ) {
             lines.push(
                 "- The terminal_* tools drive the live shell the user is watching; use them for \
                  what only an interactive program can do."
                     .to_owned(),
             );
         }
-        if self.agent.permissions.offers(super::protocol::TOOL_RUN_SUDO) {
+        if self.agent.offers_tool(super::protocol::TOOL_RUN_SUDO) {
             lines.push(
                 "- When a task needs root, call run_sudo with the same command: it asks the user \
                  for their sudo password before running. Plain run_command cannot answer sudo's \
@@ -676,7 +672,7 @@ impl AiAgent {
             model: self.model.trim().to_owned(),
             system: self.system_prompt(settings, host),
             messages: self.agent.history.clone(),
-            tools: tools::specs(&self.agent.permissions),
+            tools: tools::specs(&self.agent.permissions, self.agent.allow_all),
             max_tokens: MAX_TOKENS,
         })
     }
@@ -1137,6 +1133,12 @@ impl AiAgent {
         let mut rewind = None;
         let mut stop_command = false;
         let running = self.agent.running_command();
+        let last_user = self
+            .agent
+            .turns
+            .iter()
+            .rposition(|turn| matches!(turn, Turn::User { .. }));
+        let turn_finished = self.agent.phase.is_none();
         for (index, turn) in self.agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { text, meta } => {
@@ -1170,8 +1172,18 @@ impl AiAgent {
                     name,
                     label,
                     output,
-                    *failed,
-                    running == Some(index),
+                    ToolCardState {
+                        failed: *failed,
+                        running: running == Some(index),
+                        turn_index: index,
+                        collapsed: tool_output_is_collapsed(
+                            name,
+                            output,
+                            index,
+                            last_user,
+                            turn_finished,
+                        ),
+                    },
                 ),
                 Turn::Denied(reason) => {
                     ui.add(
@@ -1344,17 +1356,30 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
 
 /// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
 /// and the output. Returns whether its Stop button was clicked.
+struct ToolCardState {
+    failed: bool,
+    running: bool,
+    turn_index: usize,
+    collapsed: bool,
+}
+
 fn tool_card(
     ui: &mut Ui,
     palette: &Palette,
     name: &str,
     label: &str,
     output: &str,
-    failed: bool,
-    running: bool,
+    state: ToolCardState,
 ) -> bool {
+    let ToolCardState {
+        failed,
+        running,
+        turn_index,
+        collapsed,
+    } = state;
     let (badge, colour) = tool_badge(name, palette);
     let muted = to_color32(palette.text_muted);
+    let output_id = ui.make_persistent_id(("ai-command-output", turn_index));
     let mut stop = false;
     egui::Frame::new()
         .fill(to_color32(palette.bg_input))
@@ -1363,61 +1388,133 @@ fn tool_card(
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                badge_pill(ui, palette, badge, colour);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(label)
-                            .size(11.0)
-                            .monospace()
-                            .color(to_color32(palette.text)),
-                    )
-                    .truncate(),
-                );
-            });
-            ui.horizontal(|ui| {
-                let (outcome, colour) = if running {
-                    ("running", muted)
-                } else if failed {
-                    ("failed", to_color32(palette.danger))
-                } else {
-                    ("ok", to_color32(palette.ok))
-                };
-                ui.label(
-                    egui::RichText::new(outcome)
-                        .size(10.0)
-                        .strong()
-                        .color(colour),
-                );
-                // The command is still going: offer to end it here rather than on the host.
-                if running
-                    && Button::new("Stop")
-                        .compact()
-                        .kind(ButtonKind::Danger)
-                        .show(ui, palette)
-                        .clicked()
-                {
-                    stop = true;
-                }
-            });
-            if output.is_empty() {
-                ui.label(egui::RichText::new("(no output)").size(11.0).color(muted));
-                return;
-            }
             let shown = if output.chars().count() > TOOL_OUTPUT_MAX_CHARS {
                 let head: String = output.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
                 format!("{head}\n…")
             } else {
                 output.to_owned()
             };
-            ui.label(
-                egui::RichText::new(shown)
+            let (outcome, outcome_colour) = if running {
+                ("running", muted)
+            } else if failed {
+                ("failed", to_color32(palette.danger))
+            } else {
+                ("ok", to_color32(palette.ok))
+            };
+            if collapsed {
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    output_id,
+                    false,
+                )
+                    .show_header(ui, |ui| {
+                        badge_pill(ui, palette, badge, colour);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(label)
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(to_color32(palette.text)),
+                            )
+                            .truncate(),
+                        );
+                        ui.label(
+                            egui::RichText::new(outcome)
+                                .size(10.0)
+                                .strong()
+                                .color(outcome_colour),
+                        );
+                    })
+                    .body(|ui| {
+                        ui.label(
+                            egui::RichText::new(if output.is_empty() {
+                                "(no output)"
+                            } else {
+                                &shown
+                            })
+                            .size(11.0)
+                            .monospace()
+                            .color(muted),
+                        );
+                    });
+            } else {
+                ui.horizontal(|ui| {
+                    badge_pill(ui, palette, badge, colour);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .size(11.0)
+                                .monospace()
+                                .color(to_color32(palette.text)),
+                        )
+                        .truncate(),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(outcome)
+                            .size(10.0)
+                            .strong()
+                            .color(outcome_colour),
+                    );
+                    // The command is still going: offer to end it here rather than on the host.
+                    if running
+                        && Button::new("Stop")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                    {
+                        stop = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(if output.is_empty() {
+                        "(no output)"
+                    } else {
+                        &shown
+                    })
                     .size(11.0)
                     .monospace()
                     .color(muted),
-            );
+                );
+            }
         });
     stop
+}
+
+fn tool_output_is_collapsed(
+    name: &str,
+    output: &str,
+    index: usize,
+    last_user: Option<usize>,
+    turn_finished: bool,
+) -> bool {
+    let collapse_by_tool = matches!(
+        name,
+        super::protocol::TOOL_RUN_COMMAND
+            | super::protocol::TOOL_RUN_SUDO
+            | super::protocol::TOOL_LOCAL_RUN
+    ) || name.starts_with("remote_fs_");
+    let has_lots_of_output = output.chars().count() > TOOL_OUTPUT_MAX_CHARS;
+    (collapse_by_tool || has_lots_of_output)
+        && (turn_finished || last_user.is_some_and(|last_user| index < last_user))
+}
+
+#[test]
+fn tool_output_collapse_state_tracks_tool_and_output_size() {
+    use super::protocol::{TOOL_LOCAL_RUN, TOOL_RUN_COMMAND, TOOL_RUN_SUDO};
+
+    let small_output = "short output";
+    let large_output = format!("{}x", "x".repeat(TOOL_OUTPUT_MAX_CHARS));
+    assert!(tool_output_is_collapsed(TOOL_RUN_COMMAND, small_output, 3, None, true));
+    assert!(tool_output_is_collapsed(TOOL_RUN_SUDO, small_output, 3, Some(5), false));
+    assert!(tool_output_is_collapsed(TOOL_LOCAL_RUN, small_output, 3, Some(5), false));
+    assert!(!tool_output_is_collapsed(TOOL_RUN_COMMAND, small_output, 6, Some(5), false));
+    assert!(tool_output_is_collapsed("remote_fs_read_file", small_output, 3, None, true));
+    assert!(tool_output_is_collapsed("web_fetch", &large_output, 3, None, true));
+    assert!(!tool_output_is_collapsed("web_fetch", small_output, 3, None, true));
+    assert!(!tool_output_is_collapsed("web_fetch", &large_output, 3, None, false));
 }
 
 /// One tool's pill, e.g. `SSH` or `REMOTE FILESYSTEM`.
@@ -1500,6 +1597,15 @@ fn prompt_card(
                 });
             ui.add_space(PROMPT_CARD_GAP);
             controls(ui);
+        });
+}
+
+fn prompt_action_row(ui: &mut Ui, id: &str, actions: impl FnOnce(&mut Ui)) {
+    egui::ScrollArea::horizontal()
+        .id_salt(("ai-prompt-actions", id))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(actions);
         });
 }
 
@@ -1610,7 +1716,7 @@ impl AiAgent {
                     prompt_command(ui, palette, &command);
                 },
                 |ui| {
-                    ui.horizontal(|ui| {
+                    prompt_action_row(ui, "approval", |ui| {
                         if Button::new("Allow")
                             .compact()
                             .kind(ButtonKind::Primary)
@@ -1627,23 +1733,33 @@ impl AiAgent {
                         {
                             chosen = Some((false, None));
                         }
-                    });
-                    if small_button_enabled(ui, palette, "Always allow every command", true) {
-                        everything = true;
-                    }
-                    for (index, scope) in scopes.iter().enumerate() {
-                        let label = if scope.word_count == 0 {
-                            format!("Always allow exactly: {}", scope_label(&scope.text))
-                        } else {
-                            format!(
-                                "Always allow commands starting with: {}",
-                                scope_label(&scope.text)
-                            )
-                        };
-                        if small_button_enabled(ui, palette, &label, true) {
-                            chosen = Some((true, Some(index)));
+                        if Button::new("Allow all this session")
+                            .compact()
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            everything = true;
                         }
-                    }
+                    });
+                    ui.vertical(|ui| {
+                        for (index, scope) in scopes.iter().enumerate() {
+                            let label = if scope.word_count == 0 {
+                                format!("Always allow exactly: {}", scope_label(&scope.text))
+                            } else {
+                                format!(
+                                    "Always allow commands starting with: {}",
+                                    scope_label(&scope.text)
+                                )
+                            };
+                            if Button::new(&label)
+                                .compact()
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                chosen = Some((true, Some(index)));
+                            }
+                        }
+                    });
                     if let Some((allow, remember)) = chosen {
                         answers.approval = Some((allow, remember, false));
                     } else if everything {
@@ -1673,10 +1789,10 @@ impl AiAgent {
                     prompt_command(ui, palette, &label);
                 },
                 |ui| {
-                    ui.horizontal(|ui| {
+                    prompt_action_row(ui, "permission", |ui| {
                         if Button::new("Approve once")
                             .compact()
-                            .kind(ButtonKind::Primary)
+                            .primary()
                             .show(ui, palette)
                             .clicked()
                         {
@@ -1690,19 +1806,30 @@ impl AiAgent {
                         {
                             answers.permission = Some((false, false));
                         }
-                    });
-                    ui.horizontal(|ui| {
-                        if small_button_enabled(ui, palette, "Always allow", true) {
+                        if Button::new("Allow all this session")
+                            .compact()
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.allow_session = true;
+                        }
+                        if Button::new("Always allow")
+                            .compact()
+                            .primary()
+                            .show(ui, palette)
+                            .clicked()
+                        {
                             answers.permission = Some((true, true));
                         }
-                        if small_button_enabled(ui, palette, "Always deny", true) {
+                        if Button::new("Always deny")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
                             answers.permission = Some((false, true));
                         }
                     });
-                    // One answer for the whole session, without changing the settings.
-                    if small_button_enabled(ui, palette, "Allow all this session", true) {
-                        answers.allow_session = true;
-                    }
                 },
             );
         }
@@ -2777,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_runs_are_shown_with_their_output() {
+    fn finished_command_output_is_collapsed_by_default() {
         let mut plugin = AiAgent::default();
         plugin.agent.turns.push(Turn::Tool {
             name: "run_command".to_owned(),
@@ -2789,7 +2916,8 @@ mod tests {
         let painted = draw(&mut plugin, &mut settings);
         let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
         assert!(texts.contains(&"$ uptime"), "label missing: {texts:?}");
-        assert!(texts.contains(&"up 3 days"), "output missing: {texts:?}");
+        assert!(texts.contains(&"SSH"), "request type missing: {texts:?}");
+        assert!(!texts.contains(&"up 3 days"), "output is not collapsed: {texts:?}");
     }
 
     #[test]
@@ -2840,8 +2968,92 @@ mod tests {
         assert!(texts.contains(&"Allow"), "allow missing: {texts:?}");
         assert!(texts.contains(&"Deny"), "deny missing: {texts:?}");
         assert!(
-            texts.contains(&"Always allow every command"),
+            texts.contains(&"Allow all this session"),
             "allow-all missing: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn permission_actions_share_one_row() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Allowing {
+            call: super::super::protocol::ApiToolCall {
+                id: "permission-row".to_owned(),
+                name: super::super::protocol::TOOL_TERMINAL_WRITE.to_owned(),
+                arguments: r#"{"text":"ls"}"#.to_owned(),
+            },
+            label: "terminal_write".to_owned(),
+            turn: 0,
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        let permission_rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert_actions_share_row(
+            &permission_rows,
+            &[
+                "Approve once",
+                "Deny once",
+                "Allow all this session",
+                "Always allow",
+                "Always deny",
+            ],
+        );
+
+        plugin.agent.phase = Some(Phase::Approving {
+            call: super::super::protocol::ApiToolCall {
+                id: "approval-row".to_owned(),
+                name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"systemctl restart nginx"}"#.to_owned(),
+            },
+            command: "systemctl restart nginx".to_owned(),
+            scopes: super::super::rules::approval_scopes("systemctl restart nginx"),
+        });
+        let approval_rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert_actions_share_row(
+            &approval_rows,
+            &[
+                "Allow",
+                "Deny",
+                "Allow all this session",
+            ],
+        );
+        assert_actions_stack_below(&approval_rows, &["Allow", "Deny", "Allow all this session"]);
+    }
+
+    fn assert_actions_share_row(rows: &[(i32, i32, String)], labels: &[&str]) {
+        let positions: Vec<i32> = labels
+            .iter()
+            .map(|label| {
+                rows.iter()
+                    .find(|(_, _, text)| text == label)
+                    .unwrap_or_else(|| panic!("{label} missing from {rows:?}"))
+                    .0
+            })
+            .collect();
+        let top = *positions.iter().min().expect("at least one action");
+        let bottom = *positions.iter().max().expect("at least one action");
+        assert!(bottom - top <= 3, "actions span multiple rows: {rows:?}");
+    }
+
+    fn assert_actions_stack_below(rows: &[(i32, i32, String)], row_labels: &[&str]) {
+        let row_bottom = row_labels
+            .iter()
+            .filter_map(|label| rows.iter().find(|(_, _, text)| text == label))
+            .map(|(y, _, _)| *y)
+            .max()
+            .expect("at least one row action");
+        let stacked: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, text)| text.starts_with("Always allow"))
+            .collect();
+        assert!(!stacked.is_empty(), "no scope actions: {rows:?}");
+        assert!(
+            stacked.iter().all(|(y, _, _)| *y > row_bottom),
+            "scope actions are not below the main row: {rows:?}"
+        );
+        assert!(
+            stacked.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "scope actions are not vertically stacked: {rows:?}"
         );
     }
 
@@ -2949,7 +3161,7 @@ mod tests {
             "the card grew past its cap: {card:?}"
         );
 
-        // Only the command scrolls: the way to answer stays in the card, under it.
+        // The command scrolls vertically; the single-row action strip scrolls horizontally.
         let button = |label: &str| {
             texts
                 .iter()
@@ -2959,14 +3171,14 @@ mod tests {
         };
         let allow = button("Allow");
         let deny = button("Deny");
+        let allow_session = button("Allow all this session");
         let always_allow: Vec<_> = texts
             .iter()
             .filter(|(_, text)| text.starts_with("Always allow"))
             .collect();
-        const GLOBAL_ALWAYS_ALLOW_BUTTONS: usize = 1;
         assert_eq!(
             always_allow.len(),
-            scopes.len() + GLOBAL_ALWAYS_ALLOW_BUTTONS,
+            scopes.len(),
             "not all approval scopes are visible: {texts:?}"
         );
         let request_viewport = request_viewport.expect("the request has a scroll viewport");
@@ -2987,12 +3199,14 @@ mod tests {
             request_position.y > request_title_position.y,
             "request title must precede the command: {request_title_position:?}, {request_position:?}"
         );
-        for position in std::iter::once(&allow)
+        let action_positions: Vec<_> = std::iter::once(&allow)
             .chain(std::iter::once(&deny))
+            .chain(std::iter::once(&allow_session))
             .chain(always_allow.iter().map(|(position, _)| position))
-        {
+            .collect();
+        for position in action_positions {
             assert!(
-                card.contains(*position),
+                position.y >= card.top() && position.y <= card.bottom(),
                 "a control left the card: {position:?} in {card:?}"
             );
         }
@@ -3406,8 +3620,12 @@ mod tests {
                     super::super::protocol::TOOL_RUN_COMMAND,
                     "$ sleep 100",
                     "",
-                    false,
-                    running,
+                    ToolCardState {
+                        failed: false,
+                        running,
+                        turn_index: 0,
+                        collapsed: false,
+                    },
                 );
             });
             let mut texts = Vec::new();
@@ -3426,6 +3644,82 @@ mod tests {
         assert!(
             !painted(false).contains(&"Stop".to_owned()),
             "a finished command still offers Stop"
+        );
+    }
+
+    #[test]
+    fn a_completed_command_card_collapses_to_one_expandable_line() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let mut output_id = None;
+        let draw = |ctx: &egui::Context, output_id: &mut Option<egui::Id>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(WIDE_PANE, 200.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                *output_id = Some(ui.make_persistent_id(("ai-command-output", 4)));
+                tool_card(
+                    ui,
+                    &palette,
+                    super::super::protocol::TOOL_RUN_COMMAND,
+                    "$ echo ready",
+                    "captured output line",
+                    ToolCardState {
+                        failed: false,
+                        running: false,
+                        turn_index: 4,
+                        collapsed: true,
+                    },
+                );
+            });
+            let mut texts = Vec::new();
+            for clipped in std::mem::take(&mut output.shapes) {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    texts.push((text.galley.text().to_owned(), text.pos));
+                }
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+        let collapsed = draw(&ctx, &mut output_id);
+        let badge = collapsed
+            .iter()
+            .find(|(text, _)| text == "SSH")
+            .expect("request type");
+        let command = collapsed
+            .iter()
+            .find(|(text, _)| text == "$ echo ready")
+            .expect("command label");
+        let status = collapsed
+            .iter()
+            .find(|(text, _)| text == "ok")
+            .expect("command status");
+        assert!((badge.1.y - command.1.y).abs() <= 2.0, "{collapsed:?}");
+        assert!((status.1.y - command.1.y).abs() <= 2.0, "{collapsed:?}");
+        assert!(
+            !collapsed
+                .iter()
+                .any(|(text, _)| text == "captured output line"),
+            "collapsed output is visible: {collapsed:?}"
+        );
+
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            output_id.expect("collapsing header id"),
+            false,
+        );
+        state.set_open(true);
+        state.store(&ctx);
+        let expanded = draw(&ctx, &mut output_id);
+        assert!(
+            expanded
+                .iter()
+                .any(|(text, _)| text == "captured output line"),
+            "expanded output is missing: {expanded:?}"
         );
     }
 

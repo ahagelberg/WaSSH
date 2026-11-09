@@ -19,9 +19,6 @@ pub enum RuleDecision {
     Ask,
 }
 
-/// Pattern matching every command, used by "allow all commands this session".
-pub const ALLOW_ALL_PATTERN: &str = "*";
-
 /// How many leading command words are offered as "starts with" scopes.
 pub const APPROVAL_PREFIX_WORD_MAX: usize = 4;
 

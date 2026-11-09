@@ -31,7 +31,7 @@ use super::protocol::{
 };
 
 use super::agent::shell_quote;
-use super::permissions::Permissions;
+use super::permissions::{Permission, Permissions};
 
 /// Longest body a fetch may return.
 pub const MAX_FETCH_CHARS: usize = 32_000;
@@ -532,10 +532,13 @@ fn parameters(name: &str) -> (Value, Value) {
 }
 
 /// Every tool schema this host may use, ready for the provider.
-pub fn specs(permissions: &Permissions) -> Vec<Value> {
+pub fn specs(permissions: &Permissions, allow_all: bool) -> Vec<Value> {
     TOOL_SPECS
         .iter()
-        .filter(|spec| permissions.offers(spec.name))
+        .filter(|spec| {
+            permissions.offers(spec.name)
+                || (allow_all && permissions.decision(spec.name) == Permission::Ask)
+        })
         .map(|spec| spec.schema())
         .collect()
 }
@@ -1672,7 +1675,7 @@ mod tests {
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs(&Permissions::default());
+        let schemas = specs(&Permissions::default(), false);
         assert_eq!(schemas.len(), 38);
         let names: Vec<&str> = schemas
             .iter()
@@ -1699,6 +1702,25 @@ mod tests {
             assert_eq!(schema["parameters"]["type"], "object", "{schema}");
             assert!(is_tool(schema["name"].as_str().unwrap()));
         }
+    }
+
+    #[test]
+    fn allow_all_offers_ask_tools_but_not_denied_tools() {
+        let permissions = Permissions::from_settings(&serde_json::Map::from_iter([
+            (
+                super::super::permissions::group_key(super::super::permissions::GROUP_TERMINAL),
+                Value::Bool(true),
+            ),
+            (
+                super::super::permissions::method_key(TOOL_TERMINAL_WRITE),
+                Value::String("deny".to_owned()),
+            ),
+        ]));
+        assert_eq!(permissions.decision(TOOL_TERMINAL_KEYS), Permission::Ask);
+        assert_eq!(permissions.decision(TOOL_TERMINAL_WRITE), Permission::Deny);
+        let schemas = specs(&permissions, true);
+        assert!(schemas.iter().any(|schema| schema["name"] == TOOL_TERMINAL_KEYS));
+        assert!(!schemas.iter().any(|schema| schema["name"] == TOOL_TERMINAL_WRITE));
     }
 
     #[test]

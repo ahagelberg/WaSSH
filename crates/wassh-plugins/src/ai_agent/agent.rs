@@ -24,7 +24,7 @@ use super::protocol::{
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
 use super::rules::{
-    ALLOW_ALL_PATTERN, ApprovalScope, RuleDecision, approval_scopes, decide_command,
+    ApprovalScope, RuleDecision, approval_scopes, decide_command,
 };
 use super::tools::{self, ToolResult};
 use super::web;
@@ -987,19 +987,41 @@ impl Agent {
 
     /// Allow every prompt for the rest of this session, then run the tool that asked.
     ///
-    /// Commands ask through their own card, so the same answer covers them; what the
-    /// host refuses outright stays refused.
+    /// Ask decisions are allowed for the rest of the session; Deny decisions remain final.
     pub fn allow_everything(&mut self, session: Session<'_, '_>) {
         self.allow_all = true;
-        self.session_allow.push(ALLOW_ALL_PATTERN.to_owned());
         self.answer_permission(true, session);
     }
 
     /// The decision for `tool`, with this session's blanket answer applied.
     fn permission(&self, tool: &str) -> Permission {
-        match self.permissions.decision(tool) {
-            Permission::Ask if self.allow_all => Permission::Allow,
-            decision => decision,
+        if self.allow_all && self.permissions.decision(tool) == Permission::Ask {
+            Permission::Allow
+        } else {
+            self.permissions.decision(tool)
+        }
+    }
+
+    /// Whether a tool should be offered to the model for this session.
+    pub fn offers_tool(&self, tool: &str) -> bool {
+        self.permission(tool) != Permission::Deny
+    }
+
+    /// Session-wide allow answers Ask decisions but leaves command Deny rules intact.
+    fn command_decision(&self, command: &str) -> RuleDecision {
+        let decision = decide_command(
+            command,
+            Some(&self.host_allow),
+            Some(&self.host_deny),
+            Some(&self.app_allow),
+            Some(&self.app_deny),
+            &self.session_allow,
+            &self.session_deny,
+        );
+        if self.allow_all && decision == RuleDecision::Ask {
+            RuleDecision::Allow
+        } else {
+            decision
         }
     }
 
@@ -1105,15 +1127,7 @@ impl Agent {
                     );
                     return;
                 };
-                let decision = decide_command(
-                    &command,
-                    Some(&self.host_allow),
-                    Some(&self.host_deny),
-                    Some(&self.app_allow),
-                    Some(&self.app_deny),
-                    &self.session_allow,
-                    &self.session_deny,
-                );
+                let decision = self.command_decision(&command);
                 let sudo_stdin = arguments["sudoStdin"]
                     .as_str()
                     .filter(|password| !password.is_empty())
@@ -1155,15 +1169,7 @@ impl Agent {
                 };
                 // The password prompt is the approval: it names the command and only the
                 // user can answer it. Rules that refuse a command still refuse it here.
-                let decision = decide_command(
-                    &command,
-                    Some(&self.host_allow),
-                    Some(&self.host_deny),
-                    Some(&self.app_allow),
-                    Some(&self.app_deny),
-                    &self.session_allow,
-                    &self.session_deny,
-                );
+                let decision = self.command_decision(&command);
                 if decision == RuleDecision::Deny {
                     let reason =
                         format!("Running `{command}` is not allowed by the permission rules.");
@@ -1688,12 +1694,12 @@ impl Agent {
         );
     }
 
-    /// Allow every command for the rest of this session, then run this one.
+    /// Allow future Ask decisions for the rest of this session, then run this command.
     pub fn approve_everything(&mut self, session: Session<'_, '_>) {
         let Some(Phase::Approving { call, command, .. }) = self.phase.take() else {
             return;
         };
-        self.session_allow.push(ALLOW_ALL_PATTERN.to_owned());
+        self.allow_all = true;
         let turn = self.turn_for(&call);
         self.exec_command(call, command, None, turn, session);
     }
@@ -2900,6 +2906,106 @@ mod tests {
             &mut session,
         );
         assert!(!agent.approving(), "commands are covered too");
+    }
+
+    #[test]
+    fn approving_everything_covers_all_prompts_but_keeps_the_sudo_password_prompt() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_TERMINAL),
+            Value::Bool(true),
+        )]));
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "approval".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"systemctl restart nginx"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(agent.approving(), "the initial command should ask");
+        agent.approve_everything(&mut session);
+        assert!(agent.allow_all, "the session-wide permission was not stored");
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([
+            (
+                super::super::permissions::group_key(
+                    super::super::permissions::GROUP_TERMINAL,
+                ),
+                Value::Bool(true),
+            ),
+            (
+                super::super::permissions::method_key(TOOL_TERMINAL_WRITE),
+                Value::String("deny".to_owned()),
+            ),
+        ]));
+        agent.app_deny = vec!["systemctl stop*".to_owned()];
+        assert!(agent.offers_tool(TOOL_TERMINAL_KEYS));
+        assert!(!agent.offers_tool(TOOL_TERMINAL_WRITE));
+
+        agent.begin_tool(
+            ApiToolCall {
+                id: "capability".to_owned(),
+                name: TOOL_TERMINAL_WRITE.to_owned(),
+                arguments: r#"{"text":"pwd"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.allowing(), "a denied capability asked instead of refusing");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == NOT_PERMITTED
+        ));
+
+        agent.begin_tool(
+            ApiToolCall {
+                id: "ask-capability".to_owned(),
+                name: TOOL_TERMINAL_KEYS.to_owned(),
+                arguments: r#"{"keys":"CTRL+C"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.allowing(), "an Ask capability still prompted");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == "The session is not connected."
+        ));
+
+        agent.begin_tool(
+            ApiToolCall {
+                id: "command".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"systemctl status nginx"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.approving(), "a later command still asked");
+
+        agent.begin_tool(
+            ApiToolCall {
+                id: "denied-command".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"systemctl stop nginx"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.approving(), "a denied command prompted instead of refusing");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content.contains("not allowed by the permission rules")
+        ));
+
+        let mut fake = FakeSession::default();
+        let mut connected_session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "sudo".to_owned(),
+                name: TOOL_RUN_SUDO.to_owned(),
+                arguments: r#"{"command":"id"}"#.to_owned(),
+            },
+            &mut connected_session,
+        );
+        assert_eq!(agent.sudo_prompt(), Some(("id", None)));
     }
 
     #[test]
