@@ -16,3 +16,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 wassh-core = { path = "../wassh-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aes = "0.9"
+cbc = "0.2"
+pbkdf2 = { version = "0.13", features = ["hmac"] }
+secret-service = { version = "5.2", features = ["rt-async-io-crypto-rust"] }
+sha1 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+wassh-sys = { path = "../wassh-sys" }

@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, FILETIME, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetAdaptersAddresses, GetIfTable2, GAA_FLAG_SKIP_ANYCAST,
     GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IF_TYPE_SOFTWARE_LOOPBACK,
@@ -15,6 +15,9 @@ use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LookupAccountSidW, TokenUser, TOKEN_QUERY, TOKEN_USER,
+};
+use windows_sys::Win32::Security::Cryptography::{
+    CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
 };
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -41,6 +44,27 @@ use windows_sys::Wdk::System::SystemInformation::{
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 
 use crate::{Cpu, CpuTimes, Disk, Interface, Memory, Process, ProcessDetails, System};
+
+pub fn unprotect_user_data(data: &[u8]) -> Option<Vec<u8>> {
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len().try_into().ok()?,
+        pbData: data.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptUnprotectData(&input, null_mut(), null(), null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+    };
+    if success == 0 {
+        return None;
+    }
+    let value = if output.cbData == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() }
+    };
+    unsafe { LocalFree(output.pbData.cast()); }
+    Some(value)
+}
 
 /// Ticks per second of every `FILETIME` and process-time counter.
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
@@ -529,6 +553,25 @@ const _: Option<*const c_void> = None;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unprotects_current_user_data() {
+        use windows_sys::Win32::Security::Cryptography::CryptProtectData;
+        let data = b"test credential";
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: data.len().try_into().unwrap(),
+            pbData: data.as_ptr().cast_mut(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        let success = unsafe {
+            CryptProtectData(&input, null(), null(), null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+        };
+        assert_ne!(success, 0);
+        let protected = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+        unsafe { LocalFree(output.pbData.cast()); }
+        assert_eq!(unprotect_user_data(&protected).as_deref(), Some(data.as_slice()));
+        assert!(unprotect_user_data(b"invalid").is_none());
+    }
 
     #[test]
     fn the_machine_reports_its_own_numbers() {

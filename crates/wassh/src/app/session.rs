@@ -1359,7 +1359,19 @@ impl SessionEntry {
             return;
         }
         let stored = store
-            .and_then(|store| store.plugin_data(pane.id.as_str(), Some(&scope)).ok().flatten())
+            .and_then(|store| match store.plugin_data(pane.id.as_str(), Some(&scope)) {
+                Ok(Some(data)) => Some(data),
+                Ok(None) if pane.id == PluginId::Scratchpad => {
+                    let data = store.plugin_data(pane.id.as_str(), None).ok().flatten()?;
+                    let text = data.get(wassh_plugins::plugin::SCRATCHPAD_TEXT_KEY)?.as_str()?;
+                    if text.is_empty() || store.save_plugin_data(pane.id.as_str(), Some(&scope), &data).is_err() {
+                        return None;
+                    }
+                    let _ = store.save_plugin_data(pane.id.as_str(), None, &serde_json::Value::Null);
+                    Some(data)
+                }
+                _ => None,
+            })
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
         let id = pane.id;
@@ -4335,6 +4347,26 @@ mod tests {
         assert_eq!(entry.plugin_scope(), "tab:t-prompt");
         entry.host_id = Some("host-7".to_owned());
         assert_eq!(entry.plugin_scope(), "host-7");
+    }
+
+    #[test]
+    fn legacy_shared_scratchpad_is_claimed_by_one_scope() {
+        let dir = temp_dir("legacy-scratchpad");
+        let config = wassh_store::Config::open(&dir).unwrap();
+        config.save_plugin_data("scratchpad", None, &serde_json::json!({"text":"legacy notes"})).unwrap();
+        let mut first = password_entry();
+        first.host_id = Some("first".to_owned());
+        let slot = first.ensure_pane(PluginId::Scratchpad);
+        first.load_pane_data(slot, Some(&config), &PluginValues::default());
+        assert_eq!(first.panes[slot].data.values["text"], "legacy notes");
+        assert_eq!(config.plugin_data("scratchpad", Some("first")).unwrap().unwrap()["text"], "legacy notes");
+        assert_eq!(config.plugin_data("scratchpad", None).unwrap(), Some(serde_json::Value::Null));
+        let mut second = password_entry();
+        second.host_id = Some("second".to_owned());
+        let slot = second.ensure_pane(PluginId::Scratchpad);
+        second.load_pane_data(slot, Some(&config), &PluginValues::default());
+        assert!(!second.panes[slot].data.values.contains_key("text"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

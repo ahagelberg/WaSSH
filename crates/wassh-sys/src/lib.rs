@@ -108,6 +108,7 @@ use crate::windows as platform;
 #[cfg(windows)]
 pub use windows::{
     cpu, disk, memory, network, process_details, processes, stop_process, system,
+    unprotect_user_data,
 };
 
 #[cfg(target_os = "linux")]

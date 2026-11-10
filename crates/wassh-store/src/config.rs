@@ -20,6 +20,7 @@ pub struct Config {
     pub tabs: JsonDocument<Vec<TabSnapshot>>,
     /// Documents that could not be read and were reset, as `file: reason`.
     pub problems: Vec<String>,
+    pub notices: Vec<String>,
 }
 
 impl Config {
@@ -48,6 +49,7 @@ impl Config {
         Ok(Self {
             dir,
             problems,
+            notices: Vec::new(),
             settings,
             hosts,
             tabs,
@@ -56,7 +58,36 @@ impl Config {
 
     /// Open the configuration in the platform data directory.
     pub fn open_data_dir() -> Result<Self, StoreError> {
-        Self::open(paths::data_dir()?)
+        let dir = paths::data_dir()?;
+        let root = dir.parent().ok_or(StoreError::NoDataDir("data directory has no parent"))?;
+        let mut legacy = root.join("WaSSH");
+        if !legacy.is_dir() {
+            legacy = root.join("wassh");
+        }
+        Self::open_with_legacy(&dir, &legacy)
+    }
+
+    fn open_with_legacy(dir: &Path, legacy: &Path) -> Result<Self, StoreError> {
+        let migration = crate::legacy::migrate(dir, legacy);
+        let mut config = Self::open(dir)?;
+        match migration {
+            Ok(Some(_)) => config.notices.push("Imported Electron configuration.".to_owned()),
+            Ok(None) => {}
+            Err(error) => config.problems.push(format!("Electron configuration migration failed: {error}")),
+        }
+        let host_secrets = crate::legacy::migrate_host_secrets(dir, legacy, config.hosts.get());
+        let ai_secrets = crate::legacy::migrate_ai_secrets(&mut config, legacy);
+        let mut incomplete = false;
+        for result in [host_secrets, ai_secrets] {
+            match result {
+                Ok(missing) => incomplete |= missing,
+                Err(error) => config.problems.push(format!("Electron credential migration failed: {error}")),
+            }
+        }
+        if incomplete {
+            config.notices.push("Some Electron credentials could not be imported and may need to be entered again.".to_owned());
+        }
+        Ok(config)
     }
 
     /// Persist every document that has not been written yet.
@@ -159,6 +190,212 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wassh-config-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn imports_plaintext_host_secrets_without_overwriting_or_reimporting() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({"hosts": [
+            {"id":"h", "host":"example.org", "username":"alice", "passwordVaultId":"pw", "passphraseVaultId":"key"}
+        ]})).unwrap();
+        crate::write_json(&legacy.join("vault.json"), &serde_json::json!({
+            "pw": STANDARD.encode("password"), "key": STANDARD.encode("phrase")
+        })).unwrap();
+        crate::legacy::migrate(&native, &legacy).unwrap();
+        let config = Config::open(&native).unwrap();
+        let mut store = crate::secrets::SecretsStore::open(&native).unwrap();
+        store.set_passphrase("h", Some("existing")).unwrap();
+        assert!(!crate::legacy::migrate_host_secrets(&native, &legacy, config.hosts.get()).unwrap());
+        let mut store = crate::secrets::SecretsStore::open(&native).unwrap();
+        assert_eq!(store.password("h").as_deref(), Some("password"));
+        assert_eq!(store.passphrase("h").as_deref(), Some("existing"));
+        store.set_password("h", None).unwrap();
+        crate::legacy::migrate_host_secrets(&native, &legacy, config.hosts.get()).unwrap();
+        assert!(!crate::secrets::SecretsStore::open(&native).unwrap().has_password("h"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retries_unavailable_legacy_credentials() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({"hosts": [
+            {"id":"h", "host":"example.org", "username":"alice", "passwordVaultId":"pw"}
+        ]})).unwrap();
+        crate::write_json(&legacy.join("vault.json"), &serde_json::json!({"pw": "invalid-base64"})).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert!(config.notices.iter().any(|notice| notice.contains("credentials could not be imported")));
+        assert!(!crate::secrets::SecretsStore::open(&native).unwrap().has_password("h"));
+        crate::write_json(&legacy.join("vault.json"), &serde_json::json!({"pw": STANDARD.encode("password")})).unwrap();
+        Config::open_with_legacy(&native, &legacy).unwrap();
+        assert_eq!(crate::secrets::SecretsStore::open(&native).unwrap().password("h").as_deref(), Some("password"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn does_not_import_credentials_for_changed_host() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({"hosts": [
+            {"id":"h", "host":"example.org", "username":"alice", "passwordVaultId":"pw"}
+        ]})).unwrap();
+        crate::write_json(&legacy.join("vault.json"), &serde_json::json!({"pw": STANDARD.encode("password")})).unwrap();
+        crate::legacy::migrate(&native, &legacy).unwrap();
+        let config = Config::open(&native).unwrap();
+        let mut hosts = config.hosts.get().clone();
+        hosts.hosts.iter_mut().find(|host| host.id == "h").unwrap().connection.auth = wassh_core::AuthMethod::PrivateKey;
+        crate::legacy::migrate_host_secrets(&native, &legacy, &hosts).unwrap();
+        assert!(!crate::secrets::SecretsStore::open(&native).unwrap().has_password("h"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imports_legacy_ai_provider_and_key_once() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        crate::write_json(&legacy.join("plugin-ai-agent.json"), &serde_json::json!({"providers": [
+            {"id":"custom", "name":"Custom", "protocol":"openai", "baseUrl":"https://example.org", "models":[]}
+        ]})).unwrap();
+        crate::write_json(&legacy.join("vault.json"), &serde_json::json!({"ai-agent:custom": STANDARD.encode("api-key")})).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert_eq!(config.settings.get().plugin_settings["ai-agent"]["providers"][0]["id"], "custom");
+        let mut store = crate::secrets::SecretsStore::open(&native).unwrap();
+        assert_eq!(store.plugin_secret("app", "ai-agent", "provider.custom").as_deref(), Some("api-key"));
+        store.set_plugin_secret("app", "ai-agent", "provider.custom", None).unwrap();
+        Config::open_with_legacy(&native, &legacy).unwrap();
+        assert!(!crate::secrets::SecretsStore::open(&native).unwrap().has_plugin_secret("app", "ai-agent", "provider.custom"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_electron_configuration_once() {
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        crate::write_json(&paths::settings_file(&legacy), &serde_json::json!({
+            "theme":"dark", "termType":"vt100", "sessionStyleDefaults":{"fontSizePx":19}
+        })).unwrap();
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({
+            "groups":[{"id":"g", "name":"Servers", "collapsed":false, "hostIds":["h"]}],
+            "hosts":[{"id":"h", "name":"Host", "host":"example.org", "port":2222, "username":"alice", "authMethod":"password"}]
+        })).unwrap();
+        crate::write_json(&paths::tabs_file(&legacy), &serde_json::json!([{
+            "id":"t", "connection":{"hostId":"h", "host":"example.org", "port":2222}, "active":true
+        }])).unwrap();
+        crate::write_json(&paths::known_hosts_file(&legacy), &serde_json::json!([{
+            "host":"example.org", "port":2222, "keyType":"ssh-ed25519", "fingerprint":"SHA256:test"
+        }])).unwrap();
+        crate::write_json(&legacy.join("plugin-scratchpad.h.json"), &serde_json::json!({"content":"notes"})).unwrap();
+        crate::write_json(&legacy.join("vault.json"), &serde_json::json!({"password":"encrypted"})).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert!(config.problems.is_empty());
+        assert!(config.notices[0].contains("Imported Electron configuration"));
+        assert_eq!(config.settings.get().term_type, "vt100");
+        assert_eq!(config.settings.get().session_style_defaults.font_size, 19);
+        assert_eq!(config.hosts.get().host("h").unwrap().connection.host, "example.org");
+        assert_eq!(config.hosts.get().host("h").unwrap().group_id.as_deref(), Some("g"));
+        assert_eq!(config.tabs.get()[0].host_id.as_deref(), Some("h"));
+        assert_eq!(config.plugin_data("scratchpad", Some("h")).unwrap().unwrap()["text"], "notes");
+        let known: serde_json::Value = crate::read_json(&paths::known_hosts_file(&native)).unwrap().unwrap();
+        assert_eq!(known[0]["fingerprint"], "SHA256:test");
+        assert!(legacy.join("vault.json").exists());
+        assert!(!native.join("vault.json").exists());
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({"hosts":[{"id":"later", "host":"later"}]})).unwrap();
+        let reopened = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert!(reopened.hosts.get().host("later").is_none());
+        assert!(reopened.notices.is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn migration_preserves_existing_native_configuration() {
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        let mut existing = Config::open(&native).unwrap();
+        existing.settings.update(|settings| settings.term_type = "native".to_owned()).unwrap();
+        existing.save_host(HostProfile {
+            id:"same".into(), name:"Native".into(),
+            connection: ConnectionParams { host:"native.example".into(), ..Default::default() },
+            ..Default::default()
+        }).unwrap();
+        existing.tabs.set(Vec::new()).unwrap();
+        existing.save_plugin_data("scratchpad", Some("same"), &serde_json::json!({"text":"native notes"})).unwrap();
+        crate::write_json(&paths::known_hosts_file(&native), &serde_json::json!([
+            {"host":"host", "port":22, "fingerprint":"SHA256:native"}
+        ])).unwrap();
+        crate::write_json(&paths::settings_file(&legacy), &serde_json::json!({"termType":"legacy"})).unwrap();
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({"hosts":[
+            {"id":"same", "host":"old.example"}, {"id":"new", "host":"new.example"}
+        ]})).unwrap();
+        crate::write_json(&paths::tabs_file(&legacy), &serde_json::json!([{"id":"old-tab"}])).unwrap();
+        crate::write_json(&legacy.join("plugin-scratchpad.same.json"), &serde_json::json!({"content":"old notes"})).unwrap();
+        crate::write_json(&paths::known_hosts_file(&legacy), &serde_json::json!([
+            {"host":"host", "port":22, "fingerprint":"SHA256:old"},
+            {"host":"new", "port":22, "fingerprint":"SHA256:new"}
+        ])).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert_eq!(config.settings.get().term_type, "native");
+        assert_eq!(config.hosts.get().host("same").unwrap().connection.host, "native.example");
+        assert_eq!(config.hosts.get().host("new").unwrap().connection.host, "new.example");
+        assert!(config.tabs.get().is_empty());
+        assert_eq!(config.plugin_data("scratchpad", Some("same")).unwrap().unwrap()["text"], "native notes");
+        let known: serde_json::Value = crate::read_json(&paths::known_hosts_file(&native)).unwrap().unwrap();
+        assert_eq!(known[0]["fingerprint"], "SHA256:native");
+        assert_eq!(known[1]["fingerprint"], "SHA256:new");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn migration_reports_invalid_data_and_can_retry() {
+        let root = scratch();
+        let legacy = root.join("WaSSH");
+        let native = root.join("wassh-native");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(paths::hosts_file(&legacy), "{broken").unwrap();
+        crate::write_json(&paths::settings_file(&legacy), &serde_json::json!({"termType":"legacy"})).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert_eq!(config.problems.len(), 1);
+        assert!(!paths::settings_file(&native).exists());
+        assert!(!native.join(".electron-migrated").exists());
+        crate::write_json(&paths::hosts_file(&legacy), &serde_json::json!({"hosts":[{"id":"h", "host":"host"}]})).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert!(config.problems.is_empty());
+        assert_eq!(config.settings.get().term_type, "legacy");
+        assert!(config.hosts.get().host("h").is_some());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn migrates_old_sessions_file_and_reconnect_default() {
+        let root = scratch();
+        let legacy = root.join("wassh");
+        let native = root.join("wassh-native");
+        crate::write_json(&paths::settings_file(&legacy), &serde_json::json!({"autoReconnectOnDrop":false})).unwrap();
+        crate::write_json(&legacy.join("sessions.json"), &serde_json::json!([
+            {"id":"h", "host":"example.org", "connectionType":"telnet"}
+        ])).unwrap();
+        crate::write_json(&paths::tabs_file(&legacy), &serde_json::json!([
+            {"id":"t", "connection":{"hostId":"h", "host":"example.org", "connectionType":"telnet"}}
+        ])).unwrap();
+        let config = Config::open_with_legacy(&native, &legacy).unwrap();
+        assert_eq!(config.hosts.get().host("h").unwrap().connection.reconnect, wassh_core::session::ReconnectMode::None);
+        assert_eq!(config.tabs.get()[0].connection.reconnect, wassh_core::session::ReconnectMode::None);
+        assert!(config.settings.get().enabled_plugins.contains(&"scratchpad".to_owned()));
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

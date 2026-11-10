@@ -117,6 +117,9 @@ fn print_environment() {
             for problem in &config.problems {
                 println!("configuration problem: {problem}");
             }
+            for notice in &config.notices {
+                println!("configuration: {notice}");
+            }
         }
         Err(error) => println!("data directory: unavailable ({error})"),
     }

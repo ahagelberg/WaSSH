@@ -608,6 +608,14 @@ impl Shell {
                 format!("could not read configuration: {problem}"),
             );
         }
+        for notice in shell
+            .config
+            .as_ref()
+            .map(|config| config.notices.clone())
+            .unwrap_or_default()
+        {
+            shell.toasts.push(ToastKind::Info, notice);
+        }
         shell.migrate_plugin_secrets();
         shell
     }

@@ -9,6 +9,7 @@ pub mod atomic;
 pub mod backup;
 pub mod config;
 pub mod document;
+mod legacy;
 pub mod paths;
 pub mod secrets;
 pub mod zip;

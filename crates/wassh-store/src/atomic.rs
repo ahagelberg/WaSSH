@@ -17,8 +17,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write `bytes` to `path` atomically.
 ///
-/// On Unix the rename replaces the target in one step. On Windows the target is removed
-/// first, because `std::fs::rename` does not replace existing files there.
+/// Renaming replaces an existing target in one step.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
@@ -35,13 +34,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
-        #[cfg(target_os = "windows")]
-        {
-            if path.exists() {
-                fs::remove_file(path).map_err(|e| StoreError::io(path, e))?;
-                return fs::rename(&temp, path).map_err(|e| StoreError::io(path, e));
-            }
-        }
         return Err(StoreError::io(path, error));
     }
     Ok(())
@@ -143,6 +135,17 @@ mod tests {
         let loaded: Document = read_json(&path).unwrap().unwrap();
         assert_eq!(loaded.name, "second");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temp files left");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_replacement_preserves_existing_target() {
+        let dir = scratch_dir();
+        let target = dir.join("existing");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"original").unwrap();
+        assert!(write_atomic(&target, b"replacement").is_err());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"original");
         fs::remove_dir_all(&dir).ok();
     }
 
