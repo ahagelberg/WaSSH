@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.6] - 2026-11-10
+
+### Added
+
+- Share SSH identities and encrypted credentials across hosts and sessions.
+- Import configuration and available credentials from the legacy Electron app.
+
+### Notes
+
+- Legacy encrypted credentials can be imported on Windows and from Linux Secret Service;
+	other encrypted backends require credentials to be entered again.
+
 ## [2.0.5] - 2026-11-10
 
 ### Added
