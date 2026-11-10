@@ -28,12 +28,12 @@ use wassh_ui::widgets::{Button, MenuItem, MenuState, ToastKind, Toasts};
 
 use self::dialogs::{
     Command, DialogAction, Dialogs, FindCommand, FindState, GroupEditState, HostSave, HostState,
-    HostTarget, OptionsState, PaletteState, PluginSecretDrafts, SecretEdit, tab_menu_command,
+    HostTarget, IdentityDraft, OptionsState, PaletteState, PluginSecretDrafts, SecretEdit, tab_menu_command,
     tab_menu_items,
 };
 use self::quick_connect::{QuickForm, quick_connect};
 use self::session::{
-    PluginValues, Secrets, SessionEntry, SshOpen, jump_chain, open_host_sessions,
+    PluginValues, Secrets, SessionEntry, SshOpen, jump_chain, open_host_sessions, resolve_auth,
 };
 
 /// How long the window must stay put before its geometry is written to `settings.json`.
@@ -717,6 +717,7 @@ impl Shell {
                 let (jumps, jump_error) = match jump_chain(
                     &self.hosts,
                     &connection,
+                    self.identities(),
                     self.secrets.as_ref(),
                 ) {
                     Ok(jumps) => (jumps, None),
@@ -724,14 +725,13 @@ impl Shell {
                     // falling back to a direct connection to the host.
                     Err(error) => (Vec::new(), Some(error)),
                 };
-                let mut secrets = Secrets::default();
-                if connection.auth == AuthMethod::Password {
-                    secrets.password = self
-                        .stored_password(host_id.as_deref())
-                        .unwrap_or_default();
-                }
+                let (resolved, secrets, jump_error) = match resolve_auth(&connection, host_id.as_deref(), self.identities(), self.secrets.as_ref()) {
+                    Ok((resolved, secrets)) => (Some(resolved), secrets, jump_error),
+                    Err(error) => (None, Secrets::default(), Some(error)),
+                };
                 let open = SshOpen {
                     params: connection,
+                    resolved,
                     host_id,
                     secrets,
                     known_hosts: self.known_hosts.clone(),
@@ -740,7 +740,7 @@ impl Shell {
                 };
                 // With no stored password the tab reopens and asks in the terminal.
                 let entry = if open.jump_error.is_none()
-                    && open.params.auth == AuthMethod::Password
+                    && open.resolved.as_ref().unwrap_or(&open.params).auth == AuthMethod::Password
                     && open.secrets.password.is_empty()
                 {
                     SessionEntry::new_ssh_prompt(
@@ -820,21 +820,10 @@ impl Shell {
             ConnectionType::Telnet => self.open_telnet(connection, host_id),
             ConnectionType::Serial => self.open_serial(connection, host_id),
             ConnectionType::Ssh => {
-                if connection.auth != AuthMethod::Password {
-                    self.start_ssh(connection, host_id, Secrets::default());
-                    return;
-                }
-                // A saved password connects straight away; otherwise the terminal asks.
-                match self.stored_password(host_id.as_deref()) {
-                    Some(password) => self.start_ssh(
-                        connection,
-                        host_id,
-                        Secrets {
-                            password,
-                            ..Secrets::default()
-                        },
-                    ),
-                    None => self.open_ssh_prompt(connection, host_id),
+                match resolve_auth(&connection, host_id.as_deref(), self.identities(), self.secrets.as_ref()) {
+                    Ok((resolved, secrets)) if resolved.auth == AuthMethod::Password && secrets.password.is_empty() => self.open_ssh_prompt(connection, host_id),
+                    Ok((_, secrets)) => self.start_ssh(connection, host_id, secrets),
+                    Err(error) => self.toasts.push(ToastKind::Error, error),
                 }
             }
         }
@@ -896,12 +885,16 @@ impl Shell {
     /// The tab appears immediately with the `user@host's password:` prompt, matching the
     /// terminal itself, like PuTTY; a rejected password re-prompts in place.
     fn open_ssh_prompt(&mut self, connection: ConnectionParams, host_id: Option<String>) {
-        let jumps = match jump_chain(&self.hosts, &connection, self.secrets.as_ref()) {
+        let jumps = match jump_chain(&self.hosts, &connection, self.identities(), self.secrets.as_ref()) {
             Ok(jumps) => jumps,
             Err(error) => {
                 self.toasts.push(ToastKind::Error, error);
                 return;
             }
+        };
+        let (resolved, secrets) = match resolve_auth(&connection, host_id.as_deref(), self.identities(), self.secrets.as_ref()) {
+            Ok(result) => result,
+            Err(error) => { self.toasts.push(ToastKind::Error, error); return; }
         };
         let id = self.next_session_id();
         let entry = SessionEntry::new_ssh_prompt(
@@ -911,8 +904,9 @@ impl Shell {
             self.last_terminal_size,
             SshOpen {
                 params: connection,
+                resolved: Some(resolved),
                 host_id,
-                secrets: Secrets::default(),
+                secrets,
                 known_hosts: self.known_hosts.clone(),
                 jumps,
                 jump_error: None,
@@ -927,12 +921,16 @@ impl Shell {
         host_id: Option<String>,
         secrets: Secrets,
     ) {
-        let jumps = match jump_chain(&self.hosts, &connection, self.secrets.as_ref()) {
+        let jumps = match jump_chain(&self.hosts, &connection, self.identities(), self.secrets.as_ref()) {
             Ok(jumps) => jumps,
             Err(error) => {
                 self.toasts.push(ToastKind::Error, error);
                 return;
             }
+        };
+        let resolved = match resolve_auth(&connection, host_id.as_deref(), self.identities(), self.secrets.as_ref()) {
+            Ok((resolved, _)) => resolved,
+            Err(error) => { self.toasts.push(ToastKind::Error, error); return; }
         };
         let id = self.next_session_id();
         let entry = SessionEntry::new_ssh(
@@ -943,6 +941,7 @@ impl Shell {
             self.last_terminal_size,
             SshOpen {
                 params: connection,
+                resolved: Some(resolved),
                 host_id,
                 secrets,
                 known_hosts: self.known_hosts.clone(),
@@ -1008,9 +1007,31 @@ impl Shell {
     }
 
     fn restart(&mut self, index: usize, secrets: Secrets) {
+        if let Some(session) = self.sessions.get(index) && session.connection.kind == ConnectionType::Ssh {
+            let connection = session.connection.clone();
+            let host_id = session.host_id.clone();
+            let previous = session.secrets.clone();
+            let resolution = resolve_auth(&connection, host_id.as_deref(), self.identities(), self.secrets.as_ref());
+            let jumps = jump_chain(&self.hosts, &connection, self.identities(), self.secrets.as_ref());
+            let (resolved, mut credentials, mut error) = match resolution {
+                Ok((resolved, credentials)) => (Some(resolved), credentials, None),
+                Err(error) => (None, Secrets::default(), Some(error)),
+            };
+            if connection.identity_id.is_none() {
+                if !previous.password.is_empty() { credentials.password = previous.password; }
+                if !previous.key_passphrase.is_empty() { credentials.key_passphrase = previous.key_passphrase; }
+            }
+            if !secrets.password.is_empty() { credentials = secrets.clone(); }
+            let jumps = match jumps { Ok(jumps) => jumps, Err(reason) => { error = Some(reason); Vec::new() } };
+            self.sessions[index].set_resolved_auth(resolved, credentials, jumps, error);
+        }
         if let Some(session) = self.sessions.get_mut(index) {
             session.restart(&self.settings.term_type, &secrets, self.known_hosts.clone());
         }
+    }
+
+    fn identities(&self) -> &[wassh_core::Identity] {
+        self.config.as_ref().map(|config| config.identities.get().as_slice()).unwrap_or_default()
     }
 
     // --- window geometry ---------------------------------------------------
@@ -1153,12 +1174,6 @@ impl Shell {
         }
         self.touch_plugin_data();
         true
-    }
-
-    /// Password stored for a saved host, if any.
-    fn stored_password(&self, host_id: Option<&str>) -> Option<String> {
-        let host_id = host_id?;
-        self.secrets.as_ref()?.password(host_id)
     }
 
     /// Plugin `secret: true` fields the vault holds for `scope`.
@@ -1415,13 +1430,17 @@ impl Shell {
             .iter()
             .any(|session| session.host_id.as_deref() == Some(host.id.as_str()));
         let stored_plugin_secrets = self.stored_plugin_secrets(&host.id);
-        HostState::draft(host, is_new)
+        let mut state = HostState::draft(host, is_new)
             .with_defaults(&self.settings.session_style_defaults)
             .with_open_sessions(open)
             .with_saved(saved)
             .with_stored_secrets(password, passphrase)
             .with_plugin_secrets(stored_plugin_secrets)
-            .with_target(target)
+            .with_target(target);
+        if let Some(config) = &self.config {
+            state.identities = config.identities.get().clone();
+        }
+        state
     }
 
     /// Whether a password / passphrase is already stored for `host_id`.
@@ -1432,9 +1451,24 @@ impl Shell {
         }
     }
 
+    #[cfg(test)]
+    fn stored_password(&self, host_id: Option<&str>) -> Option<String> {
+        self.secrets.as_ref()?.password(host_id?)
+    }
+
     /// Options dialog state, with the app-wide plugin secrets already noted.
     fn options_state(&self) -> OptionsState {
         let mut state = OptionsState::new(&self.settings);
+        if let Some(config) = &self.config {
+            state.identities = config.identities.get().iter().map(|identity| IdentityDraft {
+                identity: identity.clone(),
+                host_count: self.hosts.hosts.iter().filter(|host| host.connection.identity_id.as_deref() == Some(identity.id.as_str())).count(),
+                stored_password: self.secrets.as_ref().and_then(|store| store.identity_password(&identity.id)).is_some(),
+                stored_passphrase: self.secrets.as_ref().and_then(|store| store.identity_passphrase(&identity.id)).is_some(),
+                ..Default::default()
+            }).collect();
+            state.identity_ids = state.identities.iter().map(|draft| draft.identity.id.clone()).collect();
+        }
         state.plugin_secrets = self
             .stored_plugin_secrets(wassh_store::secrets::APP_SCOPE)
             .into_iter()
@@ -1446,6 +1480,59 @@ impl Shell {
             })
             .collect();
         state
+    }
+
+    fn save_identities(&mut self, drafts: Vec<IdentityDraft>) -> bool {
+        let Some(config) = self.config.as_ref() else { return drafts.is_empty(); };
+        if drafts.iter().any(|draft| draft.identity.name.trim().is_empty()) {
+            self.toasts.push(ToastKind::Error, "Identity names cannot be empty.");
+            return false;
+        }
+        let removed: Vec<String> = config.identities.get().iter()
+            .filter(|identity| !drafts.iter().any(|draft| draft.identity.id == identity.id))
+            .map(|identity| identity.id.clone()).collect();
+        for id in &removed {
+            let used = self.hosts.hosts.iter().any(|host| host.connection.identity_id.as_ref() == Some(id))
+                || self.sessions.iter().any(|session| session.connection.identity_id.as_ref() == Some(id))
+                || config.tabs.get().iter().any(|tab| tab.connection.identity_id.as_ref() == Some(id));
+            if used {
+                self.toasts.push(ToastKind::Error, "Cannot delete an identity used by a host or session.");
+                return false;
+            }
+        }
+        let changes_secrets = !removed.is_empty() || drafts.iter().any(|draft| draft.clear_password || draft.clear_passphrase || !draft.password.is_empty() || !draft.passphrase.is_empty());
+        if changes_secrets && self.secrets.is_none() {
+            self.toasts.push(ToastKind::Error, "The secrets store is unavailable.");
+            return false;
+        }
+        if let Some(store) = self.secrets.as_mut() {
+            for draft in &drafts {
+                let id = &draft.identity.id;
+                let password = if draft.clear_password { Some(None) } else if draft.password.is_empty() { None } else { Some(Some(draft.password.as_str())) };
+                let passphrase = if draft.clear_passphrase { Some(None) } else if draft.passphrase.is_empty() { None } else { Some(Some(draft.passphrase.as_str())) };
+                if let Some(value) = password && let Err(error) = store.set_identity_password(id, value) {
+                    self.toasts.push(ToastKind::Error, error.to_string());
+                    return false;
+                }
+                if let Some(value) = passphrase && let Err(error) = store.set_identity_passphrase(id, value) {
+                    self.toasts.push(ToastKind::Error, error.to_string());
+                    return false;
+                }
+            }
+        }
+        let identities = drafts.into_iter().map(|draft| draft.identity).collect();
+        if let Some(config) = self.config.as_mut() && let Err(error) = config.identities.set(identities) {
+            self.toasts.push(ToastKind::Error, error.to_string());
+            return false;
+        }
+        if let Some(store) = self.secrets.as_mut() {
+            for id in removed {
+                if let Err(error) = store.forget_identity(&id) {
+                    self.toasts.push(ToastKind::Error, error.to_string());
+                }
+            }
+        }
+        true
     }
 
     /// A host id that is not in use yet.
@@ -1919,7 +2006,6 @@ impl Shell {
     fn schedule_reconnects(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|input| input.focused);
         let now = std::time::Instant::now();
-        let term_type = self.settings.term_type.clone();
         let mut retries = Vec::new();
 
         for (index, session) in self.sessions.iter_mut().enumerate() {
@@ -1953,10 +2039,7 @@ impl Shell {
         }
 
         for index in retries {
-            if let Some(session) = self.sessions.get_mut(index) {
-                let secrets = session.secrets.clone();
-                session.restart(&term_type, &secrets, self.known_hosts.clone());
-            }
+            self.restart(index, Secrets::default());
         }
 
         // Wake up in time for the next scheduled retry.
@@ -2085,7 +2168,10 @@ impl Shell {
     fn handle_dialog_actions(&mut self, actions: Vec<DialogAction>) {
         for action in actions {
             match action {
-                DialogAction::SaveSettings(mut settings, secrets) => {
+                DialogAction::SaveSettings(mut settings, secrets, identities) => {
+                    if !self.save_identities(identities) {
+                        continue;
+                    }
                     strip_plugin_secrets(&mut settings.plugin_settings);
                     self.settings = settings;
                     self.apply_plugin_secrets(wassh_store::secrets::APP_SCOPE, &secrets);
@@ -4312,6 +4398,108 @@ mod tests {
         config
     }
 
+    #[test]
+    fn identity_deletion_is_blocked_by_hosts_and_tabs() {
+        let mut config = scratch_config();
+        let identity = wassh_core::Identity { id: "shared".to_owned(), name: "Shared".to_owned(), ..Default::default() };
+        config.identities.set(vec![identity]).unwrap();
+        let mut shell = Shell::new_with(Some(config), false);
+        let connection = ConnectionParams { host: "example.com".to_owned(), identity_id: Some("shared".to_owned()), ..Default::default() };
+        let host = HostProfile { id: "host-identity".to_owned(), name: "Host".to_owned(), connection: connection.clone(), ..Default::default() };
+        shell.hosts.upsert(host);
+        assert!(!shell.save_identities(Vec::new()));
+        shell.hosts.remove("host-identity");
+        shell.config.as_mut().unwrap().tabs.set(vec![wassh_core::TabSnapshot { id: "saved-tab".to_owned(), connection: connection.clone(), ..Default::default() }]).unwrap();
+        assert!(!shell.save_identities(Vec::new()));
+        shell.config.as_mut().unwrap().tabs.set(Vec::new()).unwrap();
+        shell.open(connection, None);
+        assert!(!shell.save_identities(Vec::new()));
+        shell.close(0);
+        assert!(shell.save_identities(Vec::new()));
+        assert!(shell.identities().is_empty());
+        let dir = shell.config.as_ref().unwrap().dir.clone();
+        drop(shell);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn identity_options_count_saved_hosts_only() {
+        let mut config = scratch_config();
+        config.identities.set(vec![
+            wassh_core::Identity { id: "shared".to_owned(), name: "Shared".to_owned(), ..Default::default() },
+            wassh_core::Identity { id: "unused".to_owned(), name: "Unused".to_owned(), ..Default::default() },
+        ]).unwrap();
+        let mut shell = Shell::new_with(Some(config), false);
+        for id in ["first", "second"] {
+            shell.hosts.upsert(HostProfile {
+                id: id.to_owned(), name: id.to_owned(),
+                connection: ConnectionParams { identity_id: Some("shared".to_owned()), ..Default::default() },
+                ..Default::default()
+            });
+        }
+        shell.hosts.upsert(HostProfile { id: "other".to_owned(), name: "Other".to_owned(), ..Default::default() });
+        shell.config.as_mut().unwrap().tabs.set(vec![wassh_core::TabSnapshot {
+            connection: ConnectionParams { identity_id: Some("unused".to_owned()), ..Default::default() },
+            ..Default::default()
+        }]).unwrap();
+        let state = shell.options_state();
+        assert_eq!(state.identities[0].host_count, 2);
+        assert_eq!(state.identities[1].host_count, 0);
+        shell.hosts.remove("first");
+        assert_eq!(shell.options_state().identities[0].host_count, 1);
+        let dir = shell.config.as_ref().unwrap().dir.clone();
+        drop(shell);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn identity_credentials_are_reloaded_on_reconnect() {
+        let mut config = scratch_config();
+        config.identities.set(vec![wassh_core::Identity { id: "shared".to_owned(), name: "Shared".to_owned(), username: "alice".to_owned(), ..Default::default() }]).unwrap();
+        let mut shell = Shell::new_with(Some(config), false);
+        let connection = ConnectionParams { host: "127.0.0.1".to_owned(), port: 1, identity_id: Some("shared".to_owned()), ..Default::default() };
+        shell.open(connection, None);
+        assert!(shell.sessions[0].awaiting_login());
+        shell.secrets.as_mut().unwrap().set_identity_password("shared", Some("updated")).unwrap();
+        shell.restart(0, Secrets::default());
+        assert_eq!(shell.sessions[0].secrets.password, "updated");
+        assert!(!shell.sessions[0].awaiting_login());
+        let dir = shell.config.as_ref().unwrap().dir.clone();
+        shell.close(0);
+        drop(shell);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn identity_drafts_save_secrets_and_restore_tabs() {
+        let mut config = scratch_config();
+        config.settings.get_mut().reconnect_on_startup = true;
+        let mut tab = password_tab(None);
+        tab.connection.identity_id = Some("shared".to_owned());
+        config.tabs.set(vec![tab]).unwrap();
+        let mut shell = Shell::new_with(Some(config), false);
+        let draft = IdentityDraft {
+            identity: wassh_core::Identity {
+                id: "shared".to_owned(), name: "Shared".to_owned(), username: "bob".to_owned(),
+                ..Default::default()
+            },
+            password: "saved-secret".to_owned(),
+            ..Default::default()
+        };
+        assert!(shell.save_identities(vec![draft]));
+        let dir = shell.config.as_ref().unwrap().dir.clone();
+        let metadata = std::fs::read_to_string(wassh_store::paths::identities_file(&dir)).unwrap();
+        assert!(!metadata.contains("saved-secret"));
+        shell.finish_startup();
+        assert_eq!(shell.sessions.len(), 1);
+        assert_eq!(shell.sessions[0].secrets.password, "saved-secret");
+        assert!(!shell.sessions[0].awaiting_login());
+        assert_eq!(shell.sessions[0].connection.identity_id.as_deref(), Some("shared"));
+        shell.close(0);
+        drop(shell);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Run `frames` headless frames of the whole shell.
     fn run_shell(shell: &mut Shell, ctx: &egui::Context, frames: usize) -> usize {
         let input = egui::RawInput {
@@ -5294,8 +5482,8 @@ mod tests {
         shell.open_plugin_options("Macros");
         let state = shell.dialogs.options.as_ref().expect("options opened");
         assert_eq!(
-            state.nav.active, 6,
-            "the macro pad section follows the six built-in ones"
+            state.nav.active, dialogs::OPTION_SECTIONS.len(),
+            "the macro pad section follows the built-in ones"
         );
 
         // A label that is not a plugin does nothing.

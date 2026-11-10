@@ -9,7 +9,7 @@
 use egui::{Align, Color32, Context, Id, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use wassh_core::{
     APP_NAME, APP_VERSION, AppSettings, AuthMethod, BellMode, BusyPolicy, ConnectionType,
-    CursorStyle, HostProfile, MAX_FONT_SIZE_PX, MAX_SCROLLBACK_LINES, MIN_FONT_SIZE_PX,
+    CursorStyle, HostProfile, Identity, MAX_FONT_SIZE_PX, MAX_SCROLLBACK_LINES, MIN_FONT_SIZE_PX,
     MIN_SCROLLBACK_LINES, Multiplexer, Palette, Parity, ReconnectMode, Rgba, SessionStyle,
     SessionStyleDefaults, StopBits, ThemeMode, Tunnel, TunnelKind, colors,
 };
@@ -55,6 +55,10 @@ const SECTION_GAP: f32 = 28.0;
 const BACKDROP_ALPHA: u8 = 140;
 /// Width of a plugin's dedicated settings editor.
 const EDITOR_WIDTH: f32 = 620.0;
+const IDENTITY_EDITOR_WIDTH: f32 = 460.0;
+const IDENTITY_LABEL_WIDTH: f32 = 90.0;
+const IDENTITY_CONTROL_HEIGHT: f32 = 22.0;
+const IDENTITY_LABEL_SIZE: f32 = 10.5;
 /// Shortest a plugin's dedicated settings editor gets, whatever the window.
 const EDITOR_MIN_HEIGHT: f32 = 240.0;
 /// Share of the window height the editor may take: a dialog, not a second window.
@@ -118,7 +122,7 @@ impl GroupEditState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DialogAction {
     /// Persist these settings.
-    SaveSettings(AppSettings, PluginSecretDrafts),
+    SaveSettings(AppSettings, PluginSecretDrafts, Vec<IdentityDraft>),
     /// Persist this host (new or edited), with the credentials typed into the dialog.
     SaveHost(Box<HostSave>),
     /// Apply these settings to one open session only.
@@ -221,6 +225,23 @@ pub struct HostSave {
     pub plugin_secrets: PluginSecretDrafts,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IdentityDraft {
+    pub identity: Identity,
+    pub host_count: usize,
+    pub password: String,
+    pub passphrase: String,
+    pub stored_password: bool,
+    pub stored_passphrase: bool,
+    pub clear_password: bool,
+    pub clear_passphrase: bool,
+}
+
+pub struct IdentityEdit {
+    index: Option<usize>,
+    draft: IdentityDraft,
+}
+
 /// Entries offered by the command palette.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -319,6 +340,9 @@ pub struct OptionsState {
     pub plugin_secrets: PluginSecretDrafts,
     /// Editors of the plugin sections that own one, keyed by plugin.
     pub editors: Vec<(PluginId, Box<dyn plugin_settings::SettingsEditor>)>,
+    pub identities: Vec<IdentityDraft>,
+    pub identity_editor: Option<IdentityEdit>,
+    pub identity_ids: Vec<String>,
 }
 
 impl OptionsState {
@@ -337,6 +361,9 @@ impl OptionsState {
                 .into_iter()
                 .filter_map(|id| plugin_settings::settings_editor(id).map(|editor| (id, editor)))
                 .collect(),
+            identities: Vec::new(),
+            identity_editor: None,
+            identity_ids: Vec::new(),
         }
     }
 
@@ -425,6 +452,7 @@ pub struct HostState {
     pub clear_password: bool,
     /// The user pressed "Clear" on the stored passphrase.
     pub clear_passphrase: bool,
+    pub identities: Vec<Identity>,
 }
 
 impl HostState {
@@ -462,6 +490,7 @@ impl HostState {
             stored_passphrase: false,
             clear_password: false,
             clear_passphrase: false,
+            identities: Vec::new(),
             draft: host,
         }
     }
@@ -653,12 +682,13 @@ impl Dialogs {
             let committed = actions[before..].iter().any(|action| {
                 matches!(
                     action,
-                    DialogAction::Close | DialogAction::SaveSettings(_, _)
+                    DialogAction::Close | DialogAction::SaveSettings(_, _, _)
                 )
             });
             if !committed {
                 options_plugin_editor(ctx, palette, state);
                 options_editor_dialogs(ctx, palette, state);
+                options_identity_dialog(ctx, palette, state);
             }
         }
         if let Some(state) = self.host.as_mut() {
@@ -1119,12 +1149,13 @@ fn tunnel_port(ui: &mut Ui, palette: &Palette, port: &mut u16) {
 
 // --- Options --------------------------------------------------------------
 
-const OPTION_SECTIONS: [&str; 6] = [
+pub(super) const OPTION_SECTIONS: [&str; 7] = [
     "Appearance",
     "General",
     "Terminal",
     "Backup",
     "Host defaults",
+    "Identities",
     "Plugins",
 ];
 
@@ -1140,13 +1171,17 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         editor,
         plugin_secrets,
         editors,
+        identities,
+        identity_editor,
+        identity_ids,
         ..
     } = state;
     // Set while the section closure runs; applied once the shell returns.
     let mut open_editor = None;
     // Dialogs the sections open on top of the settings: a plugin's own editor and its
     // settings drafts. Escape closes the top one, not Options.
-    let sub_dialog = editor.is_some() || editors.iter().any(|(_, editor)| editor.dialog_open());
+    let sub_dialog = editor.is_some() || identity_editor.is_some()
+        || editors.iter().any(|(_, editor)| editor.dialog_open());
     // Plugins add one section each after the built-in ones, in plugin order, the
     // same way the original app appends them to its section list.
     let plugin_sections = app_plugin_sections(draft);
@@ -1185,7 +1220,8 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
                     foreground: term_foreground_draft,
                 },
             ),
-            5 => options_plugins(ui, palette, draft),
+            5 => options_identities(ui, palette, identities, identity_editor, identity_ids),
+            6 => options_plugins(ui, palette, draft),
             _ => {
                 if let Some(section) = plugin_sections.get(index - OPTION_SECTIONS.len()) {
                     let values = draft
@@ -1232,11 +1268,13 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
             actions.push(DialogAction::SaveSettings(
                 draft.clone().normalized(),
                 plugin_secrets.clone(),
+                identities.clone(),
             ));
         }
         // A dialog on top of the settings takes the dismissal, so the settings stay open.
         ShellOutcome::Dismissed if sub_dialog => {
             *editor = None;
+            *identity_editor = None;
             for (_, editor) in editors.iter_mut() {
                 editor.cancel();
             }
@@ -1245,6 +1283,151 @@ fn options_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) ->
         ShellOutcome::Delete | ShellOutcome::Apply | ShellOutcome::Pending => {}
     }
     actions
+}
+
+fn options_identities(
+    ui: &mut Ui,
+    palette: &Palette,
+    identities: &mut Vec<IdentityDraft>,
+    editor: &mut Option<IdentityEdit>,
+    ids: &mut Vec<String>,
+) {
+    row_block(ui, palette, "Identities", |ui| {
+        let mut remove = None;
+        let mut edit = None;
+        for (index, draft) in identities.iter().enumerate() {
+            card(ui, palette, |ui| {
+                ui.set_width(ui.available_width());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if small_button(ui, palette, "Remove") {
+                        remove = Some(index);
+                    }
+                    if small_button(ui, palette, "Edit") {
+                        edit = Some(index);
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&draft.identity.name).strong()).truncate());
+                    });
+                });
+                let method = match draft.identity.auth {
+                    AuthMethod::Password => "Password",
+                    AuthMethod::PrivateKey => "Private key",
+                    AuthMethod::None => "ssh-agent",
+                };
+                let summary = if draft.identity.username.is_empty() {
+                    method.to_owned()
+                } else {
+                    format!("{} | {method}", draft.identity.username)
+                };
+                let host_label = if draft.host_count == 1 { "host" } else { "hosts" };
+                ui.label(egui::RichText::new(format!("{summary} | Used by {} {host_label}", draft.host_count))
+                    .size(12.0).color(to_color32(palette.text_muted)));
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(index) = remove {
+            identities.remove(index);
+        }
+        if let Some(index) = edit && editor.is_none() {
+            *editor = Some(IdentityEdit { index: Some(index), draft: identities[index].clone() });
+        }
+        if small_button(ui, palette, "+ Add identity") && editor.is_none() {
+            let mut number = wassh_core::time::now_ms();
+            let id = loop {
+                let id = format!("identity-{number}");
+                if !ids.contains(&id) {
+                    break id;
+                }
+                number += 1;
+            };
+            ids.push(id.clone());
+            *editor = Some(IdentityEdit {
+                index: None,
+                draft: IdentityDraft { identity: Identity { id, ..Default::default() }, ..Default::default() },
+            });
+        }
+    });
+}
+
+fn options_identity_dialog(ctx: &Context, palette: &Palette, state: &mut OptionsState) {
+    let Some(edit) = state.identity_editor.as_mut() else {
+        return;
+    };
+    let title = if edit.index.is_some() { "Edit identity" } else { "Add an identity" };
+    let primary = if edit.index.is_some() { "Save" } else { "Add" };
+    let mut commit = false;
+    let mut cancel = false;
+    let response = modal(ctx, "identity-editor", palette, title, IDENTITY_EDITOR_WIDTH, |ui| {
+        let draft = &mut edit.draft;
+        identity_field(ui, palette, "Name", |ui| {
+            text_input(ui, palette, &mut draft.identity.name, "Identity name");
+        });
+        identity_field(ui, palette, "Username", |ui| {
+            text_input(ui, palette, &mut draft.identity.username, "username");
+        });
+        identity_field(ui, palette, "Auth method", |ui| {
+            let options = [(AuthMethod::Password, "Password"), (AuthMethod::PrivateKey, "Private key"), (AuthMethod::None, "ssh-agent")];
+            if let Some(method) = select(ui, "identity-auth", &draft.identity.auth, &options) {
+                draft.identity.auth = method;
+            }
+        });
+        if draft.identity.auth == AuthMethod::PrivateKey {
+            identity_field(ui, palette, "Private key", |ui| {
+                let mut path = draft.identity.private_key_path.clone().unwrap_or_default();
+                if text_input(ui, palette, &mut path, "~/.ssh/id_ed25519").changed() {
+                    draft.identity.private_key_path = (!path.trim().is_empty()).then_some(path);
+                }
+            });
+            identity_field(ui, palette, "Passphrase", |ui| {
+                password_input(ui, palette, &mut draft.passphrase, if draft.stored_passphrase { "(stored)" } else { "not saved" });
+            });
+            if draft.stored_passphrase {
+                checkbox(ui, palette, &mut draft.clear_passphrase, "Forget the stored passphrase");
+            }
+        } else if draft.identity.auth == AuthMethod::Password {
+            identity_field(ui, palette, "Password", |ui| {
+                password_input(ui, palette, &mut draft.password, if draft.stored_password { "(stored)" } else { "not saved" });
+            });
+            if draft.stored_password {
+                checkbox(ui, palette, &mut draft.clear_password, "Forget the stored password");
+            }
+        }
+        footer(ui, |ui| {
+            if small_button_enabled(ui, palette, primary, !draft.identity.name.trim().is_empty()) {
+                commit = true;
+            }
+            if small_button(ui, palette, "Cancel") {
+                cancel = true;
+            }
+        });
+    });
+    if commit {
+        let edit = state.identity_editor.take().unwrap();
+        if let Some(index) = edit.index {
+            state.identities[index] = edit.draft;
+        } else {
+            state.identities.push(edit.draft);
+        }
+    } else if cancel || response.dismissed {
+        state.identity_editor = None;
+    }
+}
+
+fn identity_field(ui: &mut Ui, palette: &Palette, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - IDENTITY_LABEL_WIDTH - ui.spacing().item_spacing.x).max(0.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(IDENTITY_LABEL_WIDTH, IDENTITY_CONTROL_HEIGHT),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(egui::RichText::new(label).size(IDENTITY_LABEL_SIZE).color(to_color32(palette.text_muted)));
+            },
+        );
+        ui.allocate_ui_with_layout(Vec2::new(width, IDENTITY_CONTROL_HEIGHT), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_width(width);
+            add(ui);
+        });
+    });
 }
 
 fn options_appearance(ui: &mut Ui, palette: &Palette, draft: &mut AppSettings) {
@@ -2216,6 +2399,7 @@ fn host_dialog(
         stored_passphrase,
         clear_password,
         clear_passphrase,
+        identities,
         defaults: state_defaults,
         has_sessions: _,
         saved: _,
@@ -2275,6 +2459,7 @@ fn host_dialog(
                     stored_passphrase: *stored_passphrase,
                     clear_password,
                     clear_passphrase,
+                    identities,
                 },
             ),
             "Advanced" => host_advanced(
@@ -2468,10 +2653,33 @@ struct AuthFields<'a> {
     stored_passphrase: bool,
     clear_password: &'a mut bool,
     clear_passphrase: &'a mut bool,
+    identities: &'a [Identity],
 }
 
 fn host_authentication(ui: &mut Ui, palette: &Palette, fields: &mut AuthFields<'_>) {
     let draft = &mut *fields.draft;
+    row(ui, palette, "Identity", None, |ui| {
+        let mut options = vec![(None, "Individual credentials")];
+        options.extend(fields.identities.iter().map(|identity| (Some(identity.id.clone()), identity.name.as_str())));
+        if let Some(id) = &draft.connection.identity_id && !fields.identities.iter().any(|identity| &identity.id == id) {
+            options.push((Some(id.clone()), "Missing identity"));
+        }
+        if let Some(value) = select(ui, "host-identity", &draft.connection.identity_id, &options) {
+            draft.connection.identity_id = value;
+        }
+    });
+    if let Some(id) = &draft.connection.identity_id {
+        if let Some(identity) = fields.identities.iter().find(|identity| &identity.id == id) {
+            row(ui, palette, "Username", None, |ui| { ui.label(&identity.username); });
+            row(ui, palette, "Auth method", None, |ui| {
+                ui.label(match identity.auth { AuthMethod::Password => "Password", AuthMethod::PrivateKey => "Private key", AuthMethod::None => "ssh-agent" });
+            });
+            if identity.auth == AuthMethod::PrivateKey {
+                row(ui, palette, "Private key", None, |ui| { ui.label(identity.private_key_path.as_deref().unwrap_or("")); });
+            }
+        }
+        return;
+    }
     row(ui, palette, "Username", Some("Blank uses your login name"), |ui| {
         text_input(ui, palette, &mut draft.connection.username, "username");
     });
@@ -3479,6 +3687,7 @@ mod tests {
                 "Terminal",
                 "Backup",
                 "Host defaults",
+                "Identities",
                 "Plugins"
             ]
         );
@@ -4025,6 +4234,91 @@ mod tests {
     }
 
     #[test]
+    fn identity_creation_is_available_in_options() {
+        let ctx = Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut dialogs = Dialogs {
+            options: Some(OptionsState::new(&AppSettings::default())),
+            ..Default::default()
+        };
+        let section = OPTION_SECTIONS.iter().position(|name| *name == "Identities").unwrap();
+        let mut rows = Vec::new();
+        for step in 0..12 {
+            dialogs.options.as_mut().unwrap().nav.scroll_to = Some(section);
+            rows = run_options(&ctx, &mut dialogs, size, f64::from(step) * 0.05, Vec::new());
+        }
+        let button = rows.iter().find(|(_, _, text)| text == "+ Add identity").unwrap().clone();
+        let rows = click_options(&ctx, &mut dialogs, size, &button);
+        let state = dialogs.options.as_mut().unwrap();
+        assert!(state.identities.is_empty());
+        assert!(rows.iter().any(|(_, _, text)| text == "Add an identity"));
+        assert!(rows.iter().any(|(_, _, text)| text == "Username"));
+        assert!(rows.iter().any(|(_, _, text)| text == "Auth method"));
+        state.identity_editor.as_mut().unwrap().draft.identity.name = "Shared".to_owned();
+        let rows = run_options(&ctx, &mut dialogs, size, 20.1, Vec::new());
+        let button = rows.iter().find(|(_, _, text)| text == "Add").unwrap().clone();
+        click_options(&ctx, &mut dialogs, size, &button);
+        let state = dialogs.options.as_ref().unwrap();
+        assert_eq!(state.identities.len(), 1);
+        assert_eq!(state.identities[0].identity.name, "Shared");
+        assert!(state.identity_editor.is_none());
+    }
+
+    #[test]
+    fn identity_edit_cancel_keeps_the_staged_identity() {
+        let ctx = Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut state = OptionsState::new(&AppSettings::default());
+        state.identities.push(IdentityDraft {
+            identity: Identity { id: "shared".to_owned(), name: "Shared".to_owned(), username: "alice".to_owned(), ..Default::default() },
+            host_count: 1,
+            password: "original".to_owned(),
+            stored_password: true,
+            ..Default::default()
+        });
+        state.identities.push(IdentityDraft {
+            identity: Identity { id: "another".to_owned(), name: "A longer identity name".to_owned(), ..Default::default() },
+            ..Default::default()
+        });
+        let mut dialogs = Dialogs { options: Some(state), ..Default::default() };
+        let section = OPTION_SECTIONS.iter().position(|name| *name == "Identities").unwrap();
+        let mut rows = Vec::new();
+        for step in 0..12 {
+            dialogs.options.as_mut().unwrap().nav.scroll_to = Some(section);
+            rows = run_options(&ctx, &mut dialogs, size, f64::from(step) * 0.05, Vec::new());
+        }
+        let name = rows.iter().find(|(_, _, text)| text == "Shared").unwrap();
+        assert!(rows.iter().any(|(_, _, text)| text == "alice | Password | Used by 1 host"));
+        assert!(rows.iter().any(|(_, _, text)| text == "Password | Used by 0 hosts"));
+        let edits: Vec<_> = rows.iter().filter(|(_, _, text)| text == "Edit").collect();
+        let removes: Vec<_> = rows.iter().filter(|(_, _, text)| text == "Remove").collect();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(removes.len(), 2);
+        assert_eq!(edits[0].1, edits[1].1);
+        assert_eq!(removes[0].1, removes[1].1);
+        assert!((name.0 - edits[0].0).abs() <= 2, "name and buttons should be vertically aligned");
+        assert!(edits[0].1 > name.1 + 300, "buttons should be on the right");
+        let button = rows.iter().find(|(_, _, text)| text == "Edit").unwrap().clone();
+        let rows = click_options(&ctx, &mut dialogs, size, &button);
+        assert!(rows.iter().any(|(_, _, text)| text == "Edit identity"));
+        let state = dialogs.options.as_mut().unwrap();
+        let draft = &mut state.identity_editor.as_mut().unwrap().draft;
+        draft.identity.username = "changed".to_owned();
+        draft.password = "replacement".to_owned();
+        draft.clear_password = true;
+        let escape = vec![egui::Event::Key {
+            key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false,
+            modifiers: Default::default(),
+        }];
+        run_options(&ctx, &mut dialogs, size, 30.0, escape);
+        let state = dialogs.options.as_ref().unwrap();
+        assert!(state.identity_editor.is_none());
+        assert_eq!(state.identities[0].identity.username, "alice");
+        assert_eq!(state.identities[0].password, "original");
+        assert!(!state.identities[0].clear_password);
+    }
+
+    #[test]
     fn the_provider_dialog_is_one_of_the_apps_dialogs() {
         // Adding or editing a provider opens the same kind of dialog as everything else
         // here: the app draws its frame, its buttons and Escape.
@@ -4565,6 +4859,7 @@ mod tests {
                         stored_passphrase: state.stored_passphrase,
                         clear_password: &mut state.clear_password,
                         clear_passphrase: &mut state.clear_passphrase,
+                        identities: &state.identities,
                     },
                 );
             });

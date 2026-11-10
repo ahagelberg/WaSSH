@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use wassh_core::{AppSettings, HostsDocument, TabSnapshot};
+use wassh_core::{AppSettings, HostsDocument, Identity, TabSnapshot};
 
 use crate::document::JsonDocument;
 use crate::paths;
@@ -17,6 +17,7 @@ pub struct Config {
     pub dir: PathBuf,
     pub settings: JsonDocument<AppSettings>,
     pub hosts: JsonDocument<HostsDocument>,
+    pub identities: JsonDocument<Vec<Identity>>,
     pub tabs: JsonDocument<Vec<TabSnapshot>>,
     /// Documents that could not be read and were reset, as `file: reason`.
     pub problems: Vec<String>,
@@ -40,6 +41,12 @@ impl Config {
             HostsDocument::normalized,
         );
         problems.extend(problem);
+        let (identities, problem) = JsonDocument::open_lenient(
+            paths::identities_file(&dir),
+            Vec::new(),
+            |identities| identities,
+        );
+        problems.extend(problem);
         let (tabs, problem) = JsonDocument::open_lenient(
             paths::tabs_file(&dir),
             Vec::new(),
@@ -52,6 +59,7 @@ impl Config {
             notices: Vec::new(),
             settings,
             hosts,
+            identities,
             tabs,
         })
     }
@@ -97,6 +105,9 @@ impl Config {
         }
         if self.hosts.is_dirty() {
             self.hosts.save()?;
+        }
+        if self.identities.is_dirty() {
+            self.identities.save()?;
         }
         if self.tabs.is_dirty() {
             self.tabs.save()?;

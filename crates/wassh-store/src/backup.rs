@@ -229,6 +229,37 @@ mod tests {
     }
 
     #[test]
+    fn identity_backup_restores_metadata_and_encrypted_secrets() {
+        let source = TempDir::new("identity-source");
+        let mut config = crate::Config::open(source.path()).unwrap();
+        config.identities.set(vec![wassh_core::Identity { id: "shared".to_owned(), name: "Shared".to_owned(), username: "alice".to_owned(), ..Default::default() }]).unwrap();
+        let mut vault = crate::secrets::SecretsStore::open(source.path()).unwrap();
+        vault.set_identity_password("shared", Some("secret")).unwrap();
+        let archive = TempDir::new("identity-archive");
+        let target = archive.path().join("backup.zip");
+        export(source.path(), &target).unwrap();
+        let restored = TempDir::new("identity-restored");
+        import(&target, restored.path()).unwrap();
+        let config = crate::Config::open(restored.path()).unwrap();
+        let vault = crate::secrets::SecretsStore::open(restored.path()).unwrap();
+        assert_eq!(config.identities.get()[0].username, "alice");
+        assert_eq!(vault.identity_password("shared").as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn backup_without_identities_loads_as_empty() {
+        let source = TempDir::new("old-source");
+        std::fs::write(source.path().join("settings.json"), b"{}").unwrap();
+        let archive = TempDir::new("old-archive");
+        let target = archive.path().join("backup.zip");
+        export(source.path(), &target).unwrap();
+        let restored = TempDir::new("old-restored");
+        import(&target, restored.path()).unwrap();
+        let config = crate::Config::open(restored.path()).unwrap();
+        assert!(config.identities.get().is_empty());
+    }
+
+    #[test]
     fn importing_over_existing_files_overwrites_them() {
         let source = TempDir::new("overwrite-source");
         std::fs::write(source.path().join("hosts.json"), b"new").expect("write");

@@ -64,6 +64,16 @@ pub enum AuthMethod {
     None,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Identity {
+    pub id: String,
+    pub name: String,
+    pub username: String,
+    pub auth: AuthMethod,
+    pub private_key_path: Option<String>,
+}
+
 /// Serial parity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -363,6 +373,7 @@ pub struct ConnectionParams {
     pub username: String,
     pub auth: AuthMethod,
     pub private_key_path: Option<String>,
+    pub identity_id: Option<String>,
     pub jump_host_id: Option<String>,
     pub tunnels: Vec<Tunnel>,
     pub x11: bool,
@@ -381,6 +392,7 @@ impl Default for ConnectionParams {
             username: String::new(),
             auth: AuthMethod::Password,
             private_key_path: None,
+            identity_id: None,
             jump_host_id: None,
             tunnels: Vec::new(),
             x11: false,
@@ -415,6 +427,7 @@ impl ConnectionParams {
             ConnectionType::Ssh | ConnectionType::Telnet => {}
         }
         if !self.kind.is_ssh() {
+            self.identity_id = None;
             self.tunnels.clear();
             self.x11 = false;
             self.remote_session.enabled = false;
@@ -468,6 +481,21 @@ impl ConnectionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_references_round_trip_and_old_connections_load() {
+        let old: ConnectionParams = serde_json::from_str(r#"{"host":"example.com"}"#).unwrap();
+        assert_eq!(old.identity_id, None);
+        let params = ConnectionParams {
+            identity_id: Some("shared".to_owned()),
+            ..old
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let restored: ConnectionParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.identity_id.as_deref(), Some("shared"));
+        let telnet = ConnectionParams { kind: ConnectionType::Telnet, ..restored }.normalized();
+        assert_eq!(telnet.identity_id, None);
+    }
 
     #[test]
     fn new_hosts_reconnect_when_focused() {

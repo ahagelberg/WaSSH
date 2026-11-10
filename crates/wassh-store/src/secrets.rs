@@ -54,6 +54,7 @@ pub const APP_SCOPE: &str = "app";
 struct SecretFile {
     version: u32,
     entries: BTreeMap<String, SealedEntry>,
+    identities: BTreeMap<String, SealedEntry>,
     /// Plugin secrets, `scope -> plugin -> field -> sealed value`.
     ///
     /// A plugin cannot reach the vault itself, so the host seals the values of
@@ -175,6 +176,38 @@ impl SecretsStore {
             _ => None,
         };
         self.edit(host_id, |entry| entry.passphrase = sealed)
+    }
+
+    pub fn identity_password(&self, id: &str) -> Option<String> {
+        self.file.identities.get(id)?.password.as_deref().and_then(|value| self.unseal(value))
+    }
+
+    pub fn identity_passphrase(&self, id: &str) -> Option<String> {
+        self.file.identities.get(id)?.passphrase.as_deref().and_then(|value| self.unseal(value))
+    }
+
+    pub fn set_identity_password(&mut self, id: &str, value: Option<&str>) -> Result<(), StoreError> {
+        let sealed = value.filter(|value| !value.is_empty()).map(|value| self.seal(value)).transpose()?;
+        self.edit_identity(id, |entry| entry.password = sealed)
+    }
+
+    pub fn set_identity_passphrase(&mut self, id: &str, value: Option<&str>) -> Result<(), StoreError> {
+        let sealed = value.filter(|value| !value.is_empty()).map(|value| self.seal(value)).transpose()?;
+        self.edit_identity(id, |entry| entry.passphrase = sealed)
+    }
+
+    pub fn forget_identity(&mut self, id: &str) -> Result<(), StoreError> {
+        self.file.identities.remove(id);
+        crate::write_json(&self.path, &self.file)
+    }
+
+    fn edit_identity(&mut self, id: &str, change: impl FnOnce(&mut SealedEntry)) -> Result<(), StoreError> {
+        let entry = self.file.identities.entry(id.to_owned()).or_default();
+        change(entry);
+        if entry.password.is_none() && entry.passphrase.is_none() {
+            self.file.identities.remove(id);
+        }
+        crate::write_json(&self.path, &self.file)
     }
 
     /// Stored plugin secret, if one is saved and decryptable.
@@ -317,6 +350,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wassh-secrets-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn identity_secrets_are_isolated_and_survive_reopening() {
+        let dir = scratch();
+        let mut store = SecretsStore::open(&dir).unwrap();
+        store.set_password("same", Some("host-secret")).unwrap();
+        store.set_identity_password("same", Some("identity-secret")).unwrap();
+        store.set_identity_passphrase("same", Some("key-secret")).unwrap();
+        let json = std::fs::read_to_string(secrets_file(&dir)).unwrap();
+        assert!(!json.contains("identity-secret"));
+        assert!(!json.contains("key-secret"));
+        let mut store = SecretsStore::open(&dir).unwrap();
+        assert_eq!(store.password("same").as_deref(), Some("host-secret"));
+        assert_eq!(store.identity_password("same").as_deref(), Some("identity-secret"));
+        assert_eq!(store.identity_passphrase("same").as_deref(), Some("key-secret"));
+        store.forget_identity("same").unwrap();
+        assert_eq!(store.identity_password("same"), None);
+        assert_eq!(store.password("same").as_deref(), Some("host-secret"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

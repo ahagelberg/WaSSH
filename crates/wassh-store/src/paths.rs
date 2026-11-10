@@ -13,6 +13,7 @@ pub const DATA_DIR_NAME: &str = "wassh-native";
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const HOSTS_FILE: &str = "hosts.json";
+pub const IDENTITIES_FILE: &str = "identities.json";
 pub const TABS_FILE: &str = "tabs.json";
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts.json";
 
@@ -23,6 +24,10 @@ pub fn settings_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
 
 pub fn hosts_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
     data_dir.as_ref().join(HOSTS_FILE)
+}
+
+pub fn identities_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
+    data_dir.as_ref().join(IDENTITIES_FILE)
 }
 
 pub fn tabs_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {

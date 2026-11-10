@@ -27,6 +27,12 @@ cargo run -p wassh
 
 ## Notes
 
+- In Options > Identities, create a shared SSH identity with a username and password,
+  private key, or ssh-agent. Select it in a host or session's Authentication settings.
+  Changes apply on the next connection or reconnect. An identity cannot be deleted while
+  a saved host or open/restorable tab uses it. Passwords and key passphrases are encrypted
+  in the local secrets store. Backups include the encryption key and must be protected
+  like passwords.
 - On startup, WaSSH imports pre-2.0 Electron configuration from the sibling `WaSSH`
   data directory once, leaving the original files untouched. Existing native settings,
   tabs and plugin files take precedence; hosts and known hosts are merged without

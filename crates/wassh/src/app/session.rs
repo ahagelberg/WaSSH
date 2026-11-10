@@ -216,6 +216,7 @@ pub struct Pumped {
 pub struct SshOpen {
     /// Connection parameters, already normalised.
     pub params: ConnectionParams,
+    pub resolved: Option<ConnectionParams>,
     /// Saved host this session came from, if any.
     pub host_id: Option<String>,
     /// Credentials typed for this session only.
@@ -248,6 +249,7 @@ pub struct SessionEntry {
     pub backend: Backend,
     /// Parameters the session was opened with.
     pub connection: ConnectionParams,
+    resolved: Option<ConnectionParams>,
     /// Saved host this tab came from, if any.
     pub host_id: Option<String>,
     /// Pending host-key decision.
@@ -258,6 +260,7 @@ pub struct SessionEntry {
     pub exit_reported: bool,
     /// Credentials used to open this session, kept for automatic reconnects.
     pub secrets: Secrets,
+    identity_prompt_password: bool,
     /// Message shown alongside the status, e.g. a tmux fallback notice.
     pub status_message: Option<String>,
     /// How many reconnects have been attempted since the last successful login.
@@ -343,6 +346,7 @@ impl SessionEntry {
         let jumps = open.jumps.clone();
         let mut entry = Self::prepare(id, palette, defaults, size, open.params.clone(), open.host_id.clone());
         entry.secrets = secrets;
+        entry.resolved = open.resolved.clone();
         entry.jumps = jumps;
         entry.jump_error = open.jump_error.clone();
         entry.begin(term_type, open);
@@ -369,6 +373,7 @@ impl SessionEntry {
             open.host_id.clone(),
         );
         entry.jumps = open.jumps.clone();
+        entry.resolved = open.resolved.clone();
         entry.prompt_login(open);
         entry
     }
@@ -435,11 +440,13 @@ impl SessionEntry {
             backend: Backend::Closed,
             palette: *palette,
             connection: params,
+            resolved: None,
             host_id,
             host_key_prompt: None,
             auth_prompt: None,
             exit_reported: false,
             secrets: Secrets::default(),
+            identity_prompt_password: false,
             status_message: None,
             reconnect_attempt: 0,
             retry_at: None,
@@ -593,13 +600,15 @@ impl SessionEntry {
                 self.connection = self.connection.clone().normalized();
                 let open = SshOpen {
                     params: self.connection.clone(),
+                    resolved: self.resolved.clone(),
                     host_id: self.host_id.clone(),
                     secrets: self.secrets.clone(),
                     known_hosts,
                     jumps: self.jumps.clone(),
                     jump_error: self.jump_error.clone(),
                 };
-                if self.connection.auth == AuthMethod::Password
+                if self.jump_error.is_none()
+                    && self.resolved.as_ref().unwrap_or(&self.connection).auth == AuthMethod::Password
                     && self.secrets.password.is_empty()
                 {
                     // Nothing to reuse: ask again in the terminal.
@@ -648,7 +657,7 @@ impl SessionEntry {
         secrets: &Secrets,
         known_hosts: Arc<KnownHosts>,
     ) -> SshOptions {
-        let params = &self.connection;
+        let params = self.resolved.as_ref().unwrap_or(&self.connection);
         let auth = match params.auth {
             AuthMethod::Password => SshAuth::Password(secrets.password.clone()),
             AuthMethod::PrivateKey => SshAuth::PrivateKey {
@@ -1084,8 +1093,24 @@ impl SessionEntry {
         connection: ConnectionParams,
         defaults: &SessionStyleDefaults,
     ) {
+        if self.connection.identity_id != connection.identity_id {
+            self.secrets = Secrets::default();
+            self.identity_prompt_password = false;
+        }
         self.connection = connection;
         self.apply_style(defaults);
+    }
+
+    pub fn set_resolved_auth(&mut self, resolved: Option<ConnectionParams>, mut secrets: Secrets, jumps: Vec<wassh_ssh::JumpHop>, error: Option<String>) {
+        if self.connection.identity_id.is_some() && self.identity_prompt_password && secrets.password.is_empty() {
+            secrets.password.clone_from(&self.secrets.password);
+        } else {
+            self.identity_prompt_password = false;
+        }
+        self.resolved = resolved;
+        self.secrets = secrets;
+        self.jumps = jumps;
+        self.jump_error = error;
     }
 
     /// Recompute what the renderer shows from this session's overrides plus the app defaults.
@@ -1669,7 +1694,7 @@ impl SessionEntry {
         }
         text.push_str(&format!(
             "{}@{}'s password: ",
-            open.params.username, open.params.host
+            open.resolved.as_ref().unwrap_or(&open.params).username, open.params.host
         ));
         self.login = Some(LoginPrompt {
             open,
@@ -1763,6 +1788,7 @@ impl SessionEntry {
         let open = login.open.clone();
         // Keep the password for automatic reconnects and for the retry prompt.
         self.secrets.password.clone_from(&password);
+        self.identity_prompt_password = self.connection.identity_id.is_some();
         self.login = Some(login);
         self.terminal.feed(b"\r\n");
         self.begin(term_type, open);
@@ -3069,6 +3095,7 @@ pub fn open_host_sessions<'a>(
 pub fn jump_chain(
     hosts: &wassh_core::HostsDocument,
     params: &ConnectionParams,
+    identities: &[wassh_core::Identity],
     vault: Option<&wassh_store::SecretsStore>,
 ) -> Result<Vec<wassh_ssh::JumpHop>, String> {
     let mut chain = Vec::new();
@@ -3085,7 +3112,7 @@ pub fn jump_chain(
         let host = hosts
             .host(&id)
             .ok_or_else(|| format!("jump host '{id}' no longer exists"))?;
-        let connection = &host.connection;
+        let (connection, secrets) = resolve_auth(&host.connection, Some(&host.id), identities, vault)?;
         chain.insert(
             0,
             wassh_ssh::JumpHop {
@@ -3096,7 +3123,7 @@ pub fn jump_chain(
                 } else {
                     connection.username.clone()
                 },
-                auth: jump_auth(host, vault)?,
+                auth: jump_auth(host, &connection, &secrets)?,
             },
         );
         next = connection.jump_host_id.clone();
@@ -3108,14 +3135,13 @@ pub fn jump_chain(
 /// Credentials one jump hop authenticates with, taken from the vault.
 fn jump_auth(
     host: &wassh_core::HostProfile,
-    vault: Option<&wassh_store::SecretsStore>,
+    connection: &ConnectionParams,
+    secrets: &Secrets,
 ) -> Result<wassh_ssh::SshAuth, String> {
     let name = host.display_name();
-    match host.connection.auth {
+    match connection.auth {
         AuthMethod::Password => {
-            let password = vault
-                .and_then(|vault| vault.password(&host.id))
-                .unwrap_or_default();
+            let password = secrets.password.clone();
             if password.is_empty() {
                 return Err(format!(
                     "jump host '{name}' needs a saved password in its host settings"
@@ -3124,15 +3150,13 @@ fn jump_auth(
             Ok(wassh_ssh::SshAuth::Password(password))
         }
         AuthMethod::PrivateKey => {
-            let path = host.connection.private_key_path.clone().unwrap_or_default();
+            let path = connection.private_key_path.clone().unwrap_or_default();
             if path.trim().is_empty() {
                 return Err(format!(
                     "jump host '{name}' has no private key configured"
                 ));
             }
-            let passphrase = vault
-                .and_then(|vault| vault.passphrase(&host.id))
-                .filter(|passphrase| !passphrase.is_empty());
+            let passphrase = (!secrets.key_passphrase.is_empty()).then(|| secrets.key_passphrase.clone());
             Ok(wassh_ssh::SshAuth::PrivateKey {
                 path: path.into(),
                 passphrase,
@@ -3140,6 +3164,35 @@ fn jump_auth(
         }
         AuthMethod::None => Ok(wassh_ssh::SshAuth::Agent),
     }
+}
+
+pub fn resolve_auth(
+    params: &ConnectionParams,
+    host_id: Option<&str>,
+    identities: &[wassh_core::Identity],
+    vault: Option<&wassh_store::SecretsStore>,
+) -> Result<(ConnectionParams, Secrets), String> {
+    let mut resolved = params.clone();
+    let secrets = if let Some(id) = &params.identity_id {
+        let identity = identities.iter().find(|identity| &identity.id == id)
+            .ok_or_else(|| format!("identity '{id}' no longer exists"))?;
+        resolved.username = identity.username.clone();
+        resolved.auth = identity.auth;
+        resolved.private_key_path = identity.private_key_path.clone();
+        Secrets {
+            password: vault.and_then(|vault| vault.identity_password(id)).unwrap_or_default(),
+            key_passphrase: vault.and_then(|vault| vault.identity_passphrase(id)).unwrap_or_default(),
+        }
+    } else {
+        Secrets {
+            password: host_id.and_then(|id| vault.and_then(|vault| vault.password(id))).unwrap_or_default(),
+            key_passphrase: host_id.and_then(|id| vault.and_then(|vault| vault.passphrase(id))).unwrap_or_default(),
+        }
+    };
+    if resolved.username.trim().is_empty() {
+        resolved.username = local_username();
+    }
+    Ok((resolved, secrets))
 }
 
 fn local_username() -> String {
@@ -3320,6 +3373,7 @@ mod tests {
             TerminalSize::new(80, 24),
             SshOpen {
                 params,
+                resolved: None,
                 host_id: None,
                 secrets: Secrets::default(),
                 known_hosts: Arc::new(KnownHosts::in_memory()),
@@ -3346,6 +3400,7 @@ mod tests {
             TerminalSize::new(80, 24),
             SshOpen {
                 params,
+                resolved: None,
                 host_id: None,
                 secrets: Secrets::default(),
                 known_hosts: Arc::new(KnownHosts::in_memory()),
@@ -3421,6 +3476,28 @@ mod tests {
             entry.login.as_ref().map(|login| login.attempts),
             Some(1)
         );
+    }
+
+    #[test]
+    fn identity_prompt_password_is_reused_until_a_saved_password_replaces_it() {
+        let mut entry = password_entry();
+        entry.connection.identity_id = Some("shared".to_owned());
+        entry.login_input(
+            &[
+                wassh_ui::TerminalInput::Text("typed".to_owned()),
+                wassh_ui::TerminalInput::Key(wassh_term::KeyStroke {
+                    key: Key::Enter, ctrl: false, alt: false, shift: false,
+                }),
+            ],
+            "xterm-256color",
+        );
+        let resolved = Some(entry.connection.clone());
+        entry.set_resolved_auth(resolved.clone(), Secrets::default(), Vec::new(), None);
+        assert_eq!(entry.secrets.password, "typed");
+        entry.set_resolved_auth(resolved.clone(), Secrets { password: "saved".to_owned(), ..Default::default() }, Vec::new(), None);
+        assert_eq!(entry.secrets.password, "saved");
+        entry.set_resolved_auth(resolved, Secrets::default(), Vec::new(), None);
+        assert!(entry.secrets.password.is_empty());
     }
 
     #[test]
@@ -4605,10 +4682,66 @@ mod tests {
     }
 
     #[test]
+    fn shared_identity_resolves_current_credentials_for_hosts() {
+        let dir = std::env::temp_dir().join(format!("wassh-identity-{}", std::process::id()));
+        let mut vault = wassh_store::SecretsStore::open(&dir).unwrap();
+        vault.set_identity_password("shared", Some("first")).unwrap();
+        let mut identity = wassh_core::Identity {
+            id: "shared".to_owned(), name: "Shared".to_owned(), username: "alice".to_owned(),
+            ..Default::default()
+        };
+        let params = ConnectionParams {
+            username: "individual".to_owned(), identity_id: Some("shared".to_owned()),
+            ..Default::default()
+        };
+        for host_id in ["first-host", "second-host"] {
+            let (resolved, secrets) = resolve_auth(&params, Some(host_id), &[identity.clone()], Some(&vault)).unwrap();
+            assert_eq!(resolved.username, "alice");
+            assert_eq!(secrets.password, "first");
+            assert_eq!(params.username, "individual");
+        }
+        identity.username = "bob".to_owned();
+        vault.set_identity_password("shared", Some("second")).unwrap();
+        let (resolved, secrets) = resolve_auth(&params, None, &[identity.clone()], Some(&vault)).unwrap();
+        assert_eq!(resolved.username, "bob");
+        assert_eq!(secrets.password, "second");
+        identity.auth = AuthMethod::PrivateKey;
+        identity.private_key_path = Some("/key".to_owned());
+        vault.set_identity_passphrase("shared", Some("unlock")).unwrap();
+        let (resolved, secrets) = resolve_auth(&params, None, &[identity], Some(&vault)).unwrap();
+        assert_eq!(resolved.auth, AuthMethod::PrivateKey);
+        assert_eq!(resolved.private_key_path.as_deref(), Some("/key"));
+        assert_eq!(secrets.key_passphrase, "unlock");
+        let agent = wassh_core::Identity { id: "shared".to_owned(), auth: AuthMethod::None, ..Default::default() };
+        let (resolved, _) = resolve_auth(&params, None, &[agent], Some(&vault)).unwrap();
+        assert_eq!(resolved.auth, AuthMethod::None);
+        assert!(resolve_auth(&params, None, &[], Some(&vault)).is_err());
+        drop(vault);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_host_used_as_a_jump_uses_its_shared_identity() {
+        let dir = std::env::temp_dir().join(format!("wassh-identity-jump-{}", std::process::id()));
+        let mut vault = wassh_store::SecretsStore::open(&dir).unwrap();
+        vault.set_identity_password("shared", Some("secret")).unwrap();
+        let identity = wassh_core::Identity { id: "shared".to_owned(), username: "bob".to_owned(), ..Default::default() };
+        let mut hosts = jump_hosts_doc();
+        hosts.hosts.iter_mut().find(|host| host.id == "locked").unwrap().connection.identity_id = Some("shared".to_owned());
+        let mut params = hosts.host("target").unwrap().connection.clone();
+        params.jump_host_id = Some("locked".to_owned());
+        let chain = jump_chain(&hosts, &params, &[identity], Some(&vault)).unwrap();
+        assert_eq!(chain[0].username, "bob");
+        assert!(matches!(&chain[0].auth, wassh_ssh::SshAuth::Password(value) if value == "secret"));
+        drop(vault);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn jump_chains_are_resolved_outermost_first() {
         let hosts = jump_hosts_doc();
         let params = hosts.host("target").unwrap().connection.clone();
-        let chain = jump_chain(&hosts, &params, None).expect("chain");
+        let chain = jump_chain(&hosts, &params, &[], None).expect("chain");
         assert_eq!(
             chain.iter().map(|hop| hop.host.as_str()).collect::<Vec<_>>(),
             vec!["bastion.example.com", "inner.example.com"]
@@ -4621,7 +4754,7 @@ mod tests {
     fn hosts_without_a_jump_host_have_an_empty_chain() {
         let hosts = jump_hosts_doc();
         let params = hosts.host("bastion").unwrap().connection.clone();
-        assert!(jump_chain(&hosts, &params, None).unwrap().is_empty());
+        assert!(jump_chain(&hosts, &params, &[], None).unwrap().is_empty());
     }
 
     #[test]
@@ -4634,7 +4767,7 @@ mod tests {
         let mut vault = wassh_store::SecretsStore::open(&dir).unwrap();
         vault.set_password("locked", Some("hunter2")).unwrap();
 
-        let chain = jump_chain(&hosts, &params, Some(&vault)).expect("chain");
+        let chain = jump_chain(&hosts, &params, &[], Some(&vault)).expect("chain");
         assert!(matches!(
             &chain[0].auth,
             wassh_ssh::SshAuth::Password(password) if password == "hunter2"
@@ -4648,7 +4781,7 @@ mod tests {
         let hosts = jump_hosts_doc();
         let mut params = hosts.host("target").unwrap().connection.clone();
         params.jump_host_id = Some("locked".to_owned());
-        let error = jump_chain(&hosts, &params, None).unwrap_err();
+        let error = jump_chain(&hosts, &params, &[], None).unwrap_err();
         assert!(error.contains("locked"), "error was {error}");
         assert!(error.contains("password"));
     }
@@ -4659,7 +4792,7 @@ mod tests {
         let first = hosts.hosts.iter_mut().find(|host| host.id == "bastion").unwrap();
         first.connection.jump_host_id = Some("inner".to_owned());
         let params = hosts.host("target").unwrap().connection.clone();
-        let error = jump_chain(&hosts, &params, None).unwrap_err();
+        let error = jump_chain(&hosts, &params, &[], None).unwrap_err();
         assert!(error.contains("loop"), "error was {error}");
     }
 
@@ -4668,7 +4801,7 @@ mod tests {
         let hosts = jump_hosts_doc();
         let mut params = hosts.host("target").unwrap().connection.clone();
         params.jump_host_id = Some("ghost".to_owned());
-        let error = jump_chain(&hosts, &params, None).unwrap_err();
+        let error = jump_chain(&hosts, &params, &[], None).unwrap_err();
         assert!(error.contains("ghost"), "error was {error}");
     }
 
