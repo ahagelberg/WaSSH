@@ -36,6 +36,38 @@ jobs:
       - name: Build
         run: cargo build --release -p wassh
 
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $compiler = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $compiler) { throw 'NSIS compiler not found' }
+          & $compiler "/DVERSION=$version" packaging/windows.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test Windows installer
+        shell: pwsh
+        run: |
+          $installer = (Get-Item dist/*-win-setup-x64.exe).FullName
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\WaSSH Native'
+          $executable = Join-Path $installDir 'wassh.exe'
+          $expectedHash = (Get-FileHash target/release/wassh.exe).Hash
+          foreach ($attempt in 1..2) {
+            $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+            if ((Get-FileHash $executable).Hash -ne $expectedHash) { throw 'Installed executable does not match the build' }
+          }
+          $process = Start-Process -FilePath (Join-Path $installDir 'Uninstall.exe') -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Uninstaller failed: $($process.ExitCode)" }
+          if (Test-Path $executable) { throw 'Uninstaller did not remove the executable' }
+
       - name: Package
         shell: bash
         run: |
@@ -49,13 +81,17 @@ jobs:
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.exe
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
           name: wassh-${{ github.ref_name }}-windows
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.exe
           if-no-files-found: error
 
   release-mac:
