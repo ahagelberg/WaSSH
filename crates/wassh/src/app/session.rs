@@ -1544,6 +1544,7 @@ impl SessionEntry {
         let scope = self.plugin_scope();
         let palette = self.palette;
         let host_label = self.title.clone();
+        let environment = self.connection.environment();
         let status = self.status;
         // The pane is lent out so the session itself can serve remote file requests while
         // the plugin draws.
@@ -1559,6 +1560,7 @@ impl SessionEntry {
             let mut context = PluginContext {
                 palette,
                 host_label,
+                environment,
                 status,
                 settings: &mut pane.data.values,
                 scope,

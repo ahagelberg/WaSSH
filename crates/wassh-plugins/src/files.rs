@@ -3465,6 +3465,7 @@ mod tests {
                     let mut context = PluginContext {
                         palette: Palette::dark(),
                         host_label: "dev".to_owned(),
+                        environment: "a test shell".to_owned(),
                         status: SessionStatus::Connected,
                         settings: &mut settings,
                         scope: "host-1".to_owned(),
@@ -3527,6 +3528,7 @@ mod tests {
                     let mut context = PluginContext {
                         palette: Palette::dark(),
                         host_label: "dev".to_owned(),
+                        environment: "a test shell".to_owned(),
                         status: SessionStatus::Connected,
                         settings: &mut settings,
                         scope: "host-1".to_owned(),
@@ -3601,6 +3603,7 @@ mod tests {
             let mut context = PluginContext {
                 palette,
                 host_label: "dev".to_owned(),
+                environment: "a test shell".to_owned(),
                 status: SessionStatus::Connected,
                 settings: &mut settings,
                 scope: "host-1".to_owned(),

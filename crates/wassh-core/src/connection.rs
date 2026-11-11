@@ -495,6 +495,37 @@ impl ConnectionParams {
         }
     }
 
+    /// What kind of shell or host the session runs, phrased for a prompt.
+    pub fn environment(&self) -> String {
+        match self.kind {
+            ConnectionType::Local => match &self.local {
+                LocalShell::Wsl { distro: Some(name) } => {
+                    format!("a WSL Linux shell running the {name} distribution on this machine")
+                }
+                LocalShell::Wsl { distro: None } => {
+                    "a WSL Linux shell (default distribution) on this machine".to_owned()
+                }
+                LocalShell::Cmd => {
+                    "a local Windows command prompt (cmd.exe) on this machine".to_owned()
+                }
+                LocalShell::System if cfg!(windows) => {
+                    "a local Windows PowerShell shell on this machine".to_owned()
+                }
+                LocalShell::System => "a local Unix shell on this machine".to_owned(),
+            },
+            ConnectionType::Ssh => format!(
+                "an SSH session with {}, so commands run on the remote host",
+                self.endpoint()
+            ),
+            ConnectionType::Telnet => {
+                format!("a Telnet session with {}, commands run on the remote host", self.endpoint())
+            }
+            ConnectionType::Serial => {
+                format!("a serial console at {} on this machine", self.serial.path)
+            }
+        }
+    }
+
     /// Sidebar subtitle.
     pub fn subtitle(&self) -> String {
         match self.kind {
@@ -703,6 +734,40 @@ mod tests {
             }
             .subtitle(),
             "Local (cmd)"
+        );
+    }
+
+    #[test]
+    fn environments_say_which_shell_the_session_runs() {
+        let wsl = ConnectionParams {
+            kind: ConnectionType::Local,
+            local: LocalShell::Wsl {
+                distro: Some("Ubuntu".to_owned()),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            wsl.environment(),
+            "a WSL Linux shell running the Ubuntu distribution on this machine"
+        );
+        assert_eq!(
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                local: LocalShell::Cmd,
+                ..Default::default()
+            }
+            .environment(),
+            "a local Windows command prompt (cmd.exe) on this machine"
+        );
+        assert_eq!(
+            ConnectionParams {
+                host: "example.com".to_owned(),
+                port: 22,
+                username: "alice".to_owned(),
+                ..Default::default()
+            }
+            .environment(),
+            "an SSH session with alice@example.com:22, so commands run on the remote host"
         );
     }
 

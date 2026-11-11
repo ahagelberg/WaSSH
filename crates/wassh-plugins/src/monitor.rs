@@ -3940,6 +3940,7 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
         let mut context = PluginContext {
             palette: Palette::dark(),
             host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
             status: wassh_core::SessionStatus::Connected,
             settings: &mut context_settings,
             scope: "host-1".to_owned(),

@@ -445,11 +445,17 @@ impl AiAgent {
 
     /// The system prompt: what the agent is connected to, the tools this session really
     /// offers, and how to choose between them.
-    fn system_prompt(&self, settings: &serde_json::Map<String, Value>, host: &str) -> String {
+    fn system_prompt(
+        &self,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) -> String {
         let mut lines = vec![
             format!(
                 "You are an AI development agent connected to the active WaSSH session \"{host}\"."
             ),
+            format!("Environment: {environment}."),
             format!("Current working directory: {}", self.agent.cwd),
             String::new(),
             "Available tools:".to_owned(),
@@ -662,6 +668,7 @@ impl AiAgent {
         &mut self,
         settings: &serde_json::Map<String, Value>,
         host: &str,
+        environment: &str,
     ) -> Option<CompletionRequest> {
         self.agent.repair_history();
         let provider = self.active()?;
@@ -670,7 +677,7 @@ impl AiAgent {
             api_key: self.keys.get(&provider.id).cloned().unwrap_or_default(),
             protocol: provider.protocol,
             model: self.model.trim().to_owned(),
-            system: self.system_prompt(settings, host),
+            system: self.system_prompt(settings, host, environment),
             messages: self.agent.history.clone(),
             tools: tools::specs(&self.agent.permissions, self.agent.allow_all),
             max_tokens: MAX_TOKENS,
@@ -695,18 +702,24 @@ impl AiAgent {
         meta: UserMeta,
         settings: &serde_json::Map<String, Value>,
         host: &str,
+        environment: &str,
     ) {
         if !self.agent.push_user(message, meta) {
             return;
         }
         self.error = None;
-        if let Some(request) = self.request(settings, host) {
+        if let Some(request) = self.request(settings, host, environment) {
             self.agent.start(request);
         }
     }
 
     /// Ask the model again after a run was cut off, like the reference's Continue.
-    fn resume(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
+    fn resume(
+        &mut self,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
         if !self.agent.can_resume() {
             return;
         }
@@ -714,7 +727,7 @@ impl AiAgent {
             self.error = Some(error.to_owned());
             return;
         }
-        if let Some(request) = self.request(settings, host) {
+        if let Some(request) = self.request(settings, host, environment) {
             self.error = None;
             self.agent.start(request);
         }
@@ -2025,7 +2038,7 @@ impl Plugin for AiAgent {
         // request is built, so the model sees it.
         self.agent.flush_injected();
         if self.agent.take_needs_reply() {
-            let request = self.request(context.settings, &context.host_label);
+            let request = self.request(context.settings, &context.host_label, &context.environment);
             if let Some(request) = request {
                 self.agent.start(request);
             }
@@ -2041,6 +2054,7 @@ impl Plugin for AiAgent {
                         queued.meta,
                         context.settings,
                         &context.host_label,
+                        &context.environment,
                     );
                 }
                 Err(error) => {
@@ -2120,7 +2134,7 @@ impl Plugin for AiAgent {
                         resume = small_button_enabled(ui, palette, "Continue", true);
                     });
                     if resume {
-                        self.resume(context.settings, &context.host_label);
+                        self.resume(context.settings, &context.host_label, &context.environment);
                     }
                 }
 
@@ -2436,7 +2450,13 @@ impl Plugin for AiAgent {
                     // Anything else joins the conversation the agent is in the middle of.
                     self.agent.inject_user(&message, meta);
                 } else {
-                    self.send_message(&message, meta, context.settings, &context.host_label);
+                    self.send_message(
+                        &message,
+                        meta,
+                        context.settings,
+                        &context.host_label,
+                        &context.environment,
+                    );
                 }
             }
         }
@@ -2521,6 +2541,7 @@ mod tests {
             let mut context = PluginContext {
                 palette,
                 host_label: "dev".to_owned(),
+                environment: "a test shell".to_owned(),
                 status: SessionStatus::Connected,
                 settings,
                 scope: "host-1".to_owned(),
@@ -2573,6 +2594,7 @@ mod tests {
         let mut context = PluginContext {
             palette: Palette::dark(),
             host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
             status: SessionStatus::Connected,
             settings,
             scope: "host-1".to_owned(),
@@ -3086,6 +3108,7 @@ mod tests {
         let mut context = PluginContext {
             palette: Palette::dark(),
             host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
             status: SessionStatus::Connected,
             settings: &mut settings,
             scope: "host-1".to_owned(),
@@ -3333,6 +3356,7 @@ mod tests {
             let mut context = PluginContext {
                 palette: Palette::dark(),
                 host_label: "dev".to_owned(),
+                environment: "a test shell".to_owned(),
                 status: SessionStatus::Connected,
                 settings: &mut settings,
                 scope: "host-1".to_owned(),
@@ -3794,12 +3818,13 @@ mod tests {
                 groups.into_iter().map(|group| (group_key(group), json!(true))).collect();
             let mut plugin = AiAgent::default();
             plugin.agent.permissions = Permissions::from_settings(&settings);
-            plugin.system_prompt(&serde_json::Map::new(), "dev")
+            plugin.system_prompt(&serde_json::Map::new(), "dev", "a test shell")
         };
 
         // With both filesystem groups on, both families are named and the shell is not
         // offered as a way to read files.
         let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS]);
+        assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(both.contains("- dev_grep_search:"), "{both}");
         assert!(both.contains("- local_fs_grep_search:"), "{both}");
         assert!(both.contains("Files on the connected host:"), "{both}");

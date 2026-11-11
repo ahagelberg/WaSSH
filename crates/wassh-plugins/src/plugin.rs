@@ -15,6 +15,8 @@ pub struct PluginContext<'a> {
     pub palette: Palette,
     /// Label of the host or shell this tab is attached to.
     pub host_label: String,
+    /// What kind of shell or host it is, in words a prompt can use.
+    pub environment: String,
     /// Current session status.
     pub status: SessionStatus,
     /// Stored data for this plugin in this scope (a host or an ad-hoc tab).
@@ -327,6 +329,7 @@ mod tests {
         let mut context = PluginContext {
             palette: Palette::dark(),
             host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
             status: SessionStatus::Connected,
             settings: &mut settings,
             scope: "host-1".to_owned(),
@@ -346,6 +349,7 @@ mod tests {
         let context = PluginContext {
             palette: Palette::dark(),
             host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
             status: SessionStatus::Disconnected,
             settings: &mut settings,
             scope: "host-1".to_owned(),

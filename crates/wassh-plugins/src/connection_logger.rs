@@ -1507,6 +1507,7 @@ mod tests {
                 let mut context = PluginContext {
                     palette: Palette::dark(),
                     host_label: "dev".to_owned(),
+                    environment: "a test shell".to_owned(),
                     status,
                     settings: &mut settings,
                     scope: "host-1".to_owned(),
