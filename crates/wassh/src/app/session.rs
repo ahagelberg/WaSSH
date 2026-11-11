@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
-use super::{local_exec, local_files};
+use super::{local_exec, local_files, wsl_files};
 use wassh_core::{
     AuthMethod, ConnectionParams, ConnectionType, DockEdge, DockPlacement, LocalShell, Palette,
     SessionStatus, SessionStyleDefaults, TabPluginLayout,
@@ -1221,7 +1221,12 @@ impl SessionEntry {
     fn file_job(&self, request: wassh_ssh::SftpRequest) -> Option<wassh_ssh::SftpJob> {
         match &self.backend {
             Backend::Ssh(session) => Some(session.sftp(request)),
-            Backend::Local(_) => Some(local_files::spawn(request)),
+            // A WSL tab's files are its distribution's, published on a share this machine
+            // can read like any other directory.
+            Backend::Local(_) => Some(match &self.connection.local {
+                LocalShell::Wsl { distro } => wsl_files::spawn(distro.as_deref(), request),
+                _ => local_files::spawn(request),
+            }),
             _ => None,
         }
     }
@@ -2800,9 +2805,18 @@ impl wassh_plugins::SftpAccess for SessionEntry {
         if matches!(self.backend, Backend::Local(_)) {
             let resolved = if path == "." {
                 // The browser opens in the user's home directory.
-                local_files::start_dir()
+                match &self.connection.local {
+                    LocalShell::Wsl { distro } => wsl_files::start_dir(distro.as_deref()),
+                    _ => local_files::start_dir(),
+                }
             } else {
-                match local_files::canonical(path) {
+                let resolved = match &self.connection.local {
+                    LocalShell::Wsl { distro } => {
+                        wsl_files::canonical(distro.as_deref(), path)
+                    }
+                    _ => local_files::canonical(path),
+                };
+                match resolved {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         self.files.error = Some(error);

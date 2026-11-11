@@ -10,6 +10,7 @@ pub mod local_files;
 pub mod quick_connect;
 pub mod session;
 pub mod wsl;
+pub mod wsl_files;
 
 use std::sync::Arc;
 use std::time::Duration;
