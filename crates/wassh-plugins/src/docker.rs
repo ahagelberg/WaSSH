@@ -24,9 +24,9 @@ use wassh_core::Palette;
 use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
-    Button, ButtonKind, ToastKind, Tone, badge, bar_meter, checkbox, dialog_width, empty_state,
-    footer, line_chart, modal, password_input, search_input, select_str, small_button_enabled,
-    text_input,
+    Button, ButtonKind, MenuItem, MenuState, ToastKind, Tone, badge, bar_meter, checkbox,
+    dialog_width, empty_state, footer, line_chart, modal, password_input, search_input, select_str,
+    small_button_enabled, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -174,7 +174,7 @@ impl Default for HostSettings {
     fn default() -> Self {
         Self {
             socket: model::DEFAULT_SOCKET.to_owned(),
-            show_stopped: false,
+            show_stopped: true,
             refresh: Duration::from_millis(DEFAULT_REFRESH_MS),
             stats: Duration::from_millis(DEFAULT_STATS_MS),
             log_tail: DEFAULT_LOG_TAIL,
@@ -216,7 +216,7 @@ fn read_settings(settings: &serde_json::Map<String, Value>) -> HostSettings {
         } else {
             socket
         },
-        show_stopped: flag("showStopped", false),
+        show_stopped: flag("showStopped", true),
         refresh: Duration::from_millis(refresh),
         stats: Duration::from_millis(stats),
         log_tail,
@@ -252,6 +252,7 @@ struct Update {
 }
 
 /// What a row in the container list asks for.
+#[derive(Clone, Debug)]
 enum RowEvent {
     Select(String),
     Act(Action, String, String),
@@ -259,6 +260,8 @@ enum RowEvent {
     Stats(String),
     Shell(String),
     Update(String),
+    /// A right-click on the container: open its menu.
+    Menu(String),
 }
 
 /// The Docker Manager pane.
@@ -286,6 +289,9 @@ pub struct DockerManager {
     toasts: Vec<(ToastKind, String)>,
     /// What to say when the one-off change now running succeeds.
     change_note: Option<String>,
+    /// The open container menu, and what each of its rows does.
+    menu: MenuState,
+    menu_events: Vec<Option<RowEvent>>,
     confirm: Option<Confirm>,
     sudo: Option<Sudo>,
     engine: engine::Status,
@@ -481,6 +487,13 @@ impl DockerManager {
         self.confirm_card(ui, palette, access);
         self.sudo_card(ui, palette, access);
         self.run_dialog(ui, palette, access);
+        // The container menu is drawn last so it sits over everything the pane painted.
+        if let Some(index) = self.menu.show(ui.ctx(), palette) {
+            let event = self.menu_events.get(index).cloned().flatten();
+            if let Some(event) = event {
+                typed = self.handle_event(ui, access, event).or(typed);
+            }
+        }
         typed
     }
 
@@ -585,7 +598,9 @@ impl DockerManager {
         self.last_poll = Some(Instant::now());
         let socket = self.settings.socket.clone();
         let (key, command) = match self.tab {
-            Tab::Containers => (LIST_KEY, model::ps_command(&socket, self.show_stopped())),
+            // Every container is asked for; the pane hides the stopped ones itself, so the
+            // list does not change shape when the daemon stops them for us.
+            Tab::Containers => (LIST_KEY, model::ps_command(&socket, true)),
             Tab::Images => (IMAGES_KEY, model::images_command(&socket)),
             Tab::Volumes => (VOLUMES_KEY, model::volumes_command(&socket)),
             Tab::Networks => (NETWORKS_KEY, model::networks_command(&socket)),
@@ -942,7 +957,6 @@ impl DockerManager {
             checkbox(ui, palette, &mut stopped, "Show stopped");
             if stopped != self.show_stopped() {
                 self.show_stopped = Some(stopped);
-                self.last_poll = None;
             }
             if small_button_enabled(ui, palette, "New…", true) {
                 self.run_open = true;
@@ -977,9 +991,11 @@ impl DockerManager {
         ui.add_space(6.0);
 
         let needle = self.filter.trim().to_lowercase();
+        let stopped = self.show_stopped();
         let mut rows: Vec<Container> = self
             .containers
             .iter()
+            .filter(|container| stopped || container.is_running() || container.is_paused())
             .filter(|container| {
                 needle.is_empty()
                     || container.name.to_lowercase().contains(&needle)
@@ -1008,7 +1024,6 @@ impl DockerManager {
                 empty_state(ui, palette, "Nothing matches", "Change the search to see more.");
             }
         }
-
         let panelled = self.logs_for.is_some() || self.stats_for.is_some();
         let list_height = if panelled {
             (ui.available_height() * 0.5).max(80.0)
@@ -1032,37 +1047,7 @@ impl DockerManager {
 
         let mut typed = None;
         for event in events {
-            match event {
-                RowEvent::Select(id) => self.select(access, &id),
-                RowEvent::Act(action, id, name) => {
-                    if self.pending.is_some() {
-                        continue;
-                    }
-                    if action.is_destructive() && self.settings.confirm_destructive {
-                        self.confirm = Some(Confirm { action, id, name });
-                    } else {
-                        self.start_action(access, action, &id, &name);
-                    }
-                }
-                RowEvent::Logs(id) => {
-                    self.logs_for = Some(id);
-                    self.logs.clear();
-                }
-                RowEvent::Stats(id) => {
-                    self.stats_for = Some(id);
-                    self.stats = None;
-                    self.cpu_history.clear();
-                    self.last_stats = None;
-                }
-                RowEvent::Shell(id) => {
-                    typed = Some(format!(
-                        "docker exec -it {} {}\n",
-                        model::shell_quote(&id),
-                        model::SHELL_CHOICES[self.shell.min(model::SHELL_CHOICES.len() - 1)]
-                    ));
-                }
-                RowEvent::Update(id) => self.queue_updates(&[id]),
-            }
+            typed = self.handle_event(ui, access, event).or(typed);
         }
 
         if self.detail.is_some() && typed.is_none() {
@@ -1150,6 +1135,63 @@ impl DockerManager {
             wassh_core::wake::notify();
         });
         self.search.tags = Some(pending);
+    }
+
+    /// Do what a card or one of its menu rows asks for.
+    fn handle_event(
+        &mut self,
+        ui: &Ui,
+        access: &mut dyn CommandAccess,
+        event: RowEvent,
+    ) -> Option<String> {
+        match event {
+            RowEvent::Select(id) => {
+                self.select(access, &id);
+                None
+            }
+            RowEvent::Act(action, id, name) => {
+                if self.pending.is_none() {
+                    if action.is_destructive() && self.settings.confirm_destructive {
+                        self.confirm = Some(Confirm { action, id, name });
+                    } else {
+                        self.start_action(access, action, &id, &name);
+                    }
+                }
+                None
+            }
+            RowEvent::Logs(id) => {
+                self.logs_for = Some(id);
+                self.logs.clear();
+                None
+            }
+            RowEvent::Stats(id) => {
+                self.stats_for = Some(id);
+                self.stats = None;
+                self.cpu_history.clear();
+                self.last_stats = None;
+                None
+            }
+            RowEvent::Shell(id) => Some(format!(
+                "docker exec -it {} {}\n",
+                model::shell_quote(&id),
+                model::SHELL_CHOICES[self.shell.min(model::SHELL_CHOICES.len() - 1)]
+            )),
+            RowEvent::Update(id) => {
+                self.queue_updates(&[id]);
+                None
+            }
+            RowEvent::Menu(id) => {
+                let container = self.containers.iter().find(|item| item.id == id)?;
+                let (items, events) = container_menu(container, self.stale.contains(&id));
+                let at = ui
+                    .ctx()
+                    .pointer_latest_pos()
+                    .unwrap_or_else(|| ui.min_rect().center());
+                self.menu.open_at(at, items);
+                self.menu_events = events;
+                None
+            }
+        }
     }
 
     fn queue_updates(&mut self, ids: &[String]) {
@@ -2192,7 +2234,10 @@ impl DockerManager {
     }
 }
 
-/// One container, as a card: what it is, what it is doing, and what can be done to it.
+/// One container, as a card: what it is and what it is doing.
+///
+/// The whole card is the target — a click shows its details, a right-click opens its menu —
+/// so the row holds no buttons that a right-click could miss.
 fn container_card(
     ui: &mut Ui,
     palette: &Palette,
@@ -2202,13 +2247,12 @@ fn container_card(
 ) -> Option<RowEvent> {
     let is_selected = selected.as_deref() == Some(container.id.as_str());
     let has_update = stale.contains(&container.id);
-    let mut event = None;
     let border = if is_selected {
         to_color32(palette.accent)
     } else {
         to_color32(palette.border)
     };
-    egui::Frame::NONE
+    let card = egui::Frame::NONE
         .fill(to_color32(palette.bg_panel_2))
         .stroke(egui::Stroke::new(1.0, border))
         .corner_radius(wassh_core::RADIUS)
@@ -2216,20 +2260,16 @@ fn container_card(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let name = egui::RichText::new(&container.name)
-                    .size(12.5)
-                    .strong()
-                    .color(to_color32(if is_selected {
-                        palette.accent
-                    } else {
-                        palette.text
-                    }));
-                if ui
-                    .add(egui::Label::new(name).sense(egui::Sense::click()))
-                    .clicked()
-                {
-                    event = Some(RowEvent::Select(container.id.clone()));
-                }
+                ui.label(
+                    egui::RichText::new(&container.name)
+                        .size(12.5)
+                        .strong()
+                        .color(to_color32(if is_selected {
+                            palette.accent
+                        } else {
+                            palette.text
+                        })),
+                );
                 if container.is_running() {
                     badge(ui, palette, "running", Tone::Success);
                 } else if container.is_paused() {
@@ -2269,45 +2309,74 @@ fn container_card(
                     );
                 }
             });
-            ui.add_space(5.0);
-            ui.horizontal_wrapped(|ui| {
-                for action in container.actions() {
-                    let label = match action {
-                        Action::Start => "Start",
-                        Action::Stop => "Stop",
-                        Action::Restart => "Restart",
-                        Action::Pause => "Pause",
-                        Action::Unpause => "Resume",
-                        Action::Kill => "Kill",
-                        Action::Remove => "Remove",
-                    };
-                    if small_button_enabled(ui, palette, label, true) {
-                        event = Some(RowEvent::Act(
-                            action,
-                            container.id.clone(),
-                            container.name.clone(),
-                        ));
-                    }
-                }
-                if small_button_enabled(ui, palette, "Logs", true) {
-                    event = Some(RowEvent::Logs(container.id.clone()));
-                }
-                if container.is_running() && small_button_enabled(ui, palette, "Stats", true) {
-                    event = Some(RowEvent::Stats(container.id.clone()));
-                }
-                if container.is_running() && small_button_enabled(ui, palette, "Shell", true) {
-                    event = Some(RowEvent::Shell(container.id.clone()));
-                }
-                if has_update && small_button_enabled(ui, palette, "Update", true) {
-                    event = Some(RowEvent::Update(container.id.clone()));
-                }
-                if small_button_enabled(ui, palette, "Details", true) {
-                    event = Some(RowEvent::Select(container.id.clone()));
-                }
-            });
         });
+    let rect = card.response.rect;
+    let response = ui.interact(rect, card.response.id, egui::Sense::click());
+    ui.ctx().set_cursor_icon(if response.hovered() {
+        egui::CursorIcon::PointingHand
+    } else {
+        egui::CursorIcon::Default
+    });
+    if response.hovered() && !is_selected {
+        ui.painter().rect_stroke(
+            rect,
+            wassh_core::RADIUS,
+            egui::Stroke::new(1.0, to_color32(palette.accent)),
+            egui::StrokeKind::Inside,
+        );
+    }
     ui.add_space(6.0);
-    event
+    if response.secondary_clicked() {
+        return Some(RowEvent::Menu(container.id.clone()));
+    }
+    response.clicked().then(|| RowEvent::Select(container.id.clone()))
+}
+
+/// The rows of a container's menu, and what each one does.
+fn container_menu(
+    container: &Container,
+    has_update: bool,
+) -> (Vec<MenuItem>, Vec<Option<RowEvent>>) {
+    let id = container.id.clone();
+    let name = container.name.clone();
+    let mut items = Vec::new();
+    let mut events = Vec::new();
+    let mut push = |item: MenuItem, event: Option<RowEvent>| {
+        items.push(item);
+        events.push(event);
+    };
+    push(MenuItem::new("Details"), Some(RowEvent::Select(id.clone())));
+    push(MenuItem::new("Logs"), Some(RowEvent::Logs(id.clone())));
+    if container.is_running() {
+        push(MenuItem::new("Stats"), Some(RowEvent::Stats(id.clone())));
+        push(MenuItem::new("Shell"), Some(RowEvent::Shell(id.clone())));
+    }
+    push(MenuItem::separator(), None);
+    for action in container.actions() {
+        let label = match action {
+            Action::Start => "Start",
+            Action::Stop => "Stop",
+            Action::Restart => "Restart",
+            Action::Pause => "Pause",
+            Action::Unpause => "Resume",
+            Action::Kill => "Kill",
+            Action::Remove => "Remove",
+        };
+        let item = if action == Action::Remove {
+            MenuItem::danger(label)
+        } else {
+            MenuItem::new(label)
+        };
+        push(item, Some(RowEvent::Act(action, id.clone(), name.clone())));
+    }
+    if has_update {
+        push(MenuItem::separator(), None);
+        push(
+            MenuItem::new("Update"),
+            Some(RowEvent::Update(id.clone())),
+        );
+    }
+    (items, events)
 }
 
 /// `text`, or `fallback` when it is empty.
@@ -2472,6 +2541,62 @@ mod tests {
             pane.toasts.last().map(|(_, text)| text.as_str()),
             Some("Pruned unused volumes")
         );
+    }
+
+    #[test]
+    fn a_containers_menu_offers_its_actions() {
+        let containers = model::parse_containers(PS);
+        let running = &containers[0];
+        let (items, events) = container_menu(running, true);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { label, .. } => Some(label.as_str()),
+                MenuItem::Separator => None,
+            })
+            .collect();
+        assert_eq!(labels.first(), Some(&"Details"));
+        assert!(labels.contains(&"Logs"), "{labels:?}");
+        assert!(labels.contains(&"Shell"), "a running container has a shell");
+        assert!(labels.contains(&"Update"), "a stale one can be updated");
+        assert!(
+            matches!(
+                items.iter().find(|item| matches!(item, MenuItem::Action { label, .. } if label == "Remove")),
+                Some(MenuItem::Action { danger: true, .. })
+            ),
+            "removing is the destructive row"
+        );
+        // Every clickable row does something to this container.
+        assert_eq!(items.len(), events.len());
+        for event in events.iter().flatten() {
+            let id = match event {
+                RowEvent::Select(id)
+                | RowEvent::Logs(id)
+                | RowEvent::Stats(id)
+                | RowEvent::Shell(id)
+                | RowEvent::Update(id)
+                | RowEvent::Act(_, id, _) => id,
+                RowEvent::Menu(id) => id,
+            };
+            assert_eq!(id, &running.id);
+        }
+
+        // A stopped container has nothing to show live, and no update to apply.
+        let mut stopped = running.clone();
+        stopped.state = "exited".to_owned();
+        stopped.status = "Exited (0) 2 minutes ago".to_owned();
+        let (items, _) = container_menu(&stopped, false);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { label, .. } => Some(label.as_str()),
+                MenuItem::Separator => None,
+            })
+            .collect();
+        assert!(!labels.contains(&"Shell"), "{labels:?}");
+        assert!(!labels.contains(&"Stats"), "{labels:?}");
+        assert!(!labels.contains(&"Update"), "{labels:?}");
+        assert!(labels.contains(&"Start"), "{labels:?}");
     }
 
     #[test]
@@ -2737,16 +2862,20 @@ mod tests {
     fn the_host_settings_keep_the_reference_defaults_and_bounds() {
         let defaults = read_settings(&serde_json::Map::new());
         assert_eq!(defaults.socket, model::DEFAULT_SOCKET);
-        assert!(!defaults.show_stopped);
+        // A container the daemon stopped is still the user's; hiding it by default made a
+        // restarted app look like it had lost its containers.
+        assert!(defaults.show_stopped);
         assert_eq!(defaults.refresh, Duration::from_millis(DEFAULT_REFRESH_MS));
         assert_eq!(defaults.log_tail, DEFAULT_LOG_TAIL);
         assert!(defaults.confirm_destructive);
 
         let mut settings = serde_json::Map::new();
+        settings.insert("showStopped".to_owned(), Value::from(false));
         settings.insert("refreshIntervalMs".to_owned(), Value::from(1u64));
         settings.insert("statsIntervalMs".to_owned(), Value::from(999_999u64));
         settings.insert("logTailLines".to_owned(), Value::from(5u64));
         let clamped = read_settings(&settings);
+        assert!(!clamped.show_stopped, "a stored choice is kept");
         assert_eq!(clamped.refresh, Duration::from_millis(MIN_REFRESH_MS));
         assert_eq!(clamped.stats, Duration::from_millis(MAX_STATS_MS));
         assert_eq!(clamped.log_tail, MIN_LOG_TAIL);
