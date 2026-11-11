@@ -683,15 +683,17 @@ pub fn restart_policy_flag(policy: &str) -> Option<&'static str> {
     }
 }
 
-/// `docker info` as one line of `|`-separated fields, for the engine status.
+/// `docker info` as one line of comma-separated fields, for the engine status.
 ///
 /// Single fields rather than the whole document: `docker info` has changed shape between
-/// CLI versions, while these names have been in its template all along.
+/// CLI versions, while these names have been in its template all along. Commas rather than
+/// pipes, so the template is still one argument if the shell layer that runs it loses the
+/// quotes.
 pub fn engine_command(socket: &str) -> String {
     format!(
         "docker{} info --format \
-         '{{{{.ServerVersion}}}}|{{{{.OperatingSystem}}}}|{{{{.Architecture}}}}|\
-         {{{{.ContainersRunning}}}}|{{{{.ContainersPaused}}}}|{{{{.ContainersStopped}}}}|\
+         '{{{{.ServerVersion}}}},{{{{.OperatingSystem}}}},{{{{.Architecture}}}},\
+         {{{{.ContainersRunning}}}},{{{{.ContainersPaused}}}},{{{{.ContainersStopped}}}},\
          {{{{.Images}}}}'",
         socket_flag(socket)
     )
@@ -1506,8 +1508,8 @@ mod tests {
         assert_eq!(
             engine_command(DEFAULT_SOCKET),
             "docker info --format \
-             '{{.ServerVersion}}|{{.OperatingSystem}}|{{.Architecture}}|\
-             {{.ContainersRunning}}|{{.ContainersPaused}}|{{.ContainersStopped}}|{{.Images}}'"
+             '{{.ServerVersion}},{{.OperatingSystem}},{{.Architecture}},\
+             {{.ContainersRunning}},{{.ContainersPaused}},{{.ContainersStopped}},{{.Images}}'"
         );
     }
 

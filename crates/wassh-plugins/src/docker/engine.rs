@@ -125,8 +125,8 @@ pub const UNEXPECTED_ANSWER: &str =
 /// Said when the command finished without printing anything at all.
 pub const EMPTY_ANSWER: &str = "The docker command printed nothing.";
 
-/// Fields the engine probe asks `docker info` for.
-const ENGINE_FIELDS: usize = 7;
+/// Fields the engine probe asks `docker info` for, of which the first three must arrive.
+const REQUIRED_FIELDS: usize = 3;
 
 /// Longest part of an answer the pane quotes back.
 const MAX_QUOTED_ANSWER: usize = 160;
@@ -312,16 +312,18 @@ impl Status {
 }
 
 /// Read the line [`super::model::engine_command`] asks for:
-/// `version|os|arch|running|paused|stopped|images`.
+/// `version,os,arch,running,paused,stopped,images`.
 ///
 /// A daemon that answers always names its own version, so a line without one came from
 /// something else wearing the `docker` name — not from an engine the pane can drive.
+/// The counts are not asked for again when a CLI leaves them out: the container list already
+/// knows them.
 pub fn parse_info(text: &str) -> Option<Status> {
     let line = text
         .lines()
         .map(str::trim)
-        .find(|line| line.split('|').count() == ENGINE_FIELDS)?;
-    let mut fields = line.split('|');
+        .find(|line| line.split(',').count() >= REQUIRED_FIELDS)?;
+    let mut fields = line.split(',');
     let version = fields.next().unwrap_or_default().trim();
     if version.is_empty() {
         return None;
@@ -444,7 +446,7 @@ mod tests {
 
     #[test]
     fn the_engine_status_reads_docker_info() {
-        let status = parse_info("27.1.1|Debian GNU/Linux 12 (bookworm)|x86_64|3|1|1|12\n").unwrap();
+        let status = parse_info("27.1.1,Debian GNU/Linux 12 (bookworm),x86_64,3,1,1,12\n").unwrap();
         assert!(status.is_ready());
         assert_eq!(status.version, "27.1.1");
         assert_eq!(status.os, "Debian GNU/Linux 12 (bookworm)");
@@ -459,15 +461,21 @@ mod tests {
             status.summary()
         );
         // A shell that said something before the answer does not hide it.
-        let noisy = parse_info("warning: something\n29.1.3|Ubuntu 24.04.2 LTS|arm64|0|0|1|1");
+        let noisy = parse_info("warning: something\n29.1.3,Ubuntu 24.04.2 LTS,arm64,0,0,1,1");
         assert_eq!(noisy.map(|status| status.version), Some("29.1.3".to_owned()));
+        // A CLI that leaves the counts out still names its engine.
+        let without_counts = parse_info("29.1.3,Ubuntu 24.04.2 LTS,x86_64");
+        assert_eq!(
+            without_counts.map(|status| (status.version, status.images)),
+            Some(("29.1.3".to_owned(), 0))
+        );
     }
 
     #[test]
     fn an_answer_without_a_version_is_not_an_engine() {
         assert!(parse_info("").is_none());
-        assert!(parse_info("||||||").is_none());
-        assert!(parse_info("27.1.1|Debian|x86_64").is_none(), "a short line");
+        assert!(parse_info(",,").is_none());
+        assert!(parse_info("27.1.1,Debian").is_none(), "a short line");
         assert!(parse_info("not json").is_none());
         let status = Status {
             state: Some(State::Error),
