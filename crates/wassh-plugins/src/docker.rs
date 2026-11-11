@@ -94,8 +94,8 @@ const ENGINE_RETRY: Duration = Duration::from_secs(5);
 const PANEL_HEIGHT: f32 = 160.0;
 /// Width of the create dialog on a wide window.
 const CREATE_DIALOG_WIDTH: f32 = 560.0;
-/// Width of the "are you sure" dialog.
-const CONFIRM_DIALOG_WIDTH: f32 = 420.0;
+/// Width of the small question dialogs: confirm, rename.
+const NARROW_DIALOG_WIDTH: f32 = 420.0;
 /// Width of the password dialog.
 const SUDO_DIALOG_WIDTH: f32 = 460.0;
 /// The menu switch that follows the daemon's restart policy.
@@ -256,6 +256,21 @@ struct Update {
     inspecting: bool,
 }
 
+/// A container being renamed, and the name typed so far.
+struct Rename {
+    id: String,
+    name: String,
+    to: String,
+}
+
+impl Rename {
+    /// Whether the typed name can be used: filled in, different, and a plain name.
+    fn is_ready(&self) -> bool {
+        let to = self.to.trim();
+        !to.is_empty() && to != self.name && model::is_safe_name(to)
+    }
+}
+
 /// What a row in the container list asks for.
 #[derive(Clone, Debug)]
 enum RowEvent {
@@ -273,6 +288,8 @@ enum RowEvent {
     RemoveImage(String),
     RemoveVolume(String),
     RemoveNetwork(String),
+    /// Give a container another name.
+    Rename(String, String),
 }
 
 /// The Docker Manager pane.
@@ -305,6 +322,7 @@ pub struct DockerManager {
     menu_events: Vec<Option<RowEvent>>,
     confirm: Option<Confirm>,
     sudo: Option<Sudo>,
+    rename: Option<Rename>,
     engine: engine::Status,
     /// When the engine last answered, so a silent host is asked again on its own.
     engine_checked: Option<Instant>,
@@ -484,6 +502,7 @@ impl DockerManager {
         // Nothing below can be listed, so the pane shows only the engine and its repair.
         if !self.engine.is_ready() {
             self.confirm = None;
+            self.rename = None;
             self.sudo_dialog(ui, palette, access);
             return None;
         }
@@ -496,6 +515,7 @@ impl DockerManager {
             Tab::Networks => self.draw_networks(ui, palette, access),
         }
         self.confirm_dialog(ui, palette, access);
+        self.rename_dialog(ui, palette, access);
         self.sudo_dialog(ui, palette, access);
         self.run_dialog(ui, palette, access);
         // The container menu is drawn last so it sits over everything the pane painted.
@@ -1251,6 +1271,14 @@ impl DockerManager {
                     let note = format!("Removed network {}", model::short_id(&id));
                     self.run_change(access, &command, note);
                 }
+                None
+            }
+            RowEvent::Rename(id, name) => {
+                self.rename = Some(Rename {
+                    to: name.clone(),
+                    id,
+                    name,
+                });
                 None
             }
             RowEvent::Menu(id) => {
@@ -2043,7 +2071,7 @@ impl DockerManager {
             "docker-confirm",
             palette,
             &title,
-            dialog_width(ui.ctx(), CONFIRM_DIALOG_WIDTH),
+            dialog_width(ui.ctx(), NARROW_DIALOG_WIDTH),
             |ui| {
                 self.help_detail(ui, palette, "This cannot be undone.");
                 footer(ui, |ui| {
@@ -2070,6 +2098,58 @@ impl DockerManager {
             // Escape or a click outside the dialog means no.
             None if response.dismissed => self.confirm = None,
             None => {}
+        }
+    }
+
+    /// The dialog that gives a container another name.
+    fn rename_dialog(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+        let Some(mut rename) = self.rename.take() else {
+            return;
+        };
+        let mut decision = None;
+        let mut entered = false;
+        let response = modal(
+            ui.ctx(),
+            "docker-rename",
+            palette,
+            &format!("Rename {}", rename.name),
+            dialog_width(ui.ctx(), NARROW_DIALOG_WIDTH),
+            |ui| {
+                self.help_detail(
+                    ui,
+                    palette,
+                    "The container keeps its id and settings; only the name changes.",
+                );
+                let field = text_input(ui, palette, &mut rename.to, "new name");
+                entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, "Cancel", true) {
+                        decision = Some(false);
+                    }
+                    let ready = rename.is_ready();
+                    if small_button_enabled(ui, palette, "Rename", ready)
+                        || (entered && ready)
+                    {
+                        decision = Some(true);
+                    }
+                });
+            },
+        );
+        match decision {
+            Some(true) => {
+                let to = rename.to.trim().to_owned();
+                match model::rename_command(&self.settings.socket, &rename.id, &to) {
+                    Some(command) => {
+                        let note = format!("Renamed {} to {to}", rename.name);
+                        self.run_change(access, &command, note);
+                    }
+                    // A name docker would reject: keep the field so it can be fixed.
+                    None => self.rename = Some(rename),
+                }
+            }
+            Some(false) => {}
+            None if response.dismissed => {}
+            None => self.rename = Some(rename),
         }
     }
 
@@ -2434,6 +2514,13 @@ fn container_menu(
     }
     push(MenuItem::separator(), None);
     for action in container.actions() {
+        // Rename changes the container's name, not its state, so it sits above Remove.
+        if action == Action::Remove {
+            push(
+                MenuItem::new("Rename"),
+                Some(RowEvent::Rename(id.clone(), name.clone())),
+            );
+        }
         let label = match action {
             Action::Start => "Start",
             Action::Stop => "Stop",
@@ -2736,6 +2823,11 @@ mod tests {
         assert!(labels.contains(&"Shell"), "a running container has a shell");
         assert!(labels.contains(&"Update"), "a stale one can be updated");
         assert!(
+            labels.iter().position(|label| *label == "Rename")
+                < labels.iter().position(|label| *label == "Remove"),
+            "renaming sits above the destructive row: {labels:?}"
+        );
+        assert!(
             matches!(
                 items.iter().find(|item| matches!(item, MenuItem::Action { label, .. } if label == "Remove")),
                 Some(MenuItem::Action { danger: true, .. })
@@ -2756,6 +2848,7 @@ mod tests {
                 | RowEvent::Act(_, id, _)
                 | RowEvent::Autostart(id, _, _) => id,
                 RowEvent::Menu(id) => id,
+                RowEvent::Rename(id, _) => id,
                 RowEvent::RemoveVolume(name) => name,
             };
             assert_eq!(id, &running.id);
@@ -2791,6 +2884,30 @@ mod tests {
         assert!(!labels.contains(&"Stats"), "{labels:?}");
         assert!(!labels.contains(&"Update"), "{labels:?}");
         assert!(labels.contains(&"Start"), "{labels:?}");
+        assert!(
+            labels.contains(&"Rename"),
+            "a stopped container can still be renamed: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_name_is_only_accepted_when_docker_would_take_it() {
+        let mut rename = Rename {
+            id: "abc123".to_owned(),
+            name: "web".to_owned(),
+            to: String::new(),
+        };
+        assert!(!rename.is_ready(), "an empty field is not a name");
+        rename.to = "  ".to_owned();
+        assert!(!rename.is_ready(), "nor is whitespace");
+        rename.to = "web".to_owned();
+        assert!(!rename.is_ready(), "the name it already has changes nothing");
+        rename.to = "web; rm -rf /".to_owned();
+        assert!(!rename.is_ready(), "nor is anything a shell would split");
+        rename.to = " web-2 ".to_owned();
+        assert!(rename.is_ready(), "trailing space is trimmed away");
+        let command = model::rename_command(&HostSettings::default().socket, &rename.id, "web-2");
+        assert_eq!(command.as_deref(), Some("docker rename 'abc123' 'web-2'"));
     }
 
     #[test]

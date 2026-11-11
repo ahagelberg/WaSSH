@@ -487,6 +487,19 @@ pub fn autostart_command(socket: &str, id: &str, autostart: Autostart) -> Option
     })
 }
 
+/// Rename one container. Docker keeps the container, its id and its settings; only the
+/// name it answers to changes.
+pub fn rename_command(socket: &str, id: &str, name: &str) -> Option<String> {
+    (is_safe_name(id) && is_safe_name(name)).then(|| {
+        format!(
+            "docker{} rename {} {}",
+            socket_flag(socket),
+            shell_quote(id),
+            shell_quote(name)
+        )
+    })
+}
+
 /// The restart policy of every container, as `name=policy` lines.
 ///
 /// `docker ps` does not report the policy, and `docker inspect` does; one call covers the
