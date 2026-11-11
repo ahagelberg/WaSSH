@@ -471,6 +471,33 @@ impl SessionEntry {
         entry
     }
 
+    /// Whether a title the shell reported should rename the tab.
+    ///
+    /// A Windows shell's console title is its executable path, so those tabs keep the name
+    /// the connection gave them. A WSL shell reports the user and machine it runs on, which
+    /// is worth keeping.
+    fn accepts_title(&self, title: &str) -> bool {
+        if title.trim().is_empty() {
+            return false;
+        }
+        match self.connection.kind {
+            ConnectionType::Local => matches!(self.connection.local, LocalShell::Wsl { .. }),
+            _ => true,
+        }
+    }
+
+    /// Name a title the shell reported, adding the environment a WSL tab runs in.
+    fn titled(connection: &ConnectionParams, title: String) -> String {
+        match &connection.local {
+            LocalShell::Wsl { distro: Some(name) }
+                if connection.kind == ConnectionType::Local =>
+            {
+                format!("{title} ({name})")
+            }
+            _ => title,
+        }
+    }
+
     fn start_telnet(&mut self, term_type: &str) {
         let params = &self.connection;
         let mut options = wassh_telnet::TelnetOptions::new(params.host.clone(), params.port);
@@ -898,8 +925,8 @@ impl SessionEntry {
             match event {
                 TerminalEvent::Title(title) => {
                     pumped.wake = true;
-                    if !title.trim().is_empty() {
-                        self.title = title;
+                    if self.accepts_title(&title) {
+                        self.title = Self::titled(&self.connection, title);
                     }
                 }
                 TerminalEvent::Bell => {
@@ -3239,6 +3266,60 @@ mod tests {
     const ZIP_SCAN_TEST_ITEMS: u64 = 2;
 
     #[test]
+    fn a_local_tab_keeps_the_name_its_connection_gave_it() {
+        let defaults = SessionStyleDefaults::default();
+        let local = SessionEntry::prepare(
+            "local",
+            &Palette::dark(),
+            &defaults,
+            TerminalSize::new(80, 24),
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                ..ConnectionParams::default()
+            },
+            None,
+        );
+        assert!(
+            !local.accepts_title(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "the console title is the executable's path"
+        );
+        assert!(!local.accepts_title("   "));
+
+        let ssh = SessionEntry::prepare(
+            "ssh",
+            &Palette::dark(),
+            &defaults,
+            TerminalSize::new(80, 24),
+            ConnectionParams::default(),
+            None,
+        );
+        assert!(ssh.accepts_title("user@host: ~"));
+    }
+
+    #[test]
+    fn a_wsl_tab_appends_its_environment_to_the_shell_title() {
+        let wsl = SessionEntry::prepare(
+            "wsl",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            TerminalSize::new(80, 24),
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                local: LocalShell::Wsl {
+                    distro: Some("Ubuntu".to_owned()),
+                },
+                ..ConnectionParams::default()
+            },
+            None,
+        );
+        assert!(wsl.accepts_title("octopy@dev: ~"));
+        assert_eq!(
+            SessionEntry::titled(&wsl.connection, "octopy@dev: ~".to_owned()),
+            "octopy@dev: ~ (Ubuntu)"
+        );
+    }
+
+    #[test]
     fn a_local_shell_that_exits_ends_the_session_on_purpose() {
         // The shell is replaced with one that logs out immediately, like typing `exit`.
         #[cfg(windows)]
@@ -3363,7 +3444,14 @@ mod tests {
             local_params(),
         );
         assert!(entry.is_live(), "status was {:?}", entry.status);
-        assert_eq!(entry.title, "Local terminal");
+        assert_eq!(
+            entry.title,
+            if cfg!(windows) {
+                "Local (PS)"
+            } else {
+                "Local terminal"
+            }
+        );
         assert_eq!(entry.host_id.as_deref(), Some(wassh_core::LOCAL_HOST_ID));
     }
 

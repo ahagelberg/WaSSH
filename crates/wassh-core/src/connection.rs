@@ -499,9 +499,10 @@ impl ConnectionParams {
     pub fn subtitle(&self) -> String {
         match self.kind {
             ConnectionType::Local => match &self.local {
-                LocalShell::Wsl { distro: Some(name) } => format!("WSL · {name}"),
-                LocalShell::Wsl { distro: None } => "WSL".to_owned(),
-                LocalShell::Cmd => "Command Prompt".to_owned(),
+                LocalShell::Wsl { distro: Some(name) } => format!("Local (WSL) · {name}"),
+                LocalShell::Wsl { distro: None } => "Local (WSL)".to_owned(),
+                LocalShell::Cmd => "Local (cmd)".to_owned(),
+                LocalShell::System if cfg!(windows) => "Local (PS)".to_owned(),
                 LocalShell::System => "Local terminal".to_owned(),
             },
             ConnectionType::Serial => format!(
@@ -640,7 +641,11 @@ mod tests {
                 ..Default::default()
             }
             .subtitle(),
-            "Local terminal"
+            if cfg!(windows) {
+                "Local (PS)"
+            } else {
+                "Local terminal"
+            }
         );
     }
 
@@ -666,7 +671,7 @@ mod tests {
                 distro: Some("Ubuntu".to_owned())
             }
         );
-        assert_eq!(wsl.subtitle(), "WSL · Ubuntu");
+        assert_eq!(wsl.subtitle(), "Local (WSL) · Ubuntu");
         assert_eq!(wsl.endpoint(), "Ubuntu");
 
         let empty = ConnectionParams {
@@ -678,7 +683,7 @@ mod tests {
         }
         .normalized();
         assert_eq!(empty.local, LocalShell::Wsl { distro: None });
-        assert_eq!(empty.subtitle(), "WSL");
+        assert_eq!(empty.subtitle(), "Local (WSL)");
 
         let json = serde_json::to_string(&wsl).unwrap();
         let restored: ConnectionParams = serde_json::from_str(&json).unwrap();
@@ -697,7 +702,7 @@ mod tests {
                 ..Default::default()
             }
             .subtitle(),
-            "Command Prompt"
+            "Local (cmd)"
         );
     }
 
