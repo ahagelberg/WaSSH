@@ -759,9 +759,15 @@ enum ShellOutcome {
 ///
 /// Focus is egui's own; this only reads it back so a dialog can keep the focused control
 /// in view.
-fn focused_widget(ctx: &Context) -> Option<Rect> {
+/// Screen rect of the widget the keyboard has focused in `layer`.
+///
+/// Focus is egui's own, and a dialog opened on top of the settings owns it while it is
+/// up. Following that widget's rect would scroll the settings column to wherever the
+/// dialog happens to sit.
+fn focused_widget(ctx: &Context, layer: egui::LayerId) -> Option<Rect> {
     let id = ctx.memory(|memory| memory.focused())?;
-    ctx.read_response(id).map(|response| response.rect)
+    let response = ctx.read_response(id)?;
+    (response.layer_id == layer).then_some(response.rect)
 }
 
 fn settings_shell(
@@ -962,7 +968,7 @@ fn settings_shell(
                     });
                     // Tab moves the focus down the dialog; follow it, so the next control
                     // is never left below the fold.
-                    if let Some(rect) = focused_widget(ui.ctx()) {
+                    if let Some(rect) = focused_widget(ui.ctx(), ui.layer_id()) {
                         ui.scroll_to_rect(rect, Some(Align::Center));
                     }
                     ui.add_space(16.0);
@@ -1018,7 +1024,7 @@ fn settings_shell(
             // Outline whatever the keyboard has focused: the hand-painted controls give no
             // other sign of where it went. Painted last, and by the panel rather than the
             // scrolling column, so the rail and the footer show it too.
-            if let Some(rect) = focused_widget(ui.ctx()) {
+            if let Some(rect) = focused_widget(ui.ctx(), ui.layer_id()) {
                 ui.painter().rect_stroke(
                     rect.expand(FOCUS_RING_GAP),
                     wassh_core::RADIUS,
@@ -3675,6 +3681,82 @@ mod tests {
         }
         rows.sort();
         rows
+    }
+
+    /// The y of the first painted row whose text is exactly `text`.
+    fn row_y(rows: &[(i32, i32, String)], text: &str) -> Option<i32> {
+        rows.iter()
+            .find(|(_, _, label)| label == text)
+            .map(|(y, _, _)| *y)
+    }
+
+    #[test]
+    fn focusing_a_field_in_the_identity_dialog_does_not_scroll_options() {
+        // The scroll-follow centered whatever widget held focus, and a dialog opened on
+        // top of Options owns the focus: the column jumped towards the field's screen
+        // position instead of staying put.
+        let ctx = Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        let mut dialogs = Dialogs {
+            options: Some(OptionsState::new(&AppSettings::default())),
+            ..Dialogs::default()
+        };
+        let identities = OPTION_SECTIONS.len() - 2;
+        for step in 0..12 {
+            if let Some(state) = dialogs.options.as_mut() {
+                state.nav.scroll_to = Some(identities);
+            }
+            run_options(&ctx, &mut dialogs, size, f64::from(step) * 0.05, Vec::new());
+        }
+        let rows = run_options(&ctx, &mut dialogs, size, 0.6, Vec::new());
+        let before = row_y(&rows, "IDENTITIES").expect("the Identities section is on screen");
+
+        if let Some(state) = dialogs.options.as_mut() {
+            state.identity_editor = Some(IdentityEdit {
+                index: None,
+                draft: IdentityDraft::default(),
+            });
+        }
+        run_options(&ctx, &mut dialogs, size, 0.65, Vec::new());
+        let rows = run_options(&ctx, &mut dialogs, size, 0.7, Vec::new());
+        // The auth-method dropdown shows "Password" too; the field's label sits lower.
+        let password = rows
+            .iter()
+            .filter(|(_, _, label)| label == "Password")
+            .max_by_key(|(y, _, _)| *y)
+            .map(|(y, x, _)| Pos2::new(*x as f32 + 110.0, *y as f32 + 6.0))
+            .expect("the identity dialog shows its password field");
+        let click = vec![
+            egui::Event::PointerMoved(password),
+            egui::Event::PointerButton {
+                pos: password,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: password,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        run_options(&ctx, &mut dialogs, size, 0.7, click);
+        let mut rows = Vec::new();
+        for step in 0..12 {
+            rows = run_options(
+                &ctx,
+                &mut dialogs,
+                size,
+                0.75 + f64::from(step) * 0.05,
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            row_y(&rows, "IDENTITIES"),
+            Some(before),
+            "focusing the dialog's field must not scroll Options"
+        );
     }
 
     #[test]
