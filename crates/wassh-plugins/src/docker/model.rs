@@ -414,6 +414,37 @@ pub fn action_command(socket: &str, id: &str, action: Action) -> Option<String> 
     ))
 }
 
+/// The restart policy a container starts with when the daemon comes up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Autostart {
+    /// Come back whenever the daemon does.
+    Always,
+    /// Only run when asked to.
+    Never,
+}
+
+impl Autostart {
+    /// The value `docker update --restart` takes.
+    pub fn policy(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Never => "no",
+        }
+    }
+}
+
+/// Give one container a restart policy.
+pub fn autostart_command(socket: &str, id: &str, autostart: Autostart) -> Option<String> {
+    is_safe_name(id).then(|| {
+        format!(
+            "docker{} update --restart {} {}",
+            socket_flag(socket),
+            autostart.policy(),
+            shell_quote(id)
+        )
+    })
+}
+
 /// The image list, one JSON object per line.
 pub fn images_command(socket: &str) -> String {
     format!(
@@ -1220,6 +1251,19 @@ pub fn recreate_command(socket: &str, document: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_policy_is_a_docker_update() {
+        assert_eq!(
+            autostart_command(DEFAULT_SOCKET, "abc123", Autostart::Always).as_deref(),
+            Some("docker update --restart always 'abc123'")
+        );
+        assert_eq!(
+            autostart_command("", "abc123", Autostart::Never).as_deref(),
+            Some("docker update --restart no 'abc123'")
+        );
+        assert!(autostart_command(DEFAULT_SOCKET, "two words", Autostart::Always).is_none());
+    }
 
     #[test]
     fn a_failed_run_reports_its_reason_not_its_progress() {

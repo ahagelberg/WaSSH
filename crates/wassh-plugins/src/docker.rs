@@ -263,6 +263,8 @@ enum RowEvent {
     Update(String),
     /// A right-click on the container: open its menu.
     Menu(String),
+    /// Set whether the container comes back with the daemon.
+    Autostart(String, String, model::Autostart),
 }
 
 /// The Docker Manager pane.
@@ -1185,6 +1187,18 @@ impl DockerManager {
             )),
             RowEvent::Update(id) => {
                 self.queue_updates(&[id]);
+                None
+            }
+            RowEvent::Autostart(id, name, autostart) => {
+                if let Some(command) =
+                    model::autostart_command(&self.settings.socket, &id, autostart)
+                {
+                    let note = match autostart {
+                        model::Autostart::Always => format!("{name} starts on boot"),
+                        model::Autostart::Never => format!("{name} no longer starts on boot"),
+                    };
+                    self.run_change(access, &command, note);
+                }
                 None
             }
             RowEvent::Menu(id) => {
@@ -2386,6 +2400,23 @@ fn container_menu(
             Some(RowEvent::Update(id.clone())),
         );
     }
+    push(MenuItem::separator(), None);
+    push(
+        MenuItem::new("Start on boot"),
+        Some(RowEvent::Autostart(
+            id.clone(),
+            name.clone(),
+            model::Autostart::Always,
+        )),
+    );
+    push(
+        MenuItem::new("Don't start on boot"),
+        Some(RowEvent::Autostart(
+            id.clone(),
+            name.clone(),
+            model::Autostart::Never,
+        )),
+    );
     (items, events)
 }
 
@@ -2601,11 +2632,15 @@ mod tests {
                 | RowEvent::Stats(id)
                 | RowEvent::Shell(id)
                 | RowEvent::Update(id)
-                | RowEvent::Act(_, id, _) => id,
+                | RowEvent::Act(_, id, _)
+                | RowEvent::Autostart(id, _, _) => id,
                 RowEvent::Menu(id) => id,
             };
             assert_eq!(id, &running.id);
         }
+        // Starting with the daemon is a menu choice of its own, both ways.
+        assert!(labels.contains(&"Start on boot"), "{labels:?}");
+        assert!(labels.contains(&"Don't start on boot"), "{labels:?}");
 
         // A stopped container has nothing to show live, and no update to apply.
         let mut stopped = running.clone();
