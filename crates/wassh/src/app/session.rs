@@ -300,6 +300,8 @@ pub struct SessionEntry {
     pub layout: TabPluginLayout,
     /// Live plugin instances, created on demand and kept for the tab's lifetime.
     panes: Vec<PluginPane>,
+    /// Toasts the panes raised while they were drawn, waiting for the window to show them.
+    plugin_toasts: Vec<(wassh_ui::widgets::ToastKind, String)>,
     /// Host-level plugin values this tab changed in Session settings.
     ///
     /// Kept in the tab: the saved host and its other sessions keep their own.
@@ -463,6 +465,7 @@ impl SessionEntry {
             suppress_close: false,
             layout: TabPluginLayout::empty(),
             panes: Vec::new(),
+            plugin_toasts: Vec::new(),
             plugin_overrides: wassh_core::PluginSettings::new(),
             plugin_secret_overrides: std::collections::BTreeMap::new(),
             snapshot: std::cell::RefCell::new(None),
@@ -1598,11 +1601,18 @@ impl SessionEntry {
         if !app_writes.is_empty() {
             pane.app_writes.extend(app_writes);
         }
+        let toasts = pane.plugin.take_toasts();
+        self.plugin_toasts.extend(toasts);
         self.panes.push(pane);
         // A macro or plugin action types into the shell as if the user had.
         if !typed.is_empty() {
             self.send(&typed);
         }
+    }
+
+    /// Take the toasts the panes raised while they were drawn.
+    pub fn take_plugin_toasts(&mut self) -> Vec<(wassh_ui::widgets::ToastKind, String)> {
+        std::mem::take(&mut self.plugin_toasts)
     }
 
     /// Collect finished pane commands.

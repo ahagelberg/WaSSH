@@ -3372,6 +3372,7 @@ impl Shell {
         self.show_main(ui, &ctx);
         self.show_dialogs(&ctx);
         self.show_context_menu(&ctx);
+        self.collect_pane_toasts();
 
         self.toasts.show(ui, &self.palette);
         if !self.toasts.is_empty() {
@@ -3389,6 +3390,15 @@ impl Shell {
             ctx.request_repaint();
         }
         self.schedule_repaint(&ctx);
+    }
+
+    /// Move the toasts panes raised into the window's own stack.
+    fn collect_pane_toasts(&mut self) {
+        for session in &mut self.sessions {
+            for (kind, text) in session.take_plugin_toasts() {
+                self.toasts.push(kind, text);
+            }
+        }
     }
 
     /// Re-colour everything when the desktop switches between light and dark.

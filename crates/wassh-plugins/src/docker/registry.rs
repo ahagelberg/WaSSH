@@ -11,8 +11,20 @@ use serde_json::Value;
 
 /// Docker Hub's repository search.
 const HUB_SEARCH: &str = "https://hub.docker.com/v2/search/repositories/";
+/// Docker Hub's tags of one repository.
+const HUB_TAGS: &str = "https://hub.docker.com/v2/repositories/";
 /// Quay's repository find.
 const QUAY_SEARCH: &str = "https://quay.io/api/v1/find/repositories";
+/// Quay's tags of one repository.
+const QUAY_TAGS: &str = "https://quay.io/api/v1/repository/";
+/// Tags asked for when looking for one to run.
+const TAG_PAGE: &str = "50";
+/// The tag Docker uses when none is named.
+const LATEST: &str = "latest";
+/// Where a bare name lives on Docker Hub.
+const HUB_LIBRARY: &str = "library/";
+/// The one registry whose paths are spelled out in a reference.
+const QUAY_HOST: &str = "quay.io/";
 /// Results asked for per registry.
 const PAGE_SIZE: &str = "20";
 /// Longest a search may take before it is abandoned.
@@ -147,6 +159,62 @@ pub fn parse_quay(text: &str) -> Vec<Hit> {
         .collect()
 }
 
+/// The tag to run for `reference` when the user has not chosen one.
+///
+/// Docker assumes `latest`, which many images never publish: `eclipse/mosquitto` has only
+/// version tags, so a plain pull of it fails with "not found" even though a search found
+/// it. The newest tag the registry lists is the sensible stand-in.
+pub fn default_tag(reference: &str) -> Result<String, String> {
+    Ok(pick_tag(&tags(reference)?))
+}
+
+/// The tag to run, given the tags a repository has newest first.
+pub fn pick_tag(tags: &[String]) -> String {
+    if tags.iter().any(|tag| tag == LATEST) {
+        LATEST.to_owned()
+    } else {
+        tags.first().cloned().unwrap_or_default()
+    }
+}
+
+/// The tags `reference` has, newest first.
+pub fn tags(reference: &str) -> Result<Vec<String>, String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(path) = reference.strip_prefix(QUAY_HOST) {
+        let url = format!("{QUAY_TAGS}{path}/tag/");
+        let body = get(&url, &[("limit", TAG_PAGE), ("onlyActiveTags", "true")])?;
+        return Ok(names(&body, "tags"));
+    }
+    let path = if reference.contains('/') {
+        reference.to_owned()
+    } else {
+        format!("{HUB_LIBRARY}{reference}")
+    };
+    let url = format!("{HUB_TAGS}{path}/tags");
+    let body = get(&url, &[("page_size", TAG_PAGE), ("ordering", "last_updated")])?;
+    Ok(names(&body, "results"))
+}
+
+/// The `name` of every entry in one of the registries' list answers.
+fn names(text: &str, key: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.get(key).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = text_of(entry, "name");
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
 /// A trimmed string field, empty when it is missing or not a string.
 fn text_of(value: &Value, key: &str) -> String {
     value
@@ -192,6 +260,25 @@ mod tests {
         assert_eq!(hits[0].reference, "quay.io/nginx/nginx-unprivileged");
         assert_eq!(hits[0].description, "Nginx on port 8080.");
         assert!(!hits[0].official);
+    }
+
+    #[test]
+    fn the_tag_to_run_prefers_latest_and_falls_back_to_the_newest() {
+        // `eclipse/mosquitto` publishes no latest at all, which is why a plain pull of it
+        // answers "not found" while a search finds it.
+        assert_eq!(pick_tag(&["1.4.8".to_owned(), "1.4.4".to_owned()]), "1.4.8");
+        assert_eq!(pick_tag(&["2.0".to_owned(), "latest".to_owned()]), "latest");
+        assert_eq!(pick_tag(&[]), "");
+        assert_eq!(
+            names(r#"{"count":2,"results":[{"name":"1.4.8"},{"name":"1.4.4"}]}"#, "results"),
+            vec!["1.4.8".to_owned(), "1.4.4".to_owned()]
+        );
+        assert!(
+            names(r#"{"tags":[{"name":"trixie-perl"}]}"#, "tags")
+                == vec!["trixie-perl".to_owned()],
+            "Quay lists its tags under a tags key"
+        );
+        assert!(names("not json", "results").is_empty());
     }
 
     #[test]

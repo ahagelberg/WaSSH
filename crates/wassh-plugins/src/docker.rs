@@ -24,8 +24,8 @@ use wassh_core::Palette;
 use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
-    Button, ButtonKind, bar_meter, checkbox, dialog_width, footer, line_chart, modal, password_input,
-    search_input, select_str, small_button_enabled, text_input,
+    Button, ButtonKind, ToastKind, bar_meter, checkbox, dialog_width, footer, line_chart, modal,
+    password_input, search_input, select_str, small_button_enabled, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -85,8 +85,6 @@ const MIN_LOG_TAIL: usize = 10;
 const MAX_LOG_TAIL: usize = 5_000;
 /// Samples kept for the CPU chart.
 const STATS_HISTORY: usize = 60;
-/// How long a status line stays up.
-const NOTICE_LIFETIME: Duration = Duration::from_secs(6);
 /// How often an engine that does not answer is asked again.
 const ENGINE_RETRY: Duration = Duration::from_secs(5);
 /// Height of the log, stats, detail and engine-output panels.
@@ -231,13 +229,6 @@ struct Outcome {
     error: Option<String>,
 }
 
-/// A status line above the list.
-struct Notice {
-    text: String,
-    failed: bool,
-    at: Instant,
-}
-
 /// A destructive action waiting for a yes.
 struct Confirm {
     action: Action,
@@ -290,7 +281,8 @@ pub struct DockerManager {
     stats_for: Option<String>,
     stats: Option<Stats>,
     cpu_history: Vec<f32>,
-    notice: Option<Notice>,
+    /// Messages the window shows as toasts, drained once per frame.
+    toasts: Vec<(ToastKind, String)>,
     confirm: Option<Confirm>,
     sudo: Option<Sudo>,
     engine: engine::Status,
@@ -351,6 +343,8 @@ struct ImageSearch {
     error: Option<String>,
     /// The worker's line, while it runs.
     pending: Option<std::sync::mpsc::Receiver<Result<Vec<registry::Hit>, String>>>,
+    /// The tag lookup for the image that was just picked.
+    tags: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 }
 
 impl RunForm {
@@ -425,6 +419,10 @@ impl Plugin for DockerManager {
             context.send_text(&text);
         }
     }
+
+    fn take_toasts(&mut self) -> Vec<(ToastKind, String)> {
+        std::mem::take(&mut self.toasts)
+    }
 }
 
 impl DockerManager {
@@ -461,7 +459,6 @@ impl DockerManager {
         self.poll(access);
         self.caption = Some(self.header_caption());
         self.engine_row(ui, palette, access);
-        self.notice_row(ui, palette);
         // Nothing below can be listed, so the pane shows only the engine and its repair.
         if !self.engine.is_ready() {
             self.confirm = None;
@@ -930,19 +927,11 @@ impl DockerManager {
     }
 
     fn notify(&mut self, text: String) {
-        self.notice = Some(Notice {
-            text,
-            failed: false,
-            at: Instant::now(),
-        });
+        self.toasts.push((ToastKind::Info, text));
     }
 
     fn notify_failure(&mut self, text: String) {
-        self.notice = Some(Notice {
-            text,
-            failed: true,
-            at: Instant::now(),
-        });
+        self.toasts.push((ToastKind::Error, text));
     }
 
     // --- containers -----------------------------------------------------
@@ -1091,9 +1080,29 @@ impl DockerManager {
         typed
     }
 
+    /// Take in an answer from the tag lookup.
+    fn poll_tags(&mut self) {
+        let Some(pending) = &self.search.tags else {
+            return;
+        };
+        let answer = pending.try_recv();
+        match answer {
+            Ok(Ok(tag)) => {
+                // An image without any tag at all keeps Docker's own default.
+                if !tag.is_empty() {
+                    self.run.tag = tag;
+                }
+                self.search.tags = None;
+            }
+            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => self.search.tags = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     /// Take in an answer from the registry search.
     fn poll_search(&mut self) {
         use std::sync::mpsc::TryRecvError;
+        self.poll_tags();
         let Some(pending) = &self.search.pending else {
             return;
         };
@@ -1132,11 +1141,18 @@ impl DockerManager {
         self.search.error = None;
     }
 
-    /// Start the create form from a registry hit.
+    /// Start the create form from a registry hit, with the tag that image really has.
     fn take_image(&mut self, reference: &str) {
         self.run.image = reference.to_owned();
         self.run.tag.clear();
         self.search.hits.clear();
+        let reference = reference.to_owned();
+        let (sender, pending) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(registry::default_tag(&reference));
+            wassh_core::wake::notify();
+        });
+        self.search.tags = Some(pending);
     }
 
     fn queue_updates(&mut self, ids: &[String]) {
@@ -1845,25 +1861,6 @@ impl DockerManager {
         });
     }
 
-    fn notice_row(&mut self, ui: &mut Ui, palette: &Palette) {
-        let Some(notice) = &self.notice else {
-            return;
-        };
-        if notice.at.elapsed() > NOTICE_LIFETIME {
-            self.notice = None;
-            return;
-        }
-        ui.label(
-            egui::RichText::new(&notice.text)
-                .size(10.5)
-                .color(to_color32(if notice.failed {
-                    palette.danger
-                } else {
-                    palette.accent
-                })),
-        );
-    }
-
     fn confirm_card(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
         let Some(confirm) = &self.confirm else {
             return;
@@ -2067,6 +2064,9 @@ impl DockerManager {
                     text_input(ui, palette, &mut self.run.ports, "publish a port (8080:80)");
                 });
                 ui.add_space(4.0);
+                if self.search.tags.is_some() {
+                    self.help_detail(ui, palette, "Looking up the image's tags…");
+                }
                 checkbox(ui, palette, &mut advanced, "More options");
                 if advanced {
                     ui.horizontal_wrapped(|ui| {
@@ -2098,7 +2098,7 @@ impl DockerManager {
                         self.run.restart = restart;
                     });
                 }
-                let ready = !self.run.image.trim().is_empty();
+                let ready = !self.run.image.trim().is_empty() && self.search.tags.is_none();
                 footer(ui, |ui| {
                     if small_button_enabled(ui, palette, "Cancel", true) {
                         close = true;
@@ -2355,6 +2355,27 @@ mod tests {
     }
 
     #[test]
+    fn a_chosen_image_gets_a_tag_it_actually_has() {
+        let mut pane = pane();
+        pane.take_image("eclipse/mosquitto");
+        assert_eq!(pane.run.image, "eclipse/mosquitto");
+        assert!(pane.run.tag.is_empty(), "the tag is looked up first");
+
+        // The lookup answers with the newest tag the repository has.
+        let (sender, pending) = std::sync::mpsc::channel();
+        pane.search.tags = Some(pending);
+        sender.send(Ok("1.4.8".to_owned())).unwrap();
+        pane.poll_tags();
+        assert_eq!(pane.run.tag, "1.4.8");
+        assert!(pane.search.tags.is_none());
+        assert_eq!(
+            pane.run.request().reference(),
+            "eclipse/mosquitto:1.4.8",
+            "which is what the pull needs"
+        );
+    }
+
+    #[test]
     fn a_search_that_fails_says_why() {
         let mut pane = pane();
         let (sender, pending) = std::sync::mpsc::channel();
@@ -2478,8 +2499,8 @@ mod tests {
         let sudo = pane.sudo.as_ref().expect("the password card is up");
         assert!(sudo.command.starts_with("docker ps"), "{}", sudo.command);
         assert_eq!(
-            pane.notice.as_ref().map(|notice| notice.text.as_str()),
-            Some(NEEDS_ROOT_NOTICE),
+            pane.toasts.last().map(|(kind, text)| (*kind, text.as_str())),
+            Some((ToastKind::Info, NEEDS_ROOT_NOTICE)),
             "and the notice points at the card"
         );
     }
@@ -2561,7 +2582,7 @@ mod tests {
         pane.poll(&mut access);
         assert!(pane.pending.is_none());
         assert_eq!(
-            pane.notice.as_ref().map(|notice| notice.text.as_str()),
+            pane.toasts.last().map(|(_, text)| text.as_str()),
             Some("Started web")
         );
     }

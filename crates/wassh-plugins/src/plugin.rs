@@ -188,6 +188,15 @@ pub trait Plugin {
     fn take_app_settings(&mut self) -> Vec<(String, serde_json::Value)> {
         Vec::new()
     }
+
+    /// Messages the pane wants the window to show as toasts, drained once per frame.
+    ///
+    /// A pane that reports a one-off outcome — a command finished, a pull failed — puts it
+    /// here instead of drawing a line of its own, so the window's own toast stack shows it
+    /// and the pane keeps its layout.
+    fn take_toasts(&mut self) -> Vec<(wassh_ui::widgets::ToastKind, String)> {
+        Vec::new()
+    }
 }
 
 /// A button a plugin asks the host to paint in its pane header.
