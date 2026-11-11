@@ -419,6 +419,14 @@ struct Update {
     inspecting: bool,
 }
 
+/// Which panels are open for the container whose menu is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OpenPanels {
+    details: bool,
+    logs: bool,
+    stats: bool,
+}
+
 /// A container being renamed, and the name typed so far.
 struct Rename {
     id: String,
@@ -1363,7 +1371,14 @@ impl DockerManager {
     ) -> Option<String> {
         match event {
             RowEvent::Select(id) => {
-                self.select(access, &id);
+                // The details panel is a switch too: picking the row it belongs to again
+                // closes it.
+                if self.selected.as_deref() == Some(id.as_str()) {
+                    self.selected = None;
+                    self.detail = None;
+                } else {
+                    self.select(access, &id);
+                }
                 None
             }
             RowEvent::Act(action, id, name) => {
@@ -1377,15 +1392,23 @@ impl DockerManager {
                 None
             }
             RowEvent::Logs(id) => {
-                self.logs_for = Some(id);
-                self.logs.clear();
+                if self.logs_for.as_deref() == Some(id.as_str()) {
+                    self.logs_for = None;
+                } else {
+                    self.logs_for = Some(id);
+                    self.logs.clear();
+                }
                 None
             }
             RowEvent::Stats(id) => {
-                self.stats_for = Some(id);
-                self.stats = None;
-                self.cpu_history.clear();
-                self.last_stats = None;
+                if self.stats_for.as_deref() == Some(id.as_str()) {
+                    self.stats_for = None;
+                } else {
+                    self.stats_for = Some(id);
+                    self.stats = None;
+                    self.cpu_history.clear();
+                    self.last_stats = None;
+                }
                 None
             }
             RowEvent::Shell(id) => Some(format!(
@@ -1450,8 +1473,17 @@ impl DockerManager {
                     .policies
                     .get(&container.name)
                     .is_some_and(|policy| policy == model::Autostart::Always.policy());
-                let (items, events) =
-                    container_menu(container, self.stale.contains(&id), starts_on_boot);
+                let open = OpenPanels {
+                    details: self.selected.as_deref() == Some(id.as_str()),
+                    logs: self.logs_for.as_deref() == Some(id.as_str()),
+                    stats: self.stats_for.as_deref() == Some(id.as_str()),
+                };
+                let (items, events) = container_menu(
+                    container,
+                    self.stale.contains(&id),
+                    starts_on_boot,
+                    open,
+                );
                 let at = ui
                     .ctx()
                     .pointer_latest_pos()
@@ -2660,6 +2692,7 @@ fn container_menu(
     container: &Container,
     has_update: bool,
     starts_on_boot: bool,
+    open: OpenPanels,
 ) -> (Vec<MenuItem>, Vec<Option<RowEvent>>) {
     let id = container.id.clone();
     let name = container.name.clone();
@@ -2669,10 +2702,20 @@ fn container_menu(
         items.push(item);
         events.push(event);
     };
-    push(MenuItem::new("Details"), Some(RowEvent::Select(id.clone())));
-    push(MenuItem::new("Logs"), Some(RowEvent::Logs(id.clone())));
+    // The panels are switches: ticked while that panel shows this container.
+    push(
+        MenuItem::toggle("Details", open.details),
+        Some(RowEvent::Select(id.clone())),
+    );
+    push(
+        MenuItem::toggle("Logs", open.logs),
+        Some(RowEvent::Logs(id.clone())),
+    );
     if container.is_running() {
-        push(MenuItem::new("Stats"), Some(RowEvent::Stats(id.clone())));
+        push(
+            MenuItem::toggle("Stats", open.stats),
+            Some(RowEvent::Stats(id.clone())),
+        );
         push(MenuItem::new("Shell"), Some(RowEvent::Shell(id.clone())));
     }
     push(MenuItem::separator(), None);
@@ -2974,7 +3017,7 @@ mod tests {
     fn a_containers_menu_offers_its_actions() {
         let containers = model::parse_containers(PS);
         let running = &containers[0];
-        let (items, events) = container_menu(running, true, false);
+        let (items, events) = container_menu(running, true, false, OpenPanels::default());
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {
@@ -3025,18 +3068,46 @@ mod tests {
             _ => None,
         });
         assert_eq!(toggle, Some(Some(false)), "an unticked switch");
-        let (items, _) = container_menu(running, false, true);
+        let (items, _) = container_menu(running, false, true, OpenPanels::default());
         let had = items.iter().find_map(|item| match item {
             MenuItem::Action { label, checked, .. } if label == START_ON_BOOT_LABEL => Some(*checked),
             _ => None,
         });
         assert_eq!(had, Some(Some(true)), "ticked once the daemon says so");
 
+        // The three panels are switches, ticked while they show this container.
+        let open = OpenPanels {
+            details: true,
+            logs: false,
+            stats: true,
+        };
+        let (items, _) = container_menu(running, false, false, open);
+        let ticks: Vec<(&str, Option<bool>)> = items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action {
+                    label, checked, ..
+                } if matches!(label.as_str(), "Details" | "Logs" | "Stats") => {
+                    Some((label.as_str(), *checked))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ticks,
+            [
+                ("Details", Some(true)),
+                ("Logs", Some(false)),
+                ("Stats", Some(true)),
+            ],
+            "each panel row is a switch that says whether it is open"
+        );
+
         // A stopped container has nothing to show live, and no update to apply.
         let mut stopped = running.clone();
         stopped.state = "exited".to_owned();
         stopped.status = "Exited (0) 2 minutes ago".to_owned();
-        let (items, _) = container_menu(&stopped, false, false);
+        let (items, _) = container_menu(&stopped, false, false, OpenPanels::default());
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {
