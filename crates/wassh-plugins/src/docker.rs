@@ -40,6 +40,8 @@ pub use model::{
 
 /// Key the container list is requested under.
 pub const LIST_KEY: &str = "docker.list";
+/// Key the containers' restart policies are requested under.
+pub const POLICY_KEY: &str = "docker.policies";
 /// Key container actions are requested under.
 pub const ACTION_KEY: &str = "docker.action";
 /// Key log output is requested under.
@@ -96,6 +98,8 @@ const CREATE_DIALOG_WIDTH: f32 = 560.0;
 const CONFIRM_DIALOG_WIDTH: f32 = 420.0;
 /// Width of the password dialog.
 const SUDO_DIALOG_WIDTH: f32 = 460.0;
+/// The menu switch that follows the daemon's restart policy.
+const START_ON_BOOT_LABEL: &str = "Start on boot";
 /// Docker's wording for "the tag moved".
 const PULLED_NEWER: &str = "Downloaded newer image";
 /// Shown when a command stopped because it needs root, next to the password card.
@@ -281,6 +285,8 @@ pub struct DockerManager {
     section: Section,
     shell: usize,
     containers: Vec<Container>,
+    /// Each container's restart policy, by name.
+    policies: BTreeMap<String, String>,
     images: Vec<Image>,
     volumes: Vec<Volume>,
     networks: Vec<Network>,
@@ -600,7 +606,13 @@ impl DockerManager {
         let (key, command) = match self.tab {
             // Every container is asked for; the pane hides the stopped ones itself, so the
             // list does not change shape when the daemon stops them for us.
-            Tab::Containers => (LIST_KEY, model::ps_command(&socket, true)),
+            Tab::Containers => {
+                // The restart policies come alongside, so the menu can tick its toggle.
+                if !access.is_running(POLICY_KEY) {
+                    self.run(access, POLICY_KEY, &model::policies_command(&socket));
+                }
+                (LIST_KEY, model::ps_command(&socket, true))
+            }
             Tab::Images => (IMAGES_KEY, model::images_command(&socket)),
             Tab::Volumes => (VOLUMES_KEY, model::volumes_command(&socket)),
             Tab::Networks => (NETWORKS_KEY, model::networks_command(&socket)),
@@ -621,6 +633,13 @@ impl DockerManager {
                 self.detail = None;
                 self.logs_for = None;
                 self.stats_for = None;
+            }
+        }
+        if let Some(outcome) = self.take(access, POLICY_KEY) {
+            match outcome.error {
+                // A host whose inspect cannot answer only loses the tick, not the list.
+                Some(_) => self.policies.clear(),
+                None => self.policies = model::parse_policies(&outcome.stdout),
             }
         }
         if let Some(outcome) = self.take(access, IMAGES_KEY) {
@@ -1234,7 +1253,12 @@ impl DockerManager {
             }
             RowEvent::Menu(id) => {
                 let container = self.containers.iter().find(|item| item.id == id)?;
-                let (items, events) = container_menu(container, self.stale.contains(&id));
+                let starts_on_boot = self
+                    .policies
+                    .get(&container.name)
+                    .is_some_and(|policy| policy == model::Autostart::Always.policy());
+                let (items, events) =
+                    container_menu(container, self.stale.contains(&id), starts_on_boot);
                 let at = ui
                     .ctx()
                     .pointer_latest_pos()
@@ -2300,6 +2324,7 @@ fn container_card(
 fn container_menu(
     container: &Container,
     has_update: bool,
+    starts_on_boot: bool,
 ) -> (Vec<MenuItem>, Vec<Option<RowEvent>>) {
     let id = container.id.clone();
     let name = container.name.clone();
@@ -2341,20 +2366,17 @@ fn container_menu(
         );
     }
     push(MenuItem::separator(), None);
+    // One switch, ticked when the daemon says this container comes back on its own.
     push(
-        MenuItem::new("Start on boot"),
+        MenuItem::toggle(START_ON_BOOT_LABEL, starts_on_boot),
         Some(RowEvent::Autostart(
             id.clone(),
             name.clone(),
-            model::Autostart::Always,
-        )),
-    );
-    push(
-        MenuItem::new("Don't start on boot"),
-        Some(RowEvent::Autostart(
-            id.clone(),
-            name.clone(),
-            model::Autostart::Never,
+            if starts_on_boot {
+                model::Autostart::Never
+            } else {
+                model::Autostart::Always
+            },
         )),
     );
     (items, events)
@@ -2588,7 +2610,7 @@ mod tests {
     fn a_containers_menu_offers_its_actions() {
         let containers = model::parse_containers(PS);
         let running = &containers[0];
-        let (items, events) = container_menu(running, true);
+        let (items, events) = container_menu(running, true, false);
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {
@@ -2625,15 +2647,26 @@ mod tests {
             };
             assert_eq!(id, &running.id);
         }
-        // Starting with the daemon is a menu choice of its own, both ways.
-        assert!(labels.contains(&"Start on boot"), "{labels:?}");
-        assert!(labels.contains(&"Don't start on boot"), "{labels:?}");
+        // Starting with the daemon is one switch, off for a container without the policy.
+        let toggle = items.iter().find_map(|item| match item {
+            MenuItem::Action {
+                label, checked, ..
+            } if label == START_ON_BOOT_LABEL => Some(*checked),
+            _ => None,
+        });
+        assert_eq!(toggle, Some(Some(false)), "an unticked switch");
+        let (items, _) = container_menu(running, false, true);
+        let had = items.iter().find_map(|item| match item {
+            MenuItem::Action { label, checked, .. } if label == START_ON_BOOT_LABEL => Some(*checked),
+            _ => None,
+        });
+        assert_eq!(had, Some(Some(true)), "ticked once the daemon says so");
 
         // A stopped container has nothing to show live, and no update to apply.
         let mut stopped = running.clone();
         stopped.state = "exited".to_owned();
         stopped.status = "Exited (0) 2 minutes ago".to_owned();
-        let (items, _) = container_menu(&stopped, false);
+        let (items, _) = container_menu(&stopped, false, false);
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {

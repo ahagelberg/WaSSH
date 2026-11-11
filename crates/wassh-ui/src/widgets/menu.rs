@@ -21,6 +21,10 @@ pub const SEPARATOR_HEIGHT: f32 = 9.0;
 pub const PADDING_X: f32 = 6.0;
 /// Vertical padding above the first and below the last item.
 pub const PADDING_Y: f32 = 5.0;
+/// Room a toggle row keeps for its tick.
+pub const TOGGLE_GUTTER: f32 = 16.0;
+/// The glyph a switched-on row shows.
+const TICK: &str = "\u{2713}";
 
 /// A single entry in a context menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +37,8 @@ pub enum MenuItem {
         enabled: bool,
         /// Red text and hover fill, used for destructive actions.
         danger: bool,
+        /// Whether the row is a switch, and whether it is on.
+        checked: Option<bool>,
     },
     /// A horizontal rule between groups.
     Separator,
@@ -45,6 +51,7 @@ impl MenuItem {
             label: label.into(),
             enabled: true,
             danger: false,
+            checked: None,
         }
     }
 
@@ -54,6 +61,7 @@ impl MenuItem {
             label: label.into(),
             enabled: true,
             danger: true,
+            checked: None,
         }
     }
 
@@ -63,6 +71,17 @@ impl MenuItem {
             label: label.into(),
             enabled: false,
             danger: false,
+            checked: None,
+        }
+    }
+
+    /// A row that switches something on or off, ticked when `on`.
+    pub fn toggle(label: impl Into<String>, on: bool) -> Self {
+        Self::Action {
+            label: label.into(),
+            enabled: true,
+            danger: false,
+            checked: Some(on),
         }
     }
 
@@ -150,12 +169,14 @@ impl MenuState {
         let width = items
             .iter()
             .filter_map(|item| match item {
-                MenuItem::Action { label, .. } => {
+                MenuItem::Action { label, checked, .. } => {
+                    let gutter = if checked.is_some() { TOGGLE_GUTTER } else { 0.0 };
                     Some(ctx.fonts_mut(|fonts| {
                         fonts
                             .layout_no_wrap(label.to_string(), font.clone(), text_colour)
                             .size()
                             .x
+                            + gutter
                     }))
                 }
                 MenuItem::Separator => None,
@@ -227,6 +248,7 @@ impl MenuState {
                                 label,
                                 enabled,
                                 danger,
+                                checked,
                             } => {
                                 let (rect, item_response) = ui.allocate_exact_size(
                                     Vec2::new(ui.available_width(), ITEM_HEIGHT),
@@ -254,8 +276,23 @@ impl MenuState {
                                 } else {
                                     text_colour
                                 };
+                                let left = match checked {
+                                    Some(on) => {
+                                        if *on {
+                                            ui.painter().text(
+                                                Pos2::new(rect.left() + 8.0, rect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                TICK,
+                                                font.clone(),
+                                                colour,
+                                            );
+                                        }
+                                        rect.left() + 8.0 + TOGGLE_GUTTER
+                                    }
+                                    None => rect.left() + 8.0,
+                                };
                                 ui.painter().text(
-                                    Pos2::new(rect.left() + 8.0, rect.center().y),
+                                    Pos2::new(left, rect.center().y),
                                     egui::Align2::LEFT_CENTER,
                                     label,
                                     font.clone(),
@@ -346,6 +383,7 @@ pub fn context_menu(
                                 label,
                                 enabled,
                                 danger,
+                                ..
                             } => {
                                 let (rect, response) = ui.allocate_exact_size(
                                     Vec2::new(ui.available_width(), ITEM_HEIGHT),
@@ -425,7 +463,8 @@ mod tests {
             MenuItem::Action {
                 label: "Reconnect".to_owned(),
                 enabled: true,
-                danger: false
+                danger: false,
+                checked: None,
             }
         );
         assert!(matches!(
@@ -439,5 +478,15 @@ mod tests {
                 ..
             }
         ));
+        // A toggle is a plain row that knows whether it is on.
+        assert_eq!(
+            MenuItem::toggle("Start on boot", true),
+            MenuItem::Action {
+                label: "Start on boot".to_owned(),
+                enabled: true,
+                danger: false,
+                checked: Some(true),
+            }
+        );
     }
 }

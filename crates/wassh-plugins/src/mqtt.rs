@@ -1438,6 +1438,7 @@ impl MqttAnalyser {
                     label: "Delete".to_owned(),
                     enabled: self.session.is_some(),
                     danger: true,
+                    checked: None,
                 }],
             );
         }

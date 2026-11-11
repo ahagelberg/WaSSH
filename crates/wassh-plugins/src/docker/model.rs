@@ -7,6 +7,8 @@
 //! readable (`--format '{{json .}}'` or `inspect` JSON), so the parsers here see
 //! the same fields the API returned.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 /// The daemon socket the reference defaults to.
@@ -443,6 +445,29 @@ pub fn autostart_command(socket: &str, id: &str, autostart: Autostart) -> Option
             shell_quote(id)
         )
     })
+}
+
+/// The restart policy of every container, as `name=policy` lines.
+///
+/// `docker ps` does not report the policy, and `docker inspect` does; one call covers the
+/// list, and `xargs -r` keeps an empty host from asking for an inspect of nothing.
+pub fn policies_command(socket: &str) -> String {
+    format!(
+        "docker{} ps -aq | xargs -r docker{} inspect --format '{{{{.Name}}}}={{{{.HostConfig.RestartPolicy.Name}}}}'",
+        socket_flag(socket),
+        socket_flag(socket)
+    )
+}
+
+/// Read `name=policy` lines into a map of container name to policy.
+pub fn parse_policies(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, policy) = line.trim().split_once('=')?;
+            let name = name.trim().trim_start_matches('/');
+            (!name.is_empty()).then(|| (name.to_owned(), policy.trim().to_owned()))
+        })
+        .collect()
 }
 
 /// The image list, one JSON object per line.
@@ -1251,6 +1276,14 @@ pub fn recreate_command(socket: &str, document: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_policies_are_read_by_name() {
+        let policies = parse_policies("/web=always\n/db=no\n\nno equal sign\n");
+        assert_eq!(policies.get("web").map(String::as_str), Some("always"));
+        assert_eq!(policies.get("db").map(String::as_str), Some("no"));
+        assert_eq!(policies.len(), 2, "only the name=policy lines count");
+    }
 
     #[test]
     fn a_restart_policy_is_a_docker_update() {
