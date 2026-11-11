@@ -122,8 +122,32 @@ pub const WINDOWS_GROUP_COMMAND: &str = "Start-Process -FilePath net -ArgumentLi
 pub const UNEXPECTED_ANSWER: &str =
     "The docker command answered, but not with a Docker engine version.";
 
+/// Said when the command finished without printing anything at all.
+pub const EMPTY_ANSWER: &str = "The docker command printed nothing.";
+
 /// Fields the engine probe asks `docker info` for.
 const ENGINE_FIELDS: usize = 7;
+
+/// Longest part of an answer the pane quotes back.
+const MAX_QUOTED_ANSWER: usize = 160;
+
+/// Explain an answer that is not an engine's, quoting what came back.
+///
+/// Without the answer the user cannot tell a shell wrapper from a daemon that answers in
+/// another shape, so the first line of it is shown as it arrived.
+pub fn unexpected_answer(text: &str) -> String {
+    let answer = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if answer.is_empty() {
+        return EMPTY_ANSWER.to_owned();
+    }
+    let quoted: String = answer.chars().take(MAX_QUOTED_ANSWER).collect();
+    let ellipsis = if quoted.len() < answer.len() { "…" } else { "" };
+    format!("{UNEXPECTED_ANSWER} It answered: {quoted}{ellipsis}")
+}
 
 /// Which manager the distro id, its family, and the installed tools point at.
 pub fn manager_from_probe(output: &str) -> Manager {
@@ -456,6 +480,19 @@ mod tests {
             "{}",
             status.summary()
         );
+    }
+
+    #[test]
+    fn an_answer_the_pane_cannot_use_is_quoted_back() {
+        assert_eq!(unexpected_answer("  \n  "), EMPTY_ANSWER);
+        let message = unexpected_answer("\nHello from a wrapper\nmore\n");
+        assert!(message.starts_with(UNEXPECTED_ANSWER), "{message}");
+        assert!(message.ends_with("It answered: Hello from a wrapper"), "{message}");
+        let long = "x".repeat(MAX_QUOTED_ANSWER + 40);
+        let message = unexpected_answer(&long);
+        let quoted = message.rsplit("It answered: ").next().unwrap_or_default();
+        assert_eq!(quoted.chars().count(), MAX_QUOTED_ANSWER + 1, "cut, plus …");
+        assert!(quoted.ends_with('…'), "{message}");
     }
 
     #[test]

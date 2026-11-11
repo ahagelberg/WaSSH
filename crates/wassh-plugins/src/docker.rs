@@ -959,7 +959,7 @@ impl DockerManager {
                 Some(error) => engine::status_from_failure(&error),
                 None => engine::parse_info(&outcome.stdout).unwrap_or(engine::Status {
                     state: Some(engine::State::Error),
-                    message: engine::UNEXPECTED_ANSWER.to_owned(),
+                    message: engine::unexpected_answer(&outcome.stdout),
                     ..engine::Status::default()
                 }),
             };
@@ -3193,7 +3193,11 @@ mod tests {
         pane.poll(&mut access);
         assert!(!pane.engine.is_ready(), "{}", pane.engine.summary());
         assert_eq!(pane.engine.state, Some(engine::State::Error));
-        assert_eq!(pane.engine.summary(), engine::UNEXPECTED_ANSWER);
+        assert_eq!(
+            pane.engine.summary(),
+            format!("{} It answered: {{}}", engine::UNEXPECTED_ANSWER),
+            "what the host printed is shown, so it can be acted on"
+        );
         assert_eq!(pane.header_caption().0, "engine error");
         assert!(
             !access.commands.iter().any(|(key, _)| key == LIST_KEY),
