@@ -12,7 +12,7 @@ use wassh_core::HeaderHealth;
 use wassh_core::colors;
 use wassh_core::{Palette, SessionStatus};
 use wassh_ui::widgets::{
-    Button, ButtonKind, MenuItem, context_menu, faded, footer, modal, small_button,
+    Button, ButtonKind, MenuItem, context_menu, dialog_width, faded, footer, modal, small_button,
     small_button_enabled, text_input,
 };
 
@@ -2113,7 +2113,7 @@ impl Files {
             ("files-save", 11),
             palette,
             title,
-            dialog_width(ui, 560.0),
+            dialog_width(ui.ctx(), 560.0),
             |ui| {
                 ui.add(
                     egui::Label::new(
@@ -2267,7 +2267,7 @@ impl Files {
             ("files-picker", 10),
             palette,
             "Upload files",
-            dialog_width(ui, 560.0),
+            dialog_width(ui.ctx(), 560.0),
             |ui| {
                 ui.add(
                     egui::Label::new(egui::RichText::new(&directory).size(11.0).color(muted))
@@ -2404,7 +2404,7 @@ impl Files {
             ("files-viewer", 9),
             palette,
             &viewer.name,
-            dialog_width(ui, 720.0),
+            dialog_width(ui.ctx(), 720.0),
             |ui| {
                 ui.add(
                     egui::Label::new(egui::RichText::new(&viewer.path).size(11.0).color(muted))
@@ -2602,7 +2602,7 @@ impl Files {
             ("files-dialog", id),
             palette,
             title,
-            dialog_width(ui, 460.0),
+            dialog_width(ui.ctx(), 460.0),
             |ui| {
                 match &mut draft {
                     FileDialog::NewFolder { name } => {
@@ -3148,12 +3148,6 @@ fn local_row(ui: &mut Ui, palette: &Palette, label: &str, selected: bool) -> Row
     } else {
         RowClick::None
     }
-}
-
-/// Width of a dialog: `wanted`, but never wider than the window it opens in.
-fn dialog_width(ui: &Ui, wanted: f32) -> f32 {
-    let screen = ui.ctx().content_rect().width();
-    (screen - 80.0).clamp(320.0, wanted.max(320.0))
 }
 
 /// `text`, shortened with an ellipsis when it is wider than `width`.

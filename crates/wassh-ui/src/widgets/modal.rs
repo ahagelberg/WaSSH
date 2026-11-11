@@ -24,6 +24,16 @@ pub const HEADER_HEIGHT: f32 = 46.0;
 pub const FOOTER_HEIGHT: f32 = 54.0;
 /// Padding around the dialog body.
 pub const BODY_PADDING: f32 = 16.0;
+/// Room a dialog leaves at the window's edges.
+const WINDOW_MARGIN: f32 = 80.0;
+/// Narrowest a dialog may become in a small window.
+const MIN_DIALOG_WIDTH: f32 = 320.0;
+
+/// Width of a dialog: `wanted`, but never wider than the window it opens in.
+pub fn dialog_width(ctx: &Context, wanted: f32) -> f32 {
+    let screen = ctx.content_rect().width();
+    (screen - WINDOW_MARGIN).clamp(MIN_DIALOG_WIDTH, wanted.max(MIN_DIALOG_WIDTH))
+}
 
 /// How a modal was closed this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

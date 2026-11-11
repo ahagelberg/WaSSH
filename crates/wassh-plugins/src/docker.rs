@@ -24,8 +24,8 @@ use wassh_core::Palette;
 use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
-    Button, ButtonKind, bar_meter, checkbox, line_chart, password_input, search_input, select_str,
-    small_button_enabled, text_input,
+    Button, ButtonKind, bar_meter, checkbox, dialog_width, footer, line_chart, modal, password_input,
+    search_input, select_str, small_button_enabled, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -91,6 +91,8 @@ const NOTICE_LIFETIME: Duration = Duration::from_secs(6);
 const ENGINE_RETRY: Duration = Duration::from_secs(5);
 /// Height of the log, stats, detail and engine-output panels.
 const PANEL_HEIGHT: f32 = 160.0;
+/// Width of the create dialog on a wide window.
+const CREATE_DIALOG_WIDTH: f32 = 560.0;
 /// Docker's wording for "the tag moved".
 const PULLED_NEWER: &str = "Downloaded newer image";
 /// Shown when a command stopped because it needs root, next to the password card.
@@ -476,6 +478,7 @@ impl DockerManager {
         }
         self.confirm_card(ui, palette, access);
         self.sudo_card(ui, palette, access);
+        self.run_dialog(ui, palette, access);
         ui.add_space(2.0);
         let running = self
             .containers
@@ -964,7 +967,7 @@ impl DockerManager {
                 self.last_poll = None;
             }
             if small_button_enabled(ui, palette, "New…", true) {
-                self.run_open = !self.run_open;
+                self.run_open = true;
             }
             let can_check = self.pull_queue.is_empty()
                 && self
@@ -993,10 +996,6 @@ impl DockerManager {
                 self.queue_updates(&stale);
             }
         });
-
-        if self.run_open {
-            self.run_form(ui, palette, access);
-        }
 
         let needle = self.filter.trim().to_lowercase();
         let mut rows: Vec<Container> = self
@@ -2035,73 +2034,96 @@ impl DockerManager {
         }
     }
 
-    /// The create-container form.
-    fn run_form(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
-        ui.separator();
+    /// The create dialog: find an image in the registries, then say what to run.
+    fn run_dialog(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+        if !self.run_open {
+            return;
+        }
         let searching = self.search.pending.is_some();
         let mut search = false;
-        ui.horizontal_wrapped(|ui| {
-            text_input(ui, palette, &mut self.search.query, "search Docker Hub and Quay");
-            let ready = !self.search.query.trim().is_empty() && !searching;
-            if small_button_enabled(ui, palette, "Search images", ready) {
-                search = true;
-            }
-        });
+        let mut create = false;
+        let mut close = false;
+        let mut advanced = self.run_advanced;
+        let response = modal(
+            ui.ctx(),
+            "docker-new-container",
+            palette,
+            "New container",
+            dialog_width(ui.ctx(), CREATE_DIALOG_WIDTH),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    text_input(ui, palette, &mut self.search.query, "search Docker Hub and Quay");
+                    let ready = !self.search.query.trim().is_empty() && !searching;
+                    if small_button_enabled(ui, palette, "Search images", ready) {
+                        search = true;
+                    }
+                });
+                self.search_results(ui, palette);
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    text_input(ui, palette, &mut self.run.image, "image (nginx)");
+                    text_input(ui, palette, &mut self.run.tag, "tag (latest)");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    text_input(ui, palette, &mut self.run.name, "name (optional)");
+                    text_input(ui, palette, &mut self.run.ports, "publish a port (8080:80)");
+                });
+                ui.add_space(4.0);
+                checkbox(ui, palette, &mut advanced, "More options");
+                if advanced {
+                    ui.horizontal_wrapped(|ui| {
+                        text_input(ui, palette, &mut self.run.network, "network (optional)");
+                        text_input(
+                            ui,
+                            palette,
+                            &mut self.run.command,
+                            "command override (optional)",
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        text_input(ui, palette, &mut self.run.env, "env KEY=VALUE");
+                        text_input(ui, palette, &mut self.run.volumes, "volumes site:/data");
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let mut restart = self.run.restart.min(RESTART_CHOICES.len() - 1);
+                        self.help_detail(ui, palette, "Restart policy");
+                        if let Some(picked) = select_str(
+                            ui,
+                            ("docker-restart", "pick"),
+                            RESTART_CHOICES[restart],
+                            &RESTART_CHOICES,
+                        ) && let Some(index) =
+                            RESTART_CHOICES.iter().position(|choice| *choice == picked)
+                        {
+                            restart = index;
+                        }
+                        self.run.restart = restart;
+                    });
+                }
+                let ready = !self.run.image.trim().is_empty();
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, "Cancel", true) {
+                        close = true;
+                    }
+                    if small_button_enabled(ui, palette, "Create", ready) {
+                        create = true;
+                    }
+                });
+            },
+        );
+        self.run_advanced = advanced;
         if search {
             self.start_search();
         }
-        self.search_results(ui, palette);
-        ui.horizontal_wrapped(|ui| {
-            text_input(ui, palette, &mut self.run.image, "image (nginx)");
-            text_input(ui, palette, &mut self.run.tag, "tag (latest)");
-            text_input(ui, palette, &mut self.run.name, "name (optional)");
-        });
-        ui.horizontal_wrapped(|ui| {
-            text_input(ui, palette, &mut self.run.ports, "publish a port (8080:80)");
-            checkbox(ui, palette, &mut self.run_advanced, "More options");
-        });
-        if self.run_advanced {
-            ui.horizontal_wrapped(|ui| {
-                text_input(ui, palette, &mut self.run.network, "network (optional)");
-                text_input(ui, palette, &mut self.run.command, "command override (optional)");
-            });
-            ui.horizontal_wrapped(|ui| {
-                text_input(ui, palette, &mut self.run.env, "env KEY=VALUE");
-                text_input(ui, palette, &mut self.run.volumes, "volumes site:/data");
-            });
-            ui.horizontal_wrapped(|ui| {
-                let mut restart = self.run.restart.min(RESTART_CHOICES.len() - 1);
-                self.help_detail(ui, palette, "Restart policy");
-                if let Some(picked) = select_str(
-                    ui,
-                    ("docker-restart", "pick"),
-                    RESTART_CHOICES[restart],
-                    &RESTART_CHOICES,
-                ) && let Some(index) = RESTART_CHOICES.iter().position(|choice| *choice == picked)
-                {
-                    restart = index;
-                }
-                self.run.restart = restart;
-            });
-        }
-        let mut create = false;
-        ui.horizontal(|ui| {
-            let ready = !self.run.image.trim().is_empty();
-            if small_button_enabled(ui, palette, "Create", ready) {
-                create = true;
-            }
-            if small_button_enabled(ui, palette, "Close form", true) {
-                self.run_open = false;
-            }
-        });
         if create {
             let command = model::run_command(&self.settings.socket, &self.run.request());
             self.run(access, CHANGE_KEY, &command);
-            self.run_open = false;
             self.tab = Tab::Containers;
             self.notify("Creating the container…".to_owned());
         }
-        ui.separator();
+        if close || create || response.dismissed {
+            self.run_open = false;
+        }
     }
 }
 
