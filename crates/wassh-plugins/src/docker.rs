@@ -24,9 +24,9 @@ use wassh_core::Palette;
 use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
-    Button, ButtonKind, MenuItem, MenuState, ToastKind, Tone, badge, bar_meter, checkbox,
+    Button, ButtonKind, MenuItem, MenuState, ToastKind, Tone, badge, bar_meter, card, checkbox,
     dialog_width, empty_state, footer, line_chart, modal, password_input, search_input, select_str,
-    small_button_enabled, text_input,
+    small_button_enabled, stat_row, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -1395,164 +1395,238 @@ impl DockerManager {
             });
     }
 
+    /// The live stats panel: the CPU trace, then one readable row per figure.
     fn draw_stats(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
         self.request_stats(access);
-        ui.horizontal(|ui| {
-            if small_button_enabled(ui, palette, "Close stats", true) {
-                self.stats_for = None;
-            }
-            ui.label(
-                egui::RichText::new("live stats")
-                    .size(10.0)
-                    .color(to_color32(palette.text_muted)),
+        let name = self
+            .stats_for
+            .as_ref()
+            .and_then(|id| {
+                self.containers
+                    .iter()
+                    .find(|container| &container.id == id)
+                    .map(|container| container.name.clone())
+            })
+            .unwrap_or_default();
+        let mut close = false;
+        card(ui, palette, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(if name.is_empty() {
+                        "Live stats".to_owned()
+                    } else {
+                        format!("Live stats · {name}")
+                    })
+                    .size(12.0)
+                    .strong()
+                    .color(to_color32(palette.text)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if small_button_enabled(ui, palette, "Close", true) {
+                        close = true;
+                    }
+                });
+            });
+            let Some(stats) = self.stats else {
+                self.help_detail(ui, palette, "Sampling…");
+                return;
+            };
+            ui.add_space(4.0);
+            line_chart(
+                ui,
+                palette,
+                &self.cpu_history,
+                100.0,
+                to_color32(palette.accent),
             );
+            stat_row(
+                ui,
+                palette,
+                "CPU",
+                &format!("{:.1}%", stats.cpu_percent),
+            );
+            stat_row(
+                ui,
+                palette,
+                "Memory",
+                &format!(
+                    "{} of {} · {:.1}%",
+                    model::format_bytes(stats.memory_used),
+                    model::format_bytes(stats.memory_limit),
+                    stats.memory_percent
+                ),
+            );
+            bar_meter(
+                ui,
+                palette,
+                Some((stats.memory_percent / 100.0) as f32),
+                to_color32(palette.accent),
+            );
+            stat_row(
+                ui,
+                palette,
+                "Network",
+                &format!(
+                    "↓ {} · ↑ {}",
+                    model::format_bytes(stats.net_rx),
+                    model::format_bytes(stats.net_tx)
+                ),
+            );
+            stat_row(
+                ui,
+                palette,
+                "Block I/O",
+                &format!(
+                    "read {} · write {}",
+                    model::format_bytes(stats.block_read),
+                    model::format_bytes(stats.block_write)
+                ),
+            );
+            stat_row(ui, palette, "Processes", &stats.pids.to_string());
         });
-        let Some(stats) = self.stats else {
-            ui.label(
-                egui::RichText::new("Sampling…")
-                    .size(11.0)
-                    .color(to_color32(palette.text_muted)),
-            );
-            return;
-        };
-        line_chart(
-            ui,
-            palette,
-            &self.cpu_history,
-            100.0,
-            to_color32(palette.accent),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "CPU {:.2}% · mem {} of {} ({:.1}%) · {} pids",
-                stats.cpu_percent,
-                model::format_bytes(stats.memory_used),
-                model::format_bytes(stats.memory_limit),
-                stats.memory_percent,
-                stats.pids
-            ))
-            .size(10.5)
-            .color(to_color32(palette.text)),
-        );
-        bar_meter(
-            ui,
-            palette,
-            Some((stats.memory_percent / 100.0) as f32),
-            to_color32(palette.accent),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "net ↓{} ↑{} · block read {} write {}",
-                model::format_bytes(stats.net_rx),
-                model::format_bytes(stats.net_tx),
-                model::format_bytes(stats.block_read),
-                model::format_bytes(stats.block_write)
-            ))
-            .size(10.0)
-            .color(to_color32(palette.text_muted)),
-        );
+        ui.add_space(6.0);
+        if close {
+            self.stats_for = None;
+        }
     }
 
-    /// The inspect panel under the list.
+    /// The inspect panel under the list: one card with a section of the container's facts.
     fn draw_detail(&mut self, ui: &mut Ui, palette: &Palette) -> Option<String> {
         let detail = self.detail.clone()?;
         let mut typed = None;
-        ui.horizontal_wrapped(|ui| {
-            if small_button_enabled(ui, palette, "Close details", true) {
-                self.detail = None;
-                self.selected = None;
-            }
-            ui.label(
-                egui::RichText::new(format!("{} · {}", detail.name, detail.status))
-                    .size(11.5)
-                    .strong()
-                    .color(to_color32(palette.text)),
-            );
-            for section in Section::ALL {
-                let active = section == self.section;
-                if Button::new(section.label())
-                    .compact()
-                    .active(active)
-                    .show(ui, palette)
-                    .clicked()
-                    && !active
-                {
-                    self.section = section;
-                }
-            }
-            if detail.status == "running" {
-                let mut shell = self.shell.min(model::SHELL_CHOICES.len() - 1);
-                if let Some(picked) = select_str(
-                    ui,
-                    ("docker-shell", "pick"),
-                    model::SHELL_CHOICES[shell],
-                    &model::SHELL_CHOICES,
-                ) && let Some(index) = model::SHELL_CHOICES
-                    .iter()
-                    .position(|choice| *choice == picked)
-                {
-                    shell = index;
-                }
-                self.shell = shell;
-                if small_button_enabled(ui, palette, "Open shell", true) {
-                    typed = Some(format!(
-                        "docker exec -it {} {}\n",
-                        model::shell_quote(&detail.id),
-                        model::SHELL_CHOICES[shell]
-                    ));
-                }
-            }
-        });
-        let text = match self.section {
-            Section::Overview => format!(
-                "id         {}\nimage      {}\ncommand    {}\ncreated    {}\nstarted    {}\nfinished   {}\n\
-                 exit code  {}\npid        {}\nrestarts   {}\nplatform   {}\nuser       {}\nworkdir    {}\n\
-                 tty        {}\nrestart    {}\nnetwork    {}\nprivileged {}\nauto-remove {}",
-                detail.id,
-                detail.image,
-                empty_as(&detail.command, "-"),
-                detail.created,
-                detail.started_at,
-                detail.finished_at,
-                detail
-                    .exit_code
-                    .map_or_else(|| "-".to_owned(), |code| code.to_string()),
-                detail
-                    .pid
-                    .map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
-                detail.restart_count,
-                empty_as(&detail.platform, "-"),
-                empty_as(&detail.user, "-"),
-                empty_as(&detail.workdir, "/"),
-                detail.tty,
-                empty_as(&detail.restart_policy, "no"),
-                empty_as(&detail.network_mode, "-"),
-                detail.privileged,
-                detail.auto_remove
-            ),
-            Section::Env => detail.env.join("\n"),
-            Section::Mounts => detail.mounts.join("\n"),
-            Section::Ports => detail.ports.join("\n"),
-            Section::Networks => detail.networks.join("\n"),
-            Section::Raw => detail.raw.clone(),
-        };
-        egui::ScrollArea::vertical()
-            .id_salt("docker-detail")
-            .max_height(PANEL_HEIGHT)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+        let mut close = false;
+        card(ui, palette, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(if text.trim().is_empty() {
-                        "Nothing to show."
-                    } else {
-                        text.as_str()
-                    })
-                    .font(egui::FontId::monospace(10.0))
-                    .color(to_color32(palette.text)),
+                    egui::RichText::new(&detail.name)
+                        .size(12.5)
+                        .strong()
+                        .color(to_color32(palette.text)),
                 );
+                let (label, tone) = if detail.status == "running" {
+                    ("running", Tone::Success)
+                } else {
+                    ("stopped", Tone::Neutral)
+                };
+                badge(ui, palette, label, tone);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if small_button_enabled(ui, palette, "Close", true) {
+                        close = true;
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&detail.image)
+                                .size(10.0)
+                                .monospace()
+                                .color(to_color32(palette.text_muted)),
+                        )
+                        .truncate(),
+                    );
+                });
             });
-        ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for section in Section::ALL {
+                    let active = section == self.section;
+                    if Button::new(section.label())
+                        .compact()
+                        .active(active)
+                        .show(ui, palette)
+                        .clicked()
+                        && !active
+                    {
+                        self.section = section;
+                    }
+                }
+                if detail.status == "running" {
+                    let mut shell = self.shell.min(model::SHELL_CHOICES.len() - 1);
+                    if let Some(picked) = select_str(
+                        ui,
+                        ("docker-shell", "pick"),
+                        model::SHELL_CHOICES[shell],
+                        &model::SHELL_CHOICES,
+                    ) && let Some(index) =
+                        model::SHELL_CHOICES.iter().position(|choice| *choice == picked)
+                    {
+                        shell = index;
+                    }
+                    self.shell = shell;
+                    if small_button_enabled(ui, palette, "Open shell", true) {
+                        typed = Some(format!(
+                            "docker exec -it {} {}\n",
+                            model::shell_quote(&detail.id),
+                            model::SHELL_CHOICES[shell]
+                        ));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("docker-detail")
+                .max_height(PANEL_HEIGHT)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.detail_section(ui, palette, &detail);
+                });
+        });
+        ui.add_space(6.0);
+        if close {
+            self.detail = None;
+            self.selected = None;
+        }
         typed
+    }
+
+    /// The facts one section of the detail panel shows.
+    fn detail_section(&self, ui: &mut Ui, palette: &Palette, detail: &Detail) {
+        let code = |ui: &mut Ui, text: &str| code_block(ui, palette, text);
+        match self.section {
+            Section::Overview => {
+                stat_row(ui, palette, "Id", &detail.id);
+                stat_row(ui, palette, "Image", &detail.image);
+                stat_row(ui, palette, "Command", &empty_as(&detail.command, "-"));
+                stat_row(ui, palette, "Created", &detail.created);
+                stat_row(ui, palette, "Started", &detail.started_at);
+                stat_row(ui, palette, "Finished", &detail.finished_at);
+                stat_row(
+                    ui,
+                    palette,
+                    "Exit code",
+                    &detail
+                        .exit_code
+                        .map_or_else(|| "-".to_owned(), |code| code.to_string()),
+                );
+                stat_row(
+                    ui,
+                    palette,
+                    "Process id",
+                    &detail
+                        .pid
+                        .map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
+                );
+                stat_row(ui, palette, "Restarts", &detail.restart_count.to_string());
+                stat_row(ui, palette, "Platform", &empty_as(&detail.platform, "-"));
+                stat_row(ui, palette, "User", &empty_as(&detail.user, "-"));
+                stat_row(ui, palette, "Workdir", &empty_as(&detail.workdir, "/"));
+                stat_row(ui, palette, "TTY", &detail.tty.to_string());
+                stat_row(
+                    ui,
+                    palette,
+                    "Restart policy",
+                    &empty_as(&detail.restart_policy, "no"),
+                );
+                stat_row(ui, palette, "Network", &empty_as(&detail.network_mode, "-"));
+                stat_row(ui, palette, "Privileged", &detail.privileged.to_string());
+                stat_row(ui, palette, "Auto-remove", &detail.auto_remove.to_string());
+            }
+            Section::Env => code(ui, &detail.env.join("\n")),
+            Section::Mounts => code(ui, &detail.mounts.join("\n")),
+            Section::Ports => code(ui, &detail.ports.join("\n")),
+            Section::Networks => code(ui, &detail.networks.join("\n")),
+            Section::Raw => code(ui, &detail.raw),
+        }
     }
 
     fn draw_images(&mut self, ui: &mut Ui, palette: &Palette, _access: &mut dyn CommandAccess) {
@@ -2458,6 +2532,27 @@ fn group_heading(ui: &mut Ui, palette: &Palette, text: &str, count: usize) {
             .color(to_color32(palette.text_muted)),
     );
     ui.add_space(4.0);
+}
+
+/// A block of monospace text on the terminal's own background.
+fn code_block(ui: &mut Ui, palette: &Palette, text: &str) {
+    egui::Frame::NONE
+        .fill(to_color32(palette.bg_input))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(if text.trim().is_empty() {
+                    "(nothing to show)"
+                } else {
+                    text
+                })
+                .size(10.5)
+                .monospace()
+                .color(to_color32(palette.text)),
+            );
+        });
 }
 
 /// `text`, or `fallback` when it is empty.
