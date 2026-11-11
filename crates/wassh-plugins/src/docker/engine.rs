@@ -144,6 +144,16 @@ pub fn windows_install_command() -> String {
 pub const DAEMON_DOWN_WINDOWS: &str =
     "Docker Desktop is installed but its engine is not running. Start Docker Desktop.";
 
+/// Puts the user who ran the command into the group the Docker daemon answers to.
+///
+/// `sudo` passes the invoking user in `SUDO_USER`; running it directly as root falls back to
+/// the user the shell runs as.
+pub const UNIX_GROUP_COMMAND: &str = "usermod -aG docker \"${SUDO_USER:-$USER}\"";
+
+/// Windows' equivalent, run elevated: Docker Desktop's own users group.
+pub const WINDOWS_GROUP_COMMAND: &str = "Start-Process -FilePath net -ArgumentList \
+     'localgroup','docker-users',\"$env:USERNAME\",'/add' -Verb RunAs";
+
 /// What the pane says when `docker info` answered, but not with an engine's own words.
 pub const UNEXPECTED_ANSWER: &str =
     "The docker command answered, but not with a Docker engine version.";

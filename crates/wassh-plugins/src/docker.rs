@@ -370,6 +370,22 @@ impl RunForm {
     }
 }
 
+/// Whether the privileged command's output is worth a row.
+///
+/// A run that finished with the engine answering has nothing to say; a run that is still
+/// going, or that left the engine unusable, is what a user may want to read.
+fn log_worth_showing(running: bool, engine_ready: bool, succeeded: bool) -> bool {
+    running || !engine_ready || !succeeded
+}
+
+/// A command that puts the engine right.
+enum Fix {
+    /// Needs root: tried with `sudo -n`, and the password card when that is refused.
+    Root(String),
+    /// Needs Windows' administrator prompt.
+    Elevated(String),
+}
+
 /// One entry per non-empty line.
 fn lines(text: &str) -> Vec<String> {
     text.lines()
@@ -1566,136 +1582,234 @@ impl DockerManager {
 
     // --- chrome ---------------------------------------------------------
 
-    /// The engine: what state it is in, and what to do about it.
+    /// The engine: what state it is in, what to do about it, and what it printed.
     fn engine_row(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
-        let colour = if self.engine.is_ready() {
+        let ready = self.engine.is_ready();
+        let colour = if ready {
             palette.ok
         } else if self.engine.state.is_none() {
             palette.text_muted
         } else {
             palette.danger
         };
+        let windows = access.platform() == Platform::Windows;
+        let busy = access.is_running(ROOT_KEY);
         let mut upgrade = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(self.engine.summary())
-                    .size(11.0)
-                    .color(to_color32(colour)),
-            );
-            if self.engine.is_ready()
-                && let Some(manager) = self.manager
-                && manager.upgrade_command().is_some()
-                && small_button_enabled(ui, palette, "Upgrade Docker", !access.is_running(ROOT_KEY))
-            {
-                upgrade = manager.upgrade_command();
-            }
-        });
+        let mut fix = None;
+        egui::Frame::new()
+            .fill(to_color32(palette.bg_panel_2))
+            .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+            .corner_radius(wassh_core::RADIUS)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(self.engine.summary())
+                            .size(11.5)
+                            .color(to_color32(colour)),
+                    );
+                    if ready
+                        && let Some(manager) = self.manager
+                        && manager.upgrade_command().is_some()
+                        && small_button_enabled(ui, palette, "Upgrade Docker", !busy)
+                    {
+                        upgrade = manager.upgrade_command();
+                    }
+                });
+                if !ready {
+                    fix = self.engine_fix(ui, palette, windows, busy);
+                }
+                self.engine_output(ui, palette, access);
+            });
         if let Some(command) = upgrade {
             self.run_root(access, command, None);
             self.notify("Upgrading Docker…".to_owned());
         }
-        if self.engine.is_ready() {
-            self.engine_output(ui, palette, access);
-            return;
+        match fix {
+            // Passwordless sudo first; the password card appears when that fails.
+            Some(Fix::Root(command)) => {
+                self.run_root(access, &command, None);
+                self.notify("Running the privileged command…".to_owned());
+            }
+            Some(Fix::Elevated(command)) => {
+                self.run(access, ROOT_KEY, &command);
+                self.notify("Waiting for Windows' approval…".to_owned());
+            }
+            None => {}
         }
-        self.engine_help(ui, palette, access);
-        self.engine_output(ui, palette, access);
     }
 
-    /// Explain a daemon that does not answer, and offer to fix it.
-    fn engine_help(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
-        let windows = access.platform() == Platform::Windows;
-        let busy = access.is_running(ROOT_KEY);
-        let mut root = None;
-        let mut elevate = None;
+    /// Say why the daemon does not answer, and offer the command that fixes it.
+    fn engine_fix(
+        &self,
+        ui: &mut Ui,
+        palette: &Palette,
+        windows: bool,
+        busy: bool,
+    ) -> Option<Fix> {
         match self.engine.state {
             Some(engine::State::Missing) => {
                 self.help_label(ui, palette, "Docker isn't installed on this host.");
                 if windows {
-                    if small_button_enabled(ui, palette, "Install Docker Desktop", !busy) {
-                        elevate = Some(engine::windows_install_command());
-                    }
-                    self.help_detail(ui, palette, "Windows asks for administrator approval.");
-                } else if let Some(manager) = self.manager {
-                    if let Some(command) = manager.install_command() {
-                        if small_button_enabled(ui, palette, "Install Docker", !busy) {
-                            root = Some(command);
-                        }
-                        self.help_detail(ui, palette, &format!("Through {}.", manager.label()));
-                    } else {
-                        self.help_detail(
-                            ui,
-                            palette,
-                            "This host has no package manager the pane knows; install Docker yourself.",
-                        );
-                    }
-                } else if self.detected {
                     self.help_detail(
                         ui,
                         palette,
-                        "The pane couldn't ask this host how it installs software.",
+                        "Docker Desktop is the engine for Windows; installing it asks for \
+                         administrator approval.",
                     );
-                } else {
-                    self.help_detail(ui, palette, "Looking for this host's package manager…");
+                    return small_button_enabled(ui, palette, "Install Docker Desktop", !busy)
+                        .then(engine::windows_install_command)
+                        .map(Fix::Elevated);
                 }
-            }
-            Some(engine::State::Unavailable) if windows => {
-                self.help_label(ui, palette, engine::DAEMON_DOWN_WINDOWS);
-            }
-            Some(engine::State::Unavailable) => {
-                self.help_label(ui, palette, "Docker is installed but its engine is not running.");
-                if let Some(manager) = self.manager
-                    && let Some(command) = manager.start_command()
-                    && small_button_enabled(ui, palette, "Start the engine", !busy)
-                {
-                    root = Some(command);
-                }
-            }
-            Some(engine::State::Forbidden) => {
-                self.help_label(
-                    ui,
-                    palette,
-                    "This user may not talk to the Docker daemon.",
-                );
+                let Some(manager) = self.manager else {
+                    self.help_detail(
+                        ui,
+                        palette,
+                        if self.detected {
+                            "The pane couldn't ask this host how it installs software."
+                        } else {
+                            "Looking for this host's package manager…"
+                        },
+                    );
+                    return None;
+                };
+                let Some(command) = manager.install_command() else {
+                    self.help_detail(
+                        ui,
+                        palette,
+                        "This host has no package manager the pane knows; install Docker yourself.",
+                    );
+                    return None;
+                };
                 self.help_detail(
                     ui,
                     palette,
-                    "Add the user to the docker group, then sign in again.",
+                    &format!("Installed through {}, as root.", manager.label()),
                 );
+                small_button_enabled(ui, palette, "Install Docker", !busy)
+                    .then(|| Fix::Root(command.to_owned()))
             }
-            _ => {}
-        }
-        if let Some(command) = root {
-            // Passwordless sudo first; the password card appears when that fails.
-            self.run_root(access, command, None);
-            self.notify("Running the privileged command…".to_owned());
-        }
-        if let Some(command) = elevate {
-            self.run(access, ROOT_KEY, &command);
-            self.notify("Installing Docker Desktop…".to_owned());
+            Some(engine::State::Unavailable) if windows => {
+                self.help_label(ui, palette, engine::DAEMON_DOWN_WINDOWS);
+                None
+            }
+            Some(engine::State::Unavailable) => {
+                self.help_label(ui, palette, "Docker is installed but its engine is not running.");
+                let manager = self.manager?;
+                let command = manager.start_command()?;
+                self.help_detail(ui, palette, "Starting it needs root.");
+                small_button_enabled(ui, palette, "Start the engine", !busy)
+                    .then(|| Fix::Root(command.to_owned()))
+            }
+            Some(engine::State::Forbidden) => {
+                self.help_label(ui, palette, "Your user may not talk to the Docker daemon.");
+                let fix = if windows {
+                    self.help_detail(
+                        ui,
+                        palette,
+                        "The daemon only answers administrators and the docker-users group.",
+                    );
+                    small_button_enabled(ui, palette, "Add me to docker-users", !busy)
+                        .then(|| Fix::Elevated(engine::WINDOWS_GROUP_COMMAND.to_owned()))
+                } else {
+                    self.help_detail(
+                        ui,
+                        palette,
+                        "The daemon only answers root and members of the docker group.",
+                    );
+                    small_button_enabled(ui, palette, "Add me to the docker group", !busy)
+                        .then(|| Fix::Root(engine::UNIX_GROUP_COMMAND.to_owned()))
+                };
+                self.help_detail(
+                    ui,
+                    palette,
+                    "Sign in again afterwards — a new session is what picks the group up.",
+                );
+                fix
+            }
+            Some(engine::State::Error) => {
+                self.help_detail(
+                    ui,
+                    palette,
+                    "Check that this host's docker command talks to a Docker daemon.",
+                );
+                None
+            }
+            _ => None,
         }
     }
 
-    /// What the privileged command has printed so far.
+    /// What the last privileged command printed, folded away in a log.
+    ///
+    /// It is only offered while something is wrong or still running: a finished, working
+    /// install has nothing a user needs to read.
     fn engine_output(&self, ui: &mut Ui, palette: &Palette, access: &dyn CommandAccess) {
         let Some(output) = access.output(ROOT_KEY) else {
             return;
         };
-        if output.stdout.trim().is_empty() {
+        let running = access.is_running(ROOT_KEY);
+        if !log_worth_showing(running, self.engine.is_ready(), output.succeeded()) {
             return;
         }
-        egui::ScrollArea::vertical()
-            .id_salt("docker-engine-output")
-            .max_height(PANEL_HEIGHT)
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(&output.stdout)
-                        .font(egui::FontId::monospace(9.5))
-                        .color(to_color32(palette.text)),
-                );
-            });
+        let text = if output.stderr.trim().is_empty() {
+            output.stdout.trim_end().to_owned()
+        } else if output.stdout.trim().is_empty() {
+            output.stderr.trim_end().to_owned()
+        } else {
+            format!("{}\n{}", output.stdout.trim_end(), output.stderr.trim_end())
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let (state, colour) = if running {
+            ("running", palette.text_muted)
+        } else if output.succeeded() {
+            ("done", palette.ok)
+        } else {
+            ("failed", palette.danger)
+        };
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            egui::Id::unique("docker-engine-log"),
+            false,
+        )
+        .show_header(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Log")
+                    .size(10.5)
+                    .color(to_color32(palette.text_muted)),
+            );
+            ui.label(
+                egui::RichText::new(state)
+                    .size(10.0)
+                    .strong()
+                    .color(to_color32(colour)),
+            );
+        })
+        .body(|ui| {
+            egui::Frame::new()
+                .fill(to_color32(palette.bg_input))
+                .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+                .corner_radius(wassh_core::RADIUS)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("docker-engine-output")
+                        .max_height(PANEL_HEIGHT)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&text)
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(to_color32(palette.text)),
+                            );
+                        });
+                });
+        });
     }
 
     /// A sentence of explanation at reading size.
@@ -2249,6 +2363,16 @@ mod tests {
             !access.commands.iter().any(|(key, _)| key == LIST_KEY),
             "no list is asked of an engine that is not there"
         );
+    }
+
+    #[test]
+    fn the_install_log_is_only_offered_when_something_needs_reading() {
+        // A finished install with a working engine is not worth a row.
+        assert!(!log_worth_showing(false, true, true));
+        // Still going, or ended badly, is.
+        assert!(log_worth_showing(true, true, true));
+        assert!(log_worth_showing(false, false, true));
+        assert!(log_worth_showing(false, false, false));
     }
 
     #[test]
