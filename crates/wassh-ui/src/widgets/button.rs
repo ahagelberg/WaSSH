@@ -8,15 +8,6 @@ use wassh_core::{Palette, RADIUS};
 
 use crate::terminal_view::to_color32;
 
-/// Size of the square a header close button occupies.
-pub const CLOSE_BUTTON_SIZE: f32 = 24.0;
-/// Corner radius of its hover fill.
-const CLOSE_BUTTON_RADIUS: f32 = 4.0;
-/// The cross it shows.
-pub const CLOSE_GLYPH: &str = "\u{2715}";
-/// Size the cross is drawn at.
-const CLOSE_GLYPH_SIZE: f32 = 13.0;
-
 /// Visual weight of a button.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ButtonKind {
@@ -219,31 +210,6 @@ impl<'a> Button<'a> {
             ),
         }
     }
-}
-
-/// The small cross that closes a panel or dialog header.
-pub fn close_button(ui: &mut Ui, palette: &Palette) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(CLOSE_BUTTON_SIZE), Sense::click());
-    let hovered = response.hovered();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, CLOSE_BUTTON_RADIUS, to_color32(palette.bg_panel_2));
-    }
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        CLOSE_GLYPH,
-        FontId::proportional(CLOSE_GLYPH_SIZE),
-        if hovered {
-            to_color32(palette.danger)
-        } else {
-            to_color32(palette.text_muted)
-        },
-    );
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Close")
-        .clicked()
 }
 
 /// The small action button used inside panes, rows and dialogs.

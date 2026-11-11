@@ -25,9 +25,9 @@ use wassh_core::Palette;
 use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
-    Button, ButtonKind, MenuItem, MenuState, ToastKind, Tone, badge, bar_meter, card, checkbox,
-    close_button, dialog_width, empty_state, footer, line_chart, modal, password_input,
-    search_input, select_str, small_button_enabled, stat_row, text_input,
+    Button, ButtonKind, MenuItem, MenuState, ToastKind, Tone, badge, bar_meter, checkbox,
+    dialog_width, empty_state, footer, line_chart, modal, password_input, search_input, select_str,
+    small_button_enabled, stat_row, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -91,7 +91,7 @@ const MAX_LOG_TAIL: usize = 5_000;
 const STATS_HISTORY: usize = 60;
 /// How often an engine that does not answer is asked again.
 const ENGINE_RETRY: Duration = Duration::from_secs(5);
-/// Height of the log, stats, detail and engine-output panels.
+/// Height of the log list inside an open card, and of the engine output.
 const PANEL_HEIGHT: f32 = 160.0;
 /// Width of the create dialog on a wide window.
 const CREATE_DIALOG_WIDTH: f32 = 560.0;
@@ -419,12 +419,26 @@ struct Update {
     inspecting: bool,
 }
 
-/// Which panels are open for the container whose menu is showing.
+/// Which part of an open card is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct OpenPanels {
-    details: bool,
-    logs: bool,
-    stats: bool,
+enum CardPanel {
+    #[default]
+    Details,
+    Logs,
+    Stats,
+}
+
+impl CardPanel {
+    /// The tabs of an open card, in order.
+    const ALL: [Self; 3] = [Self::Details, Self::Logs, Self::Stats];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Details => "Details",
+            Self::Logs => "Logs",
+            Self::Stats => "Stats",
+        }
+    }
 }
 
 /// A container being renamed, and the name typed so far.
@@ -445,10 +459,9 @@ impl Rename {
 /// What a row in the container list asks for.
 #[derive(Clone, Debug)]
 enum RowEvent {
-    Select(String),
+    /// A click on the card: open its panel, or close it again.
+    Toggle(String),
     Act(Action, String, String),
-    Logs(String),
-    Stats(String),
     Shell(String),
     Update(String),
     /// A right-click on the container: open its menu.
@@ -469,7 +482,10 @@ pub struct DockerManager {
     settings: HostSettings,
     tab: Tab,
     filter: String,
-    selected: Option<String>,
+    /// The container whose card is open, if any.
+    expanded: Option<String>,
+    /// Which part of that card is showing.
+    panel: CardPanel,
     section: Section,
     shell: usize,
     containers: Vec<Container>,
@@ -479,9 +495,7 @@ pub struct DockerManager {
     volumes: Vec<Volume>,
     networks: Vec<Network>,
     detail: Option<Detail>,
-    logs_for: Option<String>,
     logs: String,
-    stats_for: Option<String>,
     stats: Option<Stats>,
     cpu_history: Vec<f32>,
     /// Messages the window shows as toasts, drained once per frame.
@@ -771,6 +785,33 @@ impl DockerManager {
         self.poll_pull(access);
         self.poll_update(access);
         self.request_lists(access);
+        self.request_card(access);
+    }
+
+    /// Ask for whatever the open card shows.
+    fn request_card(&mut self, access: &mut dyn CommandAccess) {
+        let Some(id) = self.expanded.clone() else {
+            return;
+        };
+        let Some(container) = self.containers.iter().find(|item| item.id == id) else {
+            return;
+        };
+        // Stats are live only: a stopped container has nothing to sample.
+        if self.panel == CardPanel::Stats && !container.is_running() {
+            self.panel = CardPanel::Details;
+        }
+        match self.panel {
+            CardPanel::Details => {
+                if self.detail.is_none()
+                    && !access.is_running(INSPECT_KEY)
+                    && let Some(command) = model::inspect_command(&self.settings.socket, &id)
+                {
+                    self.run(access, INSPECT_KEY, &command);
+                }
+            }
+            CardPanel::Logs => self.request_logs(access),
+            CardPanel::Stats => self.request_stats(access),
+        }
     }
 
     /// Ask for the list the current tab shows, when it is due.
@@ -817,13 +858,11 @@ impl DockerManager {
                 Some(error) => self.failed(LIST_KEY, error),
                 None => self.containers = model::parse_containers(&outcome.stdout),
             }
-            if let Some(selected) = &self.selected
-                && !self.containers.iter().any(|item| &item.id == selected)
+            if let Some(expanded) = &self.expanded
+                && !self.containers.iter().any(|item| &item.id == expanded)
             {
-                self.selected = None;
+                self.expanded = None;
                 self.detail = None;
-                self.logs_for = None;
-                self.stats_for = None;
             }
         }
         if let Some(outcome) = self.take(access, POLICY_KEY) {
@@ -864,8 +903,8 @@ impl DockerManager {
             Some(error) => self.failed(ACTION_KEY, error),
             None => {
                 self.notify(format!("{} {name}", action.done()));
-                if action == Action::Remove && self.selected.as_deref() == Some(id.as_str()) {
-                    self.selected = None;
+                if action == Action::Remove && self.expanded.as_deref() == Some(id.as_str()) {
+                    self.expanded = None;
                     self.detail = None;
                 }
             }
@@ -1229,27 +1268,19 @@ impl DockerManager {
                 empty_state(ui, palette, "Nothing matches", "Change the search to see more.");
             }
         }
-        // A panel below the list needs half the pane; without one the list takes it all.
-        let panelled =
-            self.detail.is_some() || self.logs_for.is_some() || self.stats_for.is_some();
-        let list_height = if panelled {
-            (ui.available_height() * 0.5).max(80.0)
-        } else {
-            ui.available_height()
-        };
-        let selected = self.selected.clone();
         let stale = self.stale.clone();
         let mut events = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("docker-containers")
-            .max_height(list_height)
+            .max_height(ui.available_height())
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !up.is_empty() {
                     group_heading(ui, palette, "Running", up.len());
                     for container in &up {
+                        let has_update = stale.contains(&container.id);
                         if let Some(event) =
-                            container_card(ui, palette, container, &selected, &stale)
+                            self.container_card(ui, palette, access, container, has_update)
                         {
                             events.push(event);
                         }
@@ -1261,8 +1292,9 @@ impl DockerManager {
                     }
                     group_heading(ui, palette, "Stopped", down.len());
                     for container in &down {
+                        let has_update = stale.contains(&container.id);
                         if let Some(event) =
-                            container_card(ui, palette, container, &selected, &stale)
+                            self.container_card(ui, palette, access, container, has_update)
                         {
                             events.push(event);
                         }
@@ -1273,16 +1305,6 @@ impl DockerManager {
         let mut typed = None;
         for event in events {
             typed = self.handle_event(ui, access, event).or(typed);
-        }
-
-        if self.detail.is_some() && typed.is_none() {
-            typed = self.draw_detail(ui, palette);
-        }
-        if let Some(id) = self.logs_for.clone() {
-            self.draw_logs(ui, palette, access, &id);
-        }
-        if self.stats_for.is_some() {
-            self.draw_stats(ui, palette, access);
         }
         typed
     }
@@ -1370,15 +1392,8 @@ impl DockerManager {
         event: RowEvent,
     ) -> Option<String> {
         match event {
-            RowEvent::Select(id) => {
-                // The details panel is a switch too: picking the row it belongs to again
-                // closes it.
-                if self.selected.as_deref() == Some(id.as_str()) {
-                    self.selected = None;
-                    self.detail = None;
-                } else {
-                    self.select(access, &id);
-                }
+            RowEvent::Toggle(id) => {
+                self.toggle_card(access, &id);
                 None
             }
             RowEvent::Act(action, id, name) => {
@@ -1388,26 +1403,6 @@ impl DockerManager {
                     } else {
                         self.start_action(access, action, &id, &name);
                     }
-                }
-                None
-            }
-            RowEvent::Logs(id) => {
-                if self.logs_for.as_deref() == Some(id.as_str()) {
-                    self.logs_for = None;
-                } else {
-                    self.logs_for = Some(id);
-                    self.logs.clear();
-                }
-                None
-            }
-            RowEvent::Stats(id) => {
-                if self.stats_for.as_deref() == Some(id.as_str()) {
-                    self.stats_for = None;
-                } else {
-                    self.stats_for = Some(id);
-                    self.stats = None;
-                    self.cpu_history.clear();
-                    self.last_stats = None;
                 }
                 None
             }
@@ -1473,17 +1468,8 @@ impl DockerManager {
                     .policies
                     .get(&container.name)
                     .is_some_and(|policy| policy == model::Autostart::Always.policy());
-                let open = OpenPanels {
-                    details: self.selected.as_deref() == Some(id.as_str()),
-                    logs: self.logs_for.as_deref() == Some(id.as_str()),
-                    stats: self.stats_for.as_deref() == Some(id.as_str()),
-                };
-                let (items, events) = container_menu(
-                    container,
-                    self.stale.contains(&id),
-                    starts_on_boot,
-                    open,
-                );
+                let (items, events) =
+                    container_menu(container, self.stale.contains(&id), starts_on_boot);
                 let at = ui
                     .ctx()
                     .pointer_latest_pos()
@@ -1511,12 +1497,21 @@ impl DockerManager {
             .collect();
     }
 
-    fn select(&mut self, access: &mut dyn CommandAccess, id: &str) {
-        self.selected = Some(id.to_owned());
-        self.detail = None;
-        self.logs_for = None;
-        self.stats_for = None;
+    /// Open a container's card, or close it again when it is already open.
+    fn toggle_card(&mut self, access: &mut dyn CommandAccess, id: &str) {
+        if self.expanded.as_deref() == Some(id) {
+            self.expanded = None;
+            self.detail = None;
+            return;
+        }
+        self.expanded = Some(id.to_owned());
+        self.panel = CardPanel::default();
         self.section = Section::default();
+        self.detail = None;
+        self.logs.clear();
+        self.stats = None;
+        self.cpu_history.clear();
+        self.last_stats = None;
         if let Some(command) = model::inspect_command(&self.settings.socket, id) {
             self.run(access, INSPECT_KEY, &command);
         }
@@ -1541,7 +1536,7 @@ impl DockerManager {
     }
 
     fn request_logs(&mut self, access: &mut dyn CommandAccess) {
-        let Some(id) = self.logs_for.clone() else {
+        let Some(id) = self.expanded.clone() else {
             return;
         };
         if access.is_running(LOGS_KEY) || !self.logs.is_empty() {
@@ -1555,7 +1550,7 @@ impl DockerManager {
     }
 
     fn request_stats(&mut self, access: &mut dyn CommandAccess) {
-        let Some(id) = self.stats_for.clone() else {
+        let Some(id) = self.expanded.clone() else {
             return;
         };
         if access.is_running(STATS_KEY) {
@@ -1573,242 +1568,131 @@ impl DockerManager {
         }
     }
 
-    /// The log panel: one card, the tail in a terminal-style block.
-    fn draw_logs(
+    /// The log tab: the tail in a terminal-style block, newest line at the bottom.
+    fn card_logs(&self, ui: &mut Ui, palette: &Palette, access: &dyn CommandAccess) {
+        let body = if self.logs.trim().is_empty() {
+            if access.is_running(LOGS_KEY) {
+                "Fetching logs…"
+            } else {
+                "No output."
+            }
+        } else {
+            self.logs.trim_end()
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("docker-logs")
+            .max_height(PANEL_HEIGHT)
+            .auto_shrink([false, true])
+            .stick_to_bottom(true)
+            .show(ui, |ui| code_block(ui, palette, body));
+    }
+
+    /// The stats tab: the CPU trace, then one readable row per figure.
+    fn card_stats(&self, ui: &mut Ui, palette: &Palette) {
+        let Some(stats) = self.stats else {
+            ui.label(
+                egui::RichText::new("Sampling…")
+                    .size(10.5)
+                    .color(to_color32(palette.text_muted)),
+            );
+            return;
+        };
+        line_chart(
+            ui,
+            palette,
+            &self.cpu_history,
+            100.0,
+            to_color32(palette.accent),
+        );
+        stat_row(ui, palette, "CPU", &format!("{:.1}%", stats.cpu_percent));
+        stat_row(
+            ui,
+            palette,
+            "Memory",
+            &format!(
+                "{} of {} · {:.1}%",
+                model::format_bytes(stats.memory_used),
+                model::format_bytes(stats.memory_limit),
+                stats.memory_percent
+            ),
+        );
+        bar_meter(
+            ui,
+            palette,
+            Some((stats.memory_percent / 100.0) as f32),
+            to_color32(palette.accent),
+        );
+        stat_row(
+            ui,
+            palette,
+            "Network",
+            &format!(
+                "↓ {} · ↑ {}",
+                model::format_bytes(stats.net_rx),
+                model::format_bytes(stats.net_tx)
+            ),
+        );
+        stat_row(
+            ui,
+            palette,
+            "Block I/O",
+            &format!(
+                "read {} · write {}",
+                model::format_bytes(stats.block_read),
+                model::format_bytes(stats.block_write)
+            ),
+        );
+        stat_row(ui, palette, "Processes", &stats.pids.to_string());
+    }
+
+    /// The details tab: the section chips, the shell picker, then the facts.
+    fn card_details(
         &mut self,
         ui: &mut Ui,
         palette: &Palette,
-        access: &mut dyn CommandAccess,
-        id: &str,
-    ) {
-        self.request_logs(access);
-        let name = self.name_of(id);
-        let mut close = false;
-        card(ui, palette, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(if name.is_empty() {
-                        "Logs".to_owned()
-                    } else {
-                        format!("Logs · {name}")
-                    })
-                    .size(12.0)
-                    .strong()
-                    .color(to_color32(palette.text)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = close_button(ui, palette);
-                });
-            });
-            ui.add_space(4.0);
-            let body = if self.logs.trim().is_empty() {
-                if access.is_running(LOGS_KEY) {
-                    "Fetching logs…"
-                } else {
-                    "No output."
+        container: &Container,
+    ) -> Option<RowEvent> {
+        let mut event = None;
+        ui.horizontal_wrapped(|ui| {
+            for section in Section::ALL {
+                let active = section == self.section;
+                if Button::new(section.label())
+                    .compact()
+                    .active(active)
+                    .show(ui, palette)
+                    .clicked()
+                    && !active
+                {
+                    self.section = section;
                 }
-            } else {
-                self.logs.trim_end()
-            };
-            egui::ScrollArea::vertical()
-                .id_salt("docker-logs")
-                .max_height(PANEL_HEIGHT)
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| code_block(ui, palette, body));
-        });
-        ui.add_space(6.0);
-        if close {
-            self.logs_for = None;
-        }
-    }
-
-    /// The name of the container with this id, for a panel header.
-    fn name_of(&self, id: &str) -> String {
-        self.containers
-            .iter()
-            .find(|container| container.id == id)
-            .map(|container| container.name.clone())
-            .unwrap_or_default()
-    }
-
-    /// The live stats panel: the CPU trace, then one readable row per figure.
-    fn draw_stats(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
-        self.request_stats(access);
-        let name = self
-            .stats_for
-            .as_deref()
-            .map(|id| self.name_of(id))
-            .unwrap_or_default();
-        let mut close = false;
-        card(ui, palette, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(if name.is_empty() {
-                        "Live stats".to_owned()
-                    } else {
-                        format!("Live stats · {name}")
-                    })
-                    .size(12.0)
-                    .strong()
-                    .color(to_color32(palette.text)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = close_button(ui, palette);
-                });
-            });
-            let Some(stats) = self.stats else {
-                self.help_detail(ui, palette, "Sampling…");
-                return;
-            };
-            ui.add_space(4.0);
-            line_chart(
-                ui,
-                palette,
-                &self.cpu_history,
-                100.0,
-                to_color32(palette.accent),
-            );
-            stat_row(
-                ui,
-                palette,
-                "CPU",
-                &format!("{:.1}%", stats.cpu_percent),
-            );
-            stat_row(
-                ui,
-                palette,
-                "Memory",
-                &format!(
-                    "{} of {} · {:.1}%",
-                    model::format_bytes(stats.memory_used),
-                    model::format_bytes(stats.memory_limit),
-                    stats.memory_percent
-                ),
-            );
-            bar_meter(
-                ui,
-                palette,
-                Some((stats.memory_percent / 100.0) as f32),
-                to_color32(palette.accent),
-            );
-            stat_row(
-                ui,
-                palette,
-                "Network",
-                &format!(
-                    "↓ {} · ↑ {}",
-                    model::format_bytes(stats.net_rx),
-                    model::format_bytes(stats.net_tx)
-                ),
-            );
-            stat_row(
-                ui,
-                palette,
-                "Block I/O",
-                &format!(
-                    "read {} · write {}",
-                    model::format_bytes(stats.block_read),
-                    model::format_bytes(stats.block_write)
-                ),
-            );
-            stat_row(ui, palette, "Processes", &stats.pids.to_string());
-        });
-        ui.add_space(6.0);
-        if close {
-            self.stats_for = None;
-        }
-    }
-
-    /// The inspect panel under the list: one card with a section of the container's facts.
-    fn draw_detail(&mut self, ui: &mut Ui, palette: &Palette) -> Option<String> {
-        let detail = self.detail.clone()?;
-        let mut typed = None;
-        let mut close = false;
-        card(ui, palette, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&detail.name)
-                        .size(12.5)
-                        .strong()
-                        .color(to_color32(palette.text)),
-                );
-                let (label, tone) = if detail.status == "running" {
-                    ("running", Tone::Success)
-                } else {
-                    ("stopped", Tone::Neutral)
-                };
-                badge(ui, palette, label, tone);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = close_button(ui, palette);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&detail.image)
-                                .size(10.0)
-                                .monospace()
-                                .color(to_color32(palette.text_muted)),
-                        )
-                        .truncate(),
-                    );
-                });
-            });
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                for section in Section::ALL {
-                    let active = section == self.section;
-                    if Button::new(section.label())
-                        .compact()
-                        .active(active)
-                        .show(ui, palette)
-                        .clicked()
-                        && !active
-                    {
-                        self.section = section;
-                    }
+            }
+            if container.is_running() {
+                let mut shell = self.shell.min(model::SHELL_CHOICES.len() - 1);
+                if let Some(picked) = select_str(
+                    ui,
+                    ("docker-shell", "pick"),
+                    model::SHELL_CHOICES[shell],
+                    &model::SHELL_CHOICES,
+                ) && let Some(index) =
+                    model::SHELL_CHOICES.iter().position(|choice| *choice == picked)
+                {
+                    shell = index;
                 }
-                if detail.status == "running" {
-                    let mut shell = self.shell.min(model::SHELL_CHOICES.len() - 1);
-                    if let Some(picked) = select_str(
-                        ui,
-                        ("docker-shell", "pick"),
-                        model::SHELL_CHOICES[shell],
-                        &model::SHELL_CHOICES,
-                    ) && let Some(index) =
-                        model::SHELL_CHOICES.iter().position(|choice| *choice == picked)
-                    {
-                        shell = index;
-                    }
-                    self.shell = shell;
-                    if small_button_enabled(ui, palette, "Open shell", true) {
-                        typed = Some(format!(
-                            "docker exec -it {} {}\n",
-                            model::shell_quote(&detail.id),
-                            model::SHELL_CHOICES[shell]
-                        ));
-                    }
+                self.shell = shell;
+                if small_button_enabled(ui, palette, "Open shell", true) {
+                    event = Some(RowEvent::Shell(container.id.clone()));
                 }
-            });
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical()
-                .id_salt("docker-detail")
-                .max_height(PANEL_HEIGHT)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    self.detail_section(ui, palette, &detail);
-                });
+            }
         });
-        ui.add_space(6.0);
-        if close {
-            self.detail = None;
-            self.selected = None;
+        ui.add_space(4.0);
+        match self.detail.clone() {
+            Some(detail) => self.detail_section(ui, palette, &detail),
+            None => self.help_detail(ui, palette, "Reading the container…"),
         }
-        typed
+        event
     }
 
-    /// The facts one section of the detail panel shows.
+    /// The facts one section of the details tab shows.
     fn detail_section(&self, ui: &mut Ui, palette: &Palette, detail: &Detail) {
         let code = |ui: &mut Ui, text: &str| code_block(ui, palette, text);
         match self.section {
@@ -2593,104 +2477,160 @@ impl DockerManager {
             self.run_open = false;
         }
     }
-}
 
-/// One container, as a card: what it is and what it is doing.
-///
-/// The whole card is the target — a click shows its details, a right-click opens its menu —
-/// so the row holds no buttons that a right-click could miss.
-fn container_card(
-    ui: &mut Ui,
-    palette: &Palette,
-    container: &Container,
-    selected: &Option<String>,
-    stale: &[String],
-) -> Option<RowEvent> {
-    let is_selected = selected.as_deref() == Some(container.id.as_str());
-    let has_update = stale.contains(&container.id);
-    let border = if is_selected {
-        to_color32(palette.accent)
-    } else {
-        to_color32(palette.border)
-    };
-    let card = egui::Frame::NONE
-        .fill(to_color32(palette.bg_panel_2))
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(wassh_core::RADIUS)
-        .inner_margin(egui::Margin::symmetric(12, 9))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&container.name)
-                        .size(12.5)
-                        .strong()
-                        .color(to_color32(if is_selected {
-                            palette.accent
-                        } else {
-                            palette.text
-                        })),
-                );
-                if container.is_running() {
-                    badge(ui, palette, "running", Tone::Success);
-                } else if container.is_paused() {
-                    badge(ui, palette, "paused", Tone::Warning);
-                } else {
-                    badge(ui, palette, "stopped", Tone::Neutral);
-                }
-                if has_update {
-                    badge(ui, palette, "update", Tone::Warning);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&container.image)
-                                .size(10.5)
-                                .monospace()
-                                .color(to_color32(palette.text_muted)),
-                        )
-                        .truncate(),
-                    );
-                });
-            });
-            ui.add_space(3.0);
-            let ports: Vec<String> = container.ports.iter().map(Port::label).collect();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(&container.status)
-                        .size(10.5)
-                        .color(to_color32(palette.text_muted)),
-                );
-                if !ports.is_empty() {
+    /// One container as a card: its header row, and the panel underneath once it is open.
+    ///
+    /// The header is the click target — a click opens the card's panel, another closes it —
+    /// and a right-click opens the menu.
+    fn container_card(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        access: &mut dyn CommandAccess,
+        container: &Container,
+        has_update: bool,
+    ) -> Option<RowEvent> {
+        let open = self.expanded.as_deref() == Some(container.id.as_str());
+        let border = if open {
+            to_color32(palette.accent)
+        } else {
+            to_color32(palette.border)
+        };
+        let mut header = egui::Rect::NOTHING;
+        let mut event = None;
+        let card = egui::Frame::NONE
+            .fill(to_color32(palette.bg_panel_2))
+            .stroke(egui::Stroke::new(1.0, border))
+            .corner_radius(wassh_core::RADIUS)
+            .inner_margin(egui::Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(ports.join("  "))
-                            .size(10.0)
-                            .monospace()
-                            .color(to_color32(palette.accent)),
+                        egui::RichText::new(&container.name)
+                            .size(12.5)
+                            .strong()
+                            .color(to_color32(if open {
+                                palette.accent
+                            } else {
+                                palette.text
+                            })),
                     );
+                    if container.is_running() {
+                        badge(ui, palette, "running", Tone::Success);
+                    } else if container.is_paused() {
+                        badge(ui, palette, "paused", Tone::Warning);
+                    } else {
+                        badge(ui, palette, "stopped", Tone::Neutral);
+                    }
+                    if has_update {
+                        badge(ui, palette, "update", Tone::Warning);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&container.image)
+                                    .size(10.5)
+                                    .monospace()
+                                    .color(to_color32(palette.text_muted)),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+                ui.add_space(3.0);
+                let ports: Vec<String> = container.ports.iter().map(Port::label).collect();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(&container.status)
+                            .size(10.5)
+                            .color(to_color32(palette.text_muted)),
+                    );
+                    if !ports.is_empty() {
+                        ui.label(
+                            egui::RichText::new(ports.join("  "))
+                                .size(10.0)
+                                .monospace()
+                                .color(to_color32(palette.accent)),
+                        );
+                    }
+                });
+                // Everything above the panel is the row a click opens and closes.
+                header = ui.min_rect();
+                if open {
+                    event = self.card_body(ui, palette, access, container);
                 }
             });
-        });
-    let rect = card.response.rect;
-    let response = ui.interact(rect, card.response.id, egui::Sense::click());
-    ui.ctx().set_cursor_icon(if response.hovered() {
-        egui::CursorIcon::PointingHand
-    } else {
-        egui::CursorIcon::Default
-    });
-    if response.hovered() && !is_selected {
-        ui.painter().rect_stroke(
-            rect,
-            wassh_core::RADIUS,
-            egui::Stroke::new(1.0, to_color32(palette.accent)),
-            egui::StrokeKind::Inside,
+        let rect = card.response.rect;
+        let response = ui.interact(
+            header,
+            card.response.id.with("header"),
+            egui::Sense::click(),
         );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.hovered() && !open {
+            ui.painter().rect_stroke(
+                rect,
+                wassh_core::RADIUS,
+                egui::Stroke::new(1.0, to_color32(palette.accent)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.add_space(6.0);
+        if response.secondary_clicked() {
+            return Some(RowEvent::Menu(container.id.clone()));
+        }
+        if response.clicked() {
+            return Some(RowEvent::Toggle(container.id.clone()));
+        }
+        event
     }
-    ui.add_space(6.0);
-    if response.secondary_clicked() {
-        return Some(RowEvent::Menu(container.id.clone()));
+
+    /// The tabs of an open card, and the tab that is showing.
+    fn card_body(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        access: &mut dyn CommandAccess,
+        container: &Container,
+    ) -> Option<RowEvent> {
+        let running = container.is_running();
+        let mut switched = false;
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for panel in CardPanel::ALL {
+                // Nothing samples a container that is not running.
+                if panel == CardPanel::Stats && !running {
+                    continue;
+                }
+                let active = panel == self.panel;
+                if Button::new(panel.label())
+                    .compact()
+                    .active(active)
+                    .show(ui, palette)
+                    .clicked()
+                    && !active
+                {
+                    self.panel = panel;
+                    switched = true;
+                }
+            }
+        });
+        ui.add_space(4.0);
+        let mut event = None;
+        match self.panel {
+            CardPanel::Details => event = self.card_details(ui, palette, container),
+            CardPanel::Logs => self.card_logs(ui, palette, access),
+            CardPanel::Stats => self.card_stats(ui, palette),
+        }
+        // A tab that was just opened has nothing to show yet.
+        if switched {
+            self.request_card(access);
+        }
+        event
     }
-    response.clicked().then(|| RowEvent::Select(container.id.clone()))
 }
 
 /// The rows of a container's menu, and what each one does.
@@ -2698,7 +2638,6 @@ fn container_menu(
     container: &Container,
     has_update: bool,
     starts_on_boot: bool,
-    open: OpenPanels,
 ) -> (Vec<MenuItem>, Vec<Option<RowEvent>>) {
     let id = container.id.clone();
     let name = container.name.clone();
@@ -2708,20 +2647,7 @@ fn container_menu(
         items.push(item);
         events.push(event);
     };
-    // The panels are switches: ticked while that panel shows this container.
-    push(
-        MenuItem::toggle("Details", open.details),
-        Some(RowEvent::Select(id.clone())),
-    );
-    push(
-        MenuItem::toggle("Logs", open.logs),
-        Some(RowEvent::Logs(id.clone())),
-    );
     if container.is_running() {
-        push(
-            MenuItem::toggle("Stats", open.stats),
-            Some(RowEvent::Stats(id.clone())),
-        );
         push(MenuItem::new("Shell"), Some(RowEvent::Shell(id.clone())));
     }
     push(MenuItem::separator(), None);
@@ -3023,7 +2949,7 @@ mod tests {
     fn a_containers_menu_offers_its_actions() {
         let containers = model::parse_containers(PS);
         let running = &containers[0];
-        let (items, events) = container_menu(running, true, false, OpenPanels::default());
+        let (items, events) = container_menu(running, true, false);
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {
@@ -3031,8 +2957,6 @@ mod tests {
                 MenuItem::Separator => None,
             })
             .collect();
-        assert_eq!(labels.first(), Some(&"Details"));
-        assert!(labels.contains(&"Logs"), "{labels:?}");
         assert!(labels.contains(&"Shell"), "a running container has a shell");
         assert!(labels.contains(&"Update"), "a stale one can be updated");
         assert!(
@@ -3047,13 +2971,19 @@ mod tests {
             ),
             "removing is the destructive row"
         );
+        // The card's own tabs are not menu rows: a click on the row opens them.
+        for panel in CardPanel::ALL {
+            assert!(
+                !labels.contains(&panel.label()),
+                "{} is no longer a menu row: {labels:?}",
+                panel.label()
+            );
+        }
         // Every clickable row does something to this container.
         assert_eq!(items.len(), events.len());
         for event in events.iter().flatten() {
             let id = match event {
-                RowEvent::Select(id)
-                | RowEvent::Logs(id)
-                | RowEvent::Stats(id)
+                RowEvent::Toggle(id)
                 | RowEvent::Shell(id)
                 | RowEvent::Update(id)
                 | RowEvent::RemoveImage(id)
@@ -3074,46 +3004,18 @@ mod tests {
             _ => None,
         });
         assert_eq!(toggle, Some(Some(false)), "an unticked switch");
-        let (items, _) = container_menu(running, false, true, OpenPanels::default());
+        let (items, _) = container_menu(running, false, true);
         let had = items.iter().find_map(|item| match item {
             MenuItem::Action { label, checked, .. } if label == START_ON_BOOT_LABEL => Some(*checked),
             _ => None,
         });
         assert_eq!(had, Some(Some(true)), "ticked once the daemon says so");
 
-        // The three panels are switches, ticked while they show this container.
-        let open = OpenPanels {
-            details: true,
-            logs: false,
-            stats: true,
-        };
-        let (items, _) = container_menu(running, false, false, open);
-        let ticks: Vec<(&str, Option<bool>)> = items
-            .iter()
-            .filter_map(|item| match item {
-                MenuItem::Action {
-                    label, checked, ..
-                } if matches!(label.as_str(), "Details" | "Logs" | "Stats") => {
-                    Some((label.as_str(), *checked))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            ticks,
-            [
-                ("Details", Some(true)),
-                ("Logs", Some(false)),
-                ("Stats", Some(true)),
-            ],
-            "each panel row is a switch that says whether it is open"
-        );
-
         // A stopped container has nothing to show live, and no update to apply.
         let mut stopped = running.clone();
         stopped.state = "exited".to_owned();
         stopped.status = "Exited (0) 2 minutes ago".to_owned();
-        let (items, _) = container_menu(&stopped, false, false, OpenPanels::default());
+        let (items, _) = container_menu(&stopped, false, false);
         let labels: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {
@@ -3132,8 +3034,47 @@ mod tests {
     }
 
     #[test]
-    fn a_new_name_is_only_accepted_when_docker_would_take_it() {
-        let mut rename = Rename {
+    fn a_click_opens_a_container_and_another_closes_it() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        with_a_running_engine(&mut pane, &mut access);
+        access.finish(LIST_KEY, output(PS, Some(0)));
+        pane.poll(&mut access);
+        let id = pane.containers[0].id.clone();
+
+        pane.toggle_card(&mut access, &id);
+        assert_eq!(pane.expanded.as_deref(), Some(id.as_str()));
+        assert_eq!(pane.panel, CardPanel::Details, "the card opens on its facts");
+        assert!(
+            access.commands.iter().any(|(key, _)| key == INSPECT_KEY),
+            "opening a card asks what is in it: {:?}",
+            access.commands
+        );
+
+        pane.toggle_card(&mut access, &id);
+        assert!(pane.expanded.is_none(), "clicking it again closes it");
+        assert!(pane.detail.is_none(), "and drops what it showed");
+    }
+
+    #[test]
+    fn a_stopped_container_cannot_keep_the_stats_tab_open() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        with_a_running_engine(&mut pane, &mut access);
+        access.finish(LIST_KEY, output(PS, Some(0)));
+        pane.poll(&mut access);
+        let mut stopped = pane.containers[0].clone();
+        stopped.state = "exited".to_owned();
+        let id = stopped.id.clone();
+        pane.containers = vec![stopped];
+        pane.expanded = Some(id);
+        pane.panel = CardPanel::Stats;
+        pane.poll(&mut access);
+        assert_eq!(pane.panel, CardPanel::Details, "there is nothing to sample");
+    }
+
+    #[test]
+    fn a_new_name_is_only_accepted_when_docker_would_take_it() {        let mut rename = Rename {
             id: "abc123".to_owned(),
             name: "web".to_owned(),
             to: String::new(),
