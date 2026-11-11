@@ -416,6 +416,46 @@ pub fn action_command(socket: &str, id: &str, action: Action) -> Option<String> 
     ))
 }
 
+/// The container name an image suggests: its last path segment, without the tag.
+///
+/// `eclipse/mosquitto:1.4.8` reads `mosquitto`; Docker's own fallback (`adoring_feynman`)
+/// says nothing about the thing running inside.
+pub fn suggest_name(image: &str) -> Option<String> {
+    let image = image.trim();
+    if image.is_empty() {
+        return None;
+    }
+    // A tag follows the last colon that comes after the last slash, so a registry port
+    // such as `localhost:5000/app` keeps its host.
+    let without_tag = match image.rfind(':') {
+        Some(colon) if !image[colon + 1..].contains('/') => &image[..colon],
+        _ => image,
+    };
+    let segment = without_tag.rsplit('/').next().unwrap_or(without_tag).trim();
+    let cleaned: String = segment
+        .chars()
+        .map(|character| {
+            match character {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' => character,
+                _ => '-',
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|character| character == '-' || character == '.');
+    (!cleaned.is_empty()).then(|| cleaned.to_owned())
+}
+
+/// `base`, or `base-2`, `base-3`…: the first name the daemon does not already use.
+pub fn unique_name(base: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|name| name == base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| !taken.iter().any(|name| name == candidate))
+        .unwrap_or_else(|| base.to_owned())
+}
+
 /// The restart policy a container starts with when the daemon comes up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Autostart {
@@ -1276,6 +1316,25 @@ pub fn recreate_command(socket: &str, document: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_names_the_container_it_runs() {
+        assert_eq!(suggest_name("eclipse/mosquitto").as_deref(), Some("mosquitto"));
+        assert_eq!(
+            suggest_name("eclipse/mosquitto:1.4.8").as_deref(),
+            Some("mosquitto")
+        );
+        assert_eq!(suggest_name("ghcr.io/team/app:main").as_deref(), Some("app"));
+        // A registry port is not a tag.
+        assert_eq!(suggest_name("localhost:5000/app").as_deref(), Some("app"));
+        assert_eq!(suggest_name("nginx").as_deref(), Some("nginx"));
+        assert_eq!(suggest_name("   "), None);
+
+        let taken = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        assert_eq!(unique_name("web", &taken(&[])), "web");
+        assert_eq!(unique_name("web", &taken(&["web"])), "web-2");
+        assert_eq!(unique_name("web", &taken(&["web", "web-2"])), "web-3");
+    }
 
     #[test]
     fn restart_policies_are_read_by_name() {

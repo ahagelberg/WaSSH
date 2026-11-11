@@ -1038,7 +1038,9 @@ impl DockerManager {
                 empty_state(ui, palette, "Nothing matches", "Change the search to see more.");
             }
         }
-        let panelled = self.logs_for.is_some() || self.stats_for.is_some();
+        // A panel below the list needs half the pane; without one the list takes it all.
+        let panelled =
+            self.detail.is_some() || self.logs_for.is_some() || self.stats_for.is_some();
         let list_height = if panelled {
             (ui.available_height() * 0.5).max(80.0)
         } else {
@@ -2156,7 +2158,13 @@ impl DockerManager {
                     text_input(ui, palette, &mut self.run.tag, "tag (latest)");
                 });
                 ui.horizontal_wrapped(|ui| {
-                    text_input(ui, palette, &mut self.run.name, "name (optional)");
+                    // An empty name is filled from the image, so the container is not left
+                    // with Docker's random one.
+                    let placeholder = match model::suggest_name(&self.run.image) {
+                        Some(name) => format!("name ({name})"),
+                        None => "name (optional)".to_owned(),
+                    };
+                    text_input(ui, palette, &mut self.run.name, &placeholder);
                     text_input(ui, palette, &mut self.run.ports, "publish a port (8080:80)");
                 });
                 ui.add_space(4.0);
@@ -2210,7 +2218,17 @@ impl DockerManager {
             self.start_search();
         }
         if create {
-            let request = self.run.request();
+            let mut request = self.run.request();
+            if request.name.is_empty()
+                && let Some(base) = model::suggest_name(&request.image)
+            {
+                let taken: Vec<String> = self
+                    .containers
+                    .iter()
+                    .map(|container| container.name.clone())
+                    .collect();
+                request.name = model::unique_name(&base, &taken);
+            }
             let note = format!("Created a container from {}", request.reference());
             let command = model::run_command(&self.settings.socket, &request);
             self.run_change(access, &command, note);
