@@ -1252,7 +1252,14 @@ impl SessionEntry {
             }
             _ if self.connection.kind == ConnectionType::Local => {
                 let stdin = input.map(|input| format!("{input}\n"));
-                let job = local_exec::exec(command, stdin.as_deref());
+                let job = match &self.connection.local {
+                    // A WSL tab's host is its distribution, which has its own docker, its
+                    // own /proc and its own package manager.
+                    LocalShell::Wsl { distro } => {
+                        local_exec::exec_in_wsl(distro.as_deref(), command, stdin.as_deref())
+                    }
+                    _ => local_exec::exec(command, stdin.as_deref()),
+                };
                 (job.output, CommandStop::Local(job.stop))
             }
             _ => {
@@ -2993,9 +3000,11 @@ impl wassh_plugins::SftpAccess for SessionEntry {
 impl wassh_plugins::MonitorAccess for SessionEntry {
     fn native_sampling(&self) -> bool {
         // A Local tab's host is this machine, so its statistics come from the operating
-        // system itself wherever the platform has an API for them.
+        // system itself wherever the platform has an API for them. A WSL tab's host is its
+        // distribution instead, which the pane samples with a probe inside it.
         wassh_plugins::monitor::native_supported()
             && self.connection.kind == ConnectionType::Local
+            && !matches!(self.connection.local, LocalShell::Wsl { .. })
     }
 
     fn native_details(&mut self, pid: u32) -> Option<Result<Vec<(String, String)>, String>> {
