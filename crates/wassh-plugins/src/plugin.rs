@@ -154,6 +154,43 @@ impl<
 {
 }
 
+/// A tool a pane offers the AI agent.
+///
+/// Declared next to the pane that knows how to answer it, and published by [`tools`], so the
+/// agent lists it with the rest of its tools without knowing which pane it came from. A call
+/// builds the shell command that answers it, and the agent runs that the same way it runs any
+/// other command: through the host's approval rules.
+pub struct PluginTool {
+    /// Name the model calls, prefixed with the pane's own (`docker_containers`).
+    pub name: &'static str,
+    /// One line the model reads when choosing a tool.
+    pub description: &'static str,
+    /// JSON schema of the arguments object.
+    pub parameters: serde_json::Value,
+    /// The command that answers a call; `Err` is reported to the model as the tool's result.
+    pub command: fn(&serde_json::Value) -> Result<String, String>,
+}
+
+impl PluginTool {
+    /// The schema handed to the provider.
+    pub fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        })
+    }
+}
+
+/// Every tool the built-in panes offer the AI agent.
+pub fn tools() -> impl Iterator<Item = &'static PluginTool> {
+    let none: &'static [PluginTool] = &[];
+    PluginId::ALL.into_iter().flat_map(move |id| match id {
+        PluginId::DockerManager => crate::docker::TOOLS.as_slice(),
+        _ => none,
+    })
+}
+
 /// A built-in plugin view.
 pub trait Plugin {
     /// Manifest describing this plugin's id, labels and default placement.

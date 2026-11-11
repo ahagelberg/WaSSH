@@ -1193,7 +1193,48 @@ impl Agent {
                     self.run_probe(call, turn, CommandThen::Return, command, session);
                     return;
                 }
+                if let Some(tool) = tools::plugin_tool(&name) {
+                    self.run_plugin_tool(call, turn, tool, &arguments, session);
+                    return;
+                }
                 self.dispatch_remote(call, turn, &name, &arguments, session);
+            }
+        }
+    }
+
+    /// Run a tool a pane offered.
+    ///
+    /// The call becomes a command on the session's host, so it is approved the way a typed
+    /// command would be: a host that allows it runs it, a rule that forbids it refuses, and
+    /// anything else asks the user first.
+    fn run_plugin_tool(
+        &mut self,
+        call: ApiToolCall,
+        turn: usize,
+        tool: &'static crate::plugin::PluginTool,
+        arguments: &Value,
+        session: Session<'_, '_>,
+    ) {
+        let command = match (tool.command)(arguments) {
+            Ok(command) => command,
+            Err(reason) => {
+                let label = call_label(&call);
+                self.settle(call, turn, label, reason, true, session);
+                return;
+            }
+        };
+        match self.command_decision(&command) {
+            RuleDecision::Allow => self.exec_command(call, command, None, turn, session),
+            RuleDecision::Deny => {
+                let reason = format!("Running `{command}` is not allowed by the permission rules.");
+                self.settle(call, turn, format!("$ {command}"), reason, true, session);
+            }
+            RuleDecision::Ask => {
+                self.phase = Some(Phase::Approving {
+                    scopes: approval_scopes(&command),
+                    call,
+                    command,
+                });
             }
         }
     }
@@ -2710,6 +2751,52 @@ mod tests {
         );
         assert!(matches!(&agent.turns[0], Turn::Tool { failed: true, .. }));
         assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn a_pane_tool_runs_the_command_it_builds_once_approved() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "web\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: "docker_start".to_owned(),
+                arguments: r#"{"container":"web"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(agent.approving(), "a docker command has no allow rule yet");
+        agent.approve(true, None, &mut session);
+        agent.poll(&mut session);
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Tool { failed: false, .. })
+        ));
+        assert!(
+            fake.commands
+                .iter()
+                .any(|(_, command)| command.contains("docker start 'web'")),
+            "{:?}",
+            fake.commands
+        );
+    }
+
+    #[test]
+    fn a_pane_tool_without_its_container_answers_instead_of_running() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        let output = run_tool(&mut agent, &mut fake, "docker_stop", "{}");
+        assert!(output.contains("container argument"), "{output}");
+        assert!(fake.commands.is_empty(), "{:?}", fake.commands);
     }
 
     #[test]

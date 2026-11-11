@@ -32,6 +32,7 @@ use super::protocol::{
 
 use super::agent::shell_quote;
 use super::permissions::{Permission, Permissions};
+use crate::plugin::PluginTool;
 
 /// Longest body a fetch may return.
 pub const MAX_FETCH_CHARS: usize = 32_000;
@@ -533,28 +534,39 @@ fn parameters(name: &str) -> (Value, Value) {
 
 /// Every tool schema this host may use, ready for the provider.
 pub fn specs(permissions: &Permissions, allow_all: bool) -> Vec<Value> {
-    TOOL_SPECS
+    let mut specs: Vec<Value> = TOOL_SPECS
         .iter()
         .filter(|spec| {
             permissions.offers(spec.name)
                 || (allow_all && permissions.decision(spec.name) == Permission::Ask)
         })
         .map(|spec| spec.schema())
-        .collect()
+        .collect();
+    // Tools a pane offers are listed as they are: their calls run commands, which the
+    // approval rules already gate.
+    specs.extend(crate::plugin::tools().map(PluginTool::schema));
+    specs
+}
+
+/// The tool a pane offers under `name`, if there is one.
+pub fn plugin_tool(name: &str) -> Option<&'static PluginTool> {
+    crate::plugin::tools().find(|tool| tool.name == name)
 }
 
 /// Whether a tool exists.
 pub fn is_tool(name: &str) -> bool {
-    TOOL_SPECS.iter().any(|spec| spec.name == name)
+    TOOL_SPECS.iter().any(|spec| spec.name == name) || plugin_tool(name).is_some()
 }
 
 /// Whether a tool needs the connected session.
 ///
 /// `dev_diff_file` is left out: with both texts in the call it answers from the
 /// arguments alone, and a read it does need reports the missing session itself.
+/// A pane's tools are included: they are commands on the session's host.
 pub fn needs_session(name: &str) -> bool {
-    matches!(
-        name,
+    plugin_tool(name).is_some()
+        || matches!(
+            name,
         TOOL_RUN_COMMAND
             | TOOL_RUN_SUDO
             | TOOL_REMOTE_READ
@@ -1676,7 +1688,15 @@ mod tests {
     #[test]
     fn every_reference_tool_has_a_schema() {
         let schemas = specs(&Permissions::default(), false);
-        assert_eq!(schemas.len(), 38);
+        assert_eq!(schemas.len(), TOOL_SPECS.len() + crate::plugin::tools().count());
+        // The tools a pane offers are listed alongside the agent's own.
+        let docker = schemas
+            .iter()
+            .find(|schema| schema["name"] == "docker_containers")
+            .expect("the docker pane's tools are offered");
+        assert_eq!(docker["parameters"]["type"], "object");
+        assert!(is_tool("docker_containers"));
+        assert!(needs_session("docker_containers"));
         let names: Vec<&str> = schemas
             .iter()
             .map(|schema| schema["name"].as_str().unwrap())

@@ -16,6 +16,7 @@ mod model;
 mod registry;
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use egui::Ui;
@@ -31,7 +32,7 @@ use wassh_ui::widgets::{
 
 use wassh_ui::to_color32;
 use crate::command::CommandAccess;
-use crate::plugin::{Plugin, PluginContext};
+use crate::plugin::{Plugin, PluginContext, PluginTool};
 use crate::{PluginId, PluginManifest};
 
 pub use model::{
@@ -104,6 +105,168 @@ const START_ON_BOOT_LABEL: &str = "Start on boot";
 const PULLED_NEWER: &str = "Downloaded newer image";
 /// Shown when a command stopped because it needs root, next to the password card.
 const NEEDS_ROOT_NOTICE: &str = "This needs root. Enter the password to continue.";
+
+/// The tools this pane offers the AI agent.
+///
+/// Each call builds one `docker` command, which the agent runs through the same approval
+/// rules as any other command: a model without an allow rule asks the user first.
+pub static TOOLS: LazyLock<Vec<PluginTool>> = LazyLock::new(|| {
+    vec![
+    PluginTool {
+        name: "docker_containers",
+        description: "List every container on the host, running or not, with its state, status, \
+image and published ports.",
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        command: containers_tool,
+    },
+    PluginTool {
+        name: "docker_images",
+        description: "List the images on the host with their tags, ids and sizes.",
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        command: images_tool,
+    },
+    PluginTool {
+        name: "docker_volumes",
+        description: "List the host's docker volumes.",
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        command: volumes_tool,
+    },
+    PluginTool {
+        name: "docker_networks",
+        description: "List the host's docker networks.",
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        command: networks_tool,
+    },
+    PluginTool {
+        name: "docker_inspect",
+        description: "Show one container's configuration as docker inspect reports it.",
+        parameters: container_parameters(),
+        command: inspect_tool,
+    },
+    PluginTool {
+        name: "docker_logs",
+        description: "Show the last lines of one container's log, standard error included.",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "container": container_property(),
+                "tail": {
+                    "type": "number",
+                    "description": "How many recent lines to show."
+                }
+            },
+            "required": ["container"]
+        }),
+        command: logs_tool,
+    },
+    PluginTool {
+        name: "docker_start",
+        description: "Start a container.",
+        parameters: container_parameters(),
+        command: start_tool,
+    },
+    PluginTool {
+        name: "docker_stop",
+        description: "Stop a container.",
+        parameters: container_parameters(),
+        command: stop_tool,
+    },
+    PluginTool {
+        name: "docker_restart",
+        description: "Restart a container.",
+        parameters: container_parameters(),
+        command: restart_tool,
+    },
+    PluginTool {
+        name: "docker_remove",
+        description: "Remove a container, stopping it first if it is running.",
+        parameters: container_parameters(),
+        command: remove_tool,
+    },
+]
+});
+
+/// The argument every tool that works on one container takes.
+fn container_property() -> Value {
+    serde_json::json!({ "type": "string", "description": "Container name or id." })
+}
+
+fn container_parameters() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { "container": container_property() },
+        "required": ["container"]
+    })
+}
+
+fn containers_tool(_args: &Value) -> Result<String, String> {
+    Ok(model::ps_command(model::DEFAULT_SOCKET, true))
+}
+
+fn images_tool(_args: &Value) -> Result<String, String> {
+    Ok(model::images_command(model::DEFAULT_SOCKET))
+}
+
+fn volumes_tool(_args: &Value) -> Result<String, String> {
+    Ok(model::volumes_command(model::DEFAULT_SOCKET))
+}
+
+fn networks_tool(_args: &Value) -> Result<String, String> {
+    Ok(model::networks_command(model::DEFAULT_SOCKET))
+}
+
+fn inspect_tool(args: &Value) -> Result<String, String> {
+    container_command(args, |id| {
+        model::inspect_command(model::DEFAULT_SOCKET, id)
+    })
+}
+
+fn logs_tool(args: &Value) -> Result<String, String> {
+    let tail = args["tail"]
+        .as_u64()
+        .map_or(DEFAULT_LOG_TAIL, |lines| lines as usize)
+        .clamp(MIN_LOG_TAIL, MAX_LOG_TAIL);
+    container_command(args, |id| {
+        model::logs_command(model::DEFAULT_SOCKET, id, tail)
+    })
+}
+
+fn start_tool(args: &Value) -> Result<String, String> {
+    lifecycle_tool(args, Action::Start)
+}
+
+fn stop_tool(args: &Value) -> Result<String, String> {
+    lifecycle_tool(args, Action::Stop)
+}
+
+fn restart_tool(args: &Value) -> Result<String, String> {
+    lifecycle_tool(args, Action::Restart)
+}
+
+fn remove_tool(args: &Value) -> Result<String, String> {
+    lifecycle_tool(args, Action::Remove)
+}
+
+fn lifecycle_tool(args: &Value, action: Action) -> Result<String, String> {
+    container_command(args, |id| {
+        model::action_command(model::DEFAULT_SOCKET, id, action)
+    })
+}
+
+/// The command `build` makes of the container a call names, or why there is none.
+fn container_command(
+    args: &Value,
+    build: impl FnOnce(&str) -> Option<String>,
+) -> Result<String, String> {
+    let container = args["container"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "The container argument was missing or empty.".to_owned())?;
+    build(container).ok_or_else(|| {
+        format!("{container} is not a container name or id docker would take.")
+    })
+}
 
 /// Which list the pane shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2655,6 +2818,7 @@ fn empty_as(text: &str, fallback: &str) -> String {
 mod tests {
     use super::*;
     use crate::command::CommandOutput;
+    use serde_json::json;
 
     #[derive(Default)]
     struct Stub {
@@ -2908,6 +3072,53 @@ mod tests {
         assert!(rename.is_ready(), "trailing space is trimmed away");
         let command = model::rename_command(&HostSettings::default().socket, &rename.id, "web-2");
         assert_eq!(command.as_deref(), Some("docker rename 'abc123' 'web-2'"));
+    }
+
+    #[test]
+    fn the_agent_tools_build_the_commands_the_pane_would() {
+        let names: Vec<&str> = TOOLS.iter().map(|tool| tool.name).collect();
+        assert!(
+            names.iter().all(|name| name.starts_with("docker_")),
+            "a tool is named outside the pane's prefix: {names:?}"
+        );
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "a name is used twice: {names:?}");
+
+        // The listings take nothing and ask the pane's own questions.
+        assert_eq!(
+            containers_tool(&Value::Null).unwrap(),
+            model::ps_command(model::DEFAULT_SOCKET, true)
+        );
+        assert_eq!(
+            images_tool(&Value::Null).unwrap(),
+            model::images_command(model::DEFAULT_SOCKET)
+        );
+        // A call that names a container becomes the command for it.
+        assert_eq!(
+            stop_tool(&json!({ "container": "web" })).unwrap(),
+            "docker stop -t 10 'web'"
+        );
+        assert_eq!(
+            inspect_tool(&json!({ "container": " web " })).unwrap(),
+            "docker inspect 'web'"
+        );
+        // No name, or one docker would not take, is a sentence rather than a command.
+        assert!(start_tool(&json!({})).is_err());
+        assert!(start_tool(&json!({ "container": "  " })).is_err());
+        assert!(remove_tool(&json!({ "container": "web; rm -rf /" })).is_err());
+        // The tail is clamped to what the pane would ask for.
+        assert_eq!(
+            logs_tool(&json!({ "container": "web", "tail": 10_000 })).unwrap(),
+            format!("docker logs --tail {MAX_LOG_TAIL} 'web' 2>&1")
+        );
+        // Every schema handed to the provider describes a tool that takes an object.
+        for tool in TOOLS.iter() {
+            let schema = tool.schema();
+            assert_eq!(schema["name"], tool.name);
+            assert_eq!(schema["parameters"]["type"], "object");
+        }
     }
 
     #[test]
