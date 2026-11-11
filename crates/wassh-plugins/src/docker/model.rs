@@ -683,18 +683,15 @@ pub fn restart_policy_flag(policy: &str) -> Option<&'static str> {
     }
 }
 
-/// `docker info` as one line of comma-separated fields, for the engine status.
+/// The engine's own version, OS and architecture, as one line of comma-separated fields.
 ///
-/// Single fields rather than the whole document: `docker info` has changed shape between
-/// CLI versions, while these names have been in its template all along. Commas rather than
-/// pipes, so the template is still one argument if the shell layer that runs it loses the
-/// quotes.
+/// `docker version`'s server block is filled in by the daemon itself, and the command fails
+/// when nothing answers, which is exactly the question the pane asks. `docker info` is not
+/// used: on some CLIs its fields come back empty even though the daemon is answering.
 pub fn engine_command(socket: &str) -> String {
     format!(
-        "docker{} info --format \
-         '{{{{.ServerVersion}}}},{{{{.OperatingSystem}}}},{{{{.Architecture}}}},\
-         {{{{.ContainersRunning}}}},{{{{.ContainersPaused}}}},{{{{.ContainersStopped}}}},\
-         {{{{.Images}}}}'",
+        "docker{} version --format \
+         '{{{{.Server.Version}}}},{{{{.Server.Os}}}},{{{{.Server.Arch}}}},{{{{.Client.Version}}}}'",
         socket_flag(socket)
     )
 }
@@ -1504,12 +1501,11 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_probe_asks_for_one_line_of_fields() {
+    fn the_engine_probe_asks_the_daemon_for_its_version() {
         assert_eq!(
             engine_command(DEFAULT_SOCKET),
-            "docker info --format \
-             '{{.ServerVersion}},{{.OperatingSystem}},{{.Architecture}},\
-             {{.ContainersRunning}},{{.ContainersPaused}},{{.ContainersStopped}},{{.Images}}'"
+            "docker version --format \
+             '{{.Server.Version}},{{.Server.Os}},{{.Server.Arch}},{{.Client.Version}}'"
         );
     }
 

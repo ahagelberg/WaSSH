@@ -957,11 +957,7 @@ impl DockerManager {
         if let Some(outcome) = self.take(access, ENGINE_KEY) {
             self.engine = match outcome.error {
                 Some(error) => engine::status_from_failure(&error),
-                None => engine::parse_info(&outcome.stdout).unwrap_or(engine::Status {
-                    state: Some(engine::State::Error),
-                    message: engine::unexpected_answer(&outcome.stdout),
-                    ..engine::Status::default()
-                }),
+                None => engine::status_from_answer(&outcome.stdout),
             };
             self.engine_checked = Some(Instant::now());
         }
@@ -2849,7 +2845,7 @@ mod tests {
     }
 
     const PS: &str = r#"{"ID":"abc","Names":"web","Image":"nginx:latest","State":"running","Status":"Up 1 hour","Ports":"","Labels":"","Mounts":"","Networks":"bridge"}"#;
-    const INFO: &str = "27.1.1,Ubuntu 24.04.2 LTS,x86_64,1,0,2,2\n";
+    const INFO: &str = "27.1.1,linux,amd64,27.1.1\n";
 
     fn pane() -> DockerManager {
         DockerManager {

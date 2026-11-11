@@ -125,8 +125,11 @@ pub const UNEXPECTED_ANSWER: &str =
 /// Said when the command finished without printing anything at all.
 pub const EMPTY_ANSWER: &str = "The docker command printed nothing.";
 
-/// Fields the engine probe asks `docker info` for, of which the first three must arrive.
-const REQUIRED_FIELDS: usize = 3;
+/// Said when the command is there but the daemon half of its answer is empty.
+pub const DAEMON_SILENT: &str = "Docker's command is here, but no daemon answered it.";
+
+/// Fields the engine probe asks `docker version` for.
+const REQUIRED_FIELDS: usize = 4;
 
 /// Longest part of an answer the pane quotes back.
 const MAX_QUOTED_ANSWER: usize = 160;
@@ -261,14 +264,6 @@ pub struct Status {
     pub os: String,
     /// Architecture the daemon reports.
     pub arch: String,
-    /// Containers running.
-    pub running: u64,
-    /// Containers paused.
-    pub paused: u64,
-    /// Containers stopped.
-    pub stopped: u64,
-    /// Images.
-    pub images: u64,
     /// Why it is not usable, when it is not.
     pub message: String,
 }
@@ -283,14 +278,7 @@ impl Status {
     pub fn summary(&self) -> String {
         match self.state {
             None | Some(State::Checking) => "Checking the engine…".to_owned(),
-            Some(State::Ready) => format!(
-                "Engine {} · {} running, {} stopped · {} image{}",
-                self.version,
-                self.running,
-                self.stopped,
-                self.images,
-                if self.images == 1 { "" } else { "s" }
-            ),
+            Some(State::Ready) => format!("Engine {}", self.version),
             Some(State::Forbidden) => "Permission denied for the Docker daemon".to_owned(),
             Some(State::Missing) => "Docker is not installed on this host".to_owned(),
             Some(State::Unavailable) => {
@@ -311,38 +299,42 @@ impl Status {
     }
 }
 
-/// Read the line [`super::model::engine_command`] asks for:
-/// `version,os,arch,running,paused,stopped,images`.
+/// What the probe's answer says about the engine.
 ///
-/// A daemon that answers always names its own version, so a line without one came from
-/// something else wearing the `docker` name — not from an engine the pane can drive.
-/// The counts are not asked for again when a CLI leaves them out: the container list already
-/// knows them.
-pub fn parse_info(text: &str) -> Option<Status> {
+/// The line is `server version,server os,server arch,client version`. A daemon that answers
+/// always names its own version; a client version without one means the command is fine and
+/// nothing is listening; an answer that is neither came from something else wearing the
+/// `docker` name, and is quoted back so the user can see it.
+pub fn status_from_answer(text: &str) -> Status {
     let line = text
         .lines()
         .map(str::trim)
-        .find(|line| line.split(',').count() >= REQUIRED_FIELDS)?;
-    let mut fields = line.split(',');
-    let version = fields.next().unwrap_or_default().trim();
-    if version.is_empty() {
-        return None;
+        .find(|line| line.split(',').count() >= REQUIRED_FIELDS);
+    let fields: Vec<&str> = line
+        .map(|line| line.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    let version = fields.first().copied().unwrap_or_default();
+    if !version.is_empty() {
+        return Status {
+            state: Some(State::Ready),
+            version: version.to_owned(),
+            os: fields.get(1).copied().unwrap_or_default().to_owned(),
+            arch: fields.get(2).copied().unwrap_or_default().to_owned(),
+            message: String::new(),
+        };
     }
-    let os = fields.next().unwrap_or_default().trim();
-    let arch = fields.next().unwrap_or_default().trim();
-    let count =
-        |field: Option<&str>| field.and_then(|field| field.trim().parse().ok()).unwrap_or_default();
-    Some(Status {
-        state: Some(State::Ready),
-        version: version.to_owned(),
-        os: os.to_owned(),
-        arch: arch.to_owned(),
-        running: count(fields.next()),
-        paused: count(fields.next()),
-        stopped: count(fields.next()),
-        images: count(fields.next()),
-        message: String::new(),
-    })
+    if fields.get(3).is_some_and(|client| !client.is_empty()) {
+        return Status {
+            state: Some(State::Unavailable),
+            message: DAEMON_SILENT.to_owned(),
+            ..Status::default()
+        };
+    }
+    Status {
+        state: Some(State::Error),
+        message: unexpected_answer(text),
+        ..Status::default()
+    }
 }
 
 /// Explain why the probe failed.
@@ -445,39 +437,43 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_status_reads_docker_info() {
-        let status = parse_info("27.1.1,Debian GNU/Linux 12 (bookworm),x86_64,3,1,1,12\n").unwrap();
+    fn the_engine_status_reads_the_daemons_version() {
+        let status = status_from_answer("27.1.1,linux,amd64,27.1.1\n");
         assert!(status.is_ready());
         assert_eq!(status.version, "27.1.1");
-        assert_eq!(status.os, "Debian GNU/Linux 12 (bookworm)");
-        assert_eq!(status.arch, "x86_64");
-        assert_eq!(status.running, 3);
-        assert_eq!(status.paused, 1);
-        assert_eq!(status.stopped, 1);
-        assert_eq!(status.images, 12);
+        assert_eq!(status.os, "linux");
+        assert_eq!(status.arch, "amd64");
         assert!(
             status.summary().contains("Engine 27.1.1"),
             "{}",
             status.summary()
         );
         // A shell that said something before the answer does not hide it.
-        let noisy = parse_info("warning: something\n29.1.3,Ubuntu 24.04.2 LTS,arm64,0,0,1,1");
-        assert_eq!(noisy.map(|status| status.version), Some("29.1.3".to_owned()));
-        // A CLI that leaves the counts out still names its engine.
-        let without_counts = parse_info("29.1.3,Ubuntu 24.04.2 LTS,x86_64");
-        assert_eq!(
-            without_counts.map(|status| (status.version, status.images)),
-            Some(("29.1.3".to_owned(), 0))
+        let noisy = status_from_answer("warning: something\n29.1.3,linux,arm64,29.1.3");
+        assert_eq!(noisy.version, "29.1.3");
+        assert!(noisy.is_ready());
+    }
+
+    #[test]
+    fn a_client_without_a_server_is_a_daemon_that_is_not_there() {
+        let status = status_from_answer(",,,29.1.3\n");
+        assert_eq!(status.state, Some(State::Unavailable));
+        assert_eq!(status.summary(), DAEMON_SILENT);
+        // Nothing at all signed the answer: it is not the docker this pane knows.
+        let strange = status_from_answer(",,,,");
+        assert_eq!(strange.state, Some(State::Error));
+        assert!(
+            strange.summary().starts_with(UNEXPECTED_ANSWER),
+            "{}",
+            strange.summary()
         );
     }
 
     #[test]
     fn an_answer_without_a_version_is_not_an_engine() {
-        assert!(parse_info("").is_none());
-        assert!(parse_info(",,").is_none());
-        assert!(parse_info("27.1.1,Debian").is_none(), "a short line");
-        assert!(parse_info("not json").is_none());
-        let status = Status {
+        assert_eq!(status_from_answer("").state, Some(State::Error));
+        assert_eq!(status_from_answer("27.1.1,linux").state, Some(State::Error));
+        assert_eq!(status_from_answer("not json").state, Some(State::Error));        let status = Status {
             state: Some(State::Error),
             message: UNEXPECTED_ANSWER.to_owned(),
             ..Status::default()
