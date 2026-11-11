@@ -511,6 +511,12 @@ impl ConnectionParams {
                 LocalShell::System if cfg!(windows) => {
                     "a local Windows PowerShell shell on this machine".to_owned()
                 }
+                LocalShell::System if cfg!(target_os = "macos") => {
+                    "a local macOS shell on this machine".to_owned()
+                }
+                LocalShell::System if cfg!(target_os = "linux") => {
+                    "a local Linux shell on this machine".to_owned()
+                }
                 LocalShell::System => "a local Unix shell on this machine".to_owned(),
             },
             ConnectionType::Ssh => format!(
@@ -758,6 +764,20 @@ mod tests {
             }
             .environment(),
             "a local Windows command prompt (cmd.exe) on this machine"
+        );
+        assert_eq!(
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                ..Default::default()
+            }
+            .environment(),
+            if cfg!(windows) {
+                "a local Windows PowerShell shell on this machine"
+            } else if cfg!(target_os = "macos") {
+                "a local macOS shell on this machine"
+            } else {
+                "a local Linux shell on this machine"
+            }
         );
         assert_eq!(
             ConnectionParams {
