@@ -67,8 +67,8 @@ pub enum TabAction {
     Select(String),
     /// Close a tab.
     Close(String),
-    /// Open a new local tab.
-    NewTab,
+    /// The "new tab" button was clicked, at the given screen position.
+    NewTabAt((i32, i32)),
     /// Right-clicked a tab at the given position.
     Context(String, (i32, i32)),
     /// Drag reordered tabs.
@@ -283,7 +283,8 @@ pub fn tab_bar(
         }),
     );
     if new_button.clicked() {
-        actions.push(TabAction::NewTab);
+        let anchor = button.left_bottom();
+        actions.push(TabAction::NewTabAt((anchor.x as i32, anchor.y as i32)));
     }
     new_button.on_hover_text("New local terminal tab");
 

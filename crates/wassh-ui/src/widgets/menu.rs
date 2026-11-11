@@ -28,7 +28,7 @@ pub enum MenuItem {
     /// A normal, clickable row.
     Action {
         /// Text shown in the row.
-        label: &'static str,
+        label: String,
         /// Greyed-out and unclickable when false.
         enabled: bool,
         /// Red text and hover fill, used for destructive actions.
@@ -40,27 +40,27 @@ pub enum MenuItem {
 
 impl MenuItem {
     /// A clickable row.
-    pub fn new(label: &'static str) -> Self {
+    pub fn new(label: impl Into<String>) -> Self {
         Self::Action {
-            label,
+            label: label.into(),
             enabled: true,
             danger: false,
         }
     }
 
     /// A destructive row, drawn in the danger colour.
-    pub fn danger(label: &'static str) -> Self {
+    pub fn danger(label: impl Into<String>) -> Self {
         Self::Action {
-            label,
+            label: label.into(),
             enabled: true,
             danger: true,
         }
     }
 
     /// A row that is visible but cannot be activated.
-    pub fn disabled(label: &'static str) -> Self {
+    pub fn disabled(label: impl Into<String>) -> Self {
         Self::Action {
-            label,
+            label: label.into(),
             enabled: false,
             danger: false,
         }
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(
             MenuItem::new("Reconnect"),
             MenuItem::Action {
-                label: "Reconnect",
+                label: "Reconnect".to_owned(),
                 enabled: true,
                 danger: false
             }

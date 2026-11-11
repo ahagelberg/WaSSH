@@ -1435,7 +1435,7 @@ impl MqttAnalyser {
             self.menu.open_at(
                 at,
                 vec![MenuItem::Action {
-                    label: "Delete",
+                    label: "Delete".to_owned(),
                     enabled: self.session.is_some(),
                     danger: true,
                 }],

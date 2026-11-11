@@ -7,15 +7,15 @@ use wassh_core::{ConnectionParams, ConnectionType, LocalShell, Palette};
 use wassh_ui::widgets::{Button, field, password_input, select, small_button, text_input};
 
 /// Label for the plain local shell: PowerShell on Windows, `$SHELL` elsewhere.
-const LOCAL_LABEL: &str = if cfg!(windows) {
+pub(crate) const LOCAL_LABEL: &str = if cfg!(windows) {
     "Local (PS)"
 } else {
     "Local"
 };
 /// Label for the Windows command prompt.
-const CMD_LABEL: &str = "Local (cmd)";
+pub(crate) const CMD_LABEL: &str = "Local (cmd)";
 /// Label for a WSL environment.
-const WSL_LABEL: &str = "Local (WSL)";
+pub(crate) const WSL_LABEL: &str = "Local (WSL)";
 /// Height the form takes in the sidebar.
 const QUICK_HEIGHT: f32 = 236.0;
 /// Height the form takes when the WSL environment picker is shown.

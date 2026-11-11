@@ -19,7 +19,7 @@ use egui::{Key, Modifiers, Pos2, Vec2};
 
 use wassh_core::{
     APP_NAME, AppSettings, AuthMethod, ConnectionParams, ConnectionType, HostProfile,
-    HostsDocument, Palette, SessionStatus, WindowBounds, colors,
+    HostsDocument, LocalShell, Palette, SessionStatus, WindowBounds, colors,
 };
 use wassh_plugins::PluginId;
 use wassh_ssh::KnownHosts;
@@ -69,6 +69,12 @@ const PASTE_WAIT: Duration = Duration::from_secs(1);
 
 /// The program icon shown in the task bar and in Alt-Tab.
 const ICON_PNG: &[u8] = include_bytes!("../../../../res/WaSSH program icon.png");
+
+/// Menu target for the tab strip's "new tab" menu.
+const NEW_LOCAL_TARGET: &str = "new-local";
+
+/// Row shown in that menu when no WSL environment is installed.
+const NO_WSL_LABEL: &str = "No WSL environments";
 
 /// Repaint interval when nothing is happening.
 ///
@@ -164,6 +170,9 @@ pub struct Shell {
     tabs: wassh_ui::TabBarState,
     menu: MenuState,
     menu_target: Option<String>,
+    /// Local shells behind the open "new tab" menu, by item index; `None` for rows that
+    /// choose nothing, like a separator.
+    menu_local: Vec<Option<LocalShell>>,
     toasts: Toasts,
     dialogs: Dialogs,
     quick: QuickForm,
@@ -557,6 +566,7 @@ impl Shell {
             tabs: wassh_ui::TabBarState::new(),
             menu: MenuState::new(),
             menu_target: None,
+            menu_local: Vec::new(),
             toasts: Toasts::new(),
             dialogs: Dialogs::default(),
             quick: QuickForm::default(),
@@ -856,6 +866,49 @@ impl Shell {
 
     fn open_local(&mut self) {
         let params = self.local_params();
+        self.open_local_with(params);
+    }
+
+    /// Offer the local shells this machine has: its own, and on Windows the command
+    /// prompt and every installed WSL environment.
+    fn open_local_menu(&mut self, anchor: Pos2) {
+        let distros = if cfg!(windows) {
+            wassh_term::wsl::distros()
+        } else {
+            Vec::new()
+        };
+        let mut rows = vec![(
+            MenuItem::new(quick_connect::LOCAL_LABEL),
+            Some(LocalShell::System),
+        )];
+        if cfg!(windows) {
+            rows.push((MenuItem::new(quick_connect::CMD_LABEL), Some(LocalShell::Cmd)));
+            rows.push((MenuItem::separator(), None));
+            if distros.is_empty() {
+                rows.push((MenuItem::disabled(NO_WSL_LABEL), None));
+            }
+            rows.extend(distros.into_iter().map(|name| {
+                (
+                    MenuItem::new(format!("{} · {name}", quick_connect::WSL_LABEL)),
+                    Some(LocalShell::Wsl { distro: Some(name) }),
+                )
+            }));
+        }
+        // One candidate needs no menu; off Windows the platform shell is the only one.
+        if rows.len() == 1 {
+            self.open_local_shell(LocalShell::System);
+            return;
+        }
+        let (items, choices): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        self.menu.open_at(anchor, items);
+        self.menu_target = Some(NEW_LOCAL_TARGET.to_owned());
+        self.menu_local = choices;
+    }
+
+    /// Open a local tab running `shell`, with the built-in host's style.
+    fn open_local_shell(&mut self, shell: LocalShell) {
+        let mut params = self.local_params();
+        params.local = shell;
         self.open_local_with(params);
     }
 
@@ -2493,7 +2546,9 @@ impl Shell {
                         self.close(index);
                     }
                 }
-                wassh_ui::TabAction::NewTab => self.open_local(),
+                wassh_ui::TabAction::NewTabAt((x, y)) => {
+                    self.open_local_menu(Pos2::new(x as f32, y as f32));
+                }
                 wassh_ui::TabAction::Context(id, (x, y)) => {
                     self.menu
                         .open_at(Pos2::new(x as f32, y as f32), tab_menu_items());
@@ -3077,6 +3132,14 @@ impl Shell {
         let Some(target) = self.menu_target.take() else {
             return;
         };
+
+        if target == NEW_LOCAL_TARGET {
+            let shell = std::mem::take(&mut self.menu_local).into_iter().nth(index).flatten();
+            if let Some(shell) = shell {
+                self.open_local_shell(shell);
+            }
+            return;
+        }
 
         if let Some(id) = target.strip_prefix("host:") {
             let id = id.to_owned();
@@ -3831,6 +3894,17 @@ mod tests {
             .map_or(Duration::ZERO, |viewport| viewport.repaint_delay);
         output.drop_without_applying_deltas();
         delay
+    }
+
+    #[test]
+    fn the_new_tab_menu_lists_this_machines_shells() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open_local_menu(egui::Pos2::ZERO);
+        assert!(shell.menu.is_open(), "the plus button opens a menu");
+        assert_eq!(shell.menu_local.first(), Some(&Some(LocalShell::System)));
+        if cfg!(windows) {
+            assert_eq!(shell.menu_local.get(1), Some(&Some(LocalShell::Cmd)));
+        }
     }
 
     #[test]
