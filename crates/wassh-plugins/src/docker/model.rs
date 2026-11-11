@@ -591,6 +591,31 @@ pub fn privileged(command: &str, password: Option<&str>) -> String {
     format!("{prefix} sh -c {}", shell_quote(command))
 }
 
+/// The line of a failed command's output that says what went wrong.
+///
+/// A failed `docker run` writes three kinds of line to stderr: progress ("Unable to find
+/// image 'x:latest' locally"), then the reason ("docker: Error response from daemon: pull
+/// access denied …"), then advice ("Run 'docker run --help' for more information"). Neither
+/// the first line nor the last one is the answer, so the reason is picked out by its wording.
+pub fn failure_line(stderr: &str) -> Option<String> {
+    const REASONS: [&str; 4] = ["docker:", "error", "fatal:", "cannot"];
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let reason = lines.iter().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        REASONS.iter().any(|prefix| lower.starts_with(prefix))
+    });
+    let useful = reason.or_else(|| {
+        lines
+            .iter()
+            .find(|line| !line.to_ascii_lowercase().starts_with("run '"))
+    });
+    useful.or(lines.first()).map(|line| (*line).to_owned())
+}
+
 /// Whether a failure means "this needed root".
 ///
 /// sudo words the same thing differently per version and platform: "a password is required"
@@ -1195,6 +1220,35 @@ pub fn recreate_command(socket: &str, document: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_run_reports_its_reason_not_its_progress() {
+        // Taken from a real `docker run eclipse/mosquitto` on a host that may not pull it.
+        let stderr = concat!(
+            "Unable to find image 'eclipse/mosquitto:latest' locally\n",
+            "docker: Error response from daemon: pull access denied for eclipse/mosquitto, ",
+            "repository does not exist or may require 'docker login'\n",
+            "\n",
+            "Run 'docker run --help' for more information\n",
+        );
+        assert_eq!(
+            failure_line(stderr).as_deref(),
+            Some(concat!(
+                "docker: Error response from daemon: pull access denied for eclipse/mosquitto, ",
+                "repository does not exist or may require 'docker login'"
+            ))
+        );
+        // Progress alone is still the best there is, and so is advice alone.
+        assert_eq!(
+            failure_line("Unable to find image 'x:latest' locally").as_deref(),
+            Some("Unable to find image 'x:latest' locally")
+        );
+        assert_eq!(
+            failure_line("Run 'docker run --help' for more information").as_deref(),
+            Some("Run 'docker run --help' for more information")
+        );
+        assert_eq!(failure_line("  \n\n"), None);
+    }
 
     const PS: &str = concat!(
         r#"{"ID":"8f2c1b7d9e01aaaa","Names":"web","Image":"nginx:latest","#,

@@ -544,9 +544,7 @@ impl DockerManager {
                 None
             } else {
                 Some(
-                    output
-                        .error_line()
-                        .map(str::to_owned)
+                    model::failure_line(&output.stderr)
                         .unwrap_or_else(|| format!("docker exited with {:?}", output.code)),
                 )
             }
