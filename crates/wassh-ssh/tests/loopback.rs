@@ -63,6 +63,20 @@ impl server::Handler for EchoServer {
         Ok(())
     }
 
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        _data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        session.extended_data(channel, 1, b"permission denied\n".to_vec())?;
+        session.eof(channel)?;
+        session.exit_status_request(channel, 1)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
     async fn data(
         &mut self,
         channel: ChannelId,
@@ -291,6 +305,20 @@ async fn connects_authenticates_and_echoes() {
     .await;
     assert!(text.contains("echo:after-resize"), "echo after resize: {text:?}");
 
+    session.disconnect();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_reads_exit_status_after_eof() {
+    let (host, port) = spawn_server().await;
+    let mut session = SshSession::connect(options(host, port, SshAuth::Password("secret".to_owned())))
+        .expect("spawn session");
+    wait_for(&mut session, Duration::from_secs(10), |_, _, connected| connected).await;
+    let job = session.exec("docker version".to_owned());
+    let output = tokio::task::spawn_blocking(move || job.output.recv_timeout(Duration::from_secs(5)))
+        .await.unwrap().expect("command result").expect("command completed");
+    assert_eq!(output.stderr, "permission denied\n");
+    assert_eq!(output.exit_status, Some(1));
     session.disconnect();
 }
 

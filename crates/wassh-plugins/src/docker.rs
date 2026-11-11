@@ -3202,6 +3202,21 @@ mod tests {
     }
 
     #[test]
+    fn a_denied_engine_probe_reports_the_permission_error() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        pane.poll(&mut access);
+        access.finish(ENGINE_KEY, CommandOutput {
+            stdout: String::new(),
+            stderr: "permission denied while trying to connect to the docker API".to_owned(),
+            code: Some(1),
+        });
+        pane.poll(&mut access);
+        assert_eq!(pane.engine.state, Some(engine::State::Forbidden));
+        assert_eq!(pane.engine.summary(), "Permission denied for the Docker daemon");
+    }
+
+    #[test]
     fn the_install_log_is_only_offered_when_something_needs_reading() {
         // A finished install with a working engine is not worth a row.
         assert!(!log_worth_showing(false, true, true));

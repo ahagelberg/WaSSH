@@ -28,6 +28,7 @@ const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(5);
 
 /// The Windows program that runs a command inside a WSL distribution.
+#[cfg(windows)]
 const WSL: &str = "wsl.exe";
 
 /// Whether this machine can run host commands at all.

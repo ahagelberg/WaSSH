@@ -52,7 +52,7 @@ pub(crate) async fn run(
                 Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
                 Some(ChannelMsg::ExtendedData { data, .. }) => stderr.extend_from_slice(&data),
                 Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
-                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(ChannelMsg::Close) | None => break,
                 Some(_) => {}
             },
         }

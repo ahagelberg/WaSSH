@@ -3,6 +3,7 @@
 //! WSL has no API of its own: `wsl.exe` is the interface, and its redirected output is
 //! UTF-16LE, hence the decoder below.
 
+#[cfg(target_os = "windows")]
 use std::process::Stdio;
 
 /// The WSL launcher.
