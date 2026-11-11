@@ -182,10 +182,8 @@ pub struct Shell {
     plugin_values_key: Option<PluginValuesKey>,
     /// Bumped whenever the settings, the hosts or the credential vault change.
     data_generation: u64,
-    /// Window title handed to the header bar and the platform, and the tab title it was
-    /// last built from.
-    title: String,
-    title_tab: String,
+    /// The program icon, uploaded once for the header bar's corner.
+    header_icon: Option<egui::TextureHandle>,
     /// Plugin labels the Plugins menu ticks and shows a gear for, reused per frame.
     checked_labels: Vec<&'static str>,
     gear_labels: Vec<&'static str>,
@@ -573,8 +571,7 @@ impl Shell {
             plugin_values: None,
             plugin_values_key: None,
             data_generation: 0,
-            title: APP_NAME.to_owned(),
-            title_tab: String::new(),
+            header_icon: None,
             checked_labels: Vec::new(),
             gear_labels: Vec::new(),
             toolbar_buttons: Vec::new(),
@@ -3193,28 +3190,21 @@ impl Shell {
         self.persist_window_bounds(false);
     }
 
-    /// The text the window's title bar shows: the app name and the active tab.
+    /// The program icon, uploaded once for the header bar's corner.
     ///
-    /// The header bar and the platform both read it, so it is rebuilt only when the active
-    /// tab's title changed rather than once per frame.
-    fn sync_window_title(&mut self, ctx: &egui::Context) {
-        let tab = self
-            .active
-            .and_then(|index| self.sessions.get(index))
-            .map(|session| session.title.as_str())
-            .unwrap_or_default();
-        if self.title_tab == tab {
-            return;
-        }
-        self.title_tab.clear();
-        self.title_tab.push_str(tab);
-        self.title.clear();
-        self.title.push_str(APP_NAME);
-        if !tab.is_empty() {
-            self.title.push_str(" — ");
-            self.title.push_str(tab);
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
+    /// The window icon covers the task bar and Alt-Tab; with the desktop's decorations off
+    /// the corner of the title bar is the app's own to paint.
+    fn header_icon(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        self.header_icon
+            .get_or_insert_with(|| {
+                let icon = window_icon();
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                );
+                ctx.load_texture("wassh-program-icon", image, egui::TextureOptions::LINEAR)
+            })
+            .clone()
     }
 
     /// Everything inside the window frame.
@@ -3239,12 +3229,16 @@ impl Shell {
         self.pump(&ctx);
         self.shortcuts(&ctx);
         self.update_find_matches();
-        self.sync_window_title(&ctx);
         self.refresh_plugin_labels();
 
         // The window chrome: the app draws its own title bar on Windows and Linux, so it is
         // painted from the palette and follows the app's theme. macOS keeps the desktop's
         // title bar, and the app only adds the menu strip under it.
+        let header_icon = if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(self.header_icon(&ctx))
+        };
         let state = wassh_ui::titlebar::MenuState {
             shortcuts: MENU_SHORTCUTS,
             checked: &self.checked_labels,
@@ -3255,7 +3249,17 @@ impl Shell {
             wassh_ui::show_menu_bar(ui, &self.palette, menus(), state)
         } else {
             wassh_ui::resize_edges(&ctx, maximized);
-            wassh_ui::show_header_bar(ui, &self.palette, &self.title, maximized, menus(), state)
+            wassh_ui::show_header_bar(
+                ui,
+                &self.palette,
+                wassh_ui::HeaderContent {
+                    icon: header_icon.as_ref().map(|icon| icon.id()),
+                    title: APP_NAME,
+                },
+                maximized,
+                menus(),
+                state,
+            )
         };
         match action {
             Some(wassh_ui::TitlebarAction::MenuItem(item)) => self.menu_command(&ctx, item),

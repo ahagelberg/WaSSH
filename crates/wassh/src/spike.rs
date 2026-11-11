@@ -481,7 +481,10 @@ impl eframe::App for SpikeApp {
             wassh_ui::show_header_bar(
                 ui,
                 &self.palette,
-                APP_NAME,
+                wassh_ui::HeaderContent {
+                    icon: None,
+                    title: APP_NAME,
+                },
                 maximized,
                 TITLEBAR_MENUS,
                 wassh_ui::titlebar::MenuState::default(),

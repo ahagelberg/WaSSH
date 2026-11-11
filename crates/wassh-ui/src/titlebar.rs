@@ -51,6 +51,14 @@ const GEAR_TOOTH_WIDTH: f32 = 2.4;
 /// Glyph of a checked entry.
 const MENU_CHECK_GLYPH: &str = "\u{2713}";
 const MENU_PADDING: f32 = 5.0;
+/// Edge of the square program icon.
+const HEADER_ICON_SIZE: f32 = 16.0;
+/// Space between the program icon and the app name.
+const HEADER_ICON_GAP: f32 = 7.0;
+/// Width of one caption button in the Windows style.
+const CAPTION_WIDTH_WINDOWS: f32 = 46.0;
+/// Width of one caption button in the GNOME style.
+const CAPTION_WIDTH_GNOME: f32 = 34.0;
 
 /// What the user did in the window chrome.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,7 +109,17 @@ pub const fn caption_style() -> CaptionStyle {
     }
 }
 
-/// Draw the client-side header bar: title, menus and window buttons in one strip.
+/// What the header bar shows besides the menus: the program mark and name.
+#[derive(Clone, Copy, Debug)]
+pub struct HeaderContent<'a> {
+    /// Program icon, already uploaded as a texture; `None` keeps its space empty.
+    pub icon: Option<egui::TextureId>,
+    /// App name, next to the icon.
+    pub title: &'a str,
+}
+
+/// Draw the client-side header bar: icon, app name, menus and the window buttons in one
+/// strip.
 ///
 /// Use this on platforms where the app draws its own window frame
 /// (`ViewportBuilder::with_decorations(false)`); pair it with [`resize_edges`] so the window
@@ -110,11 +128,12 @@ pub const fn caption_style() -> CaptionStyle {
 pub fn show_header_bar(
     ui: &mut Ui,
     palette: &Palette,
-    title: &str,
+    content: HeaderContent<'_>,
     maximized: bool,
     menus: &[Menu],
     state: MenuState<'_>,
 ) -> Option<TitlebarAction> {
+    let HeaderContent { icon, title } = content;
     let mut action = None;
 
     egui::Panel::top("wassh-header-bar")
@@ -142,6 +161,24 @@ pub fn show_header_bar(
                 if !maximized && drag.double_clicked() {
                     action = Some(TitlebarAction::ToggleMaximize);
                 }
+                match icon {
+                    Some(texture) => {
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::splat(HEADER_ICON_SIZE),
+                            Sense::hover(),
+                        );
+                        ui.painter().image(
+                            texture,
+                            rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    // Without an icon the name keeps its place, so the menus do not shift
+                    // between platforms.
+                    None => ui.add_space(HEADER_ICON_SIZE),
+                }
+                ui.add_space(HEADER_ICON_GAP);
                 ui.label(
                     egui::RichText::new(title)
                         .size(12.5)
@@ -580,7 +617,7 @@ fn caption_button(ui: &mut Ui, palette: &Palette, button: CaptionButton) -> bool
         // Full-height rectangles flush with the title bar's top edge, like Windows.
         CaptionStyle::Windows => {
             let (rect, response) = ui.allocate_exact_size(
-                Vec2::new(46.0, WINDOW_HEADER_HEIGHT),
+                Vec2::new(CAPTION_WIDTH_WINDOWS, WINDOW_HEADER_HEIGHT),
                 Sense::click(),
             );
             if response.hovered() {
@@ -610,7 +647,7 @@ fn caption_button(ui: &mut Ui, palette: &Palette, button: CaptionButton) -> bool
         // Small rounded buttons with breathing room, like Adwaita.
         CaptionStyle::Gnome => {
             let (rect, response) = ui.allocate_exact_size(
-                Vec2::new(34.0, WINDOW_HEADER_HEIGHT),
+                Vec2::new(CAPTION_WIDTH_GNOME, WINDOW_HEADER_HEIGHT),
                 Sense::click(),
             );
             let circle = Rect::from_center_size(rect.center(), Vec2::splat(24.0));
@@ -645,7 +682,6 @@ fn caption_button(ui: &mut Ui, palette: &Palette, button: CaptionButton) -> bool
 
 /// Invisible band along the window edge that starts a resize.
 pub const RESIZE_BAND: f32 = 5.0;
-
 /// Handle the invisible resize bands around the window.
 ///
 /// Only needed when the app draws its own frame (`with_decorations(false)`); with native
@@ -962,7 +998,11 @@ mod tests {
         for _ in 0..2 {
             let mut output = ctx.run_ui(input.clone(), |ui| {
                 let state = MenuState::default();
-                let _ = show_header_bar(ui, palette, "WaSSH", false, menus, state);
+                let content = HeaderContent {
+                    icon: None,
+                    title: "WaSSH",
+                };
+                let _ = show_header_bar(ui, palette, content, false, menus, state);
             });
             fills.clear();
             texts.clear();

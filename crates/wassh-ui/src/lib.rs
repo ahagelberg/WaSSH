@@ -25,7 +25,8 @@ pub use style::apply_visuals;
 pub use tab_bar::{TabAction, TabBarState, TabView, tab_bar};
 pub use terminal_view::{TerminalView, to_color32, with_alpha};
 pub use titlebar::{
-    CaptionStyle, TitlebarAction, caption_style, resize_edges, show_header_bar, show_menu_bar,
+    CaptionStyle, HeaderContent, TitlebarAction, caption_style, resize_edges, show_header_bar,
+    show_menu_bar,
 };
 
 use wassh_core::{Palette, ThemeMode};
