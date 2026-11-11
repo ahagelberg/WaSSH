@@ -13,6 +13,7 @@
 
 mod engine;
 mod model;
+mod registry;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -294,6 +295,10 @@ pub struct DockerManager {
     new_network: String,
     run: RunForm,
     run_open: bool,
+    /// Whether the create form shows the fields most containers never need.
+    run_advanced: bool,
+    /// The registry search offered by the create form.
+    search: ImageSearch,
     updating: Vec<Update>,
     stale: Vec<String>,
     pull_queue: Vec<String>,
@@ -325,6 +330,19 @@ struct RunForm {
 
 /// The `--restart` choices the form offers.
 const RESTART_CHOICES: [&str; 4] = ["no", "always", "unless-stopped", "on-failure"];
+
+/// A registry search the create form can start and read back.
+#[derive(Default)]
+struct ImageSearch {
+    /// What to look for.
+    query: String,
+    /// What the registries answered.
+    hits: Vec<registry::Hit>,
+    /// Why the last search failed.
+    error: Option<String>,
+    /// The worker's line, while it runs.
+    pending: Option<std::sync::mpsc::Receiver<Result<Vec<registry::Hit>, String>>>,
+}
 
 impl RunForm {
     fn request(&self) -> RunRequest {
@@ -511,6 +529,7 @@ impl DockerManager {
 
     /// Fold every finished command into the pane's state.
     fn poll(&mut self, access: &mut dyn CommandAccess) {
+        self.poll_search();
         self.poll_lists(access);
         self.poll_action(access);
         self.poll_logs(access);
@@ -1017,6 +1036,54 @@ impl DockerManager {
             self.draw_stats(ui, palette, access);
         }
         typed
+    }
+
+    /// Take in an answer from the registry search.
+    fn poll_search(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(pending) = &self.search.pending else {
+            return;
+        };
+        match pending.try_recv() {
+            Ok(Ok(hits)) => {
+                self.search.hits = hits;
+                self.search.error = None;
+                self.search.pending = None;
+            }
+            Ok(Err(error)) => {
+                self.search.hits.clear();
+                self.search.error = Some(error);
+                self.search.pending = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.search.error = Some("The search stopped.".to_owned());
+                self.search.pending = None;
+            }
+        }
+    }
+
+    /// Look the typed name up in the registries, off the frame thread.
+    fn start_search(&mut self) {
+        let query = self.search.query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let (sender, pending) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(registry::search(&query));
+            wassh_core::wake::notify();
+        });
+        self.search.pending = Some(pending);
+        self.search.hits.clear();
+        self.search.error = None;
+    }
+
+    /// Start the create form from a registry hit.
+    fn take_image(&mut self, reference: &str) {
+        self.run.image = reference.to_owned();
+        self.run.tag.clear();
+        self.search.hits.clear();
     }
 
     fn queue_updates(&mut self, ids: &[String]) {
@@ -1785,39 +1852,119 @@ impl DockerManager {
         }
     }
 
+    /// What the search found, each row a click away from the form.
+    fn search_results(&mut self, ui: &mut Ui, palette: &Palette) {
+        if self.search.pending.is_some() {
+            self.help_detail(ui, palette, "Searching the registries…");
+            return;
+        }
+        if let Some(message) = &self.search.error {
+            ui.label(
+                egui::RichText::new(message)
+                    .size(10.5)
+                    .color(to_color32(palette.danger)),
+            );
+        }
+        if self.search.hits.is_empty() {
+            return;
+        }
+        let mut chosen = None;
+        egui::ScrollArea::vertical()
+            .id_salt("docker-search")
+            .max_height(PANEL_HEIGHT)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for hit in &self.search.hits {
+                    ui.horizontal_wrapped(|ui| {
+                        if small_button_enabled(ui, palette, "Use", true) {
+                            chosen = Some(hit.reference.clone());
+                        }
+                        ui.label(
+                            egui::RichText::new(&hit.reference)
+                                .size(11.5)
+                                .color(to_color32(palette.text)),
+                        );
+                        if hit.official {
+                            ui.label(
+                                egui::RichText::new("official")
+                                    .size(10.0)
+                                    .color(to_color32(palette.ok)),
+                            );
+                        }
+                        if hit.stars > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("★ {}", hit.stars))
+                                    .size(10.0)
+                                    .color(to_color32(palette.text_muted)),
+                            );
+                        }
+                        if !hit.description.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&hit.description)
+                                        .size(10.0)
+                                        .color(to_color32(palette.text_muted)),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                }
+            });
+        if let Some(reference) = chosen {
+            self.take_image(&reference);
+        }
+    }
+
     /// The create-container form.
     fn run_form(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
         ui.separator();
+        let searching = self.search.pending.is_some();
+        let mut search = false;
+        ui.horizontal_wrapped(|ui| {
+            text_input(ui, palette, &mut self.search.query, "search Docker Hub and Quay");
+            let ready = !self.search.query.trim().is_empty() && !searching;
+            if small_button_enabled(ui, palette, "Search images", ready) {
+                search = true;
+            }
+        });
+        if search {
+            self.start_search();
+        }
+        self.search_results(ui, palette);
         ui.horizontal_wrapped(|ui| {
             text_input(ui, palette, &mut self.run.image, "image (nginx)");
             text_input(ui, palette, &mut self.run.tag, "tag (latest)");
             text_input(ui, palette, &mut self.run.name, "name (optional)");
-            text_input(ui, palette, &mut self.run.network, "network (optional)");
         });
         ui.horizontal_wrapped(|ui| {
-            let mut restart = self.run.restart.min(RESTART_CHOICES.len() - 1);
-            if let Some(picked) = select_str(
-                ui,
-                ("docker-restart", "pick"),
-                RESTART_CHOICES[restart],
-                &RESTART_CHOICES,
-            ) && let Some(index) = RESTART_CHOICES.iter().position(|choice| *choice == picked)
-            {
-                restart = index;
-            }
-            self.run.restart = restart;
-            text_input(
-                ui,
-                palette,
-                &mut self.run.command,
-                "command override (optional)",
-            );
+            text_input(ui, palette, &mut self.run.ports, "publish a port (8080:80)");
+            checkbox(ui, palette, &mut self.run_advanced, "More options");
         });
-        ui.horizontal_wrapped(|ui| {
-            text_input(ui, palette, &mut self.run.ports, "ports 8080:80");
-            text_input(ui, palette, &mut self.run.env, "env KEY=VALUE");
-            text_input(ui, palette, &mut self.run.volumes, "volumes site:/data");
-        });
+        if self.run_advanced {
+            ui.horizontal_wrapped(|ui| {
+                text_input(ui, palette, &mut self.run.network, "network (optional)");
+                text_input(ui, palette, &mut self.run.command, "command override (optional)");
+            });
+            ui.horizontal_wrapped(|ui| {
+                text_input(ui, palette, &mut self.run.env, "env KEY=VALUE");
+                text_input(ui, palette, &mut self.run.volumes, "volumes site:/data");
+            });
+            ui.horizontal_wrapped(|ui| {
+                let mut restart = self.run.restart.min(RESTART_CHOICES.len() - 1);
+                self.help_detail(ui, palette, "Restart policy");
+                if let Some(picked) = select_str(
+                    ui,
+                    ("docker-restart", "pick"),
+                    RESTART_CHOICES[restart],
+                    &RESTART_CHOICES,
+                ) && let Some(index) = RESTART_CHOICES.iter().position(|choice| *choice == picked)
+                {
+                    restart = index;
+                }
+                self.run.restart = restart;
+            });
+        }
         let mut create = false;
         ui.horizontal(|ui| {
             let ready = !self.run.image.trim().is_empty();
@@ -2041,6 +2188,44 @@ mod tests {
             access.commands.len(),
             asked,
             "a cached answer is not re-read"
+        );
+    }
+
+    #[test]
+    fn a_search_answer_fills_the_create_form() {
+        let mut pane = pane();
+        let (sender, pending) = std::sync::mpsc::channel();
+        pane.search.pending = Some(pending);
+        let hit = registry::Hit {
+            reference: "quay.io/nginx/nginx-unprivileged".to_owned(),
+            description: "Nginx on port 8080.".to_owned(),
+            stars: 0,
+            official: false,
+        };
+        sender.send(Ok(vec![hit])).unwrap();
+        pane.poll_search();
+        assert_eq!(pane.search.hits.len(), 1);
+        assert!(pane.search.pending.is_none());
+
+        pane.take_image("quay.io/nginx/nginx-unprivileged");
+        assert_eq!(
+            pane.run.request().reference(),
+            "quay.io/nginx/nginx-unprivileged:latest"
+        );
+        assert!(pane.search.hits.is_empty(), "the list closes once used");
+    }
+
+    #[test]
+    fn a_search_that_fails_says_why() {
+        let mut pane = pane();
+        let (sender, pending) = std::sync::mpsc::channel();
+        pane.search.pending = Some(pending);
+        sender.send(Err("The registry search failed: offline".to_owned())).unwrap();
+        pane.poll_search();
+        assert!(pane.search.pending.is_none());
+        assert_eq!(
+            pane.search.error.as_deref(),
+            Some("The registry search failed: offline")
         );
     }
 
