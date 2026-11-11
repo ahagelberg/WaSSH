@@ -163,7 +163,6 @@ impl Section {
 #[derive(Clone, Debug)]
 struct HostSettings {
     socket: String,
-    show_stopped: bool,
     refresh: Duration,
     stats: Duration,
     log_tail: usize,
@@ -174,7 +173,6 @@ impl Default for HostSettings {
     fn default() -> Self {
         Self {
             socket: model::DEFAULT_SOCKET.to_owned(),
-            show_stopped: true,
             refresh: Duration::from_millis(DEFAULT_REFRESH_MS),
             stats: Duration::from_millis(DEFAULT_STATS_MS),
             log_tail: DEFAULT_LOG_TAIL,
@@ -216,7 +214,6 @@ fn read_settings(settings: &serde_json::Map<String, Value>) -> HostSettings {
         } else {
             socket
         },
-        show_stopped: flag("showStopped", true),
         refresh: Duration::from_millis(refresh),
         stats: Duration::from_millis(stats),
         log_tail,
@@ -268,8 +265,6 @@ enum RowEvent {
 #[derive(Default)]
 pub struct DockerManager {
     settings: HostSettings,
-    /// The toolbar's "show stopped" toggle, which starts from the host setting.
-    show_stopped: Option<bool>,
     tab: Tab,
     filter: String,
     selected: Option<String>,
@@ -553,11 +548,6 @@ impl DockerManager {
             stdout: output.stdout,
             error,
         })
-    }
-
-    /// Whether stopped containers are listed.
-    fn show_stopped(&self) -> bool {
-        self.show_stopped.unwrap_or(self.settings.show_stopped)
     }
 
     /// Fold every finished command into the pane's state.
@@ -953,11 +943,6 @@ impl DockerManager {
     ) -> Option<String> {
         ui.horizontal_wrapped(|ui| {
             search_input(ui, palette, &mut self.filter);
-            let mut stopped = self.show_stopped();
-            checkbox(ui, palette, &mut stopped, "Show stopped");
-            if stopped != self.show_stopped() {
-                self.show_stopped = Some(stopped);
-            }
             if small_button_enabled(ui, palette, "New…", true) {
                 self.run_open = true;
             }
@@ -991,11 +976,9 @@ impl DockerManager {
         ui.add_space(6.0);
 
         let needle = self.filter.trim().to_lowercase();
-        let stopped = self.show_stopped();
         let mut rows: Vec<Container> = self
             .containers
             .iter()
-            .filter(|container| stopped || container.is_running() || container.is_paused())
             .filter(|container| {
                 needle.is_empty()
                     || container.name.to_lowercase().contains(&needle)
@@ -1005,6 +988,8 @@ impl DockerManager {
             .collect();
         // Running containers first, then by name, as the reference listed them.
         rows.sort_by(|a, b| a.rank().cmp(&b.rank()).then_with(|| a.name.cmp(&b.name)));
+        let (up, down): (Vec<&Container>, Vec<&Container>) =
+            rows.iter().partition(|container| is_up(container));
 
         if rows.is_empty() {
             if self.containers.is_empty() && !access.is_running(LIST_KEY) {
@@ -1038,9 +1023,27 @@ impl DockerManager {
             .max_height(list_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for container in &rows {
-                    if let Some(event) = container_card(ui, palette, container, &selected, &stale) {
-                        events.push(event);
+                if !up.is_empty() {
+                    group_heading(ui, palette, "Running", up.len());
+                    for container in &up {
+                        if let Some(event) =
+                            container_card(ui, palette, container, &selected, &stale)
+                        {
+                            events.push(event);
+                        }
+                    }
+                }
+                if !down.is_empty() {
+                    if !up.is_empty() {
+                        ui.add_space(6.0);
+                    }
+                    group_heading(ui, palette, "Stopped", down.len());
+                    for container in &down {
+                        if let Some(event) =
+                            container_card(ui, palette, container, &selected, &stale)
+                        {
+                            events.push(event);
+                        }
                     }
                 }
             });
@@ -2379,6 +2382,22 @@ fn container_menu(
     (items, events)
 }
 
+/// Whether a container belongs under the Running heading; paused counts, stopped does not.
+fn is_up(container: &Container) -> bool {
+    container.is_running() || container.is_paused()
+}
+
+/// A small heading over a group of cards.
+fn group_heading(ui: &mut Ui, palette: &Palette, text: &str, count: usize) {
+    ui.label(
+        egui::RichText::new(format!("{} · {count}", text.to_uppercase()))
+            .size(10.0)
+            .strong()
+            .color(to_color32(palette.text_muted)),
+    );
+    ui.add_space(4.0);
+}
+
 /// `text`, or `fallback` when it is empty.
 fn empty_as(text: &str, fallback: &str) -> String {
     if text.trim().is_empty() {
@@ -2597,6 +2616,16 @@ mod tests {
         assert!(!labels.contains(&"Stats"), "{labels:?}");
         assert!(!labels.contains(&"Update"), "{labels:?}");
         assert!(labels.contains(&"Start"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_paused_container_is_listed_under_running_and_an_exited_one_is_not() {
+        let mut container = model::parse_containers(PS).remove(0);
+        assert!(is_up(&container), "the sample is running");
+        container.state = "paused".to_owned();
+        assert!(is_up(&container));
+        container.state = "exited".to_owned();
+        assert!(!is_up(&container), "a stopped container goes under Stopped");
     }
 
     #[test]
@@ -2862,20 +2891,15 @@ mod tests {
     fn the_host_settings_keep_the_reference_defaults_and_bounds() {
         let defaults = read_settings(&serde_json::Map::new());
         assert_eq!(defaults.socket, model::DEFAULT_SOCKET);
-        // A container the daemon stopped is still the user's; hiding it by default made a
-        // restarted app look like it had lost its containers.
-        assert!(defaults.show_stopped);
         assert_eq!(defaults.refresh, Duration::from_millis(DEFAULT_REFRESH_MS));
         assert_eq!(defaults.log_tail, DEFAULT_LOG_TAIL);
         assert!(defaults.confirm_destructive);
 
         let mut settings = serde_json::Map::new();
-        settings.insert("showStopped".to_owned(), Value::from(false));
         settings.insert("refreshIntervalMs".to_owned(), Value::from(1u64));
         settings.insert("statsIntervalMs".to_owned(), Value::from(999_999u64));
         settings.insert("logTailLines".to_owned(), Value::from(5u64));
         let clamped = read_settings(&settings);
-        assert!(!clamped.show_stopped, "a stored choice is kept");
         assert_eq!(clamped.refresh, Duration::from_millis(MIN_REFRESH_MS));
         assert_eq!(clamped.stats, Duration::from_millis(MAX_STATS_MS));
         assert_eq!(clamped.log_tail, MIN_LOG_TAIL);

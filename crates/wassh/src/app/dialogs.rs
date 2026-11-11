@@ -4430,7 +4430,6 @@ mod tests {
         let has = |needle: &str| rows.iter().any(|(_, _, text)| text == needle);
         for label in [
             "Daemon socket path",
-            "Show stopped containers",
             "List refresh interval (ms)",
             "Stats interval (ms)",
             "Log tail lines",

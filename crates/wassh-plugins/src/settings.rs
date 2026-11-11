@@ -634,12 +634,6 @@ const DOCKER_HOST: &[SettingsField] = &[
         "/var/run/docker.sock",
         "Path to the Docker daemon socket on this host. Rootless Docker and Docker Desktop use different paths.",
     ),
-    boolean(
-        "showStopped",
-        "Show stopped containers",
-        false,
-        "Include exited and created containers in the list.",
-    ),
     number(
         "refreshIntervalMs",
         "List refresh interval (ms)",
@@ -1502,7 +1496,6 @@ mod tests {
     fn defaults_come_from_the_manifests() {
         let values = resolve(PluginId::DockerManager, None, None);
         assert_eq!(values["socketPath"], Value::from("/var/run/docker.sock"));
-        assert_eq!(values["showStopped"], Value::Bool(false));
         assert_eq!(values["refreshIntervalMs"], Value::from(5000));
         // A secret field is not a setting: it lives in the credential vault.
         assert!(!values.contains_key("sudoPassword"));
