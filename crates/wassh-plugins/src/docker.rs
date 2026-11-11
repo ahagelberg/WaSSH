@@ -93,6 +93,8 @@ const ENGINE_RETRY: Duration = Duration::from_secs(5);
 const PANEL_HEIGHT: f32 = 160.0;
 /// Docker's wording for "the tag moved".
 const PULLED_NEWER: &str = "Downloaded newer image";
+/// Shown when a command stopped because it needs root, next to the password card.
+const NEEDS_ROOT_NOTICE: &str = "This needs root. Enter the password to continue.";
 
 /// Which list the pane shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -903,6 +905,9 @@ impl DockerManager {
                 command,
                 password: String::new(),
             });
+            // The card is where this is answered; sudo's own wording would only repeat it.
+            self.notify(NEEDS_ROOT_NOTICE.to_owned());
+            return;
         }
         self.notify_failure(error);
     }
@@ -2281,6 +2286,36 @@ mod tests {
     }
 
     #[test]
+    fn an_install_that_needs_a_password_asks_for_one() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        let install = engine::Manager::Apt.install_command().expect("a plan");
+        pane.run_root(&mut access, install, None);
+        assert_eq!(access.commands[0].1, format!("sudo -n sh -c '{install}'"));
+
+        // The sudo that ships with most distributions says this instead of "a password is
+        // required", which is what a WSL environment reports.
+        access.finish(
+            ROOT_KEY,
+            CommandOutput {
+                stdout: String::new(),
+                stderr: "sudo: interactive authentication is required".to_owned(),
+                code: Some(1),
+            },
+        );
+        pane.poll(&mut access);
+        let card = pane.sudo.as_ref().expect("the password card is up");
+        assert_eq!(card.command, install, "the card offers the same install");
+
+        // Answering it re-runs that command with the password on stdin.
+        pane.run_root(&mut access, install, Some("hunter2"));
+        let (key, command) = access.commands.last().expect("a retry");
+        assert_eq!(key, ROOT_KEY);
+        assert!(command.starts_with("sudo -S -p '' sh -c "), "{command}");
+        assert_eq!(access.inputs.last().map(String::as_str), Some("hunter2\n"));
+    }
+
+    #[test]
     fn a_privilege_failure_asks_for_the_password() {
         let mut pane = pane();
         let mut access = Stub::default();
@@ -2298,9 +2333,10 @@ mod tests {
         pane.poll(&mut access);
         let sudo = pane.sudo.as_ref().expect("the password card is up");
         assert!(sudo.command.starts_with("docker ps"), "{}", sudo.command);
-        assert!(
-            pane.notice.as_ref().is_some_and(|notice| notice.failed),
-            "and the failure is reported"
+        assert_eq!(
+            pane.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some(NEEDS_ROOT_NOTICE),
+            "and the notice points at the card"
         );
     }
 

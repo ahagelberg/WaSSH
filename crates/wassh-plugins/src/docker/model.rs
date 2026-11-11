@@ -592,6 +592,10 @@ pub fn privileged(command: &str, password: Option<&str>) -> String {
 }
 
 /// Whether a failure means "this needed root".
+///
+/// sudo words the same thing differently per version and platform: "a password is required"
+/// on older builds, "interactive authentication is required" on the sudo that ships with
+/// recent distributions (which is what a WSL environment reports).
 pub fn needs_root(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
@@ -599,7 +603,11 @@ pub fn needs_root(text: &str) -> bool {
         "are you root",
         "must be run as root",
         "a password is required",
+        "interactive authentication is required",
+        "authentication is required",
         "a terminal is required",
+        "no tty present",
+        "no askpass program specified",
         "not in the sudoers",
         "operation not permitted",
     ]
@@ -1481,6 +1489,10 @@ mod tests {
             "permission denied while trying to connect to the Docker daemon socket"
         ));
         assert!(needs_root("sudo: a password is required"));
+        assert!(needs_root("sudo: interactive authentication is required"));
+        assert!(needs_root(
+            "sudo: no tty present and no askpass program specified"
+        ));
         assert!(needs_root("Error: must be run as root"));
         assert!(!needs_root("No such container: web"));
     }
