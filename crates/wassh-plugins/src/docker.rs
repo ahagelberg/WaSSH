@@ -92,6 +92,10 @@ const ENGINE_RETRY: Duration = Duration::from_secs(5);
 const PANEL_HEIGHT: f32 = 160.0;
 /// Width of the create dialog on a wide window.
 const CREATE_DIALOG_WIDTH: f32 = 560.0;
+/// Width of the "are you sure" dialog.
+const CONFIRM_DIALOG_WIDTH: f32 = 420.0;
+/// Width of the password dialog.
+const SUDO_DIALOG_WIDTH: f32 = 460.0;
 /// Docker's wording for "the tag moved".
 const PULLED_NEWER: &str = "Downloaded newer image";
 /// Shown when a command stopped because it needs root, next to the password card.
@@ -468,7 +472,7 @@ impl DockerManager {
         // Nothing below can be listed, so the pane shows only the engine and its repair.
         if !self.engine.is_ready() {
             self.confirm = None;
-            self.sudo_card(ui, palette, access);
+            self.sudo_dialog(ui, palette, access);
             return None;
         }
         self.tab_bar(ui, palette);
@@ -479,8 +483,8 @@ impl DockerManager {
             Tab::Volumes => self.draw_volumes(ui, palette, access),
             Tab::Networks => self.draw_networks(ui, palette, access),
         }
-        self.confirm_card(ui, palette, access);
-        self.sudo_card(ui, palette, access);
+        self.confirm_dialog(ui, palette, access);
+        self.sudo_dialog(ui, palette, access);
         self.run_dialog(ui, palette, access);
         // The container menu is drawn last so it sits over everything the pane painted.
         if let Some(index) = self.menu.show(ui.ctx(), palette) {
@@ -1964,99 +1968,100 @@ impl DockerManager {
         });
     }
 
-    fn confirm_card(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+    /// The "are you sure" dialog a destructive action waits behind.
+    ///
+    /// It is a dialog rather than a card under the list: the list can fill the pane, and a
+    /// question drawn past the bottom edge reads as a menu row that did nothing.
+    fn confirm_dialog(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
         let Some(confirm) = &self.confirm else {
             return;
         };
-        ui.separator();
-        ui.label(
-            egui::RichText::new(format!(
-                "{} {}?",
-                if confirm.action == Action::Remove {
-                    "Remove"
-                } else {
-                    "Kill"
-                },
-                confirm.name
-            ))
-            .size(12.0)
-            .strong()
-            .color(to_color32(palette.text)),
-        );
-        ui.label(
-            egui::RichText::new("This cannot be undone.")
-                .size(10.5)
-                .color(to_color32(palette.text_muted)),
-        );
+        let verb = if confirm.action == Action::Remove {
+            "Remove"
+        } else {
+            "Kill"
+        };
+        let title = format!("{verb} {}?", confirm.name);
         let (action, id, name) = (confirm.action, confirm.id.clone(), confirm.name.clone());
         let mut decision = None;
-        ui.horizontal(|ui| {
-            if Button::new("Yes")
-                .compact()
-                .kind(ButtonKind::Danger)
-                .show(ui, palette)
-                .clicked()
-            {
-                decision = Some(true);
-            }
-            if Button::new("Cancel").compact().show(ui, palette).clicked() {
-                decision = Some(false);
-            }
-        });
+        let response = modal(
+            ui.ctx(),
+            "docker-confirm",
+            palette,
+            &title,
+            dialog_width(ui.ctx(), CONFIRM_DIALOG_WIDTH),
+            |ui| {
+                self.help_detail(ui, palette, "This cannot be undone.");
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, "Cancel", true) {
+                        decision = Some(false);
+                    }
+                    if Button::new(verb)
+                        .compact()
+                        .kind(ButtonKind::Danger)
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                });
+            },
+        );
         match decision {
             Some(true) => {
                 self.confirm = None;
                 self.start_action(access, action, &id, &name);
             }
             Some(false) => self.confirm = None,
+            // Escape or a click outside the dialog means no.
+            None if response.dismissed => self.confirm = None,
             None => {}
         }
     }
 
-    /// The password card, shown when a command needed root.
-    fn sudo_card(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+    /// The password dialog a command that needs root waits behind.
+    fn sudo_dialog(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
         let Some(mut sudo) = self.sudo.take() else {
             return;
         };
-        ui.separator();
-        ui.label(
-            egui::RichText::new("Root privileges needed")
-                .size(12.0)
-                .strong()
-                .color(to_color32(palette.text)),
-        );
-        ui.label(
-            egui::RichText::new("The password is used once and never stored.")
-                .size(10.5)
-                .color(to_color32(palette.text_muted)),
-        );
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(&sudo.command)
-                    .size(10.5)
-                    .monospace()
-                    .color(to_color32(palette.accent)),
-            )
-            .wrap(),
-        );
-        let response = password_input(ui, palette, &mut sudo.password, "sudo password");
-        let submitted =
-            response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         let mut decision = None;
-        ui.horizontal(|ui| {
-            if Button::new("Run with sudo")
-                .compact()
-                .primary()
-                .show(ui, palette)
-                .clicked()
-                || submitted
-            {
-                decision = Some(true);
-            }
-            if Button::new("Cancel").compact().show(ui, palette).clicked() {
-                decision = Some(false);
-            }
-        });
+        let response = modal(
+            ui.ctx(),
+            "docker-sudo",
+            palette,
+            "Root privileges needed",
+            dialog_width(ui.ctx(), SUDO_DIALOG_WIDTH),
+            |ui| {
+                self.help_detail(ui, palette, "The password is used once and never stored.");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&sudo.command)
+                            .size(10.5)
+                            .monospace()
+                            .color(to_color32(palette.accent)),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(6.0);
+                let field = password_input(ui, palette, &mut sudo.password, "sudo password");
+                let submitted =
+                    field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                footer(ui, |ui| {
+                    if small_button_enabled(ui, palette, "Cancel", true) {
+                        decision = Some(false);
+                    }
+                    if Button::new("Run with sudo")
+                        .compact()
+                        .primary()
+                        .show(ui, palette)
+                        .clicked()
+                        || submitted
+                    {
+                        decision = Some(true);
+                    }
+                });
+            },
+        );
         match decision {
             Some(true) => {
                 let password = (!sudo.password.is_empty()).then_some(sudo.password.as_str());
@@ -2064,6 +2069,8 @@ impl DockerManager {
                 self.notify("Running with sudo…".to_owned());
             }
             Some(false) => {}
+            None if response.dismissed => {}
+            // Still being typed into: keep the field for the next frame.
             None => self.sudo = Some(sudo),
         }
     }
