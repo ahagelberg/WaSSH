@@ -24,6 +24,7 @@ See [README.md](../README.md) for the crate layout. Do not treat it as a substit
 - Always check the docus before assuming things.
 - Verify that your knowledge about libraries, frameworks and API:s is up to date.
 - Encapsulation: no external use of `_` internals or private attributes. Inter-class access via public methods/properties only; add a public API if needed (avoids races/deadlocks).
+- Never put implementation specific information in user-interface. Descriptions and tips should be only for things that the user has reason to care about.
 
 ## CODE STYLE
 - Match existing style. Comments only for non-obvious behavior—never change logs or obvious code. No comment-before-blank-line padding.
