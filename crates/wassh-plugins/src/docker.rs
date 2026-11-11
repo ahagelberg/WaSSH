@@ -87,6 +87,8 @@ const MAX_LOG_TAIL: usize = 5_000;
 const STATS_HISTORY: usize = 60;
 /// How long a status line stays up.
 const NOTICE_LIFETIME: Duration = Duration::from_secs(6);
+/// How often an engine that does not answer is asked again.
+const ENGINE_RETRY: Duration = Duration::from_secs(5);
 /// Height of the log, stats, detail and engine-output panels.
 const PANEL_HEIGHT: f32 = 160.0;
 /// Docker's wording for "the tag moved".
@@ -288,7 +290,10 @@ pub struct DockerManager {
     confirm: Option<Confirm>,
     sudo: Option<Sudo>,
     engine: engine::Status,
-    engine_open: bool,
+    /// When the engine last answered, so a silent host is asked again on its own.
+    engine_checked: Option<Instant>,
+    /// Whether the package-manager probe has been answered, well or badly.
+    detected: bool,
     manager: Option<engine::Manager>,
     pull: String,
     new_volume: String,
@@ -409,7 +414,12 @@ impl DockerManager {
             return ("checking".to_owned(), HeaderHealth::Warn);
         }
         if !self.engine.is_ready() {
-            return ("no daemon".to_owned(), HeaderHealth::Bad);
+            let state = if self.engine.state == Some(engine::State::Missing) {
+                "no docker"
+            } else {
+                "no daemon"
+            };
+            return (state.to_owned(), HeaderHealth::Bad);
         }
         let running = self
             .containers
@@ -429,7 +439,14 @@ impl DockerManager {
     ) -> Option<String> {
         self.poll(access);
         self.caption = Some(self.header_caption());
-        self.engine_banner(ui, palette, access);
+        self.engine_row(ui, palette, access);
+        self.notice_row(ui, palette);
+        // Nothing below can be listed, so the pane shows only the engine and its repair.
+        if !self.engine.is_ready() {
+            self.confirm = None;
+            self.sudo_card(ui, palette, access);
+            return None;
+        }
         self.tab_bar(ui, palette);
         let mut typed = None;
         match self.tab {
@@ -438,12 +455,8 @@ impl DockerManager {
             Tab::Volumes => self.draw_volumes(ui, palette, access),
             Tab::Networks => self.draw_networks(ui, palette, access),
         }
-        self.notice_row(ui, palette);
         self.confirm_card(ui, palette, access);
         self.sudo_card(ui, palette, access);
-        if self.engine_open {
-            self.engine_panel(ui, palette, access);
-        }
         ui.add_space(2.0);
         let running = self
             .containers
@@ -679,12 +692,17 @@ impl DockerManager {
                     ..engine::Status::default()
                 }),
             };
+            self.engine_checked = Some(Instant::now());
         }
-        if self.engine.state.is_none() && !access.is_running(ENGINE_KEY) {
+        // An engine that is not answering is asked again on its own, so a host that was
+        // fixed while the pane was open recovers without a button. The last status stays on
+        // screen meanwhile, so the pane does not blink back to "checking".
+        if self.engine_due(access) {
             let command = model::engine_command(&self.settings.socket);
             self.run(access, ENGINE_KEY, &command);
         }
         if let Some(outcome) = self.take(access, DETECT_KEY) {
+            self.detected = true;
             match outcome.error {
                 Some(error) => {
                     self.manager = None;
@@ -697,11 +715,25 @@ impl DockerManager {
         // offer to install Docker, so that probe runs as soon as it is needed.
         let missing = self.engine.state == Some(engine::State::Missing);
         if missing
-            && self.manager.is_none()
+            && !self.detected
             && access.platform() != Platform::Windows
             && !access.is_running(DETECT_KEY)
         {
             self.run(access, DETECT_KEY, engine::DETECT_COMMAND);
+        }
+    }
+
+    /// Whether the engine probe is due: never asked, or asking again after a silence.
+    fn engine_due(&self, access: &dyn CommandAccess) -> bool {
+        if access.is_running(ENGINE_KEY) {
+            return false;
+        }
+        match self.engine.state {
+            None => true,
+            _ if !self.engine.is_ready() => self
+                .engine_checked
+                .is_none_or(|at| at.elapsed() >= ENGINE_RETRY),
+            _ => false,
         }
     }
 
@@ -738,7 +770,9 @@ impl DockerManager {
                 self.notify("Done".to_owned());
                 // The daemon may have changed underneath us.
                 self.engine.state = None;
+                self.engine_checked = None;
                 self.manager = None;
+                self.detected = false;
                 self.last_poll = None;
             }
         }
@@ -1526,28 +1560,40 @@ impl DockerManager {
 
     // --- chrome ---------------------------------------------------------
 
-    fn engine_banner(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+    /// The engine: what state it is in, and what to do about it.
+    fn engine_row(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+        let colour = if self.engine.is_ready() {
+            palette.ok
+        } else if self.engine.state.is_none() {
+            palette.text_muted
+        } else {
+            palette.danger
+        };
+        let mut upgrade = None;
         ui.horizontal_wrapped(|ui| {
-            let colour = if self.engine.is_ready() {
-                palette.ok
-            } else if self.engine.state.is_none() {
-                palette.text_muted
-            } else {
-                palette.danger
-            };
             ui.label(
                 egui::RichText::new(self.engine.summary())
                     .size(11.0)
                     .color(to_color32(colour)),
             );
-            if small_button_enabled(ui, palette, "Engine…", true) {
-                self.engine_open = !self.engine_open;
-            }
-            if small_button_enabled(ui, palette, "Recheck", !access.is_running(ENGINE_KEY)) {
-                self.engine.state = None;
+            if self.engine.is_ready()
+                && let Some(manager) = self.manager
+                && manager.upgrade_command().is_some()
+                && small_button_enabled(ui, palette, "Upgrade Docker", !access.is_running(ROOT_KEY))
+            {
+                upgrade = manager.upgrade_command();
             }
         });
+        if let Some(command) = upgrade {
+            self.run_root(access, command, None);
+            self.notify("Upgrading Docker…".to_owned());
+        }
+        if self.engine.is_ready() {
+            self.engine_output(ui, palette, access);
+            return;
+        }
         self.engine_help(ui, palette, access);
+        self.engine_output(ui, palette, access);
     }
 
     /// Explain a daemon that does not answer, and offer to fix it.
@@ -1565,12 +1611,24 @@ impl DockerManager {
                     }
                     self.help_detail(ui, palette, "Windows asks for administrator approval.");
                 } else if let Some(manager) = self.manager {
-                    if let Some(command) = manager.install_command()
-                        && small_button_enabled(ui, palette, "Install Docker", !busy)
-                    {
-                        root = Some(command);
+                    if let Some(command) = manager.install_command() {
+                        if small_button_enabled(ui, palette, "Install Docker", !busy) {
+                            root = Some(command);
+                        }
+                        self.help_detail(ui, palette, &format!("Through {}.", manager.label()));
+                    } else {
+                        self.help_detail(
+                            ui,
+                            palette,
+                            "This host has no package manager the pane knows; install Docker yourself.",
+                        );
                     }
-                    self.help_detail(ui, palette, &format!("Through {}.", manager.label()));
+                } else if self.detected {
+                    self.help_detail(
+                        ui,
+                        palette,
+                        "The pane couldn't ask this host how it installs software.",
+                    );
                 } else {
                     self.help_detail(ui, palette, "Looking for this host's package manager…");
                 }
@@ -1604,12 +1662,34 @@ impl DockerManager {
         if let Some(command) = root {
             // Passwordless sudo first; the password card appears when that fails.
             self.run_root(access, command, None);
-            self.notify("Installing…".to_owned());
+            self.notify("Running the privileged command…".to_owned());
         }
         if let Some(command) = elevate {
             self.run(access, ROOT_KEY, &command);
             self.notify("Installing Docker Desktop…".to_owned());
         }
+    }
+
+    /// What the privileged command has printed so far.
+    fn engine_output(&self, ui: &mut Ui, palette: &Palette, access: &dyn CommandAccess) {
+        let Some(output) = access.output(ROOT_KEY) else {
+            return;
+        };
+        if output.stdout.trim().is_empty() {
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("docker-engine-output")
+            .max_height(PANEL_HEIGHT)
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(&output.stdout)
+                        .font(egui::FontId::monospace(9.5))
+                        .color(to_color32(palette.text)),
+                );
+            });
     }
 
     /// A sentence of explanation at reading size.
@@ -1768,87 +1848,6 @@ impl DockerManager {
             }
             Some(false) => {}
             None => self.sudo = Some(sudo),
-        }
-    }
-
-    fn engine_panel(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
-        ui.separator();
-        ui.label(
-            egui::RichText::new("Docker engine")
-                .size(12.0)
-                .strong()
-                .color(to_color32(palette.text)),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "{} · {} · {} · {} running, {} paused, {} stopped · {} image{}",
-                empty_as(&self.engine.version, "version unknown"),
-                empty_as(&self.engine.os, "os unknown"),
-                empty_as(&self.engine.arch, "arch unknown"),
-                self.engine.running,
-                self.engine.paused,
-                self.engine.stopped,
-                self.engine.images,
-                if self.engine.images == 1 { "" } else { "s" }
-            ))
-            .size(10.5)
-            .color(to_color32(palette.text_muted)),
-        );
-        let busy = access.is_running(ROOT_KEY);
-        let mut detect = false;
-        let mut root = None;
-        ui.horizontal_wrapped(|ui| {
-            if small_button_enabled(
-                ui,
-                palette,
-                "Detect install method",
-                !access.is_running(DETECT_KEY),
-            ) {
-                detect = true;
-            }
-            if let Some(manager) = self.manager {
-                ui.label(
-                    egui::RichText::new(manager.label())
-                        .size(10.5)
-                        .color(to_color32(palette.text)),
-                );
-                if !self.engine.is_ready()
-                    && let Some(command) = manager.install_command()
-                    && small_button_enabled(ui, palette, "Install engine", !busy)
-                {
-                    root = Some(command);
-                }
-                if self.engine.is_ready()
-                    && let Some(command) = manager.upgrade_command()
-                    && small_button_enabled(ui, palette, "Upgrade engine", !busy)
-                {
-                    root = Some(command);
-                }
-            }
-        });
-        if detect {
-            self.run(access, DETECT_KEY, engine::DETECT_COMMAND);
-        }
-        if let Some(command) = root {
-            // Passwordless sudo first; the password card appears when that fails.
-            self.run_root(access, command, None);
-            self.notify("Running the privileged command…".to_owned());
-        }
-        if let Some(output) = access.output(ROOT_KEY).map(|output| output.stdout.clone())
-            && !output.trim().is_empty()
-        {
-            egui::ScrollArea::vertical()
-                .id_salt("docker-engine-output")
-                .max_height(PANEL_HEIGHT)
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(output)
-                            .font(egui::FontId::monospace(9.5))
-                            .color(to_color32(palette.text)),
-                    );
-                });
         }
     }
 
@@ -2253,6 +2252,14 @@ mod tests {
             !access.commands.iter().any(|(key, _)| key == LIST_KEY),
             "no list is asked for"
         );
+
+        access.finish(DETECT_KEY, output("OS_ID=ubuntu\nHAS_apt-get=1\n", Some(0)));
+        pane.poll(&mut access);
+        assert_eq!(pane.manager, Some(engine::Manager::Apt), "the host's installer");
+        assert!(pane.detected, "the probe is not asked again");
+        let asked = access.commands.len();
+        pane.poll(&mut access);
+        assert_eq!(access.commands.len(), asked, "a settled probe stays settled");
     }
 
     #[test]

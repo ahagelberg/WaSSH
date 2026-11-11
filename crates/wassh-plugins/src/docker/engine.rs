@@ -13,7 +13,10 @@ pub const DETECT_COMMAND: &str = concat!(
     ". /etc/os-release 2>/dev/null || true; ",
     "echo \"OS_ID=${ID:-unknown}\"; ",
     "echo \"OS_LIKE=${ID_LIKE:-}\"; ",
-    "for m in apt-get dnf yum zypper pacman apk; do command -v \"$m\" >/dev/null 2>&1 && echo \"HAS_$m=1\"; done"
+    "for m in apt-get dnf yum zypper pacman apk; do command -v \"$m\" >/dev/null 2>&1 && echo \"HAS_$m=1\"; done; ",
+    // The last lookup fails on a host missing that tool, which would report a failed probe
+    // for an answer that arrived intact.
+    "true"
 );
 
 /// What the host installs packages with.
@@ -139,7 +142,7 @@ pub fn windows_install_command() -> String {
 
 /// What the pane says when the CLI is there but the daemon is not.
 pub const DAEMON_DOWN_WINDOWS: &str =
-    "Docker Desktop is installed but its engine is not running. Start Docker Desktop, then recheck.";
+    "Docker Desktop is installed but its engine is not running. Start Docker Desktop.";
 
 /// Which manager the distro id, its family, and the installed tools point at.
 pub fn manager_from_probe(output: &str) -> Manager {
@@ -416,6 +419,16 @@ mod tests {
         assert!(Manager::Unknown.install_command().is_none());
         assert!(Manager::Unknown.upgrade_command().is_none());
         assert!(Manager::Unknown.start_command().is_none());
+    }
+
+    #[test]
+    fn the_probe_succeeds_whatever_tools_it_finds() {
+        // The last lookup fails for any tool the host lacks, and a non-zero status would be
+        // read as a failed probe while the answer itself arrived intact.
+        assert!(
+            DETECT_COMMAND.trim_end().ends_with("true"),
+            "{DETECT_COMMAND}"
+        );
     }
 
     #[test]
