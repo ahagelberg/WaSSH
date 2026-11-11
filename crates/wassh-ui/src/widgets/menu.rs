@@ -21,7 +21,7 @@ pub const SEPARATOR_HEIGHT: f32 = 9.0;
 pub const PADDING_X: f32 = 6.0;
 /// Vertical padding above the first and below the last item.
 pub const PADDING_Y: f32 = 5.0;
-/// Room a toggle row keeps for its tick.
+/// Room a toggle row keeps at its right edge for the tick.
 pub const TOGGLE_GUTTER: f32 = 16.0;
 /// The glyph a switched-on row shows.
 const TICK: &str = "\u{2713}";
@@ -276,28 +276,23 @@ impl MenuState {
                                 } else {
                                     text_colour
                                 };
-                                let left = match checked {
-                                    Some(on) => {
-                                        if *on {
-                                            ui.painter().text(
-                                                Pos2::new(rect.left() + 8.0, rect.center().y),
-                                                egui::Align2::LEFT_CENTER,
-                                                TICK,
-                                                font.clone(),
-                                                colour,
-                                            );
-                                        }
-                                        rect.left() + 8.0 + TOGGLE_GUTTER
-                                    }
-                                    None => rect.left() + 8.0,
-                                };
                                 ui.painter().text(
-                                    Pos2::new(left, rect.center().y),
+                                    Pos2::new(rect.left() + 8.0, rect.center().y),
                                     egui::Align2::LEFT_CENTER,
                                     label,
                                     font.clone(),
                                     colour,
                                 );
+                                // The tick sits at the row's right edge, past the label.
+                                if *checked == Some(true) {
+                                    ui.painter().text(
+                                        Pos2::new(rect.right() - 8.0, rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        TICK,
+                                        font.clone(),
+                                        colour,
+                                    );
+                                }
                                 if item_response.clicked() {
                                     activated = Some(index);
                                 }
