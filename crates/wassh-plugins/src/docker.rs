@@ -283,6 +283,8 @@ pub struct DockerManager {
     cpu_history: Vec<f32>,
     /// Messages the window shows as toasts, drained once per frame.
     toasts: Vec<(ToastKind, String)>,
+    /// What to say when the one-off change now running succeeds.
+    change_note: Option<String>,
     confirm: Option<Confirm>,
     sudo: Option<Sudo>,
     engine: engine::Status,
@@ -761,19 +763,23 @@ impl DockerManager {
             return;
         };
         match outcome.error {
-            Some(error) => self.failed(CHANGE_KEY, error),
+            Some(error) => {
+                self.change_note = None;
+                self.failed(CHANGE_KEY, error);
+            }
             None => {
-                let summary = outcome
-                    .stdout
-                    .lines()
-                    .map(str::trim)
-                    .rfind(|line| !line.is_empty())
-                    .unwrap_or("Done")
-                    .to_owned();
-                self.notify(summary);
+                // The command's own last line is often a bare id, which says nothing.
+                let note = self.change_note.take().unwrap_or_else(|| "Done".to_owned());
+                self.notify(note);
                 self.last_poll = None;
             }
         }
+    }
+
+    /// Run a one-off change, toasting `note` once it succeeds.
+    fn run_change(&mut self, access: &mut dyn CommandAccess, command: &str, note: String) {
+        self.change_note = Some(note);
+        self.run(access, CHANGE_KEY, command);
     }
 
     /// The result of privileged work (install, upgrade, or a retried command).
@@ -1483,7 +1489,8 @@ impl DockerManager {
         if let Some(id) = remove
             && let Some(command) = model::remove_image_command(&self.settings.socket, &id, true)
         {
-            self.run(access, CHANGE_KEY, &command);
+            let note = format!("Removed image {}", model::short_id(&id));
+            self.run_change(access, &command, note);
         }
     }
 
@@ -1493,13 +1500,14 @@ impl DockerManager {
             let name = self.new_volume.trim().to_owned();
             if small_button_enabled(ui, palette, "Create", !name.is_empty()) {
                 if let Some(command) = model::create_volume_command(&self.settings.socket, &name) {
-                    self.run(access, CHANGE_KEY, &command);
+                    let note = format!("Created volume {name}");
+                    self.run_change(access, &command, note);
                 }
                 self.new_volume.clear();
             }
             if small_button_enabled(ui, palette, "Prune", true) {
                 let command = model::prune_volumes_command(&self.settings.socket);
-                self.run(access, CHANGE_KEY, &command);
+                self.run_change(access, &command, "Pruned unused volumes".to_owned());
             }
             if small_button_enabled(ui, palette, "Refresh", !access.is_running(VOLUMES_KEY)) {
                 self.last_poll = None;
@@ -1536,7 +1544,8 @@ impl DockerManager {
         if let Some(name) = remove
             && let Some(command) = model::remove_volume_command(&self.settings.socket, &name, false)
         {
-            self.run(access, CHANGE_KEY, &command);
+            let note = format!("Removed volume {name}");
+            self.run_change(access, &command, note);
         }
     }
 
@@ -1548,7 +1557,8 @@ impl DockerManager {
                 if let Some(command) =
                     model::create_network_command(&self.settings.socket, &name, "bridge")
                 {
-                    self.run(access, CHANGE_KEY, &command);
+                    let note = format!("Created network {name}");
+                    self.run_change(access, &command, note);
                 }
                 self.new_network.clear();
             }
@@ -1589,7 +1599,8 @@ impl DockerManager {
         if let Some(id) = remove
             && let Some(command) = model::remove_network_command(&self.settings.socket, &id)
         {
-            self.run(access, CHANGE_KEY, &command);
+            let note = format!("Removed network {}", model::short_id(&id));
+            self.run_change(access, &command, note);
         }
     }
 
@@ -2114,10 +2125,11 @@ impl DockerManager {
             self.start_search();
         }
         if create {
-            let command = model::run_command(&self.settings.socket, &self.run.request());
-            self.run(access, CHANGE_KEY, &command);
+            let request = self.run.request();
+            let note = format!("Created a container from {}", request.reference());
+            let command = model::run_command(&self.settings.socket, &request);
+            self.run_change(access, &command, note);
             self.tab = Tab::Containers;
-            self.notify("Creating the container…".to_owned());
         }
         if close || create || response.dismissed {
             self.run_open = false;
@@ -2352,6 +2364,36 @@ mod tests {
             "quay.io/nginx/nginx-unprivileged:latest"
         );
         assert!(pane.search.hits.is_empty(), "the list closes once used");
+    }
+
+    #[test]
+    fn a_finished_change_says_what_it_did_not_the_id_docker_printed() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        pane.run_change(
+            &mut access,
+            "docker run -d nginx:latest",
+            "Created a container from nginx:latest".to_owned(),
+        );
+        access.finish(
+            CHANGE_KEY,
+            output("9f2c1b7d9e01aaaa9f2c1b7d9e01aaaa\n", Some(0)),
+        );
+        pane.poll(&mut access);
+        assert_eq!(
+            pane.toasts.last().map(|(kind, text)| (*kind, text.as_str())),
+            Some((ToastKind::Info, "Created a container from nginx:latest")),
+            "the container's id is not a message"
+        );
+
+        // A command that prints nothing still says what it did.
+        pane.run_change(&mut access, "docker volume prune -f", "Pruned unused volumes".to_owned());
+        access.finish(CHANGE_KEY, output("", Some(0)));
+        pane.poll(&mut access);
+        assert_eq!(
+            pane.toasts.last().map(|(_, text)| text.as_str()),
+            Some("Pruned unused volumes")
+        );
     }
 
     #[test]
