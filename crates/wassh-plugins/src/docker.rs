@@ -26,8 +26,8 @@ use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
     Button, ButtonKind, MenuItem, MenuState, ToastKind, Tone, badge, bar_meter, card, checkbox,
-    dialog_width, empty_state, footer, line_chart, modal, password_input, search_input, select_str,
-    small_button_enabled, stat_row, text_input,
+    close_button, dialog_width, empty_state, footer, line_chart, modal, password_input,
+    search_input, select_str, small_button_enabled, stat_row, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -1573,6 +1573,7 @@ impl DockerManager {
         }
     }
 
+    /// The log panel: one card, the tail in a terminal-style block.
     fn draw_logs(
         &mut self,
         ui: &mut Ui,
@@ -1581,41 +1582,55 @@ impl DockerManager {
         id: &str,
     ) {
         self.request_logs(access);
-        ui.horizontal(|ui| {
-            if small_button_enabled(ui, palette, "Close logs", true) {
-                self.logs_for = None;
-            }
-            ui.label(
-                egui::RichText::new(format!("logs · {}", model::short_id(id)))
-                    .size(10.0)
-                    .color(to_color32(palette.text_muted)),
-            );
-        });
-        egui::ScrollArea::vertical()
-            .id_salt("docker-logs")
-            .max_height(PANEL_HEIGHT)
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                if self.logs.trim().is_empty() {
-                    let waiting = if access.is_running(LOGS_KEY) {
-                        "Fetching logs…"
+        let name = self.name_of(id);
+        let mut close = false;
+        card(ui, palette, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(if name.is_empty() {
+                        "Logs".to_owned()
                     } else {
-                        "No output."
-                    };
-                    ui.label(
-                        egui::RichText::new(waiting)
-                            .size(11.0)
-                            .color(to_color32(palette.text_muted)),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(&self.logs)
-                            .font(egui::FontId::monospace(10.0))
-                            .color(to_color32(palette.text)),
-                    );
-                }
+                        format!("Logs · {name}")
+                    })
+                    .size(12.0)
+                    .strong()
+                    .color(to_color32(palette.text)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = close_button(ui, palette);
+                });
             });
+            ui.add_space(4.0);
+            let body = if self.logs.trim().is_empty() {
+                if access.is_running(LOGS_KEY) {
+                    "Fetching logs…"
+                } else {
+                    "No output."
+                }
+            } else {
+                self.logs.trim_end()
+            };
+            egui::ScrollArea::vertical()
+                .id_salt("docker-logs")
+                .max_height(PANEL_HEIGHT)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| code_block(ui, palette, body));
+        });
+        ui.add_space(6.0);
+        if close {
+            self.logs_for = None;
+        }
+    }
+
+    /// The name of the container with this id, for a panel header.
+    fn name_of(&self, id: &str) -> String {
+        self.containers
+            .iter()
+            .find(|container| container.id == id)
+            .map(|container| container.name.clone())
+            .unwrap_or_default()
     }
 
     /// The live stats panel: the CPU trace, then one readable row per figure.
@@ -1623,13 +1638,8 @@ impl DockerManager {
         self.request_stats(access);
         let name = self
             .stats_for
-            .as_ref()
-            .and_then(|id| {
-                self.containers
-                    .iter()
-                    .find(|container| &container.id == id)
-                    .map(|container| container.name.clone())
-            })
+            .as_deref()
+            .map(|id| self.name_of(id))
             .unwrap_or_default();
         let mut close = false;
         card(ui, palette, |ui| {
@@ -1646,9 +1656,7 @@ impl DockerManager {
                     .color(to_color32(palette.text)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if small_button_enabled(ui, palette, "Close", true) {
-                        close = true;
-                    }
+                    close = close_button(ui, palette);
                 });
             });
             let Some(stats) = self.stats else {
@@ -1735,9 +1743,7 @@ impl DockerManager {
                 };
                 badge(ui, palette, label, tone);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if small_button_enabled(ui, palette, "Close", true) {
-                        close = true;
-                    }
+                    close = close_button(ui, palette);
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(&detail.image)

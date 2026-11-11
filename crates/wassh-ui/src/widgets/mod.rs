@@ -23,7 +23,10 @@ pub mod text;
 pub mod toast;
 pub mod tree;
 
-pub use button::{Button, ButtonKind, button, chip, small_button, small_button_enabled};
+pub use button::{
+    Button, ButtonKind, CLOSE_BUTTON_SIZE, CLOSE_GLYPH, button, chip, close_button, small_button,
+    small_button_enabled,
+};
 pub use chart::line_chart;
 pub use meter::{RING_STROKE, bar_meter, faded, ring_gauge, segmented_bar};
 pub use checkbox::checkbox;
