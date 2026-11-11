@@ -1422,21 +1422,25 @@ fn tool_card(
                 )
                     .show_header(ui, |ui| {
                         badge_pill(ui, palette, badge, colour);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(label)
-                                    .size(11.0)
-                                    .monospace()
-                                    .color(to_color32(palette.text)),
-                            )
-                            .truncate(),
-                        );
-                        ui.label(
-                            egui::RichText::new(outcome)
-                                .size(10.0)
-                                .strong()
-                                .color(outcome_colour),
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(outcome)
+                                    .size(10.0)
+                                    .strong()
+                                    .color(outcome_colour),
+                            );
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(label)
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(to_color32(palette.text)),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                        });
                     })
                     .body(|ui| {
                         ui.label(
@@ -3547,6 +3551,119 @@ mod tests {
             rows.windows(2).all(|pair| pair[0] < pair[1]),
             "the bubble must stack its blocks: {texts:?}"
         );
+    }
+
+    #[test]
+    fn chat_bubbles_fit_long_text_inside_the_pane() {
+        let palette = Palette::dark();
+        let user_fill = to_color32(wassh_core::colors::tint(
+            palette.accent, palette.bg_panel_2, USER_BUBBLE_TINT,
+        ));
+        for width in [NARROW_PANE, WIDE_PANE] {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 3000.0))),
+                ..Default::default()
+            };
+            let prompt = format!("Please inspect this:\n\n```\n{}\n```", "long-path".repeat(30));
+            let terminal = format!("terminal output {}", "long-line".repeat(30));
+            let mut right = 0.0;
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    right = ui.max_rect().right();
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        user_bubble(ui, &palette, &prompt, UserMeta::default());
+                        tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
+                            failed: false, running: false, turn_index: 0, collapsed: false,
+                        });
+                        tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
+                            failed: false, running: false, turn_index: 1, collapsed: true,
+                        });
+                    });
+                });
+                shapes = std::mem::take(&mut output.shapes);
+                output.drop_without_applying_deltas();
+            }
+            let mut found = 0;
+            for clipped in shapes {
+                match clipped.shape {
+                    egui::Shape::Rect(rect) if rect.fill == user_fill || rect.fill == to_color32(palette.bg_input) => {
+                        found += 1;
+                        let limit = right.min(clipped.clip_rect.right());
+                        assert!(rect.rect.right() <= limit, "bubble exceeds pane: {:?} > {limit}", rect.rect);
+                    }
+                    egui::Shape::Text(text) if text.galley.text().contains("long-path") || text.galley.text().contains("long-line") => {
+                        found += 1;
+                        let limit = right.min(clipped.clip_rect.right());
+                        assert!(text.pos.x + text.galley.size().x <= limit, "text exceeds pane: {:?} > {limit}", text.pos.x + text.galley.size().x);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(found >= 5, "expected the bubbles and their contents, found {found}");
+        }
+    }
+
+    #[test]
+    fn chat_transcript_stays_inside_the_plugin_pane() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let body = egui::Rect::from_min_size(egui::pos2(75.0, 20.0), egui::vec2(WIDE_PANE, 700.0));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 760.0))),
+            ..Default::default()
+        };
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: format!("Please inspect {}", "long-path".repeat(30)),
+            meta: UserMeta::default(),
+        });
+        plugin.agent.turns.push(Turn::Tool {
+            name: "web_fetch".to_owned(),
+            label: "long-command".repeat(30),
+            output: format!("terminal output {}", "long-line".repeat(30)),
+            failed: false,
+        });
+        plugin.agent.turns.push(Turn::Tool {
+            name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+            label: "long-command".repeat(30),
+            output: "finished".to_owned(),
+            failed: false,
+        });
+        let mut settings = serde_json::Map::new();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let mut context = PluginContext {
+                palette, host_label: "dev".to_owned(), environment: "test".to_owned(),
+                status: SessionStatus::Connected, settings: &mut settings, scope: "host-1".to_owned(),
+                session: None, events: &[], pending_input: Vec::new(), repaint_after: None,
+                secrets: &EMPTY_SECRETS, secret_writes: Vec::new(),
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)));
+                child.set_clip_rect(body);
+                plugin.show(&mut child, &mut context);
+            });
+            shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+        }
+        let mut found = 0;
+        for clipped in shapes {
+            if let egui::Shape::Rect(rect) = &clipped.shape
+                && rect.fill == to_color32(palette.bg_input)
+            {
+                assert!(rect.rect.right() <= body.right().min(clipped.clip_rect.right()), "tool card exceeds pane: {:?} > {:?}", rect.rect, clipped.clip_rect);
+            }
+            if let egui::Shape::Text(text) = clipped.shape
+                && (text.galley.text().contains("long-path") || text.galley.text().contains("long-line"))
+            {
+                found += 1;
+                let limit = body.right().min(clipped.clip_rect.right());
+                assert!(text.pos.x + text.galley.size().x <= limit, "text exceeds pane: {} > {limit}", text.pos.x + text.galley.size().x);
+            }
+        }
+        assert_eq!(found, 2);
     }
 
     #[test]
