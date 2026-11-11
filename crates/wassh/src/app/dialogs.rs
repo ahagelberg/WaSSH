@@ -3606,7 +3606,7 @@ fn wsl_install_dialog(
                     ui,
                     palette,
                     "Distribution",
-                    Some("Installed by Windows; WSL sets the environment's name."),
+                    None,
                     |ui| {
                         let current = state.selected.clone();
                         egui::ComboBox::from_id_salt("wsl-install-distro")
