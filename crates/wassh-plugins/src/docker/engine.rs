@@ -144,6 +144,10 @@ pub fn windows_install_command() -> String {
 pub const DAEMON_DOWN_WINDOWS: &str =
     "Docker Desktop is installed but its engine is not running. Start Docker Desktop.";
 
+/// What the pane says when `docker info` answered, but not with an engine's own words.
+pub const UNEXPECTED_ANSWER: &str =
+    "The docker command answered, but not with a Docker engine version.";
+
 /// Which manager the distro id, its family, and the installed tools point at.
 pub fn manager_from_probe(output: &str) -> Manager {
     let value_of = |key: &str| -> String {
@@ -280,11 +284,7 @@ impl Status {
             None | Some(State::Checking) => "Checking the engine…".to_owned(),
             Some(State::Ready) => format!(
                 "Engine {} · {} running, {} stopped · {} image{}",
-                if self.version.is_empty() {
-                    "unknown"
-                } else {
-                    &self.version
-                },
+                self.version,
                 self.running,
                 self.stopped,
                 self.images,
@@ -311,15 +311,22 @@ impl Status {
 }
 
 /// Read `docker info --format '{{json .}}'`.
+///
+/// A daemon that answers always names its own version, so an object without one came from
+/// something else wearing the `docker` name — not from an engine the pane can drive.
 pub fn parse_info(text: &str) -> Option<Status> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     if !value.is_object() {
         return None;
     }
+    let version = string(&value, "ServerVersion");
+    if version.is_empty() {
+        return None;
+    }
     let number = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or_default();
     Some(Status {
         state: Some(State::Ready),
-        version: string(&value, "ServerVersion"),
+        version,
         os: string(&value, "OperatingSystem"),
         arch: string(&value, "Architecture"),
         running: number("ContainersRunning"),
@@ -456,6 +463,24 @@ mod tests {
         assert_eq!(status.images, 12);
         assert!(
             status.summary().contains("Engine 27.1.1"),
+            "{}",
+            status.summary()
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_version_is_not_an_engine() {
+        assert!(parse_info("{}").is_none());
+        assert!(parse_info(r#"{"ContainersRunning":0,"Images":0}"#).is_none());
+        assert!(parse_info("not json").is_none());
+        let status = Status {
+            state: Some(State::Error),
+            message: UNEXPECTED_ANSWER.to_owned(),
+            ..Status::default()
+        };
+        assert!(!status.is_ready());
+        assert!(
+            status.summary().contains("Docker engine version"),
             "{}",
             status.summary()
         );

@@ -414,10 +414,11 @@ impl DockerManager {
             return ("checking".to_owned(), HeaderHealth::Warn);
         }
         if !self.engine.is_ready() {
-            let state = if self.engine.state == Some(engine::State::Missing) {
-                "no docker"
-            } else {
-                "no daemon"
+            let state = match self.engine.state {
+                Some(engine::State::Missing) => "no docker",
+                Some(engine::State::Forbidden) => "no access",
+                Some(engine::State::Error) => "engine error",
+                _ => "no daemon",
             };
             return (state.to_owned(), HeaderHealth::Bad);
         }
@@ -688,7 +689,7 @@ impl DockerManager {
                 Some(error) => engine::status_from_failure(&error),
                 None => engine::parse_info(&outcome.stdout).unwrap_or(engine::Status {
                     state: Some(engine::State::Error),
-                    message: "docker info printed something unexpected".to_owned(),
+                    message: engine::UNEXPECTED_ANSWER.to_owned(),
                     ..engine::Status::default()
                 }),
             };
@@ -2225,6 +2226,23 @@ mod tests {
         assert_eq!(
             pane.search.error.as_deref(),
             Some("The registry search failed: offline")
+        );
+    }
+
+    #[test]
+    fn an_empty_info_answer_is_not_a_working_engine() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        pane.poll(&mut access);
+        access.finish(ENGINE_KEY, output("{}", Some(0)));
+        pane.poll(&mut access);
+        assert!(!pane.engine.is_ready(), "{}", pane.engine.summary());
+        assert_eq!(pane.engine.state, Some(engine::State::Error));
+        assert_eq!(pane.engine.summary(), engine::UNEXPECTED_ANSWER);
+        assert_eq!(pane.header_caption().0, "engine error");
+        assert!(
+            !access.commands.iter().any(|(key, _)| key == LIST_KEY),
+            "no list is asked of an engine that is not there"
         );
     }
 
