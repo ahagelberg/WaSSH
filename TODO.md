@@ -1,5 +1,7 @@
 ## Fixes
 - Light theme changes default terminal background and foreground colors
+- Wrong icon
+- Windows installed version show extra terminal window
 
 ## Additions
 - Key manager for setting up password-less logins
@@ -30,3 +32,4 @@
 - AI Agent: better approval system - detect individual commands in long command list, classify them as already approved or not depending on arguments.
 - AI Agent: add support for sub-agents.
 - AI Agent: add support for questions
+- AI Agent: support for ANSI codes (colors mainly) in command output boxes.
