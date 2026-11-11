@@ -9,6 +9,15 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use crate::grid::TerminalSize;
 
+/// PowerShell 7, preferred when it is installed.
+#[cfg(target_os = "windows")]
+const PWSH: &str = "pwsh.exe";
+/// Windows PowerShell, present on every supported Windows.
+#[cfg(target_os = "windows")]
+const POWERSHELL: &str = "powershell.exe";
+/// The Windows command prompt.
+const CMD: &str = "cmd.exe";
+
 /// A running local shell attached to a PTY.
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
@@ -84,8 +93,7 @@ impl PtySession {
     pub fn default_shell() -> (String, Vec<String>) {
         #[cfg(target_os = "windows")]
         {
-            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_owned());
-            (shell, Vec::new())
+            (powershell(), Vec::new())
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -134,6 +142,25 @@ impl PtySession {
 impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.child.kill();
+    }
+}
+
+/// The Windows command prompt, as this machine names it.
+pub fn cmd_shell() -> (String, Vec<String>) {
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| CMD.to_owned());
+    (shell, Vec::new())
+}
+
+/// PowerShell, preferring version 7 when it is on the `PATH`.
+#[cfg(target_os = "windows")]
+fn powershell() -> String {
+    let installed = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(PWSH).is_file()))
+        .unwrap_or(false);
+    if installed {
+        PWSH.to_owned()
+    } else {
+        POWERSHELL.to_owned()
     }
 }
 

@@ -6,12 +6,14 @@
 //! hairline, then label/control rows). Each dialog owns a draft copy of the model it edits
 //! and reports a [`DialogAction`] when the user commits.
 
+use std::sync::mpsc::TryRecvError;
+
 use egui::{Align, Color32, Context, Id, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use wassh_core::{
     APP_NAME, APP_VERSION, AppSettings, AuthMethod, BellMode, BusyPolicy, ConnectionType,
-    CursorStyle, HostProfile, Identity, MAX_FONT_SIZE_PX, MAX_SCROLLBACK_LINES, MIN_FONT_SIZE_PX,
-    MIN_SCROLLBACK_LINES, Multiplexer, Palette, Parity, ReconnectMode, Rgba, SessionStyle,
-    SessionStyleDefaults, StopBits, ThemeMode, Tunnel, TunnelKind, colors,
+    CursorStyle, HostProfile, Identity, LocalShell, MAX_FONT_SIZE_PX, MAX_SCROLLBACK_LINES,
+    MIN_FONT_SIZE_PX, MIN_SCROLLBACK_LINES, Multiplexer, Palette, Parity, ReconnectMode, Rgba,
+    SessionStyle, SessionStyleDefaults, StopBits, ThemeMode, Tunnel, TunnelKind, colors,
 };
 use wassh_plugins::settings::{self as plugin_settings, FieldKind, SettingsField};
 use wassh_plugins::PluginId;
@@ -22,6 +24,8 @@ use wassh_ui::widgets::{
 };
 
 use wassh_ui::terminal_view::to_color32;
+
+use super::wsl::{self, WslTask};
 
 // --- dialog metrics (from settings.css) -----------------------------------
 
@@ -53,6 +57,14 @@ const ROW_PAD: f32 = 10.0;
 const SECTION_GAP: f32 = 28.0;
 /// Backdrop alpha, matching `rgba(0,0,0,.55)`.
 const BACKDROP_ALPHA: u8 = 140;
+/// Width of the WSL environment installer.
+const WSL_DIALOG_WIDTH: f32 = 460.0;
+/// Width of the dialog that lists the installed WSL environments.
+const WSL_MANAGE_WIDTH: f32 = 520.0;
+/// Opens the installer from the manage dialog.
+const ADD_ENV_LABEL: &str = "Add environment…";
+/// Shown as a distribution picker's value while no distribution is selected.
+const DEFAULT_DISTRO_LABEL: &str = "Default distribution";
 /// Width of a plugin's dedicated settings editor.
 const EDITOR_WIDTH: f32 = 620.0;
 const IDENTITY_EDITOR_WIDTH: f32 = 460.0;
@@ -118,6 +130,93 @@ impl GroupEditState {
     }
 }
 
+    /// The dialog that installs a WSL environment.
+pub struct WslInstallState {
+    /// Whether WSL itself is installed.
+    installed: bool,
+    /// Distributions the Store offers.
+    distros: Vec<String>,
+    /// Distribution being installed, once chosen.
+    selected: Option<String>,
+    /// The running installer.
+    install: Option<WslTask>,
+    /// Whether the running install enables WSL itself rather than adding a distribution.
+    installing_wsl: bool,
+    /// What the installer printed, or why it could not finish.
+    message: Option<String>,
+    /// Whether `message` reports a failure.
+    failed: bool,
+}
+
+impl WslInstallState {
+    /// Detect WSL, then list the installable distributions and preselect the first.
+    pub fn new() -> Self {
+        let installed = wassh_term::wsl::installed();
+        let distros = if installed {
+            wassh_term::wsl::online_distros()
+        } else {
+            Vec::new()
+        };
+        let selected = distros.first().cloned();
+        Self {
+            installed,
+            distros,
+            selected,
+            install: None,
+            installing_wsl: false,
+            message: None,
+            failed: false,
+        }
+    }
+}
+
+/// The dialog that lists and removes WSL environments.
+pub struct WslManageState {
+    /// Whether Windows has a change staged that only a restart can finish.
+    reboot_pending: bool,
+    /// Installed distributions, as WSL last reported them.
+    distros: Vec<wassh_term::wsl::DistroInfo>,
+    /// Distribution the user asked to delete, until it is confirmed.
+    confirm_remove: Option<String>,
+    /// Running unregister or default change.
+    task: Option<WslTask>,
+    /// Result of the last task, or why it could not finish.
+    message: Option<String>,
+    failed: bool,
+}
+
+impl WslManageState {
+    /// List the installed environments.
+    pub fn new() -> Self {
+        Self {
+            reboot_pending: wassh_sys::reboot_pending(),
+            distros: wassh_term::wsl::listing(),
+            confirm_remove: None,
+            task: None,
+            message: None,
+            failed: false,
+        }
+    }
+}
+
+/// Which local shell the Host settings row shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalKindChoice {
+    System,
+    Cmd,
+    Wsl,
+}
+
+impl LocalKindChoice {
+    fn of(shell: &LocalShell) -> Self {
+        match shell {
+            LocalShell::System => Self::System,
+            LocalShell::Cmd => Self::Cmd,
+            LocalShell::Wsl { .. } => Self::Wsl,
+        }
+    }
+}
+
 /// What a dialog asks the shell to do once the user commits.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DialogAction {
@@ -155,6 +254,12 @@ pub enum DialogAction {
     Command(Command),
     /// Move within the find results.
     Find(FindCommand),
+    /// WSL itself became available; the pickers should re-read the machine.
+    WslChanged,
+    /// A WSL environment finished installing; refresh the pickers.
+    WslInstalled,
+    /// Open the installer from the manage dialog.
+    WslManageAdd,
     /// Close every open dialog.
     Close,
 }
@@ -453,11 +558,18 @@ pub struct HostState {
     /// The user pressed "Clear" on the stored passphrase.
     pub clear_passphrase: bool,
     pub identities: Vec<Identity>,
+    /// WSL distributions this machine has, read when the shell row needs them.
+    pub wsl_distros: Vec<String>,
 }
 
 impl HostState {
     /// Start from an arbitrary draft (used for ad-hoc sessions turned into hosts).
     pub fn draft(host: HostProfile, is_new: bool) -> Self {
+        let wsl_distros = if matches!(host.connection.local, LocalShell::Wsl { .. }) {
+            wassh_term::wsl::distros()
+        } else {
+            Vec::new()
+        };
         Self {
             nav: SettingsNav::default(),
             target: HostTarget::Host,
@@ -491,6 +603,7 @@ impl HostState {
             clear_password: false,
             clear_passphrase: false,
             identities: Vec::new(),
+            wsl_distros,
             draft: host,
         }
     }
@@ -644,6 +757,10 @@ pub struct Dialogs {
     pub find: Option<FindState>,
     /// Edit-group dialog.
     pub group_edit: Option<GroupEditState>,
+    /// WSL environment installer.
+    pub wsl_install: Option<WslInstallState>,
+    /// Dialog listing and removing the installed WSL environments.
+    pub wsl_manage: Option<WslManageState>,
 }
 
 impl Dialogs {
@@ -654,6 +771,8 @@ impl Dialogs {
             || self.about
             || self.group_edit.is_some()
             || self.palette.is_some()
+            || self.wsl_install.is_some()
+            || self.wsl_manage.is_some()
     }
 
     /// Whether anything at all is drawn, including the non-modal find bar.
@@ -699,6 +818,12 @@ impl Dialogs {
         }
         if let Some(state) = self.group_edit.as_mut() {
             actions.extend(group_edit_dialog(ctx, palette, state));
+        }
+        if let Some(state) = self.wsl_install.as_mut() {
+            actions.extend(wsl_install_dialog(ctx, palette, state));
+        }
+        if let Some(state) = self.wsl_manage.as_mut() {
+            actions.extend(wsl_manage_dialog(ctx, palette, state));
         }
         if let Some(state) = self.palette.as_mut() {
             actions.extend(palette_dialog(ctx, palette, state));
@@ -2406,6 +2531,7 @@ fn host_dialog(
         clear_password,
         clear_passphrase,
         identities,
+        wsl_distros,
         defaults: state_defaults,
         has_sessions: _,
         saved: _,
@@ -2452,6 +2578,7 @@ fn host_dialog(
                 palette,
                 draft,
                 tag_draft,
+                wsl_distros,
                 target == HostTarget::Host,
             ),
             "Authentication" => host_authentication(
@@ -2524,6 +2651,7 @@ fn host_connection(
     palette: &Palette,
     draft: &mut HostProfile,
     tag_draft: &mut String,
+    wsl_distros: &mut Vec<String>,
     host_fields: bool,
 ) {
     // Name and tags describe the saved host; a session has neither.
@@ -2628,15 +2756,82 @@ fn host_connection(
             });
         }
         ConnectionType::Local => {
-            row(ui, palette, "Shell", Some("Uses $SHELL as a login shell"), |ui| {
-                ui.label(
-                    egui::RichText::new("Local terminal")
-                        .size(12.0)
-                        .color(to_color32(palette.text_muted)),
-                );
+            row(ui, palette, "Shell", Some("What a Local tab runs"), |ui| {
+                let options = local_shell_options();
+                if let Some(choice) = select(
+                    ui,
+                    "host-local-shell",
+                    &LocalKindChoice::of(&draft.connection.local),
+                    &options,
+                ) {
+                    draft.connection.local = match choice {
+                        LocalKindChoice::System => LocalShell::System,
+                        LocalKindChoice::Cmd => LocalShell::Cmd,
+                        LocalKindChoice::Wsl => {
+                            if wsl_distros.is_empty() {
+                                *wsl_distros = wassh_term::wsl::distros();
+                            }
+                            LocalShell::Wsl {
+                                distro: wsl_distros.first().cloned(),
+                            }
+                        }
+                    };
+                }
             });
+            if let LocalShell::Wsl { distro } = &mut draft.connection.local {
+                row(
+                    ui,
+                    palette,
+                    "Distribution",
+                    Some("Environment the tab opens"),
+                    |ui| {
+                        if wsl_distros.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No WSL environments found.")
+                                    .size(12.0)
+                                    .color(to_color32(palette.text_muted)),
+                            );
+                            return;
+                        }
+                        let current = distro.clone();
+                        egui::ComboBox::from_id_salt("host-wsl-distro")
+                            .selected_text(
+                                current
+                                    .clone()
+                                    .unwrap_or_else(|| DEFAULT_DISTRO_LABEL.to_owned()),
+                            )
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for name in wsl_distros.iter() {
+                                    if ui
+                                        .selectable_label(
+                                            current.as_deref() == Some(name.as_str()),
+                                            name,
+                                        )
+                                        .clicked()
+                                    {
+                                        *distro = Some(name.clone());
+                                    }
+                                }
+                            });
+                    },
+                );
+            }
         }
     }
+}
+
+/// Shells a Local host can run.
+fn local_shell_options() -> Vec<(LocalKindChoice, &'static str)> {
+    let mut options = vec![(
+        LocalKindChoice::System,
+        if cfg!(windows) { "PowerShell" } else { "$SHELL" },
+    )];
+    if cfg!(windows) {
+        options.push((LocalKindChoice::Cmd, "Command Prompt"));
+        options.push((LocalKindChoice::Wsl, "WSL"));
+    }
+    options
 }
 
 fn reconnect_select(ui: &mut Ui, value: &mut ReconnectMode, id: &'static str) {
@@ -3328,6 +3523,326 @@ fn group_edit_dialog(
         });
     }
     actions
+}
+
+fn wsl_install_dialog(
+    ctx: &Context,
+    palette: &Palette,
+    state: &mut WslInstallState,
+) -> Vec<DialogAction> {
+    let mut actions = Vec::new();
+    // Poll the installer first, so its verdict shows in this frame rather than the next.
+    if let Some(install) = &state.install {
+        match install.output.try_recv() {
+            Ok(Ok(_)) => {
+                state.install = None;
+                if state.installing_wsl {
+                    state.installing_wsl = false;
+                    state.installed = wassh_term::wsl::installed();
+                    state.failed = false;
+                    actions.push(DialogAction::WslChanged);
+                    if state.installed {
+                        state.distros = wassh_term::wsl::online_distros();
+                        state.selected = state.distros.first().cloned();
+                        state.message = Some(
+                            "WSL is installed. Pick a distribution to add; Windows may need a \
+                             restart first."
+                                .to_owned(),
+                        );
+                    } else {
+                        state.message = Some(
+                            "WSL was installed. Restart Windows if it is still not available."
+                                .to_owned(),
+                        );
+                    }
+                } else {
+                    actions.push(DialogAction::WslInstalled);
+                }
+            }
+            Ok(Err(error)) => {
+                state.install = None;
+                state.installing_wsl = false;
+                state.message = Some(error);
+                state.failed = true;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                state.install = None;
+                state.installing_wsl = false;
+                state.message = Some("The installer stopped unexpectedly.".to_owned());
+                state.failed = true;
+            }
+        }
+    }
+    let mut install_clicked = false;
+    let mut close = false;
+    let response = modal(
+        ctx,
+        "wsl-install",
+        palette,
+        "New WSL environment",
+        WSL_DIALOG_WIDTH,
+        |ui| {
+            if !state.installed {
+                ui.label(
+                    egui::RichText::new(
+                        "WSL is not installed. Adding it needs administrator rights: Windows \
+                         asks for approval, and may want a restart before it is usable.",
+                    )
+                    .size(12.0)
+                    .color(to_color32(palette.text_muted)),
+                );
+            } else if state.distros.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No distributions could be listed. Check the connection and reopen \
+                         this dialog.",
+                    )
+                    .size(12.0)
+                    .color(to_color32(palette.text_muted)),
+                );
+            } else {
+                row(
+                    ui,
+                    palette,
+                    "Distribution",
+                    Some("Installed by Windows; WSL sets the environment's name."),
+                    |ui| {
+                        let current = state.selected.clone();
+                        egui::ComboBox::from_id_salt("wsl-install-distro")
+                            .selected_text(current.clone().unwrap_or_default())
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for distro in &state.distros {
+                                    if ui
+                                        .selectable_label(
+                                            current.as_deref() == Some(distro.as_str()),
+                                            distro,
+                                        )
+                                        .clicked()
+                                    {
+                                        state.selected = Some(distro.clone());
+                                    }
+                                }
+                            });
+                    },
+                );
+            }
+            if let Some(message) = &state.message {
+                ui.add_space(6.0);
+                let color = if state.failed {
+                    to_color32(palette.danger)
+                } else {
+                    to_color32(palette.text_muted)
+                };
+                ui.label(egui::RichText::new(message).size(12.0).color(color));
+            }
+            ui.add_space(8.0);
+            let running = state.install.is_some();
+            let label = if state.installed {
+                "Install"
+            } else {
+                "Install WSL"
+            };
+            footer(ui, |ui| {
+                if Button::new("Close").show(ui, palette).clicked() {
+                    close = true;
+                }
+                if Button::new(if running { "Installing…" } else { label })
+                    .primary()
+                    .enabled(!running && (!state.installed || state.selected.is_some()))
+                    .show(ui, palette)
+                    .clicked()
+                {
+                    install_clicked = true;
+                }
+            });
+        },
+    );
+    if response.dismissed || close {
+        actions.push(DialogAction::Close);
+    } else if install_clicked && state.install.is_none() {
+        state.failed = false;
+        if !state.installed {
+            state.install = Some(wsl::install_wsl());
+            state.installing_wsl = true;
+            state.message = Some("Installing WSL…".to_owned());
+        } else if let Some(distro) = state.selected.clone() {
+            state.install = Some(wsl::install(&distro));
+            state.installing_wsl = false;
+            state.message = Some(format!("Installing {distro}…"));
+        }
+    }
+    actions
+}
+
+fn wsl_manage_dialog(
+    ctx: &Context,
+    palette: &Palette,
+    state: &mut WslManageState,
+) -> Vec<DialogAction> {
+    let mut actions = Vec::new();
+    // Poll the running command first, so its verdict shows in this frame rather than the next.
+    if let Some(task) = &state.task {
+        match task.output.try_recv() {
+            Ok(Ok(_)) => {
+                state.task = None;
+                state.failed = false;
+                state.message = Some("Environment list updated.".to_owned());
+                state.distros = wassh_term::wsl::listing();
+                actions.push(DialogAction::WslChanged);
+            }
+            Ok(Err(error)) => {
+                state.task = None;
+                state.message = Some(error);
+                state.failed = true;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                state.task = None;
+                state.message = Some("The WSL command stopped unexpectedly.".to_owned());
+                state.failed = true;
+            }
+        }
+    }
+    let busy = state.task.is_some();
+    let mut add = false;
+    let mut close = false;
+    let mut ask_remove = None;
+    let mut delete = None;
+    let mut cancel_remove = false;
+    let mut set_default = None;
+    let response = modal(
+        ctx,
+        "wsl-manage",
+        palette,
+        "WSL environments",
+        WSL_MANAGE_WIDTH,
+        |ui| {
+            let text = to_color32(palette.text);
+            let muted = to_color32(palette.text_muted);
+            let danger = to_color32(palette.danger);
+            if state.reboot_pending {
+                ui.label(
+                    egui::RichText::new(
+                        "Windows must be restarted before WSL can be managed. Restart, then \
+                         reopen this dialog.",
+                    )
+                    .size(12.0)
+                    .color(danger),
+                );
+                ui.add_space(6.0);
+            }
+            if state.distros.is_empty() {
+                ui.label(
+                    egui::RichText::new("No WSL environments are installed.")
+                        .size(12.0)
+                        .color(muted),
+                );
+            }
+            for distro in &state.distros {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(&distro.name)
+                                .strong()
+                                .size(13.0)
+                                .color(text),
+                        );
+                        ui.label(
+                            egui::RichText::new(distro_subtitle(distro))
+                                .size(11.0)
+                                .color(muted),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if small_button_enabled(ui, palette, "Remove", !busy) {
+                            ask_remove = Some(distro.name.clone());
+                        }
+                        if !distro.default
+                            && small_button_enabled(ui, palette, "Set default", !busy)
+                        {
+                            set_default = Some(distro.name.clone());
+                        }
+                    });
+                });
+                if state.confirm_remove.as_deref() == Some(distro.name.as_str()) {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Remove {}? Everything inside it is deleted.",
+                            distro.name
+                        ))
+                        .size(12.0)
+                        .color(danger),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if Button::new("Delete").danger().show(ui, palette).clicked() {
+                            delete = Some(distro.name.clone());
+                        }
+                        if Button::new("Cancel").show(ui, palette).clicked() {
+                            cancel_remove = true;
+                        }
+                    });
+                }
+            }
+            if let Some(message) = &state.message {
+                ui.add_space(6.0);
+                let color = if state.failed { danger } else { muted };
+                ui.label(egui::RichText::new(message).size(12.0).color(color));
+            }
+            ui.add_space(8.0);
+            footer(ui, |ui| {
+                if Button::new("Close").show(ui, palette).clicked() {
+                    close = true;
+                }
+                if Button::new(if busy { "Working…" } else { ADD_ENV_LABEL })
+                    .primary()
+                    .enabled(!busy)
+                    .show(ui, palette)
+                    .clicked()
+                {
+                    add = true;
+                }
+            });
+        },
+    );
+    if response.dismissed || close {
+        actions.push(DialogAction::Close);
+    } else if cancel_remove {
+        state.confirm_remove = None;
+    } else if let Some(name) = delete {
+        state.confirm_remove = None;
+        state.task = Some(wsl::remove(&name));
+        state.message = Some(format!("Removing {name}…"));
+        state.failed = false;
+    } else if let Some(name) = ask_remove {
+        state.confirm_remove = Some(name);
+        state.message = None;
+        state.failed = false;
+    } else if let Some(name) = set_default {
+        state.task = Some(wsl::set_default(&name));
+        state.message = Some(format!("Setting {name} as the default…"));
+        state.failed = false;
+    } else if add {
+        actions.push(DialogAction::WslManageAdd);
+    }
+    actions
+}
+
+/// `WSL 2 · Running · default`, the line under a distribution's name.
+fn distro_subtitle(distro: &wassh_term::wsl::DistroInfo) -> String {
+    let mut text = format!("WSL {}", distro.version);
+    if !distro.state.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&distro.state);
+    }
+    if distro.default {
+        text.push_str(" · default");
+    }
+    text
 }
 
 // --- About, palette, find bar --------------------------------------------
@@ -4514,6 +5029,102 @@ mod tests {
             dialogs.options.as_ref().and_then(|state| state.editor),
             None,
             "no plugin editor is involved"
+        );
+    }
+
+    #[test]
+    fn the_wsl_dialog_offers_to_install_wsl_when_it_is_missing() {
+        // WSL's presence is machine state, so the dialog is handed a state rather than
+        // asking this machine.
+        let mut state = WslInstallState {
+            installed: false,
+            distros: Vec::new(),
+            selected: None,
+            install: None,
+            installing_wsl: false,
+            message: None,
+            failed: false,
+        };
+        let rows = painted_rows(&Context::default(), Vec2::new(900.0, 700.0), |ctx| {
+            let _ = wsl_install_dialog(ctx, &Palette::dark(), &mut state);
+        });
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts.iter().any(|text| text.contains("WSL is not installed")),
+            "the dialog explains why it is empty: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Install WSL"),
+            "the primary action installs WSL: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"Distribution"),
+            "there is nothing to pick from yet: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_wsl_manage_dialog_lists_environments_and_asks_before_removing() {
+        // The list comes from WSL, so the dialog is handed a state rather than asking this
+        // machine.
+        let mut state = WslManageState {
+            reboot_pending: false,
+            distros: vec![
+                wassh_term::wsl::DistroInfo {
+                    name: "Ubuntu".to_owned(),
+                    state: "Running".to_owned(),
+                    version: 2,
+                    default: true,
+                },
+                wassh_term::wsl::DistroInfo {
+                    name: "Debian".to_owned(),
+                    state: "Stopped".to_owned(),
+                    version: 2,
+                    default: false,
+                },
+            ],
+            confirm_remove: None,
+            task: None,
+            message: None,
+            failed: false,
+        };
+        let rows = painted_rows(&Context::default(), Vec2::new(900.0, 700.0), |ctx| {
+            let _ = wsl_manage_dialog(ctx, &Palette::dark(), &mut state);
+        });
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        for expected in ["Ubuntu", "Debian", "WSL 2 · Running · default", "WSL 2 · Stopped"] {
+            assert!(texts.contains(&expected), "{expected:?} in {texts:?}");
+        }
+        assert!(texts.contains(&"Remove"), "every row offers removal: {texts:?}");
+        assert!(
+            !texts.iter().any(|text| text.contains("Everything inside")),
+            "removal is not confirmed yet: {texts:?}"
+        );
+
+        state.confirm_remove = Some("Debian".to_owned());
+        let rows = painted_rows(&Context::default(), Vec2::new(900.0, 700.0), |ctx| {
+            let _ = wsl_manage_dialog(ctx, &Palette::dark(), &mut state);
+        });
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Remove Debian? Everything inside it is deleted.")),
+            "the deletion is confirmed first: {texts:?}"
+        );
+        assert!(texts.contains(&"Delete"), "{texts:?}");
+
+        state.reboot_pending = true;
+        state.confirm_remove = None;
+        let rows = painted_rows(&Context::default(), Vec2::new(900.0, 700.0), |ctx| {
+            let _ = wsl_manage_dialog(ctx, &Palette::dark(), &mut state);
+        });
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Windows must be restarted")),
+            "a staged Windows change is called out: {texts:?}"
         );
     }
 

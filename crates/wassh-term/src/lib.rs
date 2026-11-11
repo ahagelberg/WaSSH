@@ -10,6 +10,7 @@ pub mod emulator;
 pub mod grid;
 pub mod input;
 pub mod pty;
+pub mod wsl;
 
 pub use emulator::{
     AnsiPalette, CellSnapshot, CellStyle, CursorSnapshot, ScreenSnapshot, SnapshotModes,

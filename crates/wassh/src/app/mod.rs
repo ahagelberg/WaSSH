@@ -9,6 +9,7 @@ pub mod local_exec;
 pub mod local_files;
 pub mod quick_connect;
 pub mod session;
+pub mod wsl;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,9 +30,9 @@ use wassh_ui::widgets::{Button, MenuItem, MenuState, ToastKind, Toasts};
 use self::dialogs::{
     Command, DialogAction, Dialogs, FindCommand, FindState, GroupEditState, HostSave, HostState,
     HostTarget, IdentityDraft, OptionsState, PaletteState, PluginSecretDrafts, SecretEdit, tab_menu_command,
-    tab_menu_items,
+    tab_menu_items, WslInstallState, WslManageState,
 };
-use self::quick_connect::{QuickForm, quick_connect};
+use self::quick_connect::{QuickAction, QuickForm, quick_connect};
 use self::session::{
     PluginValues, Secrets, SessionEntry, SshOpen, jump_chain, open_host_sessions, resolve_auth,
 };
@@ -700,7 +701,7 @@ impl Shell {
                     &self.settings.session_style_defaults,
                     &self.settings.term_type,
                     self.last_terminal_size,
-                    self.local_params(),
+                    connection,
                 );
                 self.sessions.push(entry);
                 if let (Some(session), Some(layout)) =
@@ -813,7 +814,7 @@ impl Shell {
 
     fn open(&mut self, connection: ConnectionParams, host_id: Option<String>) {
         match connection.kind {
-            ConnectionType::Local => self.open_local(),
+            ConnectionType::Local => self.open_local_with(connection),
             ConnectionType::Telnet => self.open_telnet(connection, host_id),
             ConnectionType::Serial => self.open_serial(connection, host_id),
             ConnectionType::Ssh => {
@@ -854,6 +855,12 @@ impl Shell {
     }
 
     fn open_local(&mut self) {
+        let params = self.local_params();
+        self.open_local_with(params);
+    }
+
+    /// Open a local tab with the given shell: the built-in host's, or a quick-connect pick.
+    fn open_local_with(&mut self, connection: ConnectionParams) {
         let id = self.next_session_id();
         let entry = SessionEntry::new_local(
             id,
@@ -861,7 +868,7 @@ impl Shell {
             &self.settings.session_style_defaults,
             &self.settings.term_type,
             self.last_terminal_size,
-            self.local_params(),
+            connection,
         );
         self.push_session(entry);
     }
@@ -2247,6 +2254,16 @@ impl Shell {
                     self.persist_hosts();
                     self.dialogs.group_edit = None;
                 }
+                DialogAction::WslChanged => self.quick.refresh_wsl(),
+                DialogAction::WslManageAdd => {
+                    self.dialogs.wsl_manage = None;
+                    self.dialogs.wsl_install = Some(WslInstallState::new());
+                }
+                DialogAction::WslInstalled => {
+                    self.dialogs.wsl_install = None;
+                    self.quick.refresh_wsl();
+                    self.toasts.push(ToastKind::Info, "WSL environment installed.");
+                }
                 DialogAction::Close => self.close_dialogs(),
             }
         }
@@ -2258,6 +2275,8 @@ impl Shell {
         self.dialogs.about = false;
         self.dialogs.group_edit = None;
         self.dialogs.palette = None;
+        self.dialogs.wsl_install = None;
+        self.dialogs.wsl_manage = None;
     }
 
     // --- drawing -----------------------------------------------------------
@@ -2518,7 +2537,7 @@ impl Shell {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                let quick_height = if collapsed { 0.0 } else { 236.0 };
+                let quick_height = if collapsed { 0.0 } else { quick.height() };
                 let list_height = (ui.available_height() - quick_height).max(80.0);
                 ui.allocate_ui(Vec2::new(width, list_height), |ui| {
                     action = wassh_ui::sidebar(ui, &palette, hosts, &open, sidebar);
@@ -2535,8 +2554,15 @@ impl Shell {
                 }
             });
 
-        if let Some(connection) = submitted {
-            self.open(connection, None);
+        match submitted {
+            Some(QuickAction::Connect(connection)) => self.open(*connection, None),
+            Some(QuickAction::InstallWsl) => {
+                self.dialogs.wsl_install = Some(WslInstallState::new());
+            }
+            Some(QuickAction::ManageWsl) => {
+                self.dialogs.wsl_manage = Some(WslManageState::new());
+            }
+            None => {}
         }
         if let Some(action) = action {
             self.handle_sidebar_action(action);
@@ -3701,6 +3727,30 @@ mod tests {
         }
     }
 
+    /// Wait until the shell has painted its prompt again.
+    ///
+    /// Windows shells finish their prompt with `>`; `ping` is interrupted asynchronously,
+    /// so the prompt is the first sign that the shell reads stdin again.
+    #[cfg(windows)]
+    fn wait_for_prompt_again(shell: &mut Shell, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + SHELL_WAIT;
+        loop {
+            run_shell(shell, ctx, 1);
+            let at_prompt = shell
+                .sessions
+                .first()
+                .is_some_and(|session| session.visible_text().trim_end().ends_with('>'));
+            if at_prompt {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never came back to its prompt"
+            );
+            std::thread::sleep(SHELL_POLL);
+        }
+    }
+
     /// Run one frame with `events` as input and return what the platform was asked to do.
     fn frame_with_events(
         shell: &mut Shell,
@@ -3936,6 +3986,10 @@ mod tests {
 
         // Ctrl+C arrives from egui as a clipboard event.
         frame_with_events(&mut shell, vec![egui::Event::Copy]);
+        // PowerShell services the key a moment later, and a line typed before it is
+        // swallowed with the interrupt, so wait for the prompt to come back.
+        #[cfg(windows)]
+        wait_for_prompt_again(&mut shell, &ctx);
 
         // Only a shell that got `^C` reads the next line; the blocked command ignores its
         // stdin, so without the interrupt the answer would not come for a minute.

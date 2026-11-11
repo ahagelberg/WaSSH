@@ -10,8 +10,8 @@ use std::sync::mpsc::{Receiver, channel};
 
 use super::{local_exec, local_files};
 use wassh_core::{
-    AuthMethod, ConnectionParams, ConnectionType, DockEdge, DockPlacement, Palette, SessionStatus,
-    SessionStyleDefaults, TabPluginLayout,
+    AuthMethod, ConnectionParams, ConnectionType, DockEdge, DockPlacement, LocalShell, Palette,
+    SessionStatus, SessionStyleDefaults, TabPluginLayout,
 };
 use wassh_plugins::files::{TransferDirection, TransferState};
 use wassh_ui::dock::HeaderHealth;
@@ -621,7 +621,19 @@ impl SessionEntry {
     }
 
     fn start_local(&mut self, term_type: &str) {
-        let (shell, args) = PtySession::default_shell();
+        // The command prompt and WSL shells exist on Windows only; a configuration
+        // carried over from Windows keeps the value but cannot launch it here.
+        if !cfg!(windows) && !matches!(self.connection.local, LocalShell::System) {
+            self.backend = Backend::Closed;
+            self.status = SessionStatus::Failed;
+            self.error = Some("This local shell is only available on Windows.".to_owned());
+            return;
+        }
+        let (shell, args) = match &self.connection.local {
+            LocalShell::System => PtySession::default_shell(),
+            LocalShell::Cmd => wassh_term::pty::cmd_shell(),
+            LocalShell::Wsl { distro } => wassh_term::wsl::launch(distro.as_deref()),
+        };
         match PtySession::spawn(&shell, &args, self.terminal.size(), term_type) {
             Ok(pty) => {
                 self.backend = Backend::Local(pty);

@@ -53,6 +53,37 @@ impl ConnectionType {
     }
 }
 
+/// What a local terminal tab runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum LocalShell {
+    /// The platform's own shell: `$SHELL` on Unix, PowerShell on Windows.
+    #[default]
+    System,
+    /// The Windows command prompt.
+    Cmd,
+    /// A WSL distribution; no distribution means WSL's default.
+    Wsl {
+        #[serde(default)]
+        distro: Option<String>,
+    },
+}
+
+impl LocalShell {
+    /// Trim a distribution name and turn an empty one into "use the default".
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Wsl { distro } => Self::Wsl {
+                distro: distro.and_then(|name| {
+                    let name = name.trim();
+                    (!name.is_empty()).then(|| name.to_owned())
+                }),
+            },
+            other => other,
+        }
+    }
+}
+
 /// How to authenticate an SSH session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -379,6 +410,7 @@ pub struct ConnectionParams {
     pub x11: bool,
     pub remote_session: RemoteSession,
     pub serial: SerialConfig,
+    pub local: LocalShell,
     pub reconnect: ReconnectMode,
     pub style: SessionStyle,
 }
@@ -398,6 +430,7 @@ impl Default for ConnectionParams {
             x11: false,
             remote_session: RemoteSession::default(),
             serial: SerialConfig::default(),
+            local: LocalShell::default(),
             reconnect: ReconnectMode::default(),
             style: SessionStyle::default(),
         }
@@ -418,13 +451,17 @@ impl ConnectionParams {
                 self.auth = AuthMethod::None;
                 // A local shell has no transport to dial again.
                 self.reconnect = ReconnectMode::None;
+                self.local = self.local.clone().normalized();
             }
             ConnectionType::Serial => {
                 self.port = 0;
                 self.username.clear();
                 self.auth = AuthMethod::None;
+                self.local = LocalShell::System;
             }
-            ConnectionType::Ssh | ConnectionType::Telnet => {}
+            ConnectionType::Ssh | ConnectionType::Telnet => {
+                self.local = LocalShell::System;
+            }
         }
         if !self.kind.is_ssh() {
             self.identity_id = None;
@@ -442,7 +479,11 @@ impl ConnectionParams {
     /// `user@host:port` or a protocol-appropriate label.
     pub fn endpoint(&self) -> String {
         match self.kind {
-            ConnectionType::Local => "local".to_owned(),
+            ConnectionType::Local => match &self.local {
+                LocalShell::Wsl { distro: Some(name) } => name.clone(),
+                LocalShell::Wsl { distro: None } => "wsl".to_owned(),
+                LocalShell::System | LocalShell::Cmd => "local".to_owned(),
+            },
             ConnectionType::Serial => self.serial.path.clone(),
             ConnectionType::Ssh | ConnectionType::Telnet => {
                 if self.username.is_empty() {
@@ -457,7 +498,12 @@ impl ConnectionParams {
     /// Sidebar subtitle.
     pub fn subtitle(&self) -> String {
         match self.kind {
-            ConnectionType::Local => "Local terminal".to_owned(),
+            ConnectionType::Local => match &self.local {
+                LocalShell::Wsl { distro: Some(name) } => format!("WSL · {name}"),
+                LocalShell::Wsl { distro: None } => "WSL".to_owned(),
+                LocalShell::Cmd => "Command Prompt".to_owned(),
+                LocalShell::System => "Local terminal".to_owned(),
+            },
             ConnectionType::Serial => format!(
                 "{} · {} {}{}{}",
                 self.serial.path,
@@ -595,6 +641,63 @@ mod tests {
             }
             .subtitle(),
             "Local terminal"
+        );
+    }
+
+    #[test]
+    fn old_connections_have_no_local_shell() {
+        let old: ConnectionParams = serde_json::from_str(r#"{"host":"example.com"}"#).unwrap();
+        assert_eq!(old.local, LocalShell::System);
+    }
+
+    #[test]
+    fn local_shells_round_trip_and_clamp() {
+        let wsl = ConnectionParams {
+            kind: ConnectionType::Local,
+            local: LocalShell::Wsl {
+                distro: Some("  Ubuntu  ".to_owned()),
+            },
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(
+            wsl.local,
+            LocalShell::Wsl {
+                distro: Some("Ubuntu".to_owned())
+            }
+        );
+        assert_eq!(wsl.subtitle(), "WSL · Ubuntu");
+        assert_eq!(wsl.endpoint(), "Ubuntu");
+
+        let empty = ConnectionParams {
+            kind: ConnectionType::Local,
+            local: LocalShell::Wsl {
+                distro: Some("   ".to_owned()),
+            },
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(empty.local, LocalShell::Wsl { distro: None });
+        assert_eq!(empty.subtitle(), "WSL");
+
+        let json = serde_json::to_string(&wsl).unwrap();
+        let restored: ConnectionParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.local, wsl.local);
+
+        let ssh = ConnectionParams {
+            local: restored.local,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(ssh.local, LocalShell::System);
+        assert_eq!(
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                local: LocalShell::Cmd,
+                ..Default::default()
+            }
+            .subtitle(),
+            "Command Prompt"
         );
     }
 
