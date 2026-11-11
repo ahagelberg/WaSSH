@@ -24,8 +24,9 @@ use wassh_core::Palette;
 use wassh_core::HeaderHealth;
 use wassh_core::Platform;
 use wassh_ui::widgets::{
-    Button, ButtonKind, ToastKind, bar_meter, checkbox, dialog_width, footer, line_chart, modal,
-    password_input, search_input, select_str, small_button_enabled, text_input,
+    Button, ButtonKind, ToastKind, Tone, badge, bar_meter, checkbox, dialog_width, empty_state,
+    footer, line_chart, modal, password_input, search_input, select_str, small_button_enabled,
+    text_input,
 };
 
 use wassh_ui::to_color32;
@@ -407,7 +408,6 @@ impl Plugin for DockerManager {
     fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
         self.settings = read_settings(context.settings);
         let muted = to_color32(context.palette.text_muted);
-        let host_label = context.host_label.clone();
         let Some(access) = context.session.as_deref_mut() else {
             ui.label(
                 egui::RichText::new("Containers need an SSH or local session.")
@@ -416,7 +416,7 @@ impl Plugin for DockerManager {
             );
             return;
         };
-        let typed = self.draw(ui, &context.palette, &host_label, access);
+        let typed = self.draw(ui, &context.palette, access);
         if let Some(text) = typed {
             context.send_text(&text);
         }
@@ -447,7 +447,11 @@ impl DockerManager {
             .iter()
             .filter(|item| item.is_running())
             .count();
-        (format!("{running} up"), HeaderHealth::Ok)
+        let engine = empty_as(&self.engine.version, "engine");
+        (
+            format!("Engine {engine} · {running} up"),
+            HeaderHealth::Ok,
+        )
     }
 
     /// Draw the pane and return anything to type into the session's terminal.
@@ -455,7 +459,6 @@ impl DockerManager {
         &mut self,
         ui: &mut Ui,
         palette: &Palette,
-        host_label: &str,
         access: &mut dyn CommandAccess,
     ) -> Option<String> {
         self.poll(access);
@@ -478,21 +481,6 @@ impl DockerManager {
         self.confirm_card(ui, palette, access);
         self.sudo_card(ui, palette, access);
         self.run_dialog(ui, palette, access);
-        ui.add_space(2.0);
-        let running = self
-            .containers
-            .iter()
-            .filter(|item| item.is_running())
-            .count();
-        ui.label(
-            egui::RichText::new(format!(
-                "{host_label} · {running} up of {} container{}",
-                self.containers.len(),
-                if self.containers.len() == 1 { "" } else { "s" }
-            ))
-            .size(10.0)
-            .color(to_color32(palette.text_muted)),
-        );
         typed
     }
 
@@ -956,9 +944,6 @@ impl DockerManager {
                 self.show_stopped = Some(stopped);
                 self.last_poll = None;
             }
-            if small_button_enabled(ui, palette, "Refresh", !access.is_running(LIST_KEY)) {
-                self.last_poll = None;
-            }
             if small_button_enabled(ui, palette, "New…", true) {
                 self.run_open = true;
             }
@@ -989,6 +974,7 @@ impl DockerManager {
                 self.queue_updates(&stale);
             }
         });
+        ui.add_space(6.0);
 
         let needle = self.filter.trim().to_lowercase();
         let mut rows: Vec<Container> = self
@@ -1004,18 +990,23 @@ impl DockerManager {
         // Running containers first, then by name, as the reference listed them.
         rows.sort_by(|a, b| a.rank().cmp(&b.rank()).then_with(|| a.name.cmp(&b.name)));
 
-        if self.containers.is_empty() && access.is_running(LIST_KEY) {
-            ui.label(
-                egui::RichText::new("Listing containers…")
-                    .size(11.0)
-                    .color(to_color32(palette.text_muted)),
-            );
-        } else if self.containers.is_empty() && self.engine.is_ready() {
-            ui.label(
-                egui::RichText::new("No containers on this host.")
-                    .size(11.0)
-                    .color(to_color32(palette.text_muted)),
-            );
+        if rows.is_empty() {
+            if self.containers.is_empty() && !access.is_running(LIST_KEY) {
+                empty_state(
+                    ui,
+                    palette,
+                    "No containers yet",
+                    "New… runs one from an image, from any registry.",
+                );
+            } else if self.containers.is_empty() {
+                ui.label(
+                    egui::RichText::new("Listing containers…")
+                        .size(11.0)
+                        .color(to_color32(palette.text_muted)),
+                );
+            } else {
+                empty_state(ui, palette, "Nothing matches", "Change the search to see more.");
+            }
         }
 
         let panelled = self.logs_for.is_some() || self.stats_for.is_some();
@@ -1033,7 +1024,7 @@ impl DockerManager {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for container in &rows {
-                    if let Some(event) = container_row(ui, palette, container, &selected, &stale) {
+                    if let Some(event) = container_card(ui, palette, container, &selected, &stale) {
                         events.push(event);
                     }
                 }
@@ -1452,38 +1443,62 @@ impl DockerManager {
                 self.pull_queue = vec![self.pull.trim().to_owned()];
                 self.notify("Pulling…".to_owned());
             }
-            if small_button_enabled(ui, palette, "Refresh", !access.is_running(IMAGES_KEY)) {
-                self.last_poll = None;
-            }
         });
+        ui.add_space(6.0);
+        if self.images.is_empty() {
+            empty_state(
+                ui,
+                palette,
+                "No images yet",
+                "Pull one by name, or run a container from the Containers tab.",
+            );
+        }
         let mut remove = None;
         egui::ScrollArea::vertical()
             .id_salt("docker-images")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for image in &self.images {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(image.references.join(", "))
-                                .size(11.5)
-                                .color(to_color32(palette.text)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {} · {} container{}",
-                                model::format_bytes(image.size),
-                                image.created,
-                                image.containers,
-                                if image.containers == 1 { "" } else { "s" }
-                            ))
-                            .size(10.0)
-                            .color(to_color32(palette.text_muted)),
-                        );
-                        if small_button_enabled(ui, palette, "Remove", true) {
-                            remove = Some(image.id.clone());
-                        }
-                    });
-                    ui.separator();
+                    egui::Frame::NONE
+                        .fill(to_color32(palette.bg_panel_2))
+                        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+                        .corner_radius(wassh_core::RADIUS)
+                        .inner_margin(egui::Margin::symmetric(12, 9))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(image.references.join(", "))
+                                            .size(12.0)
+                                            .monospace()
+                                            .color(to_color32(palette.text)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if small_button_enabled(ui, palette, "Remove", true) {
+                                            remove = Some(image.id.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {} · {} container{}",
+                                    model::format_bytes(image.size),
+                                    image.created,
+                                    image.containers,
+                                    if image.containers == 1 { "" } else { "s" }
+                                ))
+                                .size(10.5)
+                                .color(to_color32(palette.text_muted)),
+                            );
+                        });
+                    ui.add_space(6.0);
                 }
             });
         if let Some(id) = remove
@@ -1509,36 +1524,55 @@ impl DockerManager {
                 let command = model::prune_volumes_command(&self.settings.socket);
                 self.run_change(access, &command, "Pruned unused volumes".to_owned());
             }
-            if small_button_enabled(ui, palette, "Refresh", !access.is_running(VOLUMES_KEY)) {
-                self.last_poll = None;
-            }
         });
+        ui.add_space(6.0);
+        if self.volumes.is_empty() {
+            empty_state(ui, palette, "No volumes yet", "Name one above to create it.");
+        }
         let mut remove = None;
         egui::ScrollArea::vertical()
             .id_salt("docker-volumes")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for volume in &self.volumes {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&volume.name)
-                                .size(11.5)
-                                .color(to_color32(palette.text)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {}",
-                                volume.driver,
-                                empty_as(&volume.mountpoint, "-")
-                            ))
-                            .size(10.0)
-                            .color(to_color32(palette.text_muted)),
-                        );
-                        if small_button_enabled(ui, palette, "Remove", true) {
-                            remove = Some(volume.name.clone());
-                        }
-                    });
-                    ui.separator();
+                    egui::Frame::NONE
+                        .fill(to_color32(palette.bg_panel_2))
+                        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+                        .corner_radius(wassh_core::RADIUS)
+                        .inner_margin(egui::Margin::symmetric(12, 9))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&volume.name)
+                                            .size(12.0)
+                                            .color(to_color32(palette.text)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if small_button_enabled(ui, palette, "Remove", true) {
+                                            remove = Some(volume.name.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    volume.driver,
+                                    empty_as(&volume.mountpoint, "-")
+                                ))
+                                .size(10.5)
+                                .monospace()
+                                .color(to_color32(palette.text_muted)),
+                            );
+                        });
+                    ui.add_space(6.0);
                 }
             });
         if let Some(name) = remove
@@ -1562,38 +1596,57 @@ impl DockerManager {
                 }
                 self.new_network.clear();
             }
-            if small_button_enabled(ui, palette, "Refresh", !access.is_running(NETWORKS_KEY)) {
-                self.last_poll = None;
-            }
         });
+        ui.add_space(6.0);
+        if self.networks.is_empty() {
+            empty_state(ui, palette, "No networks yet", "Name one above to create it.");
+        }
         let mut remove = None;
         egui::ScrollArea::vertical()
             .id_salt("docker-networks")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for network in &self.networks {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&network.name)
-                                .size(11.5)
-                                .color(to_color32(palette.text)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {} · {}{}",
-                                network.short_id(),
-                                network.driver,
-                                network.scope,
-                                if network.internal { " · internal" } else { "" }
-                            ))
-                            .size(10.0)
-                            .color(to_color32(palette.text_muted)),
-                        );
-                        if small_button_enabled(ui, palette, "Remove", true) {
-                            remove = Some(network.id.clone());
-                        }
-                    });
-                    ui.separator();
+                    egui::Frame::NONE
+                        .fill(to_color32(palette.bg_panel_2))
+                        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+                        .corner_radius(wassh_core::RADIUS)
+                        .inner_margin(egui::Margin::symmetric(12, 9))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&network.name)
+                                            .size(12.0)
+                                            .color(to_color32(palette.text)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if small_button_enabled(ui, palette, "Remove", true) {
+                                            remove = Some(network.id.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {} · {}{}",
+                                    network.short_id(),
+                                    network.driver,
+                                    network.scope,
+                                    if network.internal { " · internal" } else { "" }
+                                ))
+                                .size(10.5)
+                                .monospace()
+                                .color(to_color32(palette.text_muted)),
+                            );
+                        });
+                    ui.add_space(6.0);
                 }
             });
         if let Some(id) = remove
@@ -1607,6 +1660,9 @@ impl DockerManager {
     // --- chrome ---------------------------------------------------------
 
     /// The engine: what state it is in, what to do about it, and what it printed.
+    ///
+    /// A working engine says nothing here: its version and container count sit in the pane
+    /// header, so the list below never moves because of a status line.
     fn engine_row(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
         let ready = self.engine.is_ready();
         let colour = if ready {
@@ -1618,38 +1674,29 @@ impl DockerManager {
         };
         let windows = access.platform() == Platform::Windows;
         let busy = access.is_running(ROOT_KEY);
-        let mut upgrade = None;
         let mut fix = None;
+        if ready {
+            return;
+        }
         egui::Frame::new()
             .fill(to_color32(palette.bg_panel_2))
             .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
             .corner_radius(wassh_core::RADIUS)
-            .inner_margin(egui::Margin::symmetric(10, 8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new(self.engine.summary())
-                            .size(11.5)
+                            .size(12.0)
+                            .strong()
                             .color(to_color32(colour)),
                     );
-                    if ready
-                        && let Some(manager) = self.manager
-                        && manager.upgrade_command().is_some()
-                        && small_button_enabled(ui, palette, "Upgrade Docker", !busy)
-                    {
-                        upgrade = manager.upgrade_command();
-                    }
                 });
-                if !ready {
-                    fix = self.engine_fix(ui, palette, windows, busy);
-                }
+                fix = self.engine_fix(ui, palette, windows, busy);
                 self.engine_output(ui, palette, access);
             });
-        if let Some(command) = upgrade {
-            self.run_root(access, command, None);
-            self.notify("Upgrading Docker…".to_owned());
-        }
+        ui.add_space(8.0);
         match fix {
             // Passwordless sudo first; the password card appears when that fails.
             Some(Fix::Root(command)) => {
@@ -2058,9 +2105,17 @@ impl DockerManager {
             dialog_width(ui.ctx(), CREATE_DIALOG_WIDTH),
             |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    text_input(ui, palette, &mut self.search.query, "search Docker Hub and Quay");
+                    let field = text_input(
+                        ui,
+                        palette,
+                        &mut self.search.query,
+                        "search Docker Hub and Quay",
+                    );
                     let ready = !self.search.query.trim().is_empty() && !searching;
-                    if small_button_enabled(ui, palette, "Search images", ready) {
+                    let entered = field.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if small_button_enabled(ui, palette, "Search images", ready) || (entered && ready)
+                    {
                         search = true;
                     }
                 });
@@ -2137,8 +2192,8 @@ impl DockerManager {
     }
 }
 
-/// One row in the container list.
-fn container_row(
+/// One container, as a card: what it is, what it is doing, and what can be done to it.
+fn container_card(
     ui: &mut Ui,
     palette: &Palette,
     container: &Container,
@@ -2146,89 +2201,112 @@ fn container_row(
     stale: &[String],
 ) -> Option<RowEvent> {
     let is_selected = selected.as_deref() == Some(container.id.as_str());
+    let has_update = stale.contains(&container.id);
     let mut event = None;
-    ui.horizontal_wrapped(|ui| {
-        let name = egui::RichText::new(&container.name)
-            .size(12.0)
-            .strong()
-            .color(to_color32(if is_selected {
-                palette.accent
-            } else {
-                palette.text
-            }));
-        if ui
-            .add(egui::Label::new(name).sense(egui::Sense::click()))
-            .clicked()
-        {
-            event = Some(RowEvent::Select(container.id.clone()));
-        }
-        ui.label(
-            egui::RichText::new(format!("· {}", container.image))
-                .size(11.0)
-                .color(to_color32(palette.text_muted)),
-        );
-        if stale.contains(&container.id) {
-            ui.label(
-                egui::RichText::new("update")
-                    .size(10.0)
-                    .color(to_color32(palette.warn)),
-            );
-        }
-        ui.label(
-            egui::RichText::new(&container.status)
-                .size(11.0)
-                .color(to_color32(if container.is_running() {
-                    palette.ok
+    let border = if is_selected {
+        to_color32(palette.accent)
+    } else {
+        to_color32(palette.border)
+    };
+    egui::Frame::NONE
+        .fill(to_color32(palette.bg_panel_2))
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let name = egui::RichText::new(&container.name)
+                    .size(12.5)
+                    .strong()
+                    .color(to_color32(if is_selected {
+                        palette.accent
+                    } else {
+                        palette.text
+                    }));
+                if ui
+                    .add(egui::Label::new(name).sense(egui::Sense::click()))
+                    .clicked()
+                {
+                    event = Some(RowEvent::Select(container.id.clone()));
+                }
+                if container.is_running() {
+                    badge(ui, palette, "running", Tone::Success);
+                } else if container.is_paused() {
+                    badge(ui, palette, "paused", Tone::Warning);
                 } else {
-                    palette.text_muted
-                })),
-        );
-    });
-    ui.horizontal_wrapped(|ui| {
-        for action in container.actions() {
-            let label = match action {
-                Action::Start => "Start",
-                Action::Stop => "Stop",
-                Action::Restart => "Restart",
-                Action::Pause => "Pause",
-                Action::Unpause => "Resume",
-                Action::Kill => "Kill",
-                Action::Remove => "Remove",
-            };
-            if small_button_enabled(ui, palette, label, true) {
-                event = Some(RowEvent::Act(
-                    action,
-                    container.id.clone(),
-                    container.name.clone(),
-                ));
-            }
-        }
-        if small_button_enabled(ui, palette, "Logs", true) {
-            event = Some(RowEvent::Logs(container.id.clone()));
-        }
-        if container.is_running() && small_button_enabled(ui, palette, "Stats", true) {
-            event = Some(RowEvent::Stats(container.id.clone()));
-        }
-        if container.is_running() && small_button_enabled(ui, palette, "Shell", true) {
-            event = Some(RowEvent::Shell(container.id.clone()));
-        }
-        if stale.contains(&container.id) && small_button_enabled(ui, palette, "Update", true) {
-            event = Some(RowEvent::Update(container.id.clone()));
-        }
-        if small_button_enabled(ui, palette, "Details", true) {
-            event = Some(RowEvent::Select(container.id.clone()));
-        }
-    });
-    let ports: Vec<String> = container.ports.iter().map(Port::label).collect();
-    if !ports.is_empty() {
-        ui.label(
-            egui::RichText::new(ports.join("  "))
-                .size(10.0)
-                .monospace()
-                .color(to_color32(palette.text_muted)),
-        );
-    }
-    ui.separator();
+                    badge(ui, palette, "stopped", Tone::Neutral);
+                }
+                if has_update {
+                    badge(ui, palette, "update", Tone::Warning);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&container.image)
+                                .size(10.5)
+                                .monospace()
+                                .color(to_color32(palette.text_muted)),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+            ui.add_space(3.0);
+            let ports: Vec<String> = container.ports.iter().map(Port::label).collect();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(&container.status)
+                        .size(10.5)
+                        .color(to_color32(palette.text_muted)),
+                );
+                if !ports.is_empty() {
+                    ui.label(
+                        egui::RichText::new(ports.join("  "))
+                            .size(10.0)
+                            .monospace()
+                            .color(to_color32(palette.accent)),
+                    );
+                }
+            });
+            ui.add_space(5.0);
+            ui.horizontal_wrapped(|ui| {
+                for action in container.actions() {
+                    let label = match action {
+                        Action::Start => "Start",
+                        Action::Stop => "Stop",
+                        Action::Restart => "Restart",
+                        Action::Pause => "Pause",
+                        Action::Unpause => "Resume",
+                        Action::Kill => "Kill",
+                        Action::Remove => "Remove",
+                    };
+                    if small_button_enabled(ui, palette, label, true) {
+                        event = Some(RowEvent::Act(
+                            action,
+                            container.id.clone(),
+                            container.name.clone(),
+                        ));
+                    }
+                }
+                if small_button_enabled(ui, palette, "Logs", true) {
+                    event = Some(RowEvent::Logs(container.id.clone()));
+                }
+                if container.is_running() && small_button_enabled(ui, palette, "Stats", true) {
+                    event = Some(RowEvent::Stats(container.id.clone()));
+                }
+                if container.is_running() && small_button_enabled(ui, palette, "Shell", true) {
+                    event = Some(RowEvent::Shell(container.id.clone()));
+                }
+                if has_update && small_button_enabled(ui, palette, "Update", true) {
+                    event = Some(RowEvent::Update(container.id.clone()));
+                }
+                if small_button_enabled(ui, palette, "Details", true) {
+                    event = Some(RowEvent::Select(container.id.clone()));
+                }
+            });
+        });
+    ui.add_space(6.0);
     event
 }
 

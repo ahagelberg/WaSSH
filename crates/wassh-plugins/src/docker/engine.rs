@@ -78,40 +78,6 @@ impl Manager {
         })
     }
 
-    /// The privileged command that upgrades the engine, without `sudo`.
-    pub fn upgrade_command(self) -> Option<&'static str> {
-        Some(match self {
-            Self::Apt => concat!(
-                "export DEBIAN_FRONTEND=noninteractive && apt-get update && ",
-                "apt-get install -y --only-upgrade docker.io containerd runc || ",
-                "apt-get install -y --only-upgrade docker.io; ",
-                "systemctl try-restart docker 2>/dev/null || true"
-            ),
-            Self::Dnf => concat!(
-                "dnf upgrade -y moby-engine docker 2>/dev/null || dnf upgrade -y moby-engine; ",
-                "systemctl try-restart docker 2>/dev/null || true"
-            ),
-            Self::Yum => concat!(
-                "yum update -y docker && ",
-                "systemctl try-restart docker 2>/dev/null || true"
-            ),
-            Self::Zypper => concat!(
-                "zypper --non-interactive update docker && ",
-                "systemctl try-restart docker 2>/dev/null || true"
-            ),
-            Self::Pacman => concat!(
-                "pacman -Syu --noconfirm docker && ",
-                "systemctl try-restart docker 2>/dev/null || true"
-            ),
-            Self::Apk => concat!(
-                "apk upgrade docker && ",
-                "rc-service docker restart 2>/dev/null || ",
-                "service docker restart 2>/dev/null || true"
-            ),
-            Self::Unknown => return None,
-        })
-    }
-
     /// The privileged command that starts the daemon an installed engine ships with.
     pub fn start_command(self) -> Option<&'static str> {
         Some(match self {
@@ -417,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn every_known_manager_has_both_privileged_commands() {
+    fn every_known_manager_can_install_and_start_the_engine() {
         for manager in [
             Manager::Apt,
             Manager::Dnf,
@@ -427,14 +393,11 @@ mod tests {
             Manager::Apk,
         ] {
             let install = manager.install_command().unwrap();
-            let upgrade = manager.upgrade_command().unwrap();
             let start = manager.start_command().unwrap();
             assert!(!install.is_empty(), "{:?}", manager);
-            assert!(!upgrade.is_empty(), "{:?}", manager);
             assert!(!start.is_empty(), "{:?}", manager);
         }
         assert!(Manager::Unknown.install_command().is_none());
-        assert!(Manager::Unknown.upgrade_command().is_none());
         assert!(Manager::Unknown.start_command().is_none());
     }
 
