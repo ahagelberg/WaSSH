@@ -3046,6 +3046,10 @@ impl wassh_plugins::CommandAccess for SessionEntry {
     fn cancel(&mut self, key: &str) {
         self.commands.cancel(key);
     }
+
+    fn platform(&self) -> wassh_core::Platform {
+        self.connection.platform()
+    }
 }
 
 impl wassh_plugins::TcpAccess for SessionEntry {

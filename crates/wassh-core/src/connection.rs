@@ -53,6 +53,18 @@ impl ConnectionType {
     }
 }
 
+/// The operating system a session's commands run on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Platform {
+    /// Windows, where the shell is PowerShell or `cmd.exe`.
+    Windows,
+    /// Any Unix, including a WSL distribution.
+    Unix,
+    /// A remote host, which has not said which it is.
+    #[default]
+    Unknown,
+}
+
 /// What a local terminal tab runs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -532,6 +544,21 @@ impl ConnectionParams {
         }
     }
 
+    /// Which operating system the session's commands run on, when that is known.
+    pub fn platform(&self) -> Platform {
+        match self.kind {
+            ConnectionType::Local => match &self.local {
+                LocalShell::Cmd => Platform::Windows,
+                LocalShell::Wsl { .. } => Platform::Unix,
+                LocalShell::System if cfg!(windows) => Platform::Windows,
+                LocalShell::System => Platform::Unix,
+            },
+            ConnectionType::Ssh | ConnectionType::Telnet | ConnectionType::Serial => {
+                Platform::Unknown
+            }
+        }
+    }
+
     /// Sidebar subtitle.
     pub fn subtitle(&self) -> String {
         match self.kind {
@@ -788,6 +815,36 @@ mod tests {
             }
             .environment(),
             "an SSH session with alice@example.com:22, so commands run on the remote host"
+        );
+    }
+
+    #[test]
+    fn local_sessions_know_which_platform_their_commands_run_on() {
+        let local = |shell: LocalShell| {
+            ConnectionParams {
+                kind: ConnectionType::Local,
+                local: shell,
+                ..Default::default()
+            }
+            .platform()
+        };
+        assert_eq!(local(LocalShell::Cmd), Platform::Windows);
+        assert_eq!(local(LocalShell::Wsl { distro: None }), Platform::Unix);
+        assert_eq!(
+            local(LocalShell::System),
+            if cfg!(windows) {
+                Platform::Windows
+            } else {
+                Platform::Unix
+            }
+        );
+        assert_eq!(
+            ConnectionParams {
+                host: "example.com".to_owned(),
+                ..Default::default()
+            }
+            .platform(),
+            Platform::Unknown
         );
     }
 

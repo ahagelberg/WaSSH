@@ -21,6 +21,7 @@ use egui::Ui;
 use serde_json::Value;
 use wassh_core::Palette;
 use wassh_core::HeaderHealth;
+use wassh_core::Platform;
 use wassh_ui::widgets::{
     Button, ButtonKind, bar_meter, checkbox, line_chart, password_input, search_input, select_str,
     small_button_enabled, text_input,
@@ -538,6 +539,10 @@ impl DockerManager {
         if busy {
             return;
         }
+        // Without a daemon every list command only fails; the engine row already says why.
+        if !self.engine.is_ready() {
+            return;
+        }
         self.last_poll = Some(Instant::now());
         let socket = self.settings.socket.clone();
         let (key, command) = match self.tab {
@@ -644,10 +649,8 @@ impl DockerManager {
     }
 
     fn poll_engine(&mut self, access: &mut dyn CommandAccess) {
-        if self.engine.state.is_none() && !access.is_running(ENGINE_KEY) {
-            let command = model::engine_command(&self.settings.socket);
-            self.run(access, ENGINE_KEY, &command);
-        }
+        // Read the answer first: asking again on the frame it arrived would replace it with
+        // a new probe and the status would never settle.
         if let Some(outcome) = self.take(access, ENGINE_KEY) {
             self.engine = match outcome.error {
                 Some(error) => engine::status_from_failure(&error),
@@ -658,6 +661,10 @@ impl DockerManager {
                 }),
             };
         }
+        if self.engine.state.is_none() && !access.is_running(ENGINE_KEY) {
+            let command = model::engine_command(&self.settings.socket);
+            self.run(access, ENGINE_KEY, &command);
+        }
         if let Some(outcome) = self.take(access, DETECT_KEY) {
             match outcome.error {
                 Some(error) => {
@@ -666,6 +673,16 @@ impl DockerManager {
                 }
                 None => self.manager = Some(engine::manager_from_probe(&outcome.stdout)),
             }
+        }
+        // A host without the CLI has to know how it installs packages before the pane can
+        // offer to install Docker, so that probe runs as soon as it is needed.
+        let missing = self.engine.state == Some(engine::State::Missing);
+        if missing
+            && self.manager.is_none()
+            && access.platform() != Platform::Windows
+            && !access.is_running(DETECT_KEY)
+        {
+            self.run(access, DETECT_KEY, engine::DETECT_COMMAND);
         }
     }
 
@@ -926,15 +943,11 @@ impl DockerManager {
                     .size(11.0)
                     .color(to_color32(palette.text_muted)),
             );
-        } else if self.containers.is_empty() {
+        } else if self.containers.is_empty() && self.engine.is_ready() {
             ui.label(
-                egui::RichText::new(if self.engine.is_ready() {
-                    "No containers on this host."
-                } else {
-                    "No containers. Is Docker installed and running on this host?"
-                })
-                .size(11.0)
-                .color(to_color32(palette.text_muted)),
+                egui::RichText::new("No containers on this host.")
+                    .size(11.0)
+                    .color(to_color32(palette.text_muted)),
             );
         }
 
@@ -1467,6 +1480,87 @@ impl DockerManager {
                 self.engine.state = None;
             }
         });
+        self.engine_help(ui, palette, access);
+    }
+
+    /// Explain a daemon that does not answer, and offer to fix it.
+    fn engine_help(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+        let windows = access.platform() == Platform::Windows;
+        let busy = access.is_running(ROOT_KEY);
+        let mut root = None;
+        let mut elevate = None;
+        match self.engine.state {
+            Some(engine::State::Missing) => {
+                self.help_label(ui, palette, "Docker isn't installed on this host.");
+                if windows {
+                    if small_button_enabled(ui, palette, "Install Docker Desktop", !busy) {
+                        elevate = Some(engine::windows_install_command());
+                    }
+                    self.help_detail(ui, palette, "Windows asks for administrator approval.");
+                } else if let Some(manager) = self.manager {
+                    if let Some(command) = manager.install_command()
+                        && small_button_enabled(ui, palette, "Install Docker", !busy)
+                    {
+                        root = Some(command);
+                    }
+                    self.help_detail(ui, palette, &format!("Through {}.", manager.label()));
+                } else {
+                    self.help_detail(ui, palette, "Looking for this host's package manager…");
+                }
+            }
+            Some(engine::State::Unavailable) if windows => {
+                self.help_label(ui, palette, engine::DAEMON_DOWN_WINDOWS);
+            }
+            Some(engine::State::Unavailable) => {
+                self.help_label(ui, palette, "Docker is installed but its engine is not running.");
+                if let Some(manager) = self.manager
+                    && let Some(command) = manager.start_command()
+                    && small_button_enabled(ui, palette, "Start the engine", !busy)
+                {
+                    root = Some(command);
+                }
+            }
+            Some(engine::State::Forbidden) => {
+                self.help_label(
+                    ui,
+                    palette,
+                    "This user may not talk to the Docker daemon.",
+                );
+                self.help_detail(
+                    ui,
+                    palette,
+                    "Add the user to the docker group, then sign in again.",
+                );
+            }
+            _ => {}
+        }
+        if let Some(command) = root {
+            // Passwordless sudo first; the password card appears when that fails.
+            self.run_root(access, command, None);
+            self.notify("Installing…".to_owned());
+        }
+        if let Some(command) = elevate {
+            self.run(access, ROOT_KEY, &command);
+            self.notify("Installing Docker Desktop…".to_owned());
+        }
+    }
+
+    /// A sentence of explanation at reading size.
+    fn help_label(&self, ui: &mut Ui, palette: &Palette, text: &str) {
+        ui.label(
+            egui::RichText::new(text)
+                .size(12.0)
+                .color(to_color32(palette.text)),
+        );
+    }
+
+    /// The quieter line under it.
+    fn help_detail(&self, ui: &mut Ui, palette: &Palette, text: &str) {
+        ui.label(
+            egui::RichText::new(text)
+                .size(10.5)
+                .color(to_color32(palette.text_muted)),
+        );
     }
 
     fn tab_bar(&mut self, ui: &mut Ui, palette: &Palette) {
@@ -1908,6 +2002,7 @@ mod tests {
     }
 
     const PS: &str = r#"{"ID":"abc","Names":"web","Image":"nginx:latest","State":"running","Status":"Up 1 hour","Ports":"","Labels":"","Mounts":"","Networks":"bridge"}"#;
+    const INFO: &str = r#"{"ServerVersion":"27.1.1","ContainersRunning":1,"Images":2}"#;
 
     fn pane() -> DockerManager {
         DockerManager {
@@ -1916,11 +2011,18 @@ mod tests {
         }
     }
 
+    /// The daemon answered, so the pane may ask for lists.
+    fn with_a_running_engine(pane: &mut DockerManager, access: &mut Stub) {
+        pane.poll(access);
+        access.finish(ENGINE_KEY, output(INFO, Some(0)));
+        pane.poll(access);
+    }
+
     #[test]
     fn the_list_is_asked_for_once_and_read_once() {
         let mut pane = pane();
         let mut access = Stub::default();
-        pane.poll(&mut access);
+        with_a_running_engine(&mut pane, &mut access);
         let list = access
             .commands
             .iter()
@@ -1943,10 +2045,36 @@ mod tests {
     }
 
     #[test]
-    fn a_privilege_failure_asks_for_the_password() {
+    fn a_host_without_docker_is_asked_how_it_installs_packages() {
         let mut pane = pane();
         let mut access = Stub::default();
         pane.poll(&mut access);
+        access.finish(
+            ENGINE_KEY,
+            CommandOutput {
+                stdout: String::new(),
+                stderr: "sh: 1: docker: not found".to_owned(),
+                code: Some(127),
+            },
+        );
+        pane.poll(&mut access);
+        assert_eq!(pane.engine.state, Some(engine::State::Missing));
+        assert!(
+            access.commands.iter().any(|(key, _)| key == DETECT_KEY),
+            "the package-manager probe runs on its own"
+        );
+        // Nothing can be listed, and a failing list would only cover the reason with noise.
+        assert!(
+            !access.commands.iter().any(|(key, _)| key == LIST_KEY),
+            "no list is asked for"
+        );
+    }
+
+    #[test]
+    fn a_privilege_failure_asks_for_the_password() {
+        let mut pane = pane();
+        let mut access = Stub::default();
+        with_a_running_engine(&mut pane, &mut access);
         access.outputs.insert(
             LIST_KEY.to_owned(),
             CommandOutput {

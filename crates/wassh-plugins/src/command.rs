@@ -59,6 +59,14 @@ pub trait CommandAccess {
     /// The command answers with a failure naming the stop, the same way its exit status
     /// would arrive.
     fn cancel(&mut self, key: &str);
+
+    /// Which operating system the commands run on, when the session knows.
+    ///
+    /// A pane that installs software needs to know whether to reach for `sudo` or for an
+    /// elevated Windows program. Unknown means "ask the host with a probe".
+    fn platform(&self) -> wassh_core::Platform {
+        wassh_core::Platform::Unknown
+    }
 }
 
 /// TCP, forwarded through the session.

@@ -108,7 +108,38 @@ impl Manager {
             Self::Unknown => return None,
         })
     }
+
+    /// The privileged command that starts the daemon an installed engine ships with.
+    pub fn start_command(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Apt | Self::Dnf | Self::Yum | Self::Zypper | Self::Pacman => {
+                "systemctl start docker"
+            }
+            Self::Apk => "rc-service docker start 2>/dev/null || service docker start",
+            Self::Unknown => return None,
+        })
+    }
 }
+
+/// The winget package that installs Docker Desktop on Windows.
+pub const DOCKER_DESKTOP_PACKAGE: &str = "Docker.DockerDesktop";
+
+/// Windows' script that starts the Docker Desktop install elevated, without waiting.
+///
+/// `winget` needs an administrator, so the UAC prompt belongs to the user; the script
+/// returns as soon as that is answered and the installer keeps running on its own, which
+/// keeps the pane's command from being killed at the local command timeout.
+pub fn windows_install_command() -> String {
+    format!(
+        "Start-Process -FilePath winget -ArgumentList \
+         'install','-e','--id','{DOCKER_DESKTOP_PACKAGE}',\
+         '--accept-package-agreements','--accept-source-agreements' -Verb RunAs"
+    )
+}
+
+/// What the pane says when the CLI is there but the daemon is not.
+pub const DAEMON_DOWN_WINDOWS: &str =
+    "Docker Desktop is installed but its engine is not running. Start Docker Desktop, then recheck.";
 
 /// Which manager the distro id, its family, and the installed tools point at.
 pub fn manager_from_probe(output: &str) -> Manager {
@@ -201,7 +232,9 @@ pub enum State {
     Checking,
     /// Answering.
     Ready,
-    /// No daemon (not installed, or not running).
+    /// The `docker` command is not on this host at all.
+    Missing,
+    /// The command is there but no daemon answers.
     Unavailable,
     /// The daemon is there but this user may not talk to it.
     Forbidden,
@@ -255,6 +288,7 @@ impl Status {
                 if self.images == 1 { "" } else { "s" }
             ),
             Some(State::Forbidden) => "Permission denied for the Docker daemon".to_owned(),
+            Some(State::Missing) => "Docker is not installed on this host".to_owned(),
             Some(State::Unavailable) => {
                 if self.message.is_empty() {
                     "No Docker daemon".to_owned()
@@ -299,14 +333,20 @@ pub fn status_from_failure(message: &str) -> Status {
     let forbidden = lower.contains("permission denied")
         || lower.contains("got permission denied")
         || lower.contains("are you root");
+    // Both shells say it in their own words: `sh: 1: docker: not found` on Unix,
+    // `'docker' is not recognized …` in `cmd.exe` and PowerShell.
+    let missing = lower.contains("docker: not found")
+        || lower.contains("docker: command not found")
+        || lower.contains("is not recognized as an internal or external command")
+        || lower.contains("is not recognized as the name of a cmdlet");
     let unavailable = lower.contains("cannot connect to the docker daemon")
         || lower.contains("is the docker daemon running")
-        || lower.contains("command not found")
-        || lower.contains("no such file or directory")
-        || lower.contains("docker: not found");
+        || lower.contains("no such file or directory");
     Status {
         state: Some(if forbidden {
             State::Forbidden
+        } else if missing {
+            State::Missing
         } else if unavailable {
             State::Unavailable
         } else {
@@ -368,11 +408,23 @@ mod tests {
         ] {
             let install = manager.install_command().unwrap();
             let upgrade = manager.upgrade_command().unwrap();
+            let start = manager.start_command().unwrap();
             assert!(!install.is_empty(), "{:?}", manager);
             assert!(!upgrade.is_empty(), "{:?}", manager);
+            assert!(!start.is_empty(), "{:?}", manager);
         }
         assert!(Manager::Unknown.install_command().is_none());
         assert!(Manager::Unknown.upgrade_command().is_none());
+        assert!(Manager::Unknown.start_command().is_none());
+    }
+
+    #[test]
+    fn the_windows_plan_installs_docker_desktop_elevated() {
+        let command = windows_install_command();
+        assert!(command.contains(DOCKER_DESKTOP_PACKAGE), "{command}");
+        assert!(command.contains("-Verb RunAs"), "{command}");
+        // Waiting for the installer would outlast the command timeout.
+        assert!(!command.contains("-Wait"), "{command}");
     }
 
     #[test]
@@ -414,7 +466,14 @@ mod tests {
         );
         assert_eq!(
             status_from_failure("sh: 1: docker: not found").state,
-            Some(State::Unavailable)
+            Some(State::Missing)
+        );
+        assert_eq!(
+            status_from_failure(
+                "docker : The term 'docker' is not recognized as the name of a cmdlet"
+            )
+            .state,
+            Some(State::Missing)
         );
         assert_eq!(status_from_failure("boom").state, Some(State::Error));
     }
