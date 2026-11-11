@@ -20,6 +20,7 @@ wassh-plugins = { path = "../wassh-plugins" }
 wassh-serial = { path = "../wassh-serial" }
 wassh-store = { path = "../wassh-store" }
 wassh-ssh = { path = "../wassh-ssh" }
+wassh-sys = { path = "../wassh-sys" }
 wassh-telnet = { path = "../wassh-telnet" }
 wassh-term = { path = "../wassh-term" }
 wassh-ui = { path = "../wassh-ui" }

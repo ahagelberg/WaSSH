@@ -45,6 +45,74 @@ use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 
 use crate::{Cpu, CpuTimes, Disk, Interface, Memory, Process, ProcessDetails, System};
 
+/// Attach to the console this process was started from, when there is one.
+///
+/// A GUI-subsystem binary has no console of its own; starting it from Explorer or the Start
+/// menu has no parent console either, and the failed attach is harmless.
+pub fn attach_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+}
+
+/// Whether Windows has a change staged that only a restart can finish.
+///
+/// The component-store marker is set by DISM when an optional component is enabled (what
+/// `wsl --install` does); the file-rename queue covers the rest.
+pub fn reboot_pending() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    };
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    const COMPONENT_STORE: &str =
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending";
+    const SESSION_MANAGER: &str = "SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+    let mut key = null_mut();
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide(COMPONENT_STORE).as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    } == 0
+    {
+        unsafe { RegCloseKey(key) };
+        return true;
+    }
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide(SESSION_MANAGER).as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    } != 0
+    {
+        return false;
+    }
+    let mut kind = 0;
+    let mut size = 0;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            wide("PendingFileRenameOperations").as_ptr(),
+            null(),
+            &mut kind,
+            null_mut(),
+            &mut size,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    status == 0 && size > 0
+}
+
 pub fn unprotect_user_data(data: &[u8]) -> Option<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len().try_into().ok()?,

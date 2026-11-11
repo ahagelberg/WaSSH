@@ -101,6 +101,35 @@ pub fn disk_io() -> Option<(u64, u64)> {
     platform::disk_io()
 }
 
+/// Give a GUI-subsystem process the console it was started from, so its CLI flags print.
+///
+/// A binary built with `windows_subsystem = "windows"` gets no console when launched from a
+/// terminal; attaching to the parent's is what lets `--version` and friends write where the
+/// user can read it.
+#[cfg(windows)]
+pub fn attach_console() {
+    windows::attach_console();
+}
+
+/// No-op where the console is inherent to the process.
+#[cfg(not(windows))]
+pub fn attach_console() {}
+
+/// Whether Windows has a change staged that only a restart can finish.
+///
+/// Enabling an optional component (as `wsl --install` does) lands in the component store and
+/// stays unusable until the machine restarts.
+#[cfg(windows)]
+pub fn reboot_pending() -> bool {
+    windows::reboot_pending()
+}
+
+/// No restart bookkeeping to read on other platforms.
+#[cfg(not(windows))]
+pub fn reboot_pending() -> bool {
+    false
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

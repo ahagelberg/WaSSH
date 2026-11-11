@@ -4,6 +4,10 @@
 //! harness and `--widgets` its widget gallery.
 
 #![forbid(unsafe_code)]
+// A console-subsystem release binary opens a console window next to the app when it is
+// started from Explorer, the Start menu or the installer. The CLI flags still print by
+// attaching to the console they were typed in (see `main`).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod gallery;
@@ -16,6 +20,11 @@ use wassh_plugins::toolbar_plugins;
 
 fn main() -> ExitCode {
     app::mark_process_start();
+    // The release binary is GUI-subsystem, so it has no console of its own; a command-line
+    // flag expects the one it was typed in.
+    if std::env::args_os().len() > 1 {
+        wassh_sys::attach_console();
+    }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None => {
