@@ -3764,8 +3764,8 @@ mod tests {
         assert_eq!(
             entry
                 .output("stdin")
-                .map(|output| output.stdout.trim().to_owned()),
-            Some("s3cret".to_owned())
+                .map(|output| output.stdout.as_str()),
+            Some("s3cret\n")
         );
     }
 

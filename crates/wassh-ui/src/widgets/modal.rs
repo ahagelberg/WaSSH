@@ -28,6 +28,12 @@ pub const BODY_PADDING: f32 = 16.0;
 const WINDOW_MARGIN: f32 = 80.0;
 /// Narrowest a dialog may become in a small window.
 const MIN_DIALOG_WIDTH: f32 = 320.0;
+const MODAL_FRAME_ID: &str = "wassh-modal-frame";
+
+pub fn modal_shown(ctx: &Context) -> bool {
+    ctx.data(|data| data.get_temp::<u64>(Id::unique(MODAL_FRAME_ID)))
+        == Some(ctx.cumulative_frame_nr())
+}
 
 /// Width of a dialog: `wanted`, but never wider than the window it opens in.
 pub fn dialog_width(ctx: &Context, wanted: f32) -> f32 {
@@ -61,6 +67,8 @@ pub fn modal(
     width: f32,
     body: impl FnOnce(&mut Ui),
 ) -> ModalResponse {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| data.insert_temp(Id::unique(MODAL_FRAME_ID), frame));
     let screen = ctx.content_rect();
     let mut dismissed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
     // Every id below hangs off the dialog's own id: two modals can be open in one frame
@@ -178,6 +186,20 @@ mod tests {
     fn modal_response_reports_open_state() {
         assert!(ModalResponse { dismissed: false }.is_open());
         assert!(!ModalResponse { dismissed: true }.is_open());
+    }
+
+    #[test]
+    fn modal_is_marked_only_in_the_frame_it_is_shown() {
+        let ctx = Context::default();
+        let input = egui::RawInput::default();
+        let output = ctx.run_pass(input.clone(), |ctx| {
+            assert!(!modal_shown(ctx));
+            modal(ctx, "test", &Palette::dark(), "Test", DIALOG_WIDTH, |_| {});
+            assert!(modal_shown(ctx));
+        });
+        output.drop_without_applying_deltas();
+        let output = ctx.run_pass(input, |ctx| assert!(!modal_shown(ctx)));
+        output.drop_without_applying_deltas();
     }
 
     #[test]

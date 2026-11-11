@@ -74,6 +74,11 @@ const ICON_PNG: &[u8] = include_bytes!("../../../../res/WaSSH program icon.png")
 /// Menu target for the tab strip's "new tab" menu.
 const NEW_LOCAL_TARGET: &str = "new-local";
 
+const STATUS_BAR_HEIGHT: f32 = 24.0;
+const STATUS_BAR_PADDING: f32 = 10.0;
+const STATUS_DOT_SIZE: f32 = 6.0;
+const STATUS_TEXT_SIZE: f32 = 11.0;
+
 /// Row shown in that menu when no WSL environment is installed.
 const NO_WSL_LABEL: &str = "No WSL environments";
 
@@ -2115,7 +2120,7 @@ impl Shell {
     fn forward_input(&mut self, ctx: &egui::Context) {
         // A widget holding egui's focus (a button reached by Tab, say) consumes nothing,
         // so only a text field being edited may keep the keys from the terminal.
-        if self.dialogs.modal_open() || ctx.text_edit_focused() {
+        if self.dialogs.modal_open() || wassh_ui::widgets::modal_shown(ctx) || ctx.text_edit_focused() {
             return;
         }
         let Some(index) = self.active else {
@@ -2566,6 +2571,44 @@ impl Shell {
                 }
             }
         }
+    }
+
+    fn show_status_bar(&self, ui: &mut egui::Ui) {
+        let palette = self.palette;
+        egui::Panel::bottom("wassh-status-bar")
+            .exact_size(STATUS_BAR_HEIGHT)
+            .frame(egui::Frame::NONE.fill(wassh_ui::terminal_view::to_color32(palette.bg_panel)))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0, wassh_ui::terminal_view::to_color32(palette.border)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(STATUS_BAR_PADDING);
+                    let sessions = self.sessions.len();
+                    let connected = self.sessions.iter().filter(|session| session.status == SessionStatus::Connected).count();
+                    let label = if sessions == 1 { "session" } else { "sessions" };
+                    ui.label(egui::RichText::new(format!("{sessions} {label} | {connected} connected"))
+                        .size(STATUS_TEXT_SIZE).color(wassh_ui::terminal_view::to_color32(palette.text_muted)));
+                    if let Some(session) = self.active() {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add_space(STATUS_BAR_PADDING);
+                            let (dot, _) = ui.allocate_exact_size(Vec2::splat(STATUS_DOT_SIZE), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), STATUS_DOT_SIZE / 2.0, wassh_ui::tab_bar::status_color(session.status, &palette));
+                            let label = match session.status {
+                                SessionStatus::Idle => "Idle",
+                                SessionStatus::Connecting => "Connecting",
+                                SessionStatus::AwaitingHostKey => "Waiting for host key",
+                                SessionStatus::Authenticating => "Authenticating",
+                                SessionStatus::Connected => "Connected",
+                                SessionStatus::Reconnecting => "Reconnecting",
+                                SessionStatus::Disconnected => "Disconnected",
+                                SessionStatus::Closed => "Closed",
+                                SessionStatus::Failed => "Connection failed",
+                            };
+                            ui.label(egui::RichText::new(label).size(STATUS_TEXT_SIZE).color(wassh_ui::terminal_view::to_color32(palette.text_muted)));
+                        });
+                    }
+                });
+            });
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -3364,6 +3407,8 @@ impl Shell {
             None => {}
         }
 
+        self.show_status_bar(ui);
+
         // The sidebar claims the left edge first, so the tab strip starts at the sidebar's
         // edge instead of running to the window border.
         self.show_sidebar(ui);
@@ -4052,6 +4097,70 @@ mod tests {
             );
             assert!(!ctx.egui_wants_keyboard_input());
         }
+    }
+
+    #[test]
+    fn status_bar_reserves_space_and_shows_the_active_session() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let mut reserved = 0.0;
+        let mut output = ctx.run_ui(input.clone(), |ui| {
+            let bottom = ui.available_rect_before_wrap().bottom();
+            shell.show_status_bar(ui);
+            reserved = bottom - ui.available_rect_before_wrap().bottom();
+        });
+        assert_eq!(reserved, STATUS_BAR_HEIGHT);
+        assert!(output.shapes.iter().any(|clipped| matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text() == "0 sessions | 0 connected")));
+        output.drop_without_applying_deltas();
+
+        shell.open_local();
+        shell.sessions[0].status = SessionStatus::Connected;
+        output = ctx.run_ui(input.clone(), |ui| shell.show_status_bar(ui));
+        let text = |label: &str| output.shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos.x),
+            _ => None,
+        }).expect("status bar text");
+        assert!(text("Connected") < 640.0);
+        assert!(text("1 session | 1 connected") > 640.0);
+        output.drop_without_applying_deltas();
+
+        shell.open_local();
+        shell.sessions[1].status = SessionStatus::Disconnected;
+        output = ctx.run_ui(input, |ui| shell.show_status_bar(ui));
+        assert!(output.shapes.iter().any(|clipped| matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text() == "2 sessions | 1 connected")));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn plugin_modal_keystrokes_do_not_reach_the_terminal() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.open(ConnectionParams {
+            host: "127.0.0.1".to_owned(), username: "alice".to_owned(), ..Default::default()
+        }, None);
+        assert!(shell.sessions[0].awaiting_login());
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            events: vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            wassh_ui::widgets::modal(ui.ctx(), "plugin-test", &Palette::dark(), "Test", 460.0, |_| {});
+            shell.forward_input(ui.ctx());
+        });
+        output.drop_without_applying_deltas();
+        assert!(shell.sessions[0].awaiting_login());
+        let input = egui::RawInput {
+            events: vec![key_event(egui::Key::Escape, egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| shell.forward_input(ui.ctx()));
+        output.drop_without_applying_deltas();
+        assert!(!shell.sessions[0].awaiting_login());
     }
 
     #[test]

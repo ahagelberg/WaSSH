@@ -409,6 +409,7 @@ struct Confirm {
 struct Sudo {
     command: String,
     password: String,
+    focus_pending: bool,
 }
 
 /// A container update in flight.
@@ -728,7 +729,7 @@ impl DockerManager {
         self.commands.insert(ROOT_KEY, command.to_owned());
         let full = model::privileged(command, password);
         match password {
-            Some(password) => access.exec_input(ROOT_KEY, &full, &format!("{password}\n")),
+            Some(password) => access.exec_input(ROOT_KEY, &full, password),
             None => access.exec(ROOT_KEY, &full),
         }
     }
@@ -1172,6 +1173,7 @@ impl DockerManager {
             self.sudo = Some(Sudo {
                 command,
                 password: String::new(),
+                focus_pending: true,
             });
             // The card is where this is answered; sudo's own wording would only repeat it.
             self.notify(NEEDS_ROOT_NOTICE.to_owned());
@@ -2259,6 +2261,10 @@ impl DockerManager {
                 );
                 ui.add_space(6.0);
                 let field = password_input(ui, palette, &mut sudo.password, "sudo password");
+                if sudo.focus_pending {
+                    field.request_focus();
+                    sudo.focus_pending = false;
+                }
                 let submitted =
                     field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 footer(ui, |ui| {
@@ -3287,7 +3293,40 @@ mod tests {
         let (key, command) = access.commands.last().expect("a retry");
         assert_eq!(key, ROOT_KEY);
         assert!(command.starts_with("sudo -S -p '' sh -c "), "{command}");
-        assert_eq!(access.inputs.last().map(String::as_str), Some("hunter2\n"));
+        assert_eq!(access.inputs.last().map(String::as_str), Some("hunter2"));
+    }
+
+    #[test]
+    fn sudo_dialog_focuses_password_and_submits_with_enter() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let mut pane = pane();
+        let mut access = Stub::default();
+        pane.sudo = Some(Sudo {
+            command: "docker ps".to_owned(),
+            password: String::new(),
+            focus_pending: true,
+        });
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input(Vec::new()), |ui| pane.sudo_dialog(ui, &palette, &mut access));
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(input(vec![egui::Event::Text("typed password".to_owned())]), |ui| {
+            pane.sudo_dialog(ui, &palette, &mut access);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(pane.sudo.as_ref().map(|sudo| sudo.password.as_str()), Some("typed password"));
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let output = ctx.run_ui(input(vec![enter]), |ui| pane.sudo_dialog(ui, &palette, &mut access));
+        output.drop_without_applying_deltas();
+        assert!(pane.sudo.is_none());
+        assert_eq!(access.inputs, ["typed password"]);
     }
 
     #[test]
@@ -3322,7 +3361,7 @@ mod tests {
         pane.run_root(&mut access, "docker ps", Some("hunter2"));
         assert_eq!(access.commands[0].0, ROOT_KEY);
         assert_eq!(access.commands[0].1, "sudo -S -p '' sh -c 'docker ps'");
-        assert_eq!(access.inputs, ["hunter2\n"]);
+        assert_eq!(access.inputs, ["hunter2"]);
         // The unprivileged command is remembered, so a retry can be offered again.
         assert_eq!(
             pane.commands.get(ROOT_KEY).map(String::as_str),

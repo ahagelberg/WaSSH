@@ -89,6 +89,54 @@ impl server::Handler for EchoServer {
     }
 }
 
+#[derive(Clone)]
+struct ExecInputServer;
+
+impl server::Handler for ExecInputServer {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        Ok(if password == "secret" { Auth::Accept } else { Auth::reject() })
+    }
+
+    async fn channel_open_session(
+        &mut self, _channel: Channel<Msg>, reply: ChannelOpenHandle, _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self, channel: ChannelId, _term: &str, _col_width: u32, _row_height: u32,
+        _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        Ok(())
+    }
+
+    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        Ok(())
+    }
+
+    async fn exec_request(&mut self, channel: ChannelId, _data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        let _ = session.channel_success(channel);
+        Ok(())
+    }
+
+    async fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        session.data(channel, data.to_vec())?;
+        Ok(())
+    }
+
+    async fn channel_eof(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+}
+
 /// Throwaway ed25519 host key used only by these tests.
 const TEST_HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACC3YJilmtTL1Yzxj1k9A91pbvonkDdGrD49/iE9WfkUBAAAAJAA4kMiAOJD\nIgAAAAtzc2gtZWQyNTUxOQAAACC3YJilmtTL1Yzxj1k9A91pbvonkDdGrD49/iE9WfkUBA\nAAAECoQUbFK7LflE6UdHX/68zm8oBEXxSmq7niKCwA/yVCNLdgmKWa1MvVjPGPWT0D3Wlu\n+ieQN0asPj3+IT1Z+RQEAAAACndhc3NoLXRlc3QBAgM=\n-----END OPENSSH PRIVATE KEY-----\n";
 
@@ -319,6 +367,20 @@ async fn exec_reads_exit_status_after_eof() {
         .await.unwrap().expect("command result").expect("command completed");
     assert_eq!(output.stderr, "permission denied\n");
     assert_eq!(output.exit_status, Some(1));
+    session.disconnect();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_input_preserves_password_bytes() {
+    let (host, port) = spawn_server_with(ExecInputServer).await;
+    let mut session = SshSession::connect(options(host, port, SshAuth::Password("secret".to_owned())))
+        .expect("spawn session");
+    wait_for(&mut session, Duration::from_secs(10), |_, _, connected| connected).await;
+    let job = session.exec_with_input("cat".to_owned(), Some("p@ss word\n".to_owned()));
+    let output = tokio::task::spawn_blocking(move || job.output.recv_timeout(Duration::from_secs(5)))
+        .await.unwrap().expect("command result").expect("command completed");
+    assert_eq!(output.stdout, "p@ss word\n");
+    assert_eq!(output.exit_status, Some(0));
     session.disconnect();
 }
 

@@ -30,7 +30,7 @@ pub use checkbox::checkbox;
 pub use color::{color_picker_button, hex_color_input, parse_hex_draft, rgba_from_color32};
 pub use field::{field, password_input, search_input, text_area, text_area_with_id, text_input};
 pub use menu::{MenuItem, MenuState, context_menu};
-pub use modal::{ModalResponse, dialog_width, footer, modal};
+pub use modal::{ModalResponse, dialog_width, footer, modal, modal_shown};
 pub use number::{clamp_value, number_input};
 pub use select::{select, select_str, select_width};
 pub use slider::{SLIDER_HEIGHT, SLIDER_WIDTH, slider_field, step_slider};
