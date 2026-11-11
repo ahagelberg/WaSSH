@@ -265,6 +265,10 @@ enum RowEvent {
     Menu(String),
     /// Set whether the container comes back with the daemon.
     Autostart(String, String, model::Autostart),
+    /// Remove an image, volume or network once its menu says so.
+    RemoveImage(String),
+    RemoveVolume(String),
+    RemoveNetwork(String),
 }
 
 /// The Docker Manager pane.
@@ -1201,6 +1205,33 @@ impl DockerManager {
                 }
                 None
             }
+            RowEvent::RemoveImage(id) => {
+                if let Some(command) =
+                    model::remove_image_command(&self.settings.socket, &id, true)
+                {
+                    let note = format!("Removed image {}", model::short_id(&id));
+                    self.run_change(access, &command, note);
+                }
+                None
+            }
+            RowEvent::RemoveVolume(name) => {
+                if let Some(command) =
+                    model::remove_volume_command(&self.settings.socket, &name, false)
+                {
+                    let note = format!("Removed volume {name}");
+                    self.run_change(access, &command, note);
+                }
+                None
+            }
+            RowEvent::RemoveNetwork(id) => {
+                if let Some(command) =
+                    model::remove_network_command(&self.settings.socket, &id)
+                {
+                    let note = format!("Removed network {}", model::short_id(&id));
+                    self.run_change(access, &command, note);
+                }
+                None
+            }
             RowEvent::Menu(id) => {
                 let container = self.containers.iter().find(|item| item.id == id)?;
                 let (items, events) = container_menu(container, self.stale.contains(&id));
@@ -1498,7 +1529,7 @@ impl DockerManager {
         typed
     }
 
-    fn draw_images(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
+    fn draw_images(&mut self, ui: &mut Ui, palette: &Palette, _access: &mut dyn CommandAccess) {
         ui.horizontal_wrapped(|ui| {
             text_input(ui, palette, &mut self.pull, "nginx:latest");
             let ready = !self.pull.trim().is_empty();
@@ -1516,60 +1547,26 @@ impl DockerManager {
                 "Pull one by name, or run a container from the Containers tab.",
             );
         }
-        let mut remove = None;
+        let mut asked = None;
         egui::ScrollArea::vertical()
             .id_salt("docker-images")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for image in &self.images {
-                    egui::Frame::NONE
-                        .fill(to_color32(palette.bg_panel_2))
-                        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
-                        .corner_radius(wassh_core::RADIUS)
-                        .inner_margin(egui::Margin::symmetric(12, 9))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(image.references.join(", "))
-                                            .size(12.0)
-                                            .monospace()
-                                            .color(to_color32(palette.text)),
-                                    )
-                                    .truncate(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if small_button_enabled(ui, palette, "Remove", true) {
-                                            remove = Some(image.id.clone());
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {} · {} container{}",
-                                    model::format_bytes(image.size),
-                                    image.created,
-                                    image.containers,
-                                    if image.containers == 1 { "" } else { "s" }
-                                ))
-                                .size(10.5)
-                                .color(to_color32(palette.text_muted)),
-                            );
-                        });
-                    ui.add_space(6.0);
+                    let detail = format!(
+                        "{} · {} · {} container{}",
+                        model::format_bytes(image.size),
+                        image.created,
+                        image.containers,
+                        if image.containers == 1 { "" } else { "s" }
+                    );
+                    let title = image.references.join(", ");
+                    if list_card(ui, palette, &title, &detail) {
+                        asked = Some(RowEvent::RemoveImage(image.id.clone()));
+                    }
                 }
             });
-        if let Some(id) = remove
-            && let Some(command) = model::remove_image_command(&self.settings.socket, &id, true)
-        {
-            let note = format!("Removed image {}", model::short_id(&id));
-            self.run_change(access, &command, note);
-        }
+        self.open_row_menu(ui, asked);
     }
 
     fn draw_volumes(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
@@ -1592,58 +1589,23 @@ impl DockerManager {
         if self.volumes.is_empty() {
             empty_state(ui, palette, "No volumes yet", "Name one above to create it.");
         }
-        let mut remove = None;
+        let mut asked = None;
         egui::ScrollArea::vertical()
             .id_salt("docker-volumes")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for volume in &self.volumes {
-                    egui::Frame::NONE
-                        .fill(to_color32(palette.bg_panel_2))
-                        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
-                        .corner_radius(wassh_core::RADIUS)
-                        .inner_margin(egui::Margin::symmetric(12, 9))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&volume.name)
-                                            .size(12.0)
-                                            .color(to_color32(palette.text)),
-                                    )
-                                    .truncate(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if small_button_enabled(ui, palette, "Remove", true) {
-                                            remove = Some(volume.name.clone());
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    volume.driver,
-                                    empty_as(&volume.mountpoint, "-")
-                                ))
-                                .size(10.5)
-                                .monospace()
-                                .color(to_color32(palette.text_muted)),
-                            );
-                        });
-                    ui.add_space(6.0);
+                    let detail = format!(
+                        "{} · {}",
+                        volume.driver,
+                        empty_as(&volume.mountpoint, "-")
+                    );
+                    if list_card(ui, palette, &volume.name, &detail) {
+                        asked = Some(RowEvent::RemoveVolume(volume.name.clone()));
+                    }
                 }
             });
-        if let Some(name) = remove
-            && let Some(command) = model::remove_volume_command(&self.settings.socket, &name, false)
-        {
-            let note = format!("Removed volume {name}");
-            self.run_change(access, &command, note);
-        }
+        self.open_row_menu(ui, asked);
     }
 
     fn draw_networks(&mut self, ui: &mut Ui, palette: &Palette, access: &mut dyn CommandAccess) {
@@ -1664,60 +1626,38 @@ impl DockerManager {
         if self.networks.is_empty() {
             empty_state(ui, palette, "No networks yet", "Name one above to create it.");
         }
-        let mut remove = None;
+        let mut asked = None;
         egui::ScrollArea::vertical()
             .id_salt("docker-networks")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for network in &self.networks {
-                    egui::Frame::NONE
-                        .fill(to_color32(palette.bg_panel_2))
-                        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
-                        .corner_radius(wassh_core::RADIUS)
-                        .inner_margin(egui::Margin::symmetric(12, 9))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&network.name)
-                                            .size(12.0)
-                                            .color(to_color32(palette.text)),
-                                    )
-                                    .truncate(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if small_button_enabled(ui, palette, "Remove", true) {
-                                            remove = Some(network.id.clone());
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {} · {}{}",
-                                    network.short_id(),
-                                    network.driver,
-                                    network.scope,
-                                    if network.internal { " · internal" } else { "" }
-                                ))
-                                .size(10.5)
-                                .monospace()
-                                .color(to_color32(palette.text_muted)),
-                            );
-                        });
-                    ui.add_space(6.0);
+                    let detail = format!(
+                        "{} · {} · {}{}",
+                        network.short_id(),
+                        network.driver,
+                        network.scope,
+                        if network.internal { " · internal" } else { "" }
+                    );
+                    if list_card(ui, palette, &network.name, &detail) {
+                        asked = Some(RowEvent::RemoveNetwork(network.id.clone()));
+                    }
                 }
             });
-        if let Some(id) = remove
-            && let Some(command) = model::remove_network_command(&self.settings.socket, &id)
-        {
-            let note = format!("Removed network {}", model::short_id(&id));
-            self.run_change(access, &command, note);
-        }
+        self.open_row_menu(ui, asked);
+    }
+
+    /// Open the one-row menu a list card asks for on a right-click.
+    fn open_row_menu(&mut self, ui: &Ui, asked: Option<RowEvent>) {
+        let Some(event) = asked else {
+            return;
+        };
+        let at = ui
+            .ctx()
+            .pointer_latest_pos()
+            .unwrap_or_else(|| ui.min_rect().center());
+        self.menu.open_at(at, vec![MenuItem::danger("Remove")]);
+        self.menu_events = vec![Some(event)];
     }
 
     // --- chrome ---------------------------------------------------------
@@ -2425,6 +2365,50 @@ fn is_up(container: &Container) -> bool {
     container.is_running() || container.is_paused()
 }
 
+/// A card in the image, volume or network list: a title, a line of detail, and a
+/// right-click menu. Returns true when its menu was asked for.
+fn list_card(ui: &mut Ui, palette: &Palette, title: &str, detail: &str) -> bool {
+    let card = egui::Frame::NONE
+        .fill(to_color32(palette.bg_panel_2))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .size(12.0)
+                        .monospace()
+                        .color(to_color32(palette.text)),
+                )
+                .truncate(),
+            );
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(detail)
+                        .size(10.5)
+                        .monospace()
+                        .color(to_color32(palette.text_muted)),
+                )
+                .truncate(),
+            );
+        });
+    let rect = card.response.rect;
+    let response = ui.interact(rect, card.response.id, egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_stroke(
+            rect,
+            wassh_core::RADIUS,
+            egui::Stroke::new(1.0, to_color32(palette.accent)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.add_space(6.0);
+    response.secondary_clicked()
+}
+
 /// A small heading over a group of cards.
 fn group_heading(ui: &mut Ui, palette: &Palette, text: &str, count: usize) {
     ui.label(
@@ -2632,9 +2616,12 @@ mod tests {
                 | RowEvent::Stats(id)
                 | RowEvent::Shell(id)
                 | RowEvent::Update(id)
+                | RowEvent::RemoveImage(id)
+                | RowEvent::RemoveNetwork(id)
                 | RowEvent::Act(_, id, _)
                 | RowEvent::Autostart(id, _, _) => id,
                 RowEvent::Menu(id) => id,
+                RowEvent::RemoveVolume(name) => name,
             };
             assert_eq!(id, &running.id);
         }
