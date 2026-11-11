@@ -328,7 +328,7 @@ impl Plugin for MacroPad {
                 .max_rect(action_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        if Button::new("＋ Add macro").primary().show(&mut actions, &palette).clicked() {
+        if Button::new("Add macro").primary().show(&mut actions, &palette).clicked() {
             self.draft = Some(Draft {
                 id: next_id(&self.macros),
                 ..Draft::default()
@@ -675,7 +675,7 @@ mod tests {
         assert!(has("tail -n 100 /var/log/syslog"), "the text preview is shown");
         assert!(has("ps aux"));
         // The shared footer buttons are at the bottom of the pane.
-        assert!(has("＋ Add macro"));
+        assert!(has("Add macro"));
         assert!(has("New group"));
         // The old chip layout and the count line are gone.
         assert!(!texts.iter().any(|text| text.contains("Click to run")));

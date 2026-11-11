@@ -6,8 +6,6 @@
 //! has given a password (or `sudo -n` works), so nothing privileged happens
 //! while the panel is merely open.
 
-use serde_json::Value;
-
 /// Probe that tells us which package manager owns Docker.
 pub const DETECT_COMMAND: &str = concat!(
     ". /etc/os-release 2>/dev/null || true; ",
@@ -123,6 +121,9 @@ pub const WINDOWS_GROUP_COMMAND: &str = "Start-Process -FilePath net -ArgumentLi
 /// What the pane says when `docker info` answered, but not with an engine's own words.
 pub const UNEXPECTED_ANSWER: &str =
     "The docker command answered, but not with a Docker engine version.";
+
+/// Fields the engine probe asks `docker info` for.
+const ENGINE_FIELDS: usize = 7;
 
 /// Which manager the distro id, its family, and the installed tools point at.
 pub fn manager_from_probe(output: &str) -> Manager {
@@ -286,29 +287,34 @@ impl Status {
     }
 }
 
-/// Read `docker info --format '{{json .}}'`.
+/// Read the line [`super::model::engine_command`] asks for:
+/// `version|os|arch|running|paused|stopped|images`.
 ///
-/// A daemon that answers always names its own version, so an object without one came from
+/// A daemon that answers always names its own version, so a line without one came from
 /// something else wearing the `docker` name — not from an engine the pane can drive.
 pub fn parse_info(text: &str) -> Option<Status> {
-    let value: Value = serde_json::from_str(text.trim()).ok()?;
-    if !value.is_object() {
-        return None;
-    }
-    let version = string(&value, "ServerVersion");
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.split('|').count() == ENGINE_FIELDS)?;
+    let mut fields = line.split('|');
+    let version = fields.next().unwrap_or_default().trim();
     if version.is_empty() {
         return None;
     }
-    let number = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or_default();
+    let os = fields.next().unwrap_or_default().trim();
+    let arch = fields.next().unwrap_or_default().trim();
+    let count =
+        |field: Option<&str>| field.and_then(|field| field.trim().parse().ok()).unwrap_or_default();
     Some(Status {
         state: Some(State::Ready),
-        version,
-        os: string(&value, "OperatingSystem"),
-        arch: string(&value, "Architecture"),
-        running: number("ContainersRunning"),
-        paused: number("ContainersPaused"),
-        stopped: number("ContainersStopped"),
-        images: number("Images"),
+        version: version.to_owned(),
+        os: os.to_owned(),
+        arch: arch.to_owned(),
+        running: count(fields.next()),
+        paused: count(fields.next()),
+        stopped: count(fields.next()),
+        images: count(fields.next()),
         message: String::new(),
     })
 }
@@ -341,14 +347,6 @@ pub fn status_from_failure(message: &str) -> Status {
         message: message.trim().to_owned(),
         ..Status::default()
     }
-}
-
-fn string(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
 }
 
 #[cfg(test)]
@@ -422,14 +420,11 @@ mod tests {
 
     #[test]
     fn the_engine_status_reads_docker_info() {
-        let status = parse_info(
-            r#"{"ServerVersion":"27.1.1","OperatingSystem":"Debian GNU/Linux 12 (bookworm)",
-                "Architecture":"x86_64","Containers":5,"ContainersRunning":3,
-                "ContainersPaused":1,"ContainersStopped":1,"Images":12}"#,
-        )
-        .unwrap();
+        let status = parse_info("27.1.1|Debian GNU/Linux 12 (bookworm)|x86_64|3|1|1|12\n").unwrap();
         assert!(status.is_ready());
         assert_eq!(status.version, "27.1.1");
+        assert_eq!(status.os, "Debian GNU/Linux 12 (bookworm)");
+        assert_eq!(status.arch, "x86_64");
         assert_eq!(status.running, 3);
         assert_eq!(status.paused, 1);
         assert_eq!(status.stopped, 1);
@@ -439,12 +434,16 @@ mod tests {
             "{}",
             status.summary()
         );
+        // A shell that said something before the answer does not hide it.
+        let noisy = parse_info("warning: something\n29.1.3|Ubuntu 24.04.2 LTS|arm64|0|0|1|1");
+        assert_eq!(noisy.map(|status| status.version), Some("29.1.3".to_owned()));
     }
 
     #[test]
     fn an_answer_without_a_version_is_not_an_engine() {
-        assert!(parse_info("{}").is_none());
-        assert!(parse_info(r#"{"ContainersRunning":0,"Images":0}"#).is_none());
+        assert!(parse_info("").is_none());
+        assert!(parse_info("||||||").is_none());
+        assert!(parse_info("27.1.1|Debian|x86_64").is_none(), "a short line");
         assert!(parse_info("not json").is_none());
         let status = Status {
             state: Some(State::Error),

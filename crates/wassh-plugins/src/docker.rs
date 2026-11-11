@@ -2849,7 +2849,7 @@ mod tests {
     }
 
     const PS: &str = r#"{"ID":"abc","Names":"web","Image":"nginx:latest","State":"running","Status":"Up 1 hour","Ports":"","Labels":"","Mounts":"","Networks":"bridge"}"#;
-    const INFO: &str = r#"{"ServerVersion":"27.1.1","ContainersRunning":1,"Images":2}"#;
+    const INFO: &str = "27.1.1|Ubuntu 24.04.2 LTS|x86_64|1|0|2|2\n";
 
     fn pane() -> DockerManager {
         DockerManager {

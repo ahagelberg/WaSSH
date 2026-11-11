@@ -683,10 +683,16 @@ pub fn restart_policy_flag(policy: &str) -> Option<&'static str> {
     }
 }
 
-/// `docker info` as JSON, for the engine status.
+/// `docker info` as one line of `|`-separated fields, for the engine status.
+///
+/// Single fields rather than the whole document: `docker info` has changed shape between
+/// CLI versions, while these names have been in its template all along.
 pub fn engine_command(socket: &str) -> String {
     format!(
-        "docker{} info --format '{{{{json .}}}}'",
+        "docker{} info --format \
+         '{{{{.ServerVersion}}}}|{{{{.OperatingSystem}}}}|{{{{.Architecture}}}}|\
+         {{{{.ContainersRunning}}}}|{{{{.ContainersPaused}}}}|{{{{.ContainersStopped}}}}|\
+         {{{{.Images}}}}'",
         socket_flag(socket)
     )
 }
@@ -1492,6 +1498,16 @@ mod tests {
         assert_eq!(
             ps_command("/run/user/1000/docker.sock", false),
             "docker -H 'unix:///run/user/1000/docker.sock' ps --no-trunc --format '{{json .}}'"
+        );
+    }
+
+    #[test]
+    fn the_engine_probe_asks_for_one_line_of_fields() {
+        assert_eq!(
+            engine_command(DEFAULT_SOCKET),
+            "docker info --format \
+             '{{.ServerVersion}}|{{.OperatingSystem}}|{{.Architecture}}|\
+             {{.ContainersRunning}}|{{.ContainersPaused}}|{{.ContainersStopped}}|{{.Images}}'"
         );
     }
 
