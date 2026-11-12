@@ -2522,7 +2522,11 @@ impl Files {
                             };
                             let label = |ui: &mut Ui| {
                                 if mode == ViewerMode::Markdown {
-                                    crate::ai_agent::markdown::render(ui, palette, &body);
+                                    crate::ai_agent::markdown::render(
+                                        ui,
+                                        crate::ai_agent::markdown::Ink::pane(palette),
+                                        &body,
+                                    );
                                 } else {
                                     ui.add(
                                         egui::Label::new(

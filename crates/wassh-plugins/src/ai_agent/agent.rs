@@ -177,12 +177,8 @@ pub enum Phase {
     Asking {
         /// The call being answered.
         call: ApiToolCall,
-        /// Questions shown one at a time.
+        /// Questions the pane shows one at a time.
         questions: Vec<AgentQuestion>,
-        /// Index of the question currently shown.
-        current: usize,
-        /// Answers recorded on earlier questions.
-        answers: Vec<String>,
     },
     /// A command needs root, so the user is asked for their password.
     Sudo {
@@ -1098,17 +1094,7 @@ impl Agent {
                             options: Vec::new(),
                         }]
                     });
-                let text = questions[0].text.clone();
-                self.turns.push(Turn::Question {
-                    text: text.clone(),
-                    answer: None,
-                });
-                self.phase = Some(Phase::Asking {
-                    call,
-                    questions,
-                    current: 0,
-                    answers: Vec::new(),
-                });
+                self.phase = Some(Phase::Asking { call, questions });
             }
             TOOL_RUN_COMMAND => {
                 let Some(command) = arguments["command"]
@@ -1756,60 +1742,34 @@ impl Agent {
             .unwrap_or_else(|| self.turns.len().saturating_sub(1))
     }
 
-    /// Answer the agent's question.
-    pub fn answer(&mut self, text: &str, session: Session<'_, '_>) {
-        let answer = text.trim().to_owned();
-        if answer.is_empty() {
-            return;
-        }
-        let Some(Phase::Asking {
-            call,
-            questions,
-            current,
-            mut answers,
-        }) = self.phase.take()
-        else {
+    /// Answer the agent's questions, in the order they were asked.
+    ///
+    /// Every question needs an answer; anything less leaves the agent waiting.
+    pub fn answer(&mut self, answers: &[String], session: Session<'_, '_>) {
+        let Some(Phase::Asking { call, questions }) = self.phase.take() else {
             return;
         };
-        if current >= questions.len() {
-            self.phase = Some(Phase::Asking {
-                call,
-                questions,
-                current,
-                answers,
-            });
+        let answers: Vec<String> = answers
+            .iter()
+            .map(|answer| answer.trim().to_owned())
+            .collect();
+        if answers.len() != questions.len() || answers.iter().any(String::is_empty) {
+            self.phase = Some(Phase::Asking { call, questions });
             return;
         }
-        if let Some(Turn::Question { answer: slot, .. }) = self
-            .turns
-            .iter_mut()
-            .rev()
-            .find(|turn| matches!(turn, Turn::Question { answer: None, .. }))
-        {
-            *slot = Some(answer.clone());
-        }
-        answers.push(answer);
-        let next = current + 1;
-        if let Some(question) = questions.get(next) {
+        let turn = self.turn_for(&call);
+        for (question, answer) in questions.iter().zip(&answers) {
             self.turns.push(Turn::Question {
                 text: question.text.clone(),
-                answer: None,
+                answer: Some(answer.clone()),
             });
-            self.phase = Some(Phase::Asking {
-                call,
-                questions,
-                current: next,
-                answers,
-            });
-            return;
         }
         let result = questions
             .iter()
-            .zip(answers)
+            .zip(&answers)
             .map(|(question, answer)| format!("{}: {}", question.text, answer))
             .collect::<Vec<_>>()
             .join("\n");
-        let turn = self.turn_for(&call);
         self.settle(call, turn, "ask_user".to_owned(), result, false, session);
     }
 
@@ -2706,28 +2666,33 @@ mod tests {
             },
             &mut session,
         );
+        assert!(agent.asking());
 
-        agent.answer("", &mut session);
-        assert!(matches!(
-            &agent.phase,
-            Some(Phase::Asking { current, .. }) if *current == 0
-        ));
-        assert!(!agent.needs_reply, "an empty answer cannot continue");
+        // A partial set, or a blank answer, cannot continue.
+        agent.answer(&["Rust".to_owned()], &mut session);
+        assert!(agent.asking());
+        assert!(!agent.needs_reply, "one answer of two cannot continue");
+        agent.answer(&["Rust".to_owned(), "  ".to_owned()], &mut session);
+        assert!(agent.asking());
+        assert!(
+            !agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::Question { .. })),
+            "nothing was answered, so nothing goes in the transcript"
+        );
 
-        agent.answer("Rust", &mut session);
-        assert!(matches!(
-            &agent.phase,
-            Some(Phase::Asking { current, .. }) if *current == 1
-        ));
-        assert!(!agent.needs_reply, "the first answer is not the final answer");
-        assert!(matches!(
-            &agent.turns[1],
-            Turn::Question { answer: Some(answer), .. } if answer == "Rust"
-        ));
-
-        agent.answer("main.rs", &mut session);
+        agent.answer(&["Rust".to_owned(), "main.rs".to_owned()], &mut session);
         assert!(!agent.asking());
         assert!(agent.needs_reply);
+        assert!(agent.turns.iter().any(|turn| matches!(
+            turn,
+            Turn::Question { answer: Some(answer), .. } if answer == "Rust"
+        )));
+        assert!(agent.turns.iter().any(|turn| matches!(
+            turn,
+            Turn::Question { answer: Some(answer), .. } if answer == "main.rs"
+        )));
         assert!(matches!(
             agent.turns.iter().find(|turn| matches!(turn, Turn::Tool { .. })),
             Some(Turn::Tool { output, .. })
@@ -3131,7 +3096,7 @@ mod tests {
             &mut session,
         );
         assert!(agent.asking());
-        agent.answer("notes.txt", &mut session);
+        agent.answer(&["notes.txt".to_owned()], &mut session);
         assert!(!agent.asking());
         assert!(agent.turns.iter().any(|turn| matches!(
             turn,

@@ -6,7 +6,7 @@
 //! is shown verbatim, which is the safest failure for a chat pane.
 
 use egui::text::LayoutJob;
-use egui::{FontId, TextFormat, Ui};
+use egui::{Color32, FontId, TextFormat, Ui};
 use wassh_core::Palette;
 
 use wassh_ui::{to_color32, with_alpha};
@@ -19,6 +19,62 @@ const PARAGRAPH_SPACE: f32 = 7.0;
 const LIST_ITEM_SPACE: f32 = 2.0;
 const LIST_MARKER_WIDTH: f32 = 24.0;
 const CODE_TEXT_SIZE: f32 = 12.0;
+/// Alpha of a fenced block's and a bold run's plate on the pane.
+const PLATE_ALPHA: u8 = 18;
+/// Alpha of an inline code plate on the pane.
+const CODE_PLATE_ALPHA: u8 = 24;
+/// Alpha of muted text (list markers, quotes, language tags) on the accent bubble.
+const ON_ACCENT_MUTED_ALPHA: u8 = 200;
+/// Alpha of the black plates used on the accent bubble.
+const ON_ACCENT_PLATE_ALPHA: u8 = 56;
+/// Alpha of a bold run's plate on the accent bubble.
+const ON_ACCENT_STRONG_ALPHA: u8 = 40;
+
+/// The colours a document is drawn in.
+///
+/// The pane hands it its own tokens; the user bubble is an accent fill like a primary
+/// button, so it needs white ink and dark plates instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ink {
+    /// Body, heading and code text.
+    pub text: Color32,
+    /// List markers, quote bars and language tags.
+    pub muted: Color32,
+    /// Inline code.
+    pub code: Color32,
+    /// Behind inline code.
+    pub code_bg: Color32,
+    /// Behind fenced blocks.
+    pub plate: Color32,
+    /// Behind `**bold**`.
+    pub strong: Color32,
+}
+
+impl Ink {
+    /// The pane's own text colours.
+    pub fn pane(palette: &Palette) -> Self {
+        Self {
+            text: to_color32(palette.text),
+            muted: to_color32(palette.text_muted),
+            code: to_color32(palette.accent),
+            code_bg: with_alpha(palette.text_muted, CODE_PLATE_ALPHA),
+            plate: with_alpha(palette.text_muted, PLATE_ALPHA),
+            strong: with_alpha(palette.accent, PLATE_ALPHA),
+        }
+    }
+
+    /// White on the accent, the way a primary button paints its label.
+    pub fn on_accent() -> Self {
+        Self {
+            text: Color32::WHITE,
+            muted: Color32::from_white_alpha(ON_ACCENT_MUTED_ALPHA),
+            code: Color32::WHITE,
+            code_bg: Color32::from_black_alpha(ON_ACCENT_PLATE_ALPHA),
+            plate: Color32::from_black_alpha(ON_ACCENT_PLATE_ALPHA),
+            strong: Color32::from_black_alpha(ON_ACCENT_STRONG_ALPHA),
+        }
+    }
+}
 
 /// One block of a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,29 +257,28 @@ fn numbered(line: &str) -> Option<(u32, String)> {
 }
 
 /// Lay out one line with its inline styles.
-pub fn inline_job(line: &str, palette: &Palette, size: f32) -> LayoutJob {
+pub fn inline_job(line: &str, ink: Ink, size: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
-    let body = to_color32(palette.text);
     for (kind, text) in inline(line) {
         let mut format = TextFormat {
             font_id: FontId::proportional(size),
-            color: body,
+            color: ink.text,
             ..Default::default()
         };
         match kind {
             Inline::Normal => {}
             Inline::Bold => {
                 format.font_id = FontId::proportional(size);
-                format.color = to_color32(palette.text);
-                format.background = with_alpha(palette.accent, 18);
+                format.color = ink.text;
+                format.background = ink.strong;
             }
             Inline::Italic => {
                 format.italics = true;
             }
             Inline::Code => {
                 format.font_id = FontId::monospace(size - 0.5);
-                format.color = to_color32(palette.accent);
-                format.background = with_alpha(palette.text_muted, 24);
+                format.color = ink.code;
+                format.background = ink.code_bg;
             }
         }
         job.append(&text, 0.0, format);
@@ -235,7 +290,7 @@ fn heading_size(level: usize) -> f32 {
     HEADING_SIZES[level.saturating_sub(1).min(HEADING_SIZES.len() - 1)]
 }
 
-fn render_list_item(ui: &mut Ui, marker: String, item: &str, palette: &Palette) {
+fn render_list_item(ui: &mut Ui, marker: String, item: &str, ink: Ink) {
     ui.add_space(LIST_ITEM_SPACE);
     ui.horizontal_top(|ui| {
         ui.add_sized(
@@ -243,17 +298,16 @@ fn render_list_item(ui: &mut Ui, marker: String, item: &str, palette: &Palette) 
             egui::Label::new(
                 egui::RichText::new(marker)
                     .size(BODY_TEXT_SIZE)
-                    .color(to_color32(palette.text_muted)),
+                    .color(ink.muted),
             )
             .halign(egui::Align::Max),
         );
-        ui.add(egui::Label::new(inline_job(item, palette, BODY_TEXT_SIZE)).wrap());
+        ui.add(egui::Label::new(inline_job(item, ink, BODY_TEXT_SIZE)).wrap());
     });
 }
 
-/// Draw a Markdown document.
-pub fn render(ui: &mut Ui, palette: &Palette, text: &str) {
-    let muted = to_color32(palette.text_muted);
+/// Draw a Markdown document in `ink`.
+pub fn render(ui: &mut Ui, ink: Ink, text: &str) {
     for block in blocks(text) {
         match block {
             Block::Heading(level, title) => {
@@ -262,43 +316,45 @@ pub fn render(ui: &mut Ui, palette: &Palette, text: &str) {
                     egui::RichText::new(title)
                         .size(heading_size(level))
                         .strong()
-                        .color(to_color32(palette.text)),
+                        .color(ink.text),
                 );
                 ui.add_space(HEADING_BOTTOM_SPACE);
             }
             Block::Paragraph(line) => {
-                ui.add(egui::Label::new(inline_job(&line, palette, BODY_TEXT_SIZE)).wrap());
+                ui.add(egui::Label::new(inline_job(&line, ink, BODY_TEXT_SIZE)).wrap());
                 ui.add_space(PARAGRAPH_SPACE);
             }
             Block::Bullet(item) => {
-                render_list_item(ui, "•".to_owned(), &item, palette);
+                render_list_item(ui, "•".to_owned(), &item, ink);
             }
             Block::Numbered(number, item) => {
-                render_list_item(ui, format!("{number}."), &item, palette);
+                render_list_item(ui, format!("{number}."), &item, ink);
             }
             Block::Quote(line) => {
                 ui.horizontal_top(|ui| {
                     ui.add_sized(
                         egui::vec2(LIST_MARKER_WIDTH, 0.0),
-                        egui::Label::new(egui::RichText::new("▏").size(BODY_TEXT_SIZE).color(muted)),
+                        egui::Label::new(
+                            egui::RichText::new("▏").size(BODY_TEXT_SIZE).color(ink.muted),
+                        ),
                     );
-                    ui.add(egui::Label::new(inline_job(&line, palette, BODY_TEXT_SIZE)).wrap());
+                    ui.add(egui::Label::new(inline_job(&line, ink, BODY_TEXT_SIZE)).wrap());
                 });
                 ui.add_space(PARAGRAPH_SPACE);
             }
             Block::Code(language, lines) => {
                 if !language.is_empty() {
-                    ui.label(egui::RichText::new(language).size(10.0).color(muted));
+                    ui.label(egui::RichText::new(language).size(10.0).color(ink.muted));
                 }
                 egui::Frame::new()
-                    .fill(with_alpha(palette.text_muted, 18))
+                    .fill(ink.plate)
                     .inner_margin(egui::Margin::symmetric(6, 4))
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(lines.join("\n"))
                                 .size(CODE_TEXT_SIZE)
                                 .monospace()
-                                .color(to_color32(palette.text)),
+                                .color(ink.text),
                         );
                     });
                 ui.add_space(PARAGRAPH_SPACE);
@@ -313,6 +369,18 @@ pub fn render(ui: &mut Ui, palette: &Palette, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_accent_ink_is_white_on_dark_plates() {
+        let ink = Ink::on_accent();
+        assert_eq!(ink.text, Color32::WHITE);
+        assert_eq!(ink.code, Color32::WHITE);
+        assert_ne!(ink.plate, Color32::TRANSPARENT);
+        // The pane keeps its own tokens.
+        let palette = Palette::dark();
+        assert_eq!(Ink::pane(&palette).text, to_color32(palette.text));
+        assert_ne!(Ink::pane(&palette).code_bg, ink.code_bg);
+    }
 
     #[test]
     fn inline_markers_become_runs() {
@@ -396,7 +464,7 @@ mod tests {
                     ui,
                     "•".to_owned(),
                     "This list item is long enough to wrap onto multiple lines in a narrow pane.",
-                    &Palette::dark(),
+                    Ink::pane(&Palette::dark()),
                 );
             });
         });

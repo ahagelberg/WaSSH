@@ -17,9 +17,10 @@ use wassh_ui::widgets::{
 };
 
 use super::agent::{
-    Agent, Phase, SUMMARY_SYSTEM_PROMPT, ToolSettings, Turn, UserMeta, history_from_json,
-    history_to_json, turns_from_json, turns_to_json,
+    Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, ToolSettings, Turn, UserMeta,
+    history_from_json, history_to_json, turns_from_json, turns_to_json,
 };
+use super::markdown::Ink;
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, MAX_ATTACHMENT_BYTES,
@@ -61,13 +62,10 @@ const FOOTER_TEXT_SIZE: f32 = 11.0;
 const MIN_COMPOSER_WIDTH: f32 = 80.0;
 /// Gap between two entries of the transcript.
 const TURN_GAP: f32 = 8.0;
-/// Share of the pane a user message may take, like the reference's bubble.
 /// Share of the pane a chat message may take.
 const MESSAGE_BUBBLE_SHARE: f32 = 0.92;
-/// Share of the accent mixed into the user bubble's background.
-const USER_BUBBLE_TINT: f32 = 0.20;
-/// Share of the accent mixed into the user bubble's border.
-const USER_BUBBLE_BORDER_TINT: f32 = 0.40;
+/// Transparency of the context tags on the accent-filled user bubble.
+const USER_BUBBLE_TAG_ALPHA: u8 = 200;
 /// Share of a tool badge's colour mixed into its pill.
 const BADGE_TINT: f32 = 0.25;
 /// Characters kept from one tool's output.
@@ -278,9 +276,7 @@ pub struct AiAgent {
     /// A summary running on its own thread.
     summary: Option<(SummaryMode, Receiver<Result<String, String>>)>,
     /// The question composer, while `ask_user` waits.
-    answer: String,
-    /// Selected answer option for the current question.
-    answer_choice: Option<usize>,
+    questions: QuestionWizard,
     /// The password being typed into the sudo card.
     sudo: String,
     /// Whether the stored conversation has been read back.
@@ -318,8 +314,7 @@ impl Default for AiAgent {
             refreshed: std::collections::BTreeSet::new(),
             app_writes: Vec::new(),
             summary: None,
-            answer: String::new(),
-            answer_choice: None,
+            questions: QuestionWizard::default(),
             sudo: String::new(),
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
@@ -406,7 +401,7 @@ impl AiAgent {
         self.agent.clear();
         self.attachments.clear();
         self.error = None;
-        self.answer.clear();
+        self.questions = QuestionWizard::default();
     }
 
     /// Swap a stored conversation back into the pane.
@@ -1127,14 +1122,14 @@ impl AiAgent {
         }
     }
 
-    /// Paint the transcript.
+    /// Paint the transcript, answering where each user bubble landed on screen.
     fn transcript(
         &mut self,
         ui: &mut Ui,
         palette: &wassh_core::Palette,
         muted: egui::Color32,
         session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
-    ) {
+    ) -> Vec<(usize, egui::Rect)> {
         if self.agent.turns.is_empty() {
             let empty = if self.providers.is_empty() {
                 "No model providers configured yet. Configure one in Options."
@@ -1144,6 +1139,7 @@ impl AiAgent {
             ui.add(egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap());
         }
         let mut rewind = None;
+        let mut bubbles = Vec::new();
         let mut stop_command = false;
         let running = self.agent.running_command();
         let last_user = self
@@ -1155,9 +1151,11 @@ impl AiAgent {
         for (index, turn) in self.agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { text, meta } => {
-                    if user_bubble(ui, palette, text, *meta) {
+                    let reply = user_bubble(ui, palette, text, *meta);
+                    if reply.clicked {
                         rewind = Some(index);
                     }
+                    bubbles.push((index, reply.rect));
                 }
                 Turn::Assistant { text, stopped } => {
                     // A reply waiting for its first token, or one that only asked for
@@ -1264,15 +1262,62 @@ impl AiAgent {
             );
         }
         // Clicking a message takes the conversation back to it, like the reference.
-        if let Some(text) = rewind.and_then(|index| self.agent.rewind_to(index)) {
+        if let Some(index) = rewind {
+            self.rewind_message(index);
+        }
+        if stop_command {
+            self.agent.stop_command(session);
+        }
+        bubbles
+    }
+
+    /// Take the conversation back to the message at `index`, its text back in the composer.
+    fn rewind_message(&mut self, index: usize) {
+        if let Some(text) = self.agent.rewind_to(index) {
             self.draft = text;
             self.attachments.clear();
             self.attach_terminal = false;
             self.queued = None;
         }
-        if stop_command {
-            self.agent.stop_command(session);
-        }
+    }
+
+    /// Draw the newest message that scrolled past the top of `viewport` again, pinned there.
+    ///
+    /// A pinned copy is opaque, so the transcript scrolls under it. Coming back into view
+    /// releases it, and the message before it takes its place.
+    fn pinned_bubble(
+        &self,
+        ui: &mut Ui,
+        palette: &wassh_core::Palette,
+        viewport: egui::Rect,
+        bubbles: &[(usize, egui::Rect)],
+    ) -> Option<PinnedBubble> {
+        let (index, _) = bubbles
+            .iter()
+            .rev()
+            .find(|(_, rect)| rect.top() < viewport.top())?;
+        let Some(Turn::User { text, meta }) = self.agent.turns.get(*index) else {
+            return None;
+        };
+        let mut pinned = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(viewport)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        pinned.set_clip_rect(viewport);
+        let clicked = egui::Frame::new()
+            .fill(to_color32(palette.bg_panel))
+            .show(&mut pinned, |ui| {
+                // The backdrop spans the whole transcript, so nothing shows beside the
+                // pinned bubble where it scrolls underneath.
+                ui.set_min_width(ui.available_width());
+                user_bubble(ui, palette, text, *meta).clicked
+            })
+            .inner;
+        Some(PinnedBubble {
+            index: *index,
+            clicked,
+        })
     }
 }
 
@@ -1296,25 +1341,30 @@ fn cropped_select<T: Clone + PartialEq>(
     select_width(&mut child, id, selected, options, width)
 }
 
-/// A user message: a bubble against the right edge, tinted with the accent like the
-/// reference's `.ai-agent-user-text`. Clicking it rewinds the conversation to that point.
-fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bool {
+/// What a drawn user bubble reports back.
+struct BubbleReply {
+    /// The bubble was clicked, asking to rewind the conversation to it.
+    clicked: bool,
+    /// Where the bubble landed on screen.
+    rect: egui::Rect,
+}
+
+/// A message drawn again at the top of the transcript.
+struct PinnedBubble {
+    /// Index of the message in the transcript.
+    index: usize,
+    /// The pinned copy was clicked, asking to rewind to it.
+    clicked: bool,
+}
+
+/// A user message: a bubble against the right edge, filled with the accent like a primary
+/// button and carrying white ink. Clicking it rewinds the conversation to that point.
+fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> BubbleReply {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
-    let fill = to_color32(wassh_core::colors::tint(
-        palette.accent,
-        palette.bg_panel_2,
-        USER_BUBBLE_TINT,
-    ));
-    let border = to_color32(wassh_core::colors::tint(
-        palette.accent,
-        palette.border,
-        USER_BUBBLE_BORDER_TINT,
-    ));
     let response = ui
         .with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             egui::Frame::new()
-                .fill(fill)
-                .stroke(egui::Stroke::new(1.0, border))
+                .fill(to_color32(palette.accent))
                 .corner_radius(wassh_core::RADIUS)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
@@ -1334,19 +1384,22 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> bo
                             ui.label(
                                 egui::RichText::new(tags.join("  "))
                                     .size(9.5)
-                                    .color(to_color32(palette.text_muted)),
+                                    .color(egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA)),
                             );
                         }
-                        super::markdown::render(ui, palette, text);
+                        super::markdown::render(ui, Ink::on_accent(), text);
                     });
                 })
                 .response
         })
         .inner;
-    response
-        .interact(egui::Sense::click())
-        .on_hover_text("Click to rewind to this message")
-        .clicked()
+    BubbleReply {
+        clicked: response
+            .interact(egui::Sense::click())
+            .on_hover_text("Click to rewind to this message")
+            .clicked(),
+        rect: response.rect,
+    }
 }
 
 /// An assistant response: Markdown in a neutral bubble against the left edge.
@@ -1361,7 +1414,7 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
             .show(ui, |ui| {
                 ui.set_max_width(room);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    super::markdown::render(ui, palette, text);
+                    super::markdown::render(ui, Ink::pane(palette), text);
                 });
             });
     });
@@ -1688,10 +1741,62 @@ struct PromptAnswers {
     permission: Option<(bool, bool)>,
     /// Capability card: allow every prompt for the rest of the session.
     allow_session: bool,
-    /// The question card's answer.
-    answer: Option<String>,
+    /// The question card's answers, one per question.
+    answers: Option<Vec<String>>,
     /// The sudo card.
     sudo: Option<SudoAnswer>,
+}
+
+/// What the question card holds: the call it belongs to, the question on screen and what
+/// the user entered for each of them.
+#[derive(Default)]
+struct QuestionWizard {
+    /// Id of the `ask_user` call the answers belong to.
+    call: Option<String>,
+    /// Question currently shown.
+    page: usize,
+    /// What the user entered per question, in the order they were asked.
+    drafts: Vec<QuestionDraft>,
+}
+
+/// What the user entered on one question.
+#[derive(Clone, Default)]
+struct QuestionDraft {
+    /// Option the user picked, when the answer is one of them.
+    chosen: Option<usize>,
+    /// Typed answer, which stands in place of an option.
+    text: String,
+}
+
+impl QuestionWizard {
+    /// Start on the first question of `call`, unless the card is already there.
+    fn open(&mut self, call: &str, question_count: usize) {
+        if self.call.as_deref() == Some(call) && self.drafts.len() == question_count {
+            return;
+        }
+        self.call = Some(call.to_owned());
+        self.page = 0;
+        self.drafts = vec![QuestionDraft::default(); question_count];
+    }
+
+    /// The answer entered for the question on `page`, once it has one.
+    fn answer(&self, page: usize, options: &[String]) -> Option<String> {
+        let draft = self.drafts.get(page)?;
+        let text = draft.text.trim();
+        if !text.is_empty() {
+            return Some(text.to_owned());
+        }
+        draft.chosen.and_then(|index| options.get(index)).cloned()
+    }
+
+    /// Every question's answer, once each of them has one.
+    fn answers(&self, questions: &[AgentQuestion]) -> Option<Vec<String>> {
+        questions
+            .iter()
+            .enumerate()
+            .map(|(page, question)| self.answer(page, &question.options))
+            .collect()
+    }
 }
 
 impl AiAgent {
@@ -1851,19 +1956,17 @@ impl AiAgent {
             );
         }
 
-        // The question card.
-        let question = match &self.agent.phase {
-            Some(Phase::Asking {
-                questions,
-                current,
-                ..
-            }) => questions
-                .get(*current)
-                .cloned()
-                .map(|question| (question, *current, questions.len())),
+        // The question card: one question at a time, every answer kept so Previous can
+        // change it and only the last question submits.
+        let asking = match &self.agent.phase {
+            Some(Phase::Asking { call, questions }) => Some((call.id.clone(), questions.clone())),
             _ => None,
         };
-        if let Some((question, current, question_count)) = question {
+        if let Some((call, questions)) = asking {
+            self.questions.open(&call, questions.len());
+            let page = self.questions.page;
+            let question = &questions[page];
+            let is_last = page + QUESTION_INDEX_OFFSET >= questions.len();
             prompt_card(
                 ui,
                 palette,
@@ -1872,8 +1975,8 @@ impl AiAgent {
                     ui.label(
                         egui::RichText::new(format!(
                             "Question {} of {}",
-                            current + QUESTION_INDEX_OFFSET,
-                            question_count
+                            page + QUESTION_INDEX_OFFSET,
+                            questions.len()
                         ))
                         .size(10.0)
                         .color(muted),
@@ -1887,56 +1990,54 @@ impl AiAgent {
                 },
                 |ui| {
                     let room = (ui.available_width() - PROMPT_CARD_GAP).max(MIN_ANSWER_WIDTH);
-                    let free_text_index = question.options.len();
-                    let is_last = current + QUESTION_INDEX_OFFSET >= question_count;
-                    let mut answer_on_enter = false;
+                    let mut picked = false;
+                    let mut enter = false;
+                    let mut confirmed = false;
+                    let mut previous = false;
                     ui.allocate_ui_with_layout(
                         egui::Vec2::new(room, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(room);
-                            if !question.options.is_empty() {
-                                for (index, option) in question.options.iter().enumerate() {
-                                    ui.radio_value(
-                                        &mut self.answer_choice,
-                                        Some(index),
-                                        option,
-                                    );
+                            let draft = &mut self.questions.drafts[page];
+                            // An option is the whole answer, so picking one moves on — but
+                            // never past the last question: that one still needs Answer.
+                            for (index, option) in question.options.iter().enumerate() {
+                                if ui.radio(draft.chosen == Some(index), option).clicked() {
+                                    draft.chosen = Some(index);
+                                    draft.text.clear();
+                                    picked = true;
                                 }
-                                ui.radio_value(
-                                    &mut self.answer_choice,
-                                    Some(free_text_index),
-                                    "Other (write your own)",
-                                );
                             }
-                            let free_text_selected = question.options.is_empty()
-                                || self.answer_choice == Some(free_text_index);
-                            if free_text_selected {
-                                let response =
-                                    text_area(ui, palette, &mut self.answer, 2, "Your answer…");
-                                answer_on_enter = response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                                    && !ui.input(|input| input.modifiers.shift);
+                            // "Write your own" is the text field itself, there from the
+                            // start: no option to pick before it can be used.
+                            let response =
+                                text_area(ui, palette, &mut draft.text, 2, "Your answer…");
+                            if !draft.text.trim().is_empty() {
+                                draft.chosen = None;
                             }
+                            enter = response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                && !ui.input(|input| input.modifiers.shift);
                         },
                     );
-                    let answer = if question.options.is_empty()
-                        || self.answer_choice == Some(free_text_index)
-                    {
-                        self.answer.trim().to_owned()
-                    } else {
-                        self.answer_choice
-                            .and_then(|index| question.options.get(index))
-                            .cloned()
-                            .unwrap_or_default()
-                    };
-                    if !answer.is_empty() && answer_on_enter {
-                        answers.answer = Some(answer);
-                    } else {
-                        let label = if is_last { "Continue" } else { "Next" };
-                        if small_button_enabled(ui, palette, label, !answer.is_empty()) {
-                            answers.answer = Some(answer);
+                    let answered = self.questions.answer(page, &question.options).is_some();
+                    confirmed |= enter && answered;
+                    ui.horizontal(|ui| {
+                        if small_button_enabled(ui, palette, "Previous", page > 0) {
+                            previous = true;
                         }
+                        let label = if is_last { "Answer" } else { "Next" };
+                        if small_button_enabled(ui, palette, label, answered) {
+                            confirmed = true;
+                        }
+                    });
+                    if previous {
+                        self.questions.page = page.saturating_sub(1);
+                    } else if confirmed && is_last {
+                        answers.answers = self.questions.answers(&questions);
+                    } else if confirmed || (picked && !is_last) {
+                        self.questions.page = page + 1;
                     }
                 },
             );
@@ -2361,13 +2462,13 @@ impl Plugin for AiAgent {
             });
 
         // Transcript.
-        egui::ScrollArea::vertical()
+        let scroll = egui::ScrollArea::vertical()
             .id_salt("ai-transcript")
             .max_height(ui.available_height())
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                self.transcript(ui, palette, muted, &mut session);
+                let bubbles = self.transcript(ui, palette, muted, &mut session);
 
                 if let Some(error) = &self.error {
                     ui.add(
@@ -2379,7 +2480,16 @@ impl Plugin for AiAgent {
                         .wrap(),
                     );
                 }
+                bubbles
             });
+
+        // The message the transcript scrolled past the top stays pinned there, as in the
+        // reference chat: a long reply cannot push it out of sight.
+        if let Some(pinned) = self.pinned_bubble(ui, palette, scroll.inner_rect, &scroll.inner)
+            && pinned.clicked
+        {
+            self.rewind_message(pinned.index);
+        }
 
         if let Some((allow, remember, everything)) = prompts.approval {
             if everything {
@@ -2399,10 +2509,9 @@ impl Plugin for AiAgent {
             }
             self.agent.answer_permission(allow, &mut session);
         }
-        if let Some(answer) = prompts.answer {
-            self.answer.clear();
-            self.answer_choice = None;
-            self.agent.answer(&answer, &mut session);
+        if let Some(answers) = prompts.answers {
+            self.questions = QuestionWizard::default();
+            self.agent.answer(&answers, &mut session);
         }
         match prompts.sudo {
             Some(SudoAnswer::Run) => {
@@ -2515,6 +2624,9 @@ mod tests {
     const WIDE_PANE: f32 = 560.0;
     const NARROW_PANE: f32 = 120.0;
     const PROMPT_SCROLL_TOP_TOLERANCE: f32 = 20.0;
+    /// Highest a pinned bubble's text may start: the transcript sits just under the
+    /// pane's own controls.
+    const PINNED_TOP_MAX: f32 = 100.0;
 
     use super::super::settings_ui::{API_KEYS_KEY, provider_secret_field};
     use super::*;
@@ -3252,12 +3364,6 @@ mod tests {
                 text: "Which file?".to_owned(),
                 options: Vec::new(),
             }],
-            current: 0,
-            answers: Vec::new(),
-        });
-        plugin.agent.turns.push(Turn::Question {
-            text: "Which file?".to_owned(),
-            answer: None,
         });
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
@@ -3270,7 +3376,7 @@ mod tests {
             texts.contains(&"Your answer…"),
             "answer box missing: {texts:?}"
         );
-        assert!(texts.contains(&"Continue"), "continue missing: {texts:?}");
+        assert!(texts.contains(&"Answer"), "answer button missing: {texts:?}");
     }
 
     #[test]
@@ -3318,8 +3424,6 @@ mod tests {
                 text: "Which file?".to_owned(),
                 options: Vec::new(),
             }],
-            current: 0,
-            answers: Vec::new(),
         });
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
 
@@ -3341,8 +3445,6 @@ mod tests {
                 text: "Which file?".to_owned(),
                 options: Vec::new(),
             }],
-            current: 0,
-            answers: Vec::new(),
         });
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -3401,8 +3503,28 @@ mod tests {
         );
     }
 
+    /// The painted row whose text is `text`.
+    fn row_of(rows: &[(i32, i32, String)], text: &str) -> (i32, i32, String) {
+        rows.iter()
+            .find(|(_, _, painted)| painted == text)
+            .unwrap_or_else(|| panic!("{text} is not painted: {rows:?}"))
+            .clone()
+    }
+
+    /// Click the painted `text` and draw the frame that shows the result.
+    fn click_and_draw(
+        plugin: &mut AiAgent,
+        settings: &mut serde_json::Map<String, Value>,
+        ctx: &egui::Context,
+        rows: &[(i32, i32, String)],
+        text: &str,
+    ) -> Vec<(i32, i32, String)> {
+        frame(plugin, settings, ctx, click(row_of(rows, text)));
+        frame(plugin, settings, ctx, Vec::new())
+    }
+
     #[test]
-    fn a_multi_question_card_shows_choices_and_advances_one_at_a_time() {
+    fn a_question_card_advances_on_a_pick_and_only_the_last_one_submits() {
         let mut plugin = AiAgent::default();
         plugin.agent.phase = Some(Phase::Asking {
             call: super::super::protocol::ApiToolCall {
@@ -3417,31 +3539,69 @@ mod tests {
                 },
                 super::super::agent::AgentQuestion {
                     text: "Which file?".to_owned(),
-                    options: Vec::new(),
+                    options: vec!["main.rs".to_owned(), "lib.rs".to_owned()],
                 },
             ],
-            current: 0,
-            answers: Vec::new(),
-        });
-        plugin.agent.turns.push(Turn::Question {
-            text: "Which language?".to_owned(),
-            answer: None,
         });
         let mut settings = serde_json::Map::new();
-        let painted = draw(&mut plugin, &mut settings);
-        let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
+        let ctx = egui::Context::default();
+        // The bottom panel settles its height over the first frames.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
 
         for expected in [
             "Question 1 of 2",
             "Which language?",
             "Rust",
             "Go",
-            "Other (write your own)",
+            "Your answer…",
+            "Previous",
             "Next",
         ] {
             assert!(texts.contains(&expected), "{expected} missing: {texts:?}");
         }
-        assert!(!texts.contains(&"Continue"), "not on the final question");
+        assert!(!texts.contains(&"Answer"), "not on the final question");
+        assert!(
+            !texts.contains(&"Other (write your own)"),
+            "the text field is the free answer: {texts:?}"
+        );
+
+        // Picking an option is the answer: the card moves on by itself.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Go");
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(texts.contains(&"Question 2 of 2"), "{texts:?}");
+        assert!(texts.contains(&"Which file?"), "{texts:?}");
+        assert!(
+            texts.contains(&"Answer"),
+            "the last question submits: {texts:?}"
+        );
+
+        // Previous goes back with the answer still chosen, and the pick can change.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Previous");
+        assert_eq!(plugin.questions.page, 0);
+        assert_eq!(plugin.questions.drafts[0].chosen, Some(1));
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Rust");
+        assert_eq!(plugin.questions.page, 1);
+        assert_eq!(plugin.questions.drafts[0].chosen, Some(0));
+
+        // The last question only records the pick; the Answer button submits.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "lib.rs");
+        assert!(plugin.agent.asking(), "a pick on the last question waits");
+        assert_eq!(plugin.questions.drafts[1].chosen, Some(1));
+        click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Answer");
+
+        assert!(!plugin.agent.asking());
+        let answers: Vec<&str> = plugin
+            .agent
+            .turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Question { answer, .. } => answer.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, ["Rust", "lib.rs"]);
     }
 
     #[test]
@@ -3556,9 +3716,7 @@ mod tests {
     #[test]
     fn chat_bubbles_fit_long_text_inside_the_pane() {
         let palette = Palette::dark();
-        let user_fill = to_color32(wassh_core::colors::tint(
-            palette.accent, palette.bg_panel_2, USER_BUBBLE_TINT,
-        ));
+        let user_fill = to_color32(palette.accent);
         for width in [NARROW_PANE, WIDE_PANE] {
             let ctx = egui::Context::default();
             let input = egui::RawInput {
@@ -3697,16 +3855,210 @@ mod tests {
 
         let bubble = bubble.expect("the assistant bubble has a neutral panel fill");
         let response = response.expect("the assistant response is drawn");
-        let user_fill = to_color32(wassh_core::colors::tint(
-            palette.accent,
-            palette.bg_panel_2,
-            USER_BUBBLE_TINT,
-        ));
-        assert_ne!(to_color32(palette.bg_panel_2), user_fill);
+        assert_ne!(to_color32(palette.bg_panel_2), to_color32(palette.accent));
         assert!(bubble.left() < WIDE_PANE / 2.0, "bubble should start on the left");
         assert!(
             response.x >= bubble.left() && response.x < bubble.center().x,
             "response text should be left-aligned inside its bubble: {response:?} in {bubble:?}"
+        );
+    }
+
+    #[test]
+    fn a_user_bubble_is_an_accent_surface_with_white_ink() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            user_bubble(ui, &palette, "hello", UserMeta::default());
+        });
+        let mut fill = None;
+        let mut ink = None;
+        for clipped in std::mem::take(&mut output.shapes) {
+            match clipped.shape {
+                egui::Shape::Rect(rect) if rect.fill == to_color32(palette.accent) => {
+                    fill = Some(rect.rect);
+                }
+                egui::Shape::Text(text) if text.galley.text() == "hello" => {
+                    ink = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color);
+                }
+                _ => {}
+            }
+        }
+        output.drop_without_applying_deltas();
+
+        assert!(fill.is_some(), "the bubble takes the accent, like a primary button");
+        assert_eq!(ink, Some(egui::Color32::WHITE), "its text is white");
+    }
+
+    /// A frame of the pinned copy: which message pinned, where each painted text landed,
+    /// and the bubble's backdrop.
+    fn pinned_frame(
+        plugin: &AiAgent,
+        viewport: egui::Rect,
+        bubbles: &[(usize, egui::Rect)],
+    ) -> (Option<usize>, Vec<(f32, String)>, Option<egui::Rect>) {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(800.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let mut pinned = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            pinned = plugin
+                .pinned_bubble(ui, &palette, viewport, bubbles)
+                .map(|pinned| pinned.index);
+        });
+        let mut texts = Vec::new();
+        let mut backdrop = None;
+        for clipped in std::mem::take(&mut output.shapes) {
+            match clipped.shape {
+                egui::Shape::Text(text) => texts.push((text.pos.y, text.galley.text().to_owned())),
+                egui::Shape::Rect(rect) if rect.fill == to_color32(palette.bg_panel) => {
+                    backdrop = Some(rect.rect);
+                }
+                _ => {}
+            }
+        }
+        output.drop_without_applying_deltas();
+        (pinned, texts, backdrop)
+    }
+
+    #[test]
+    fn the_newest_message_scrolled_past_the_top_is_pinned_there() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "first question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.agent.turns.push(Turn::User {
+            text: "second question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        let viewport =
+            egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(WIDE_PANE, 200.0));
+        let first = egui::Rect::from_min_size(egui::pos2(0.0, -200.0), egui::vec2(120.0, 30.0));
+        let second = egui::Rect::from_min_size(egui::pos2(0.0, 10.0), egui::vec2(120.0, 30.0));
+
+        // Both are above the viewport: the newest one is the one that pins.
+        let (pinned, texts, backdrop) = pinned_frame(&plugin, viewport, &[(0, first), (1, second)]);
+        assert_eq!(pinned, Some(1));
+        let (y, text) = texts.first().expect("the pinned copy is drawn");
+        assert_eq!(text, "second question");
+        assert!(
+            *y >= viewport.top() && *y < viewport.top() + second.height(),
+            "the copy sits at the top of the transcript: {y} in {viewport:?}"
+        );
+        let backdrop = backdrop.expect("the pinned copy has an opaque backdrop");
+        assert_eq!(
+            backdrop.width(),
+            viewport.width(),
+            "the backdrop covers the whole transcript width"
+        );
+
+        // The newest came back into view: the message before it takes over.
+        let visible = egui::Rect::from_min_size(egui::pos2(0.0, 150.0), egui::vec2(120.0, 30.0));
+        let inside = egui::Rect::from_min_size(egui::pos2(0.0, 250.0), egui::vec2(120.0, 30.0));
+        let (pinned, texts, _) = pinned_frame(&plugin, viewport, &[(0, first), (1, visible)]);
+        assert_eq!(pinned, Some(0));
+        assert_eq!(
+            texts.first().map(|(_, text)| text.as_str()),
+            Some("first question")
+        );
+
+        // Nothing scrolled past the top: nothing is pinned.
+        let (pinned, texts, _) = pinned_frame(&plugin, viewport, &[(0, visible), (1, inside)]);
+        assert_eq!(pinned, None);
+        assert!(texts.is_empty(), "nothing is drawn: {texts:?}");
+    }
+
+    #[test]
+    fn a_long_reply_keeps_the_last_message_pinned_at_the_top() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "first question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.agent.turns.push(Turn::Assistant {
+            text: format!("answer one {}", "filler ".repeat(120)),
+            stopped: false,
+        });
+        plugin.agent.turns.push(Turn::User {
+            text: "second question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.agent.turns.push(Turn::Assistant {
+            text: format!("answer two {}", "filler ".repeat(400)),
+            stopped: false,
+        });
+        let ctx = egui::Context::default();
+        let mut settings = serde_json::Map::new();
+        let mut rows = Vec::new();
+        for frame in 0..6 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(WIDE_PANE, 420.0),
+                )),
+                // Time steps instead of the wall clock, so the scroll settles on a frame
+                // of its own instead of racing the test.
+                time: Some(frame as f64),
+                ..Default::default()
+            };
+            let mut context = PluginContext {
+                palette: Palette::dark(),
+                host_label: "dev".to_owned(),
+                environment: "a test shell".to_owned(),
+                status: SessionStatus::Connected,
+                settings: &mut settings,
+                scope: "host-1".to_owned(),
+                session: None,
+                events: &[],
+                pending_input: Vec::new(),
+                repaint_after: None,
+                secrets: &EMPTY_SECRETS,
+                secret_writes: Vec::new(),
+            };
+            let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            rows = shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::Shape::Text(text) => {
+                        Some((text.pos.y, text.galley.text().to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+
+        let pinned = rows
+            .iter()
+            .filter(|(_, text)| text == "second question")
+            .map(|(y, _)| *y)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            pinned < PINNED_TOP_MAX,
+            "the newest message is pinned at the top of the transcript: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, text)| text == "first question"),
+            "only the newest message pins: {rows:?}"
         );
     }
 
@@ -3728,8 +4080,9 @@ mod tests {
         };
         let muted = to_color32(palette.text_muted);
         let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
-        let mut output =
-            ctx.run_ui(input, |ui| plugin.transcript(ui, &palette, muted, &mut session));
+        let mut output = ctx.run_ui(input, |ui| {
+            plugin.transcript(ui, &palette, muted, &mut session);
+        });
         let mut bubbles = Vec::new();
         for clipped in std::mem::take(&mut output.shapes) {
             if let egui::Shape::Rect(rect) = clipped.shape
