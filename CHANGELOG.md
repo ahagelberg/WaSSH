@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.8] - 2026-11-12
+
+### Added
+
+- Publish an AppImage with the Linux release, next to the tarball.
+- Publish Debian and RPM packages with the Linux release.
+
+### Fixed
+
+- Stop Windows from opening a console window for every command the app runs behind
+  the scenes.
+
 ## [2.0.7] - 2026-11-11
 
 ### Added
