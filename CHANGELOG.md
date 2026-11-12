@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.9] - 2026-11-12
+
+### Fixed
+
+- Install the Windows build for every user, in Program Files, instead of into one
+  user's profile. Older copies in the profile are removed by the installer.
+
 ## [2.0.8] - 2026-11-12
 
 ### Added
