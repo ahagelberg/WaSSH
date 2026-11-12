@@ -3758,14 +3758,15 @@ mod tests {
         assert_eq!(output.code, Some(0));
         assert!(entry.failure("probe").is_none());
 
-        // stdin travels too, which is how `sudo -S` gets its password.
+        // stdin travels too, which is how `sudo -S` gets its password. A shell without a
+        // console of its own ends the line its own way, so the bytes are trimmed.
         entry.exec_input("stdin", ECHO_STDIN, "s3cret");
         settle_command(&mut entry, "stdin");
         assert_eq!(
             entry
                 .output("stdin")
-                .map(|output| output.stdout.as_str()),
-            Some("s3cret\n")
+                .map(|output| output.stdout.trim()),
+            Some("s3cret")
         );
     }
 

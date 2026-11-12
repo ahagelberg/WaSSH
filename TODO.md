@@ -1,6 +1,4 @@
 ## Fixes
-- Light theme changes default terminal background and foreground colors
-- Wrong icon
 - Windows installed version show command window for every WSL command run.
 
 ## Additions

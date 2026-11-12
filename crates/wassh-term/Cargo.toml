@@ -14,3 +14,4 @@ portable-pty = { workspace = true }
 serde = { workspace = true }
 vte = { workspace = true }
 wassh-core = { path = "../wassh-core" }
+wassh-sys = { path = "../wassh-sys" }

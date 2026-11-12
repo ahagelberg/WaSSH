@@ -65,12 +65,13 @@ pub fn listing() -> Vec<DistroInfo> {
 pub fn installed() -> bool {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new(WSL)
-            .arg("--status")
+        let mut wsl = std::process::Command::new(WSL);
+        wsl.arg("--status")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        wassh_sys::hide_console(&mut wsl);
+        wsl.status()
             .map(|status| status.success())
             .unwrap_or(false)
     }
@@ -86,11 +87,10 @@ fn run_list(args: &[&str]) -> String {
     if !installed() {
         return String::new();
     }
-    let Ok(output) = std::process::Command::new(WSL)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-    else {
+    let mut wsl = std::process::Command::new(WSL);
+    wsl.args(args).stdin(Stdio::null());
+    wassh_sys::hide_console(&mut wsl);
+    let Ok(output) = wsl.output() else {
         return String::new();
     };
     decode_console_output(&output.stdout)

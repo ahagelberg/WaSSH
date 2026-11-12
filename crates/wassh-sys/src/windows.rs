@@ -30,8 +30,8 @@ use windows_sys::Win32::System::SystemInformation::{
     PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM64, SYSTEM_INFO,
 };
 use windows_sys::Win32::System::Threading::{
-    GetProcessHandleCount, GetProcessIoCounters, GetProcessTimes, GetSystemTimes, OpenProcess,
-    OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, IO_COUNTERS,
+    CREATE_NO_WINDOW, GetProcessHandleCount, GetProcessIoCounters, GetProcessTimes, GetSystemTimes,
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, IO_COUNTERS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
 };
 use windows_sys::Win32::System::Time::{
@@ -55,6 +55,16 @@ pub fn attach_console() {
             windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
         );
     }
+}
+
+/// Keep a child process from opening a console window of its own.
+///
+/// A GUI-subsystem process passes no console to its children, so Windows opens a fresh
+/// window for every console program it starts — `powershell.exe`, `wsl.exe`, `cmd.exe`.
+/// A command whose answer is read through pipes needs no window, only the pipe.
+pub fn hide_console(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 /// Whether Windows has a change staged that only a restart can finish.

@@ -111,9 +111,10 @@ fn spawn(job: impl FnOnce() -> Result<String, String> + Send + 'static) -> WslTa
 }
 
 fn run(args: &[&str]) -> Result<String, String> {
-    let output = Command::new(WSL)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut wsl = Command::new(WSL);
+    wsl.args(args).stdin(Stdio::null());
+    wassh_sys::hide_console(&mut wsl);
+    let output = wsl
         .output()
         .map_err(|error| format!("running {WSL}: {error}"))?;
     let mut text = wsl::decode_console_output(&output.stdout);
@@ -122,9 +123,12 @@ fn run(args: &[&str]) -> Result<String, String> {
 }
 
 fn run_wsl_installer() -> Result<String, String> {
-    let output = Command::new(POWERSHELL)
+    let mut installer = Command::new(POWERSHELL);
+    installer
         .args(["-NoProfile", "-NonInteractive", "-Command", INSTALL_WSL_SCRIPT])
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    wassh_sys::hide_console(&mut installer);
+    let output = installer
         .output()
         .map_err(|error| format!("running {POWERSHELL}: {error}"))?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();

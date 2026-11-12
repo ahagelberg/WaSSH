@@ -176,10 +176,13 @@ fn run(
     if !supported() {
         return Err("Local host commands need a shell on this platform.".to_owned());
     }
-    let mut child = command_for(which, command)?
+    let mut shell = command_for(which, command)?;
+    shell
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    wassh_sys::hide_console(&mut shell);
+    let mut child = shell
         .spawn()
         .map_err(|error| format!("running the local shell: {error}"))?;
     // Writing stdin and dropping it closes the pipe, so a command that reads it

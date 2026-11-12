@@ -5461,6 +5461,7 @@ dependencies = [
  "serde",
  "vte",
  "wassh-core",
+ "wassh-sys",
 ]
 
 [[package]]

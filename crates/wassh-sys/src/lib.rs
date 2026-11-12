@@ -115,6 +115,10 @@ pub fn attach_console() {
 #[cfg(not(windows))]
 pub fn attach_console() {}
 
+/// Nothing to hide where a child process has no window of its own.
+#[cfg(not(windows))]
+pub fn hide_console(_command: &mut std::process::Command) {}
+
 /// Whether Windows has a change staged that only a restart can finish.
 ///
 /// Enabling an optional component (as `wsl --install` does) lands in the component store and
@@ -136,7 +140,7 @@ mod windows;
 use crate::windows as platform;
 #[cfg(windows)]
 pub use windows::{
-    cpu, disk, memory, network, process_details, processes, stop_process, system,
+    cpu, disk, hide_console, memory, network, process_details, processes, stop_process, system,
     unprotect_user_data,
 };
 

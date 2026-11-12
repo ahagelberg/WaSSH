@@ -1547,6 +1547,7 @@ fn shell_command(command: &str) -> Command {
     {
         let mut shell = Command::new("cmd");
         shell.arg("/C").arg(command);
+        wassh_sys::hide_console(&mut shell);
         shell
     }
     #[cfg(not(windows))]

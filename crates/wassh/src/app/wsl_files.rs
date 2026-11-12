@@ -144,11 +144,11 @@ fn home_dir(name: &str) -> String {
 
 /// Run one shell command in the distribution and return its first line of output.
 fn wsl_output(name: &str, command: &str) -> Option<String> {
-    let output = std::process::Command::new("wsl.exe")
-        .args(["--distribution", name, "--exec", "/bin/sh", "-c", command])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let mut wsl = std::process::Command::new("wsl.exe");
+    wsl.args(["--distribution", name, "--exec", "/bin/sh", "-c", command])
+        .stdin(std::process::Stdio::null());
+    wassh_sys::hide_console(&mut wsl);
+    let output = wsl.output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines().next().map(|line| line.trim().to_owned())
 }
