@@ -15,6 +15,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a release builds with the packager it was tested with.
+  NFPM_VERSION: v2.49.0
 
 jobs:
   release-windows:
@@ -195,6 +197,25 @@ jobs:
           rm -f appimagetool
           ls -l dist/*.AppImage
 
+      - name: Build Debian and RPM packages
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          # nfpm names its builds by Go architecture, and its assets mix the two schemes:
+          # amd64 ships as x86_64, arm64 as arm64.
+          case "${{ matrix.arch }}" in
+            aarch64) package_arch=arm64; asset_arch=arm64 ;;
+            *) package_arch=amd64; asset_arch=x86_64 ;;
+          esac
+          curl -fsSL -o nfpm.tgz \
+            "https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/nfpm_${NFPM_VERSION#v}_Linux_${asset_arch}.tar.gz"
+          tar -xzf nfpm.tgz nfpm
+          for packager in deb rpm; do
+            VERSION="$version" ARCH="$package_arch" ./nfpm package \
+              --config packaging/nfpm.yaml --packager "$packager" --target dist/
+          done
+          rm -f nfpm nfpm.tgz
+          ls -l dist/*.deb dist/*.rpm
+
       - name: Package
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -211,6 +232,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
@@ -219,4 +242,6 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
           if-no-files-found: error

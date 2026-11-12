@@ -1,0 +1,37 @@
+# One description of the package, built into both a .deb and an .rpm.
+#
+# CI sets VERSION from Cargo.toml and ARCH from the runner (amd64, arm64), and runs the
+# command from the repository root after a release build: nfpm resolves the paths below
+# from the working directory.
+name: wassh
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: Andreas Hagelberg <andreas@hagelberg.name>
+vendor: WaSSH
+homepage: https://github.com/ahagelberg/WaSSH
+license: MIT
+description: |
+  Advanced multi-tab SSH client with Telnet and serial support.
+
+  WaSSH keeps hosts, sessions and encrypted secrets in one window, with panes for
+  file transfer, server monitoring, MQTT, Docker and an AI agent.
+contents:
+  - src: target/release/wassh
+    dst: /usr/bin/wassh
+    file_info:
+      mode: 0755
+  - src: packaging/wassh.desktop
+    dst: /usr/share/applications/wassh.desktop
+    file_info:
+      mode: 0644
+  - src: "res/WaSSH program icon.png"
+    dst: /usr/share/icons/hicolor/512x512/apps/wassh.png
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/wassh/README.md
+    file_info:
+      mode: 0644
