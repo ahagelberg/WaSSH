@@ -172,6 +172,29 @@ jobs:
       - name: Build
         run: cargo build --release -p wassh
 
+      - name: Build AppImage
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          arch="${{ matrix.arch }}"
+          appdir="dist/WaSSH.AppDir"
+          rm -rf "$appdir"
+          # The AppDir is the image's own file system: the binary, its entry and its icon.
+          install -Dm755 target/release/wassh "$appdir/usr/bin/wassh"
+          install -Dm644 packaging/wassh.desktop "$appdir/wassh.desktop"
+          install -Dm644 packaging/wassh.desktop "$appdir/usr/share/applications/wassh.desktop"
+          install -Dm644 "res/WaSSH program icon.png" "$appdir/wassh.png"
+          install -Dm644 "res/WaSSH program icon.png" \
+            "$appdir/usr/share/icons/hicolor/512x512/apps/wassh.png"
+          ln -s usr/bin/wassh "$appdir/AppRun"
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${arch}.AppImage"
+          chmod +x appimagetool
+          # The runners have no FUSE, and none is needed to pack an image.
+          VERSION="$version" ARCH="$arch" ./appimagetool --appimage-extract-and-run \
+            "$appdir" "dist/wassh-$version-linux-$arch.AppImage"
+          rm -f appimagetool
+          ls -l dist/*.AppImage
+
       - name: Package
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -185,11 +208,15 @@ jobs:
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.AppImage
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
           name: wassh-${{ github.ref_name }}-linux-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.AppImage
           if-no-files-found: error
