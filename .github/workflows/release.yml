@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         run: |
           $installer = (Get-Item dist/*-win-setup-x64.exe).FullName
-          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\WaSSH Native'
+          $installDir = Join-Path $env:ProgramFiles 'WaSSH Native'
           $executable = Join-Path $installDir 'wassh.exe'
           $expectedHash = (Get-FileHash target/release/wassh.exe).Hash
           foreach ($attempt in 1..2) {
