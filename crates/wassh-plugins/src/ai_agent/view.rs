@@ -66,6 +66,14 @@ const TURN_GAP: f32 = 8.0;
 const MESSAGE_BUBBLE_SHARE: f32 = 0.92;
 /// Transparency of the context tags on the accent-filled user bubble.
 const USER_BUBBLE_TAG_ALPHA: u8 = 200;
+/// Lines the prompt editor opens with at least.
+const EDITOR_MIN_ROWS: usize = 2;
+/// Lines the prompt editor grows to before it starts scrolling.
+const EDITOR_MAX_ROWS: usize = 10;
+/// Keys the prompt editor answers to, under the field.
+const EDITOR_HINT: &str = "Enter to send · Esc to cancel";
+/// Why an earlier prompt cannot be edited just now.
+const EDIT_WHILE_BUSY: &str = "Stop the current run before editing an earlier message.";
 /// Share of a tool badge's colour mixed into its pill.
 const BADGE_TINT: f32 = 0.25;
 /// Characters kept from one tool's output.
@@ -277,6 +285,8 @@ pub struct AiAgent {
     summary: Option<(SummaryMode, Receiver<Result<String, String>>)>,
     /// The question composer, while `ask_user` waits.
     questions: QuestionWizard,
+    /// The prompt opened for editing in the transcript, if any.
+    editing: Option<MessageEdit>,
     /// The password being typed into the sudo card.
     sudo: String,
     /// Whether the stored conversation has been read back.
@@ -315,6 +325,7 @@ impl Default for AiAgent {
             app_writes: Vec::new(),
             summary: None,
             questions: QuestionWizard::default(),
+            editing: None,
             sudo: String::new(),
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
@@ -402,6 +413,7 @@ impl AiAgent {
         self.attachments.clear();
         self.error = None;
         self.questions = QuestionWizard::default();
+        self.editing = None;
     }
 
     /// Swap a stored conversation back into the pane.
@@ -431,6 +443,7 @@ impl AiAgent {
         }
         self.attachments.clear();
         self.error = None;
+        self.editing = None;
     }
 
     /// The provider in use.
@@ -1129,7 +1142,7 @@ impl AiAgent {
         palette: &wassh_core::Palette,
         muted: egui::Color32,
         session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
-    ) -> Vec<(usize, egui::Rect)> {
+    ) -> TranscriptReply {
         if self.agent.turns.is_empty() {
             let empty = if self.providers.is_empty() {
                 "No model providers configured yet. Configure one in Options."
@@ -1138,7 +1151,9 @@ impl AiAgent {
             };
             ui.add(egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap());
         }
-        let mut rewind = None;
+        let mut open = None;
+        let mut edit_action = EditAction::None;
+        let editing = self.editing.as_ref().map(|edit| edit.index);
         let mut bubbles = Vec::new();
         let mut stop_command = false;
         let running = self.agent.running_command();
@@ -1151,11 +1166,17 @@ impl AiAgent {
         for (index, turn) in self.agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { text, meta } => {
-                    let reply = user_bubble(ui, palette, text, *meta);
-                    if reply.clicked {
-                        rewind = Some(index);
+                    if editing == Some(index)
+                        && let Some(edit) = self.editing.as_mut()
+                    {
+                        edit_action = prompt_editor(ui, palette, edit);
+                    } else {
+                        let reply = user_bubble(ui, palette, text, *meta);
+                        if reply.clicked {
+                            open = Some(index);
+                        }
+                        bubbles.push((index, reply.rect));
                     }
-                    bubbles.push((index, reply.rect));
                 }
                 Turn::Assistant { text, stopped } => {
                     // A reply waiting for its first token, or one that only asked for
@@ -1261,24 +1282,71 @@ impl AiAgent {
                     .color(muted),
             );
         }
-        // Clicking a message takes the conversation back to it, like the reference.
-        if let Some(index) = rewind {
-            self.rewind_message(index);
+        // Clicking a message opens it for editing; the edit itself is sent by the pane.
+        if let Some(index) = open {
+            self.edit_prompt(index);
         }
+        let submitted = match edit_action {
+            EditAction::Cancel => {
+                self.editing = None;
+                None
+            }
+            EditAction::Submit => self.editing.take().map(|edit| (edit.index, edit.text)),
+            EditAction::None => None,
+        };
         if stop_command {
             self.agent.stop_command(session);
         }
-        bubbles
+        TranscriptReply {
+            bubbles,
+            submitted,
+        }
     }
 
-    /// Take the conversation back to the message at `index`, its text back in the composer.
-    fn rewind_message(&mut self, index: usize) {
-        if let Some(text) = self.agent.rewind_to(index) {
-            self.draft = text;
-            self.attachments.clear();
-            self.attach_terminal = false;
-            self.queued = None;
+    /// Open the prompt at `index` in the transcript, ready to be rewritten.
+    fn edit_prompt(&mut self, index: usize) {
+        let Some(Turn::User { text, .. }) = self.agent.turns.get(index) else {
+            return;
+        };
+        if self.agent.blocked() {
+            self.error = Some(EDIT_WHILE_BUSY.to_owned());
+            return;
         }
+        self.editing = Some(MessageEdit {
+            index,
+            text: text.clone(),
+            opening: true,
+        });
+    }
+
+    /// Send `text` in place of the prompt at `index`, dropping everything after it.
+    fn replace_prompt(
+        &mut self,
+        index: usize,
+        text: &str,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.agent.blocked() {
+            self.error = Some(EDIT_WHILE_BUSY.to_owned());
+            return;
+        }
+        if self.agent.rewind_to(index).is_none() {
+            return;
+        }
+        self.editing = None;
+        self.draft.clear();
+        self.attachments.clear();
+        self.attach_terminal = false;
+        self.queued = None;
+        // The files and terminal tail the first version carried are not in the transcript,
+        // so the edited prompt goes out as written.
+        self.send_message(text, UserMeta::default(), settings, host, environment);
     }
 
     /// Draw the newest message that scrolled past the top of `viewport` again, pinned there.
@@ -1343,7 +1411,7 @@ fn cropped_select<T: Clone + PartialEq>(
 
 /// What a drawn user bubble reports back.
 struct BubbleReply {
-    /// The bubble was clicked, asking to rewind the conversation to it.
+    /// The bubble was clicked, asking to edit the prompt.
     clicked: bool,
     /// Where the bubble landed on screen.
     rect: egui::Rect,
@@ -1353,12 +1421,92 @@ struct BubbleReply {
 struct PinnedBubble {
     /// Index of the message in the transcript.
     index: usize,
-    /// The pinned copy was clicked, asking to rewind to it.
+    /// The pinned copy was clicked, asking to edit the prompt.
     clicked: bool,
 }
 
+/// What the transcript reports after a frame: where each prompt landed, and the edited
+/// prompt the pane still has to send.
+struct TranscriptReply {
+    /// Screen rect of every user bubble drawn.
+    bubbles: Vec<(usize, egui::Rect)>,
+    /// The edited prompt waiting to go out, as turn index and text.
+    submitted: Option<(usize, String)>,
+}
+
+/// A prompt opened for editing in the transcript.
+struct MessageEdit {
+    /// Turn index of the message being edited.
+    index: usize,
+    /// What the editor holds.
+    text: String,
+    /// Whether the editor still has to be focused and scrolled into view.
+    opening: bool,
+}
+
+/// What the prompt editor did this frame.
+enum EditAction {
+    /// Still editing.
+    None,
+    /// Put the message back as it was.
+    Cancel,
+    /// Send the edited prompt in place of the old one.
+    Submit,
+}
+
+/// A prompt opened for editing: the same accent bubble, holding a text field.
+///
+/// Enter sends the edited prompt, Escape puts the message back. The cue underneath says
+/// so, because neither key is discoverable otherwise.
+fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> EditAction {
+    let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
+    let id = ui.make_persistent_id(("ai-prompt-editor", edit.index));
+    let mut action = EditAction::None;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+        egui::Frame::new()
+            .fill(to_color32(palette.accent))
+            .corner_radius(wassh_core::RADIUS)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(room);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    let rows = edit
+                        .text
+                        .lines()
+                        .count()
+                        .clamp(EDITOR_MIN_ROWS, EDITOR_MAX_ROWS);
+                    let response =
+                        text_area_with_id(ui, palette, &mut edit.text, rows, "Prompt", id);
+                    if edit.opening {
+                        response.request_focus();
+                        ui.scroll_to_rect(response.rect, Some(egui::Align::TOP));
+                        edit.opening = false;
+                    }
+                    if ui.memory(|memory| memory.has_focus(id))
+                        && ui.input_mut(|input| {
+                            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        })
+                    {
+                        action = EditAction::Submit;
+                    }
+                    if ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    }) {
+                        action = EditAction::Cancel;
+                    }
+                    ui.label(
+                        egui::RichText::new(EDITOR_HINT)
+                            .size(9.5)
+                            .color(egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA)),
+                    );
+                });
+            });
+    });
+    action
+}
+
 /// A user message: a bubble against the right edge, filled with the accent like a primary
-/// button and carrying white ink. Clicking it rewinds the conversation to that point.
+/// button and carrying white ink. Clicking it opens the prompt for editing.
 fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> BubbleReply {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
     let response = ui
@@ -1369,6 +1517,9 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> Bu
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(room);
+                    // The prompt is a block that opens an editor, not text to select: no
+                    // text cursor, no selection, until it has been clicked.
+                    ui.style_mut().interaction.selectable_labels = false;
                     // The frame hugs the right edge while its text stays left-aligned.
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         // What went out with the message, like the reference's ctx tags.
@@ -1396,7 +1547,8 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> Bu
     BubbleReply {
         clicked: response
             .interact(egui::Sense::click())
-            .on_hover_text("Click to rewind to this message")
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Click to edit this message")
             .clicked(),
         rect: response.rect,
     }
@@ -1855,14 +2007,15 @@ impl AiAgent {
                         {
                             chosen = Some((false, None));
                         }
-                        if Button::new("Allow all this session")
-                            .compact()
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            everything = true;
-                        }
                     });
+                    // Session-wide, so it gets its own line: the row never scrolls.
+                    if Button::new("Allow all this session")
+                        .compact()
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        everything = true;
+                    }
                     ui.vertical(|ui| {
                         for (index, scope) in scopes.iter().enumerate() {
                             let label = if scope.word_count == 0 {
@@ -1911,7 +2064,7 @@ impl AiAgent {
                     prompt_command(ui, palette, &label);
                 },
                 |ui| {
-                    prompt_action_row(ui, "permission", |ui| {
+                    prompt_action_row(ui, "permission-now", |ui| {
                         if Button::new("Approve once")
                             .compact()
                             .primary()
@@ -1928,13 +2081,10 @@ impl AiAgent {
                         {
                             answers.permission = Some((false, false));
                         }
-                        if Button::new("Allow all this session")
-                            .compact()
-                            .show(ui, palette)
-                            .clicked()
-                        {
-                            answers.allow_session = true;
-                        }
+                    });
+                    // The remembered answers and the session-wide one each get their own
+                    // line, so no row has to scroll sideways.
+                    prompt_action_row(ui, "permission-always", |ui| {
                         if Button::new("Always allow")
                             .compact()
                             .primary()
@@ -1952,6 +2102,13 @@ impl AiAgent {
                             answers.permission = Some((false, true));
                         }
                     });
+                    if Button::new("Allow all this session")
+                        .compact()
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        answers.allow_session = true;
+                    }
                 },
             );
         }
@@ -2468,7 +2625,7 @@ impl Plugin for AiAgent {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                let bubbles = self.transcript(ui, palette, muted, &mut session);
+                let reply = self.transcript(ui, palette, muted, &mut session);
 
                 if let Some(error) = &self.error {
                     ui.add(
@@ -2480,15 +2637,27 @@ impl Plugin for AiAgent {
                         .wrap(),
                     );
                 }
-                bubbles
+                reply
             });
+        let reply = scroll.inner;
 
         // The message the transcript scrolled past the top stays pinned there, as in the
-        // reference chat: a long reply cannot push it out of sight.
-        if let Some(pinned) = self.pinned_bubble(ui, palette, scroll.inner_rect, &scroll.inner)
+        // reference chat: a long reply cannot push it out of sight. It opens the same
+        // editor as the message it copies.
+        if self.editing.is_none()
+            && let Some(pinned) = self.pinned_bubble(ui, palette, scroll.inner_rect, &reply.bubbles)
             && pinned.clicked
         {
-            self.rewind_message(pinned.index);
+            self.edit_prompt(pinned.index);
+        }
+        if let Some((index, text)) = reply.submitted {
+            self.replace_prompt(
+                index,
+                &text,
+                context.settings,
+                &context.host_label,
+                &context.environment,
+            );
         }
 
         if let Some((allow, remember, everything)) = prompts.approval {
@@ -3112,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_actions_share_one_row() {
+    fn permission_actions_keep_the_remembered_choices_on_their_own_line() {
         let mut plugin = AiAgent::default();
         plugin.agent.phase = Some(Phase::Allowing {
             call: super::super::protocol::ApiToolCall {
@@ -3126,15 +3295,15 @@ mod tests {
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
         let permission_rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert_actions_share_row(
-            &permission_rows,
-            &[
-                "Approve once",
-                "Deny once",
-                "Allow all this session",
-                "Always allow",
-                "Always deny",
-            ],
+        assert_actions_share_row(&permission_rows, &["Approve once", "Deny once"]);
+        assert_actions_share_row(&permission_rows, &["Always allow", "Always deny"]);
+        let once = row_y(&permission_rows, "Approve once");
+        let always = row_y(&permission_rows, "Always allow");
+        let session = row_y(&permission_rows, "Allow all this session");
+        assert!(always > once, "the remembered choices are below the once ones");
+        assert!(
+            session > always,
+            "the session-wide allow is on its own line: {permission_rows:?}"
         );
 
         plugin.agent.phase = Some(Phase::Approving {
@@ -3147,15 +3316,21 @@ mod tests {
             scopes: super::super::rules::approval_scopes("systemctl restart nginx"),
         });
         let approval_rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert_actions_share_row(
-            &approval_rows,
-            &[
-                "Allow",
-                "Deny",
-                "Allow all this session",
-            ],
+        assert_actions_share_row(&approval_rows, &["Allow", "Deny"]);
+        assert_eq!(row_y(&approval_rows, "Allow"), row_y(&approval_rows, "Deny"));
+        assert!(
+            row_y(&approval_rows, "Allow all this session") > row_y(&approval_rows, "Allow"),
+            "the session-wide allow is on its own line: {approval_rows:?}"
         );
         assert_actions_stack_below(&approval_rows, &["Allow", "Deny", "Allow all this session"]);
+    }
+
+    /// The y of the painted `label`.
+    fn row_y(rows: &[(i32, i32, String)], label: &str) -> i32 {
+        rows.iter()
+            .find(|(_, _, text)| text == label)
+            .unwrap_or_else(|| panic!("{label} missing from {rows:?}"))
+            .0
     }
 
     fn assert_actions_share_row(rows: &[(i32, i32, String)], labels: &[&str]) {
@@ -3509,6 +3684,88 @@ mod tests {
             .find(|(_, _, painted)| painted == text)
             .unwrap_or_else(|| panic!("{text} is not painted: {rows:?}"))
             .clone()
+    }
+
+    /// A bare key press.
+    fn key(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    /// A pane holding two prompts, each with its reply.
+    fn two_prompts() -> AiAgent {
+        let mut plugin = AiAgent::default();
+        for (prompt, reply) in [("first prompt", "a reply"), ("second prompt", "another reply")] {
+            plugin.agent.turns.push(Turn::User {
+                text: prompt.to_owned(),
+                meta: UserMeta::default(),
+            });
+            plugin.agent.turns.push(Turn::Assistant {
+                text: reply.to_owned(),
+                stopped: false,
+            });
+        }
+        plugin
+    }
+
+    #[test]
+    fn clicking_a_prompt_opens_it_for_editing() {
+        let mut plugin = two_prompts();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        // The bottom panel and the scroll area settle over the first frames.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        frame(&mut plugin, &mut settings, &ctx, click(row_of(&rows, "second prompt")));
+        assert_eq!(plugin.editing.as_ref().map(|edit| edit.index), Some(2));
+
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts.contains(&EDITOR_HINT),
+            "the editor says which keys it answers to: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"second prompt"),
+            "the prompt is in the field: {texts:?}"
+        );
+
+        // Escape puts the message back as it was.
+        frame(&mut plugin, &mut settings, &ctx, key(egui::Key::Escape));
+        assert!(plugin.editing.is_none());
+        assert_eq!(plugin.agent.turns.len(), 4);
+    }
+
+    #[test]
+    fn sending_an_edited_prompt_restarts_the_chat_from_it() {
+        let mut plugin = two_prompts();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        frame(&mut plugin, &mut settings, &ctx, click(row_of(&rows, "second prompt")));
+        let edit = plugin.editing.as_mut().expect("the prompt is being edited");
+        edit.text = "rewritten prompt".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        // Enter, in the focused field, sends it and drops what followed.
+        frame(&mut plugin, &mut settings, &ctx, key(egui::Key::Enter));
+        assert!(plugin.editing.is_none(), "the editor closed");
+        assert_eq!(plugin.agent.turns.len(), 3, "{:?}", plugin.agent.turns);
+        assert!(matches!(
+            &plugin.agent.turns[1],
+            Turn::Assistant { text, .. } if text == "a reply"
+        ));
+        assert!(matches!(
+            &plugin.agent.turns[2],
+            Turn::User { text, .. } if text == "rewritten prompt"
+        ));
     }
 
     /// Click the painted `text` and draw the frame that shows the result.
