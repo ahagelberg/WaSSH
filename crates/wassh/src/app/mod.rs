@@ -2548,6 +2548,7 @@ impl Shell {
             .map(|(index, session)| wassh_ui::TabView {
                 id: &session.id,
                 title: &session.title,
+                kind: session.connection.tab_tag(),
                 status: session.status,
                 active: active == Some(index),
                 accent: session.accent(),
