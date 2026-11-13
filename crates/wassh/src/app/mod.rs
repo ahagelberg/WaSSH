@@ -4696,9 +4696,12 @@ mod tests {
 
     fn scratch_config() -> Config {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Windows hands a dead process's id to the next one, so the pid alone can land on
+        // the directory a previous run left behind: the millisecond keeps it fresh.
         let dir = std::env::temp_dir().join(format!(
-            "wassh-shell-{}-{n}",
-            std::process::id()
+            "wassh-shell-{}-{n}-{}",
+            std::process::id(),
+            wassh_core::time::now_ms()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut config = Config::open(&dir).expect("config");
