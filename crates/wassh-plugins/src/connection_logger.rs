@@ -13,7 +13,9 @@ use wassh_core::time::now_ms;
 use wassh_core::{ConnectionEvent, Palette, SessionStatus};
 
 use wassh_ui::to_color32;
-use wassh_ui::widgets::{Button, fixed_inset_card, small_button};
+use wassh_ui::widgets::{
+    Button, faded, small_button, truncating_galley, truncating_galley_with,
+};
 
 use crate::plugin::{Plugin, PluginContext};
 use crate::time;
@@ -28,10 +30,12 @@ pub const MAX_ENTRIES_KEY: &str = "maxEntries";
 /// Entries kept when the settings say nothing.
 pub const DEFAULT_MAX_ENTRIES: usize = 500;
 
-/// Height of the timeline bar.
+/// Height of the timeline bar, and the shortest it shrinks to in a low pane.
 const TIMELINE_HEIGHT: f32 = 28.0;
-/// Height of the step chart's box.
+const TIMELINE_MIN_HEIGHT: f32 = 12.0;
+/// Height of the step chart's box, and the shortest it shrinks to in a low pane.
 const STEP_HEIGHT: f32 = 80.0;
+const STEP_MIN_HEIGHT: f32 = 36.0;
 /// Space above and below the step line.
 const STEP_PADDING: f32 = 10.0;
 /// Thickness of the step line.
@@ -48,18 +52,35 @@ const HEAT_GAP: f32 = 3.0;
 const HEAT_RADIUS: u8 = 3;
 /// Side of a legend sample.
 const HEAT_SAMPLE: f32 = 10.0;
-/// Tallest the heatmap gets before it scrolls.
+/// Tallest the heatmap gets before it scrolls, and the shortest it shrinks to.
 const HEAT_MAX_HEIGHT: f32 = 90.0;
-/// Height of the axis under a graph.
+const HEAT_MIN_HEIGHT: f32 = HEAT_CELL * 2.0 + HEAT_GAP;
+/// Height of the axis under a graph, and the narrowest a tick label's slot gets before the
+/// axis drops one.
 const AXIS_HEIGHT: f32 = 14.0;
-/// Corner radius of the boxes the graph and the cards draw.
+const TICK_ROOM: f32 = 88.0;
+/// Corner radius of every box the pane draws.
 const SURFACE_RADIUS: u8 = 4;
 /// Gap between the blocks of the pane.
 const BLOCK_GAP: f32 = 6.0;
 /// Narrowest metric card, and the padding inside it.
 const METRIC_MIN_WIDTH: f32 = 130.0;
-const METRIC_PAD_X: i8 = 8;
-const METRIC_PAD_Y: i8 = 6;
+const METRIC_PAD_X: f32 = 8.0;
+const METRIC_PAD_Y: f32 = 6.0;
+/// Gap between a card's label and its value, and the border strength of a card.
+const METRIC_LINE_GAP: f32 = 2.0;
+const METRIC_BORDER: f32 = 0.7;
+/// Label and value sizes on a metric card, and the dot marking a live state.
+const METRIC_LABEL_SIZE: f32 = 10.0;
+const METRIC_VALUE_SIZE: f32 = 13.0;
+const METRIC_DOT: f32 = 6.0;
+const METRIC_DOT_GAP: f32 = 6.0;
+/// One row of the event list, the line a message takes, and the gap between columns.
+const LIST_ROW_HEIGHT: f32 = 16.0;
+const LIST_MESSAGE_HEIGHT: f32 = 13.0;
+const LIST_COLUMN_GAP: f32 = 10.0;
+/// Length of a day, for axis labels that have to name the day.
+const DAY_MS: u64 = 86_400_000;
 /// Narrowest a timeline segment is drawn, so a short blip stays visible.
 const MIN_SEGMENT_PX: f32 = 2.0;
 /// Padding inside a tooltip, the gap between its lines, and its inset from the graph.
@@ -100,6 +121,14 @@ impl LogKind {
             Self::Failed => "failed",
         }
     }
+
+    /// Every kind, for measuring the widest label the list prints.
+    const ALL: [Self; 4] = [
+        Self::Connected,
+        Self::Reconnecting,
+        Self::Disconnected,
+        Self::Failed,
+    ];
 
     /// Whether the session was up before this entry.
     fn ends_a_session(self) -> bool {
@@ -558,9 +587,18 @@ impl Plugin for ConnectionLogger {
         self.metrics(ui, &palette, context.status, &summary);
         ui.add_space(BLOCK_GAP);
         match self.graph {
-            GraphMode::Timeline => timeline(ui, &palette, range, &spans),
-            GraphMode::Step => step_chart(ui, &palette, range, &spans),
-            GraphMode::Heatmap => heatmap(ui, &palette, range, &spans),
+            GraphMode::Timeline => {
+                let height = graph_height(ui, TIMELINE_HEIGHT, TIMELINE_MIN_HEIGHT);
+                timeline(ui, &palette, range, &spans, height);
+            }
+            GraphMode::Step => {
+                let height = graph_height(ui, STEP_HEIGHT, STEP_MIN_HEIGHT);
+                step_chart(ui, &palette, range, &spans, height);
+            }
+            GraphMode::Heatmap => {
+                let height = graph_height(ui, HEAT_MAX_HEIGHT, HEAT_MIN_HEIGHT);
+                heatmap(ui, &palette, range, &spans, height);
+            }
         }
         ui.add_space(BLOCK_GAP);
         self.list(ui, &palette);
@@ -635,58 +673,44 @@ impl ConnectionLogger {
 
     /// The five cards above the graph.
     fn metrics(&self, ui: &mut Ui, palette: &Palette, status: SessionStatus, summary: &Summary) {
-        let columns = (((ui.available_width() + BLOCK_GAP) / (METRIC_MIN_WIDTH + BLOCK_GAP)).floor()
-            as usize)
-            .clamp(1, 5);
-        let width = ((ui.available_width() - BLOCK_GAP * (columns - 1) as f32) / columns as f32)
-            .max(METRIC_MIN_WIDTH * 0.6);
-        let ok = to_color32(palette.ok);
-        ui.horizontal_wrapped(|ui| {
-            metric_card(
-                ui,
-                palette,
-                &format!("uptime ({})", self.window.label()),
-                &format!("{:.1}%", summary.uptime_pct),
-                Some(ok),
-                width,
-            );
-            metric_card(
-                ui,
-                palette,
-                "current state",
-                &format!(
-                    "\u{25cf} {} ({})",
+        let state = status_colour(palette, status);
+        let cards = [
+            MetricCard {
+                label: format!("uptime ({})", self.window.label()),
+                value: format!("{:.1}%", summary.uptime_pct),
+                colour: Some(to_color32(palette.ok)),
+                dot: None,
+            },
+            MetricCard {
+                label: "current state".to_owned(),
+                value: format!(
+                    "{} ({})",
                     status_label(status),
                     format_duration(Some(summary.current_duration_ms))
                 ),
-                Some(status_colour(palette, status)),
-                width,
-            );
-            metric_card(
-                ui,
-                palette,
-                "disconnects",
-                &summary.disconnects.to_string(),
-                None,
-                width,
-            );
-            metric_card(
-                ui,
-                palette,
-                "total connected",
-                &format_duration(Some(summary.connected_ms)),
-                None,
-                width,
-            );
-            metric_card(
-                ui,
-                palette,
-                "avg session",
-                &format_duration(Some(summary.average_connected_ms)),
-                None,
-                width,
-            );
-        });
+                colour: Some(state),
+                dot: Some(state),
+            },
+            MetricCard {
+                label: "disconnects".to_owned(),
+                value: summary.disconnects.to_string(),
+                colour: None,
+                dot: None,
+            },
+            MetricCard {
+                label: "total connected".to_owned(),
+                value: format_duration(Some(summary.connected_ms)),
+                colour: None,
+                dot: None,
+            },
+            MetricCard {
+                label: "avg session".to_owned(),
+                value: format_duration(Some(summary.average_connected_ms)),
+                colour: None,
+                dot: None,
+            },
+        ];
+        metric_grid(ui, palette, &cards);
     }
 
     /// The event log under the graph.
@@ -703,39 +727,197 @@ impl ConnectionLogger {
                     );
                     return;
                 }
+                let time_font = egui::FontId::monospace(10.0);
+                let kind_font = egui::FontId::monospace(11.0);
+                let time_width = text_width(ui, LIST_TIME_SAMPLE, &time_font) + LIST_COLUMN_GAP;
+                let kind_width = LogKind::ALL
+                    .iter()
+                    .map(|kind| text_width(ui, kind.label(), &kind_font))
+                    .fold(0.0, f32::max)
+                    + LIST_COLUMN_GAP;
                 for entry in self.entries.iter().rev() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(time::format_millis(entry.at_ms))
-                                .font(egui::FontId::monospace(10.0))
-                                .color(muted),
+                    let height = LIST_ROW_HEIGHT
+                        + if entry.message.is_some() {
+                            LIST_MESSAGE_HEIGHT
+                        } else {
+                            0.0
+                        };
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), height),
+                        egui::Sense::hover(),
+                    );
+                    let mid = row.top() + LIST_ROW_HEIGHT / 2.0;
+                    let mut x = row.left();
+                    for (text, font, colour, column) in [
+                        (
+                            time::format_millis(entry.at_ms),
+                            time_font.clone(),
+                            muted,
+                            time_width,
+                        ),
+                        (
+                            entry.kind.label().to_owned(),
+                            kind_font.clone(),
+                            kind_colour(palette, entry.kind),
+                            kind_width,
+                        ),
+                    ] {
+                        let galley = truncating_galley_with(ui, text, font, colour, column);
+                        ui.painter().galley(
+                            egui::pos2(x, mid - galley.size().y / 2.0),
+                            galley,
+                            colour,
                         );
-                        ui.label(
-                            egui::RichText::new(entry.kind.label())
-                                .font(egui::FontId::monospace(11.0))
-                                .color(kind_colour(palette, entry.kind)),
+                        x += column;
+                    }
+                    if entry.duration_ms.is_some() {
+                        let text = format!("after {}", format_duration(entry.duration_ms));
+                        let galley = truncating_galley(
+                            ui,
+                            text,
+                            METRIC_LABEL_SIZE,
+                            muted,
+                            (row.right() - x).max(0.0),
                         );
-                        if entry.duration_ms.is_some() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "after {}",
-                                    format_duration(entry.duration_ms)
-                                ))
-                                .size(10.0)
-                                .color(muted),
-                            );
-                        }
-                    });
+                        ui.painter().galley(
+                            egui::pos2(x, mid - galley.size().y / 2.0),
+                            galley,
+                            muted,
+                        );
+                    }
                     if let Some(message) = &entry.message {
-                        ui.label(
-                            egui::RichText::new(message)
-                                .size(10.0)
-                                .color(to_color32(palette.text_muted)),
+                        let galley = truncating_galley(
+                            ui,
+                            message.clone(),
+                            METRIC_LABEL_SIZE,
+                            muted,
+                            (row.right() - row.left() - time_width).max(0.0),
+                        );
+                        let y = row.top() + LIST_ROW_HEIGHT;
+                        ui.painter().galley(
+                            egui::pos2(row.left() + time_width, y),
+                            galley,
+                            muted,
                         );
                     }
                 }
             });
     }
+}
+
+/// Widest timestamp the event list prints, so its columns never move.
+const LIST_TIME_SAMPLE: &str = "00-00 00:00:00";
+
+/// Width of `text` in `font`.
+fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x
+}
+
+/// Height of one line in `font`.
+fn line_height(ui: &Ui, font: &egui::FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap("X".to_owned(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .y
+}
+
+/// One card above the graph: a label, a value and how they are coloured.
+struct MetricCard {
+    label: String,
+    value: String,
+    colour: Option<egui::Color32>,
+    /// A dot painted before the value, for the card that reports the live state.
+    dot: Option<egui::Color32>,
+}
+
+/// Draw the cards in rows of equal width and height, wrapping only when the pane is too narrow
+/// to give every card [`METRIC_MIN_WIDTH`].
+///
+/// Laid out by hand on purpose: a wrapped `horizontal` layout centres each child on the row's
+/// cross axis, so cards of different heights step down the pane, and its item spacing is what
+/// decides whether the last card fits, not [`BLOCK_GAP`].
+fn metric_grid(ui: &mut Ui, palette: &Palette, cards: &[MetricCard]) {
+    let gap = ui.spacing().item_spacing.x;
+    let available = ui.available_width();
+    let columns = (((available + gap) / (METRIC_MIN_WIDTH + gap)).floor() as usize)
+        .clamp(1, cards.len().max(1));
+    let width = ((available - gap * columns.saturating_sub(1) as f32) / columns as f32)
+        .max(METRIC_MIN_WIDTH * 0.6);
+    let label_font = egui::FontId::proportional(METRIC_LABEL_SIZE);
+    let value_font = egui::FontId::monospace(METRIC_VALUE_SIZE);
+    let height = METRIC_PAD_Y * 2.0
+        + METRIC_LINE_GAP
+        + line_height(ui, &label_font)
+        + line_height(ui, &value_font);
+    let rows = cards.len().div_ceil(columns).max(1);
+    let total = rows as f32 * height + (rows - 1) as f32 * gap;
+    let (grid, _) = ui.allocate_exact_size(egui::vec2(available, total), egui::Sense::hover());
+    for (index, card) in cards.iter().enumerate() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                grid.left() + (index % columns) as f32 * (width + gap),
+                grid.top() + (index / columns) as f32 * (height + gap),
+            ),
+            egui::vec2(width, height),
+        );
+        metric_card(ui, palette, rect, card, &label_font, &value_font);
+    }
+}
+
+/// Paint one metric card: its label above, its value in the monospace face, both cut to the
+/// card so a wrapper never makes it taller than its neighbours.
+fn metric_card(
+    ui: &Ui,
+    palette: &Palette,
+    rect: egui::Rect,
+    card: &MetricCard,
+    label_font: &egui::FontId,
+    value_font: &egui::FontId,
+) {
+    let muted = to_color32(palette.text_muted);
+    let painter = ui.painter();
+    painter.rect_filled(rect, SURFACE_RADIUS, to_color32(palette.bg_input));
+    painter.rect_stroke(
+        rect,
+        SURFACE_RADIUS,
+        egui::Stroke::new(1.0, faded(palette.border, METRIC_BORDER)),
+        egui::StrokeKind::Inside,
+    );
+    let room = (rect.width() - METRIC_PAD_X * 2.0).max(0.0);
+    let label = truncating_galley_with(
+        ui,
+        card.label.to_uppercase(),
+        label_font.clone(),
+        muted,
+        room,
+    );
+    let mut y = rect.top() + METRIC_PAD_Y;
+    ui.painter()
+        .galley(egui::pos2(rect.left() + METRIC_PAD_X, y), label.clone(), muted);
+    y += label.size().y + METRIC_LINE_GAP;
+
+    let colour = card.colour.unwrap_or(to_color32(palette.text));
+    let mut x = rect.left() + METRIC_PAD_X;
+    if let Some(dot) = card.dot {
+        let value_height = line_height(ui, value_font);
+        ui.painter().circle_filled(
+            egui::pos2(x + METRIC_DOT / 2.0, y + value_height / 2.0),
+            METRIC_DOT / 2.0,
+            dot,
+        );
+        x += METRIC_DOT + METRIC_DOT_GAP;
+    }
+    let value = truncating_galley_with(
+        ui,
+        card.value.clone(),
+        value_font.clone(),
+        colour,
+        (rect.right() - METRIC_PAD_X - x).max(0.0),
+    );
+    ui.painter().galley(egui::pos2(x, y), value, colour);
 }
 
 /// The status in one word, as the current-state card shows it.
@@ -799,36 +981,24 @@ fn short_time(ms: u64) -> String {
     )
 }
 
-/// One metric card: its label above, its value in the monospace face.
-fn metric_card(
-    ui: &mut Ui,
-    palette: &Palette,
-    label: &str,
-    value: &str,
-    colour: Option<egui::Color32>,
-    width: f32,
-) {
-    let muted = to_color32(palette.text_muted);
-    let text = colour.unwrap_or(to_color32(palette.text));
-    fixed_inset_card(
-        ui,
-        palette,
-        width,
-        egui::Margin::symmetric(METRIC_PAD_X, METRIC_PAD_Y),
-        |ui| {
-            ui.label(
-                egui::RichText::new(label.to_uppercase())
-                    .size(10.0)
-                    .color(muted),
-            );
-            ui.label(egui::RichText::new(value).size(13.0).strong().monospace().color(text));
-        },
-    );
+/// A tick label: `HH:MM`, prefixed with the day when the window spans more than one.
+fn tick_time(range: Range, at_ms: u64) -> String {
+    if range.duration_ms() > DAY_MS {
+        let (_, _, day) = time::civil_from_days((at_ms / DAY_MS) as i64);
+        format!("{day:02} {}", short_time(at_ms))
+    } else {
+        short_time(at_ms)
+    }
 }
 
-/// The axis under a graph: `ticks` labels from the window's start to "Now".
-fn time_axis(ui: &mut Ui, palette: &Palette, range: Range, ticks: usize) {
-    let ticks = ticks.max(2);
+/// Room a graph gets: its full height in a tall pane, shrunk to `min` (never below) so the
+/// event list under it keeps whatever is left.
+fn graph_height(ui: &Ui, full: f32, min: f32) -> f32 {
+    (ui.available_height() - AXIS_HEIGHT).clamp(min, full)
+}
+
+/// The axis under a graph: time labels from the window's start to "Now", as many as fit.
+fn time_axis(ui: &mut Ui, palette: &Palette, range: Range) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), AXIS_HEIGHT),
         egui::Sense::hover(),
@@ -836,24 +1006,19 @@ fn time_axis(ui: &mut Ui, palette: &Palette, range: Range, ticks: usize) {
     let painter = ui.painter();
     let muted = to_color32(palette.text_muted);
     let font = egui::FontId::monospace(10.0);
+    let ticks = ((rect.width() / TICK_ROOM) as usize).clamp(2, 7);
     for index in 0..ticks {
         let fraction = index as f64 / (ticks - 1) as f64;
+        let at_ms = range.start_ms + (range.duration_ms() as f64 * fraction) as u64;
         let (align, text) = if index == 0 {
-            (egui::Align2::LEFT_TOP, time::format_seconds(range.start_ms / 1000))
+            (egui::Align2::LEFT_TOP, tick_time(range, range.start_ms))
         } else if index + 1 == ticks {
-            (
-                egui::Align2::RIGHT_TOP,
-                format!("Now ({})", short_time(range.end_ms)),
-            )
+            (egui::Align2::RIGHT_TOP, format!("Now ({})", short_time(at_ms)))
         } else {
-            let at = range.start_ms + (range.duration_ms() as f64 * fraction) as u64;
-            (egui::Align2::CENTER_TOP, short_time(at))
+            (egui::Align2::CENTER_TOP, tick_time(range, at_ms))
         };
         painter.text(
-            egui::pos2(
-                rect.left() + fraction as f32 * rect.width(),
-                rect.top(),
-            ),
+            egui::pos2(rect.left() + fraction as f32 * rect.width(), rect.top()),
             align,
             text,
             font.clone(),
@@ -863,9 +1028,9 @@ fn time_axis(ui: &mut Ui, palette: &Palette, range: Range, ticks: usize) {
 }
 
 /// The timeline bar: one strip, each state in its own colour.
-fn timeline(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
+fn timeline(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span], height: f32) {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), TIMELINE_HEIGHT),
+        egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
     );
     let painter = ui.painter();
@@ -886,7 +1051,7 @@ fn timeline(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
         egui::Stroke::new(1.0, to_color32(palette.border)),
         egui::StrokeKind::Inside,
     );
-    time_axis(ui, palette, range, 5);
+    time_axis(ui, palette, range);
 
     let Some(position) = response.hover_pos() else {
         return;
@@ -906,7 +1071,7 @@ fn timeline(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
         &span.kind.label().to_uppercase(),
         &format!(
             "{} \u{2192} {} ({})",
-            short_time(span.start_ms),
+            tick_time(range, span.start_ms),
             short_time(span.end_ms),
             format_duration(Some(span.duration_ms()))
         ),
@@ -915,18 +1080,19 @@ fn timeline(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
 }
 
 /// The step chart: the state as a line that steps between up and down, filled underneath.
-fn step_chart(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
+fn step_chart(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span], height: f32) {
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), STEP_HEIGHT),
+        egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
     );
     let painter = ui.painter();
     let border = to_color32(palette.border);
     let ok = to_color32(palette.ok);
     painter.rect_filled(rect, SURFACE_RADIUS, to_color32(palette.bg_input));
+    let padding = STEP_PADDING.min((height - STEP_WIDTH) / 2.0).max(2.0);
     let plot = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 1.0, rect.top() + STEP_PADDING),
-        egui::pos2(rect.right() - 1.0, rect.bottom() - STEP_PADDING),
+        egui::pos2(rect.left() + 1.0, rect.top() + padding),
+        egui::pos2(rect.right() - 1.0, rect.bottom() - padding),
     );
     // The two levels: up (dashed) and down (solid), as the reference draws them.
     painter.extend(egui::Shape::dashed_line(
@@ -969,7 +1135,7 @@ fn step_chart(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
         egui::Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
     );
-    time_axis(ui, palette, range, 3);
+    time_axis(ui, palette, range);
 }
 
 /// The area under a step line, fading from the line down to its baseline.
@@ -1012,7 +1178,7 @@ fn with_alpha(colour: egui::Color32, alpha: f32) -> egui::Color32 {
 }
 
 /// The heatmap: one cell per hour, shaded by how much of it the session was up.
-fn heatmap(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
+fn heatmap(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span], max_height: f32) {
     let buckets = hourly_buckets(range, spans);
     let width = ui.available_width();
     let columns = (((width + HEAT_GAP) / (HEAT_CELL + HEAT_GAP)).floor() as usize).max(1);
@@ -1022,7 +1188,7 @@ fn heatmap(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
     let height = rows as f32 * HEAT_CELL + (rows - 1) as f32 * HEAT_GAP;
     let (grid, hovered) = egui::ScrollArea::vertical()
         .id_salt("conn-log-heatmap")
-        .max_height(HEAT_MAX_HEIGHT)
+        .max_height(max_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let (rect, response) = ui.allocate_exact_size(
@@ -1060,7 +1226,7 @@ fn heatmap(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span]) {
     };
     let mut lines = format!(
         "{} \u{2192} {}",
-        time::format_seconds(bucket.start_ms / 1000),
+        tick_time(range, bucket.start_ms),
         short_time(bucket.end_ms)
     );
     lines.push('\n');
@@ -1092,7 +1258,7 @@ fn heat_axis(ui: &mut Ui, palette: &Palette, range: Range) {
     painter.text(
         rect.left_top(),
         egui::Align2::LEFT_TOP,
-        time::format_seconds(range.start_ms / 1000),
+        tick_time(range, range.start_ms),
         font.clone(),
         muted,
     );
@@ -1490,14 +1656,20 @@ mod tests {
         logger: &mut ConnectionLogger,
         status: SessionStatus,
     ) -> (Vec<(egui::Rect, egui::Color32)>, Vec<String>) {
+        paint_at(logger, status, egui::vec2(600.0, 900.0))
+    }
+
+    /// [`paint`] in a viewport of `size`, for the geometry of a docked pane.
+    fn paint_at(
+        logger: &mut ConnectionLogger,
+        status: SessionStatus,
+        size: egui::Vec2,
+    ) -> (Vec<(egui::Rect, egui::Color32)>, Vec<String>) {
         let ctx = egui::Context::default();
         let mut settings = serde_json::Map::new();
         let secrets = std::collections::BTreeMap::new();
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(600.0, 900.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             ..Default::default()
         };
         let mut fills = Vec::new();
@@ -1604,6 +1776,54 @@ mod tests {
                 .iter()
                 .any(|(rect, _)| (rect.height() - STEP_HEIGHT).abs() < 0.5),
             "the step chart's box"
+        );
+    }
+
+    #[test]
+    fn a_low_wide_dock_keeps_the_cards_on_one_row_and_the_graph_on_screen() {
+        let mut logger = recent_logger();
+        const PANE: egui::Vec2 = egui::Vec2::new(1400.0, 132.0);
+        let (fills, texts) = paint_at(&mut logger, SessionStatus::Disconnected, PANE);
+        let palette = Palette::dark();
+        let cards: Vec<egui::Rect> = fills
+            .iter()
+            .filter(|(rect, fill)| {
+                *fill == to_color32(palette.bg_input) && rect.height() > TIMELINE_HEIGHT
+            })
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(cards.len(), 5, "one card each: {cards:?}");
+        let top = cards[0].top();
+        assert!(
+            cards.iter().all(|card| (card.top() - top).abs() < 0.5),
+            "the cards share one row: {cards:?}"
+        );
+        assert!(texts.contains(&"AVG SESSION".to_owned()), "{texts:?}");
+
+        let strip = fills.iter().find(|(rect, fill)| {
+            *fill == to_color32(palette.ok) && (rect.height() - TIMELINE_HEIGHT).abs() < 0.5
+        });
+        let (strip, _) = strip.expect("the timeline is drawn");
+        assert!(
+            strip.top() >= 0.0 && strip.bottom() <= PANE.y,
+            "the graph sits inside the pane: {strip:?}"
+        );
+
+        // The step chart is the tallest graph, so it is the one that has to give way.
+        let mut logger = recent_logger();
+        logger.graph = GraphMode::Step;
+        let (fills, _) = paint_at(&mut logger, SessionStatus::Disconnected, PANE);
+        let box_ = fills
+            .iter()
+            .map(|(rect, _)| *rect)
+            .find(|rect| {
+                rect.height() >= STEP_MIN_HEIGHT && rect.height() <= STEP_HEIGHT
+                    && rect.width() > PANE.x * 0.9
+            })
+            .expect("the step chart is drawn");
+        assert!(
+            box_.bottom() <= PANE.y,
+            "the step chart shrinks to the pane: {box_:?}"
         );
     }
 }
