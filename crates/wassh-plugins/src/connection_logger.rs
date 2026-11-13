@@ -537,10 +537,17 @@ impl ConnectionLogger {
         self.loaded = true;
     }
 
-    /// Fold in everything new from the session, returning whether the log changed.
+    /// Fold in everything newer than the log, returning whether it changed.
+    ///
+    /// The host offers the session's whole history on every poll, so anything the log
+    /// already holds has to be skipped — not just an immediate repeat of the newest entry.
     fn absorb(&mut self, events: &[ConnectionEvent], max_entries: usize) -> bool {
+        let newest = self.entries.last().map(|entry| entry.at_ms);
         let mut changed = false;
         for event in events {
+            if newest.is_some_and(|at_ms| event.at_ms < at_ms) {
+                continue;
+            }
             changed |= self.merge(event, max_entries);
         }
         changed
@@ -552,12 +559,10 @@ impl Plugin for ConnectionLogger {
         PluginId::ConnectionLogger.manifest()
     }
 
-    fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
-        let palette = context.palette;
+    fn poll(&mut self, context: &mut PluginContext<'_>) {
         if !self.loaded {
             self.load(context.value(LOG_KEY));
         }
-
         let enabled = context
             .value(ENABLED_KEY)
             .and_then(serde_json::Value::as_bool)
@@ -568,10 +573,21 @@ impl Plugin for ConnectionLogger {
             .map(|value| value as usize)
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_ENTRIES);
-
         if enabled && self.absorb(context.events, max_entries) {
             context.set_value(LOG_KEY, to_value(&self.entries));
         }
+    }
+
+    fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
+        let palette = context.palette;
+        // The pane records exactly what a closed pane records, so the log is the same
+        // whichever way it was fed.
+        self.poll(context);
+
+        let enabled = context
+            .value(ENABLED_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
 
         // The graph and the cards above it all read the same window of the log.
         if self.controls(ui, &palette, enabled) {
@@ -1393,6 +1409,28 @@ mod tests {
             assert!(!logger.merge(&event(1_000, status, None), 10), "{status:?}");
         }
         assert!(logger.entries().is_empty());
+    }
+
+    #[test]
+    fn a_replayed_history_adds_nothing() {
+        // The host offers the session's whole history on every poll, so the same events
+        // arrive again and again; only what the log does not hold may be appended.
+        let mut logger = ConnectionLogger::default();
+        let events = vec![
+            event(1_000, SessionStatus::Connected, None),
+            event(2_000, SessionStatus::Reconnecting, None),
+            event(3_000, SessionStatus::Connected, None),
+        ];
+        assert!(logger.absorb(&events, 10));
+        assert_eq!(logger.entries().len(), 3);
+
+        assert!(!logger.absorb(&events, 10), "a replay changes nothing");
+        assert_eq!(logger.entries().len(), 3, "{:?}", logger.entries());
+
+        let mut grown = events.clone();
+        grown.push(event(9_000, SessionStatus::Disconnected, None));
+        assert!(logger.absorb(&grown, 10));
+        assert_eq!(logger.entries().len(), 4);
     }
 
     #[test]

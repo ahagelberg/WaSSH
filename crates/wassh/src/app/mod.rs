@@ -2022,14 +2022,23 @@ impl Shell {
         }
         let term_type = self.settings.term_type.clone();
         let mut results = Vec::with_capacity(self.sessions.len());
+        let mut changed = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             results.push((index, session.pump(&term_type)));
+            if session.take_plugin_dirty() {
+                changed.push(index);
+            }
             // Collect any finished remote-file or monitoring requests.
             session.poll_files();
             session.poll_commands();
             if session.requests_pending() {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
+        }
+        // A pane that records history does it whether or not it is drawn, so every tab
+        // whose status changed hands its events on here.
+        for index in changed {
+            self.poll_session_plugins(index);
         }
         let mut exited = Vec::new();
         for (index, pumped) in results {
@@ -2339,6 +2348,21 @@ impl Shell {
     }
 
     // --- drawing -----------------------------------------------------------
+
+    /// Let the panes of session `index` fold in what happened while they were not drawn.
+    ///
+    /// The values come through the same cache the drawn tab uses, and whatever the panes
+    /// wrote is saved straight away, because an undrawn tab never reaches
+    /// [`Self::persist_plugin_data`].
+    fn poll_session_plugins(&mut self, index: usize) {
+        let values = self.take_plugin_values(index);
+        let enabled = self.settings.enabled_plugins.clone();
+        if let Some(session) = self.sessions.get_mut(index) {
+            session.poll_plugins(self.config.as_ref(), &values, &enabled);
+        }
+        self.plugin_values = Some(values);
+        self.persist_plugin_data(index);
+    }
 
     /// Write any plugin data that changed while the tab was drawn.
     fn persist_plugin_data(&mut self, index: usize) {
