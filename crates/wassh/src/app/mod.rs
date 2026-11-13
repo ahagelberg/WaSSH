@@ -1137,6 +1137,29 @@ impl Shell {
         self.write_settings();
     }
 
+    /// Maximise the window, or put it back on the rectangle it had before.
+    ///
+    /// Windows does not record the restore rectangle of a borderless window that the shell
+    /// snapped (Win+Left and friends): asking it to restore a maximized window lands on the
+    /// rectangle from before the snap. The rectangle the app tracked while the window was
+    /// last normal is applied after the restore instead, in the same units the launch
+    /// restore uses.
+    fn toggle_maximize(&mut self, ctx: &egui::Context, maximized: bool) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        let Some(bounds) = self.window.normal.filter(|_| maximized) else {
+            return;
+        };
+        let pixels_per_point = ctx.pixels_per_point();
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            bounds.x as f32 / pixels_per_point,
+            bounds.y as f32 / pixels_per_point,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            bounds.width as f32,
+            bounds.height as f32,
+        )));
+    }
+
     // --- persistence -------------------------------------------------------
 
     fn save_settings(&mut self) {
@@ -3426,7 +3449,7 @@ impl Shell {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
             Some(wassh_ui::TitlebarAction::ToggleMaximize) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                self.toggle_maximize(&ctx, maximized);
             }
             Some(wassh_ui::TitlebarAction::Close) => self.quit_requested = true,
             None => {}
@@ -5290,6 +5313,75 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         assert_eq!(shell.window.offset, None, "a refused move teaches nothing");
+    }
+
+    #[test]
+    fn unmaximizing_puts_the_window_back_on_the_tracked_rectangle() {
+        // Windows keeps a borderless window's restore rectangle from before the shell
+        // snapped it, so the rectangle tracked while the window was last normal is applied
+        // after the restore.
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(2048.0, 1232.0));
+        let tiled = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 1232.0));
+        let viewport = |inner: egui::Rect, maximized: bool| egui::ViewportInfo {
+            outer_rect: Some(inner),
+            inner_rect: Some(inner),
+            maximized: Some(maximized),
+            ..Default::default()
+        };
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .insert(egui::ViewportId::ROOT, viewport(tiled, false));
+        let output = ctx.run_ui(input.clone(), |ui| {
+            let ctx = ui.ctx().clone();
+            shell.track_window_bounds(&ctx);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(shell.window.normal.map(|bounds| bounds.width), Some(1024));
+
+        let mut maximize = |maximized: bool| {
+            input
+                .viewports
+                .insert(egui::ViewportId::ROOT, viewport(screen, maximized));
+            let output = ctx.run_ui(input.clone(), |ui| {
+                let ctx = ui.ctx().clone();
+                shell.toggle_maximize(&ctx, maximized);
+            });
+            let commands: Vec<egui::ViewportCommand> = output
+                .viewport_output
+                .values()
+                .flat_map(|viewport| viewport.commands.iter().cloned())
+                .collect();
+            output.drop_without_applying_deltas();
+            commands
+        };
+
+        let commands = maximize(false);
+        assert!(commands.contains(&egui::ViewportCommand::Maximized(true)));
+
+        let commands = maximize(true);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, egui::ViewportCommand::OuterPosition(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0))],
+            "the restore lands where the window was before it was maximized"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![egui::ViewportCommand::InnerSize(egui::vec2(1024.0, 1232.0))]
+        );
     }
 
     #[test]
