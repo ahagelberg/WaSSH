@@ -158,25 +158,24 @@ pub fn show_header_bar(
             // Caption buttons claim the right edge; the menus and title share the rest.
             ui.horizontal_centered(|ui| {
                 ui.add_space(10.0);
-                if !maximized && drag.double_clicked() {
+                // Double-clicking the title bar maximises a restored window and restores a
+                // maximised one, the way a desktop title bar does.
+                if drag.double_clicked() {
                     action = Some(TitlebarAction::ToggleMaximize);
                 }
-                match icon {
-                    Some(texture) => {
-                        let (rect, _) = ui.allocate_exact_size(
-                            Vec2::splat(HEADER_ICON_SIZE),
-                            Sense::hover(),
-                        );
-                        ui.painter().image(
-                            texture,
-                            rect,
-                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                    // Without an icon the name keeps its place, so the menus do not shift
-                    // between platforms.
-                    None => ui.add_space(HEADER_ICON_SIZE),
+                // The program icon doubles as the close button, as on a desktop title bar.
+                let (icon_rect, icon_response) =
+                    ui.allocate_exact_size(Vec2::splat(HEADER_ICON_SIZE), Sense::click());
+                if icon_response.double_clicked() {
+                    action = Some(TitlebarAction::Close);
+                }
+                if let Some(texture) = icon {
+                    ui.painter().image(
+                        texture,
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
                 }
                 ui.add_space(HEADER_ICON_GAP);
                 ui.label(
@@ -1045,5 +1044,100 @@ mod tests {
                 assert!(texts.contains(&label.to_owned()), "{label:?} in {texts:?}");
             }
         }
+    }
+
+    /// Double-click the header bar, aiming at `pos` (resolved from the bar's rectangle),
+    /// and report the action the second click produced.
+    fn double_click_header(
+        maximized: bool,
+        pos: impl Fn(egui::Rect) -> egui::Pos2,
+    ) -> Option<TitlebarAction> {
+        const MENUS: &[Menu] = &[("Help", &["About"])];
+        const CLICK_GAP: f64 = 0.05;
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(640.0, 400.0));
+        let mut action = None;
+        let mut click = None;
+        let mut time = 0.0;
+        // One frame to lay the bar out, then the two clicks a double-click is made of.
+        for _ in 0..3 {
+            let events = click.map_or_else(Vec::new, |at: egui::Pos2| {
+                let button = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                vec![
+                    egui::Event::PointerMoved(at),
+                    button(true),
+                    button(false),
+                ]
+            });
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                let content = HeaderContent {
+                    icon: None,
+                    title: "WaSSH",
+                };
+                let found = show_header_bar(
+                    ui,
+                    &palette,
+                    content,
+                    maximized,
+                    MENUS,
+                    MenuState::default(),
+                );
+                if found.is_some() {
+                    action = found;
+                }
+            });
+            let strip = output.shapes.iter().find_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect)
+                    if (rect.rect.height() - WINDOW_HEADER_HEIGHT).abs() < 0.5
+                        && rect.fill != egui::Color32::TRANSPARENT =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            });
+            output.drop_without_applying_deltas();
+            click = Some(pos(strip.expect("the bar paints its background")));
+            time += CLICK_GAP;
+        }
+        action
+    }
+
+    #[test]
+    fn a_double_click_restores_a_maximised_window() {
+        let action = double_click_header(true, |strip| {
+            egui::pos2(strip.right() - 200.0, strip.center().y)
+        });
+        assert_eq!(action, Some(TitlebarAction::ToggleMaximize));
+    }
+
+    #[test]
+    fn a_double_click_maximises_a_restored_window() {
+        let action = double_click_header(false, |strip| {
+            egui::pos2(strip.right() - 200.0, strip.center().y)
+        });
+        assert_eq!(action, Some(TitlebarAction::ToggleMaximize));
+    }
+
+    #[test]
+    fn double_clicking_the_program_icon_closes_the_window() {
+        let action = double_click_header(false, |strip| {
+            egui::pos2(
+                strip.left() + 10.0 + HEADER_ICON_SIZE / 2.0,
+                strip.center().y,
+            )
+        });
+        assert_eq!(action, Some(TitlebarAction::Close));
     }
 }
