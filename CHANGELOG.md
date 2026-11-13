@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.0.10] - 2026-11-13
+
+### Added
+
+- Ask the AI agent's questions one at a time: picking an option answers and moves on, Previous
+  walks back over the answers, and the text field is always there as the free-form answer.
+- Fill the chat's user messages with the accent colour and keep the newest one pinned above the
+  transcript while a long reply scrolls.
+
+### Fixed
+
+- Lay the Connection Log out by hand, so its cards share one row and the timeline, step chart or
+  heatmap is drawn inside a docked pane instead of below it.
+
 ## [2.0.9] - 2026-11-12
 
 ### Fixed
