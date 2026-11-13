@@ -200,6 +200,9 @@ pub struct Shell {
     data_generation: u64,
     /// The program icon, uploaded once for the header bar's corner.
     header_icon: Option<egui::TextureHandle>,
+    /// Whether the window icon has been handed to the window a second time, once it was
+    /// on screen; see [`Shell::refresh_window_icon`].
+    icon_refreshed: bool,
     /// Plugin labels the Plugins menu ticks and shows a gear for, reused per frame.
     checked_labels: Vec<&'static str>,
     gear_labels: Vec<&'static str>,
@@ -589,6 +592,7 @@ impl Shell {
             plugin_values_key: None,
             data_generation: 0,
             header_icon: None,
+            icon_refreshed: false,
             checked_labels: Vec::new(),
             gear_labels: Vec::new(),
             toolbar_buttons: Vec::new(),
@@ -3344,8 +3348,15 @@ impl Shell {
             self.styled_palette = Some(self.palette);
             apply_visuals(&ctx, self.palette);
         }
+        // Windows makes the task bar button from the window icon while the window is being
+        // created, before winit has set that icon, so the button keeps the generic program
+        // icon until the window is activated. Setting the icon again once the window is on
+        // screen makes the shell take it for the button.
         if self.first_frame_ms.is_none() {
             self.first_frame_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
+        } else if !self.icon_refreshed {
+            self.icon_refreshed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(window_icon()))));
         }
         if let Some(fullscreen) = self.fullscreen_request.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
