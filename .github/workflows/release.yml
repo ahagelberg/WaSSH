@@ -58,17 +58,20 @@ jobs:
         shell: pwsh
         run: |
           $installer = (Get-Item dist/*-win-setup-x64.exe).FullName
-          $installDir = Join-Path $env:ProgramFiles 'WaSSH Native'
+          $installDir = Join-Path $env:ProgramFiles 'WaSSH'
           $executable = Join-Path $installDir 'wassh.exe'
+          $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\WaSSH\WaSSH.lnk'
           $expectedHash = (Get-FileHash target/release/wassh.exe).Hash
           foreach ($attempt in 1..2) {
             $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
             if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
             if ((Get-FileHash $executable).Hash -ne $expectedHash) { throw 'Installed executable does not match the build' }
+            if (-not (Test-Path $startMenu)) { throw 'Installer did not add the Start Menu shortcut' }
           }
           $process = Start-Process -FilePath (Join-Path $installDir 'Uninstall.exe') -ArgumentList '/S' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Uninstaller failed: $($process.ExitCode)" }
           if (Test-Path $executable) { throw 'Uninstaller did not remove the executable' }
+          if (Test-Path $startMenu) { throw 'Uninstaller did not remove the Start Menu shortcut' }
 
       - name: Package
         shell: bash
