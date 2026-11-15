@@ -292,6 +292,9 @@ pub struct Terminal {
     size: TerminalSize,
     palette: AnsiPalette,
     base_style: CellStyle,
+    /// Grid point the drag in progress started from, so the selection can be ordered
+    /// whichever way the pointer travels.
+    selection_anchor: Option<Point>,
     /// Bumped whenever the visible grid or the selection changes, so a caller can keep
     /// the snapshot it derived until the next change.
     revision: u64,
@@ -320,6 +323,7 @@ impl Terminal {
             size,
             palette: ansi_palette,
             base_style: CellStyle::blank(&ansi_palette),
+            selection_anchor: None,
             revision: 0,
         }
     }
@@ -378,6 +382,7 @@ impl Terminal {
         let Some(point) = self.grid_point(row, col) else {
             return;
         };
+        self.selection_anchor = Some(point);
         self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
         self.touch();
     }
@@ -387,16 +392,28 @@ impl Terminal {
         let Some(point) = self.grid_point(row, col) else {
             return;
         };
-        let Some(selection) = self.term.selection.as_mut() else {
+        let Some(anchor) = self.selection_anchor else {
             return;
         };
-        selection.update(point, Side::Right);
+        // alacritty only keeps a whole cell at each end when the earlier point is its left
+        // side and the later one its right side. Order the two ends instead of keeping the
+        // drag roles: dragging back over a cell would otherwise drop it, so the first column
+        // of a line could never be selected.
+        let (start, end) = if point < anchor {
+            (point, anchor)
+        } else {
+            (anchor, point)
+        };
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
         self.touch();
     }
 
     /// Drop the selection.
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
+        self.selection_anchor = None;
         self.touch();
     }
 
@@ -581,6 +598,34 @@ mod tests {
         term.clear_selection();
         assert!(!term.has_selection());
         assert!(term.snapshot().selection.is_none());
+    }
+
+    #[test]
+    fn dragging_back_to_the_first_column_selects_its_character() {
+        let (mut term, _rx) = terminal(20, 3);
+        term.feed(b"hello world");
+        // Dragging right to left must reach column 0, both when the drag starts further
+        // along the line and when it starts on the second character.
+        for (from, expected) in [(10, "hello world"), (1, "he")] {
+            term.begin_selection(0, from);
+            term.extend_selection(0, 0);
+            let snapshot = term.snapshot();
+            let span = snapshot.selection.expect("a span");
+            assert_eq!(span.start, (0, 0), "the first column is not selected");
+            assert_eq!(span.end, (0, from), "the drag end moved: {span:?}");
+            assert!(snapshot.is_selected(0, 0));
+            assert_eq!(term.selection_text().as_deref(), Some(expected));
+        }
+
+        // A backwards drag across lines keeps its whole start cell too.
+        term.feed(b"\r\nsecond");
+        term.begin_selection(1, 3);
+        term.extend_selection(0, 0);
+        let snapshot = term.snapshot();
+        let span = snapshot.selection.expect("a span");
+        assert_eq!(span.start, (0, 0));
+        assert_eq!(span.end, (1, 3));
+        assert_eq!(term.selection_text().as_deref(), Some("hello world\nseco"));
     }
 
     #[test]
