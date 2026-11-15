@@ -20,7 +20,7 @@ use egui::{Key, Modifiers, Pos2, Vec2};
 
 use wassh_core::{
     APP_NAME, AppSettings, AuthMethod, ConnectionParams, ConnectionType, HostProfile,
-    HostsDocument, LocalShell, Palette, SessionStatus, WindowBounds, colors,
+    HostsDocument, LocalShell, Palette, SessionStatus, WindowBounds,
 };
 use wassh_plugins::PluginId;
 use wassh_ssh::KnownHosts;
@@ -2313,6 +2313,19 @@ impl Shell {
                     self.persist_hosts();
                     self.dialogs.group_edit = None;
                 }
+                DialogAction::CreateGroup { name, color } => {
+                    let id = format!("group-{}", self.next_id);
+                    self.next_id += 1;
+                    self.hosts.groups.push(wassh_core::HostGroup {
+                        id,
+                        name,
+                        color,
+                        collapsed: false,
+                    });
+                    self.hosts = std::mem::take(&mut self.hosts).normalized();
+                    self.persist_hosts();
+                    self.dialogs.group_edit = None;
+                }
                 DialogAction::WslChanged => self.quick.refresh_wsl(),
                 DialogAction::WslManageAdd => {
                     self.dialogs.wsl_manage = None;
@@ -2677,19 +2690,7 @@ impl Shell {
             }
             wassh_ui::SidebarAction::NewHost => self.handle_command(Command::NewHost),
             wassh_ui::SidebarAction::NewGroup => {
-                let id = format!("group-{}", self.next_id);
-                self.next_id += 1;
-                self.hosts.groups.push(wassh_core::HostGroup {
-                    id: id.clone(),
-                    name: "New group".to_owned(),
-                    color: Some(colors::GROUP_COLOR_PRESETS[4]),
-                    collapsed: false,
-                });
-                if let Some(group) = self.hosts.groups.iter().find(|group| group.id == id).cloned()
-                {
-                    self.sidebar.begin_rename(&group);
-                }
-                self.persist_hosts();
+                self.dialogs.group_edit = Some(GroupEditState::creating());
             }
             wassh_ui::SidebarAction::ToggleCollapsed => {
                 self.sidebar.collapsed = !self.sidebar.collapsed;
@@ -5841,6 +5842,37 @@ mod tests {
             );
             walked.push(focused);
         }
+    }
+
+    #[test]
+    fn the_new_group_button_asks_for_a_name_and_then_creates_the_group() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        shell.handle_sidebar_action(wassh_ui::SidebarAction::NewGroup);
+        let dialog = shell
+            .dialogs
+            .group_edit
+            .as_ref()
+            .expect("New group opened no dialog");
+        assert!(dialog.creating, "New group opened the rename dialog");
+        assert!(
+            dialog.name.is_empty(),
+            "the name field should start empty: {:?}",
+            dialog.name
+        );
+        // Nothing is saved until the dialog is committed.
+        let before = shell.hosts.groups.len();
+
+        shell.handle_dialog_actions(vec![DialogAction::CreateGroup {
+            name: "Ops".to_owned(),
+            color: None,
+        }]);
+        assert!(shell.dialogs.group_edit.is_none(), "the dialog stayed open");
+        assert_eq!(shell.hosts.groups.len(), before + 1);
+        assert!(
+            shell.hosts.groups.iter().any(|group| group.name == "Ops"),
+            "the group was not added: {:?}",
+            shell.hosts.groups
+        );
     }
 
     #[test]

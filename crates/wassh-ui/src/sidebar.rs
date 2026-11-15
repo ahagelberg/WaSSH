@@ -316,20 +316,11 @@ fn host_list(
 ) -> Option<SidebarAction> {
     let mut action = None;
     let mut drop_target: Option<(Option<String>, usize)> = None;
-    let mut shown_groups = 0usize;
 
+    // Every group is listed, empty or not: a group is where hosts get dragged to, so one
+    // that cannot be seen cannot be filled.
     for group in &hosts.groups {
         let members = hosts.hosts_in_group(&group.id);
-        // A group with nothing in it is noise, unless its name is being edited (a freshly
-        // created group must stay on screen so the rename field has somewhere to live).
-        let renaming = state
-            .renaming
-            .as_ref()
-            .is_some_and(|(id, _)| *id == group.id);
-        if members.is_empty() && !renaming {
-            continue;
-        }
-        shown_groups += 1;
         if let Some(found) =
             group_card(ui, palette, group, &members, open, state, &mut drop_target)
         {
@@ -338,7 +329,7 @@ fn host_list(
     }
 
     let ungrouped = hosts.ungrouped();
-    if !ungrouped.is_empty() || (hosts.groups.is_empty() && shown_groups == 0) {
+    if !ungrouped.is_empty() || hosts.groups.is_empty() {
         ui.add_space(GROUP_GAP);
         if hosts.groups.is_empty() {
             // Without groups the hosts are drawn as a flat list.
@@ -372,7 +363,7 @@ fn host_list(
     }
 
     // Every group is empty and nothing sits outside them.
-    if shown_groups == 0 && ungrouped.is_empty() {
+    if hosts.groups.is_empty() && ungrouped.is_empty() {
         ui.add_space(GROUP_GAP);
         empty_hosts(ui, palette);
     }
@@ -454,7 +445,7 @@ fn group_card(
             GROUP_PADDING.x as i8,
             GROUP_PADDING.y as i8,
         ));
-    frame.show(ui, |ui| {
+    let card = frame.show(ui, |ui| {
         ui.set_width(SIDEBAR_WIDTH - LIST_PADDING * 2.0 - GROUP_PADDING.x * 2.0);
 
         // Header row.
@@ -588,6 +579,22 @@ fn group_card(
             }
         }
     });
+
+    // The card itself takes a drop the rows did not claim: an empty group has no row to
+    // aim at, and dropping on a header means "the end of this group".
+    if state.is_dragging()
+        && drop_target.is_none()
+        && let Some(pointer) = ui.ctx().input(|input| input.pointer.hover_pos())
+        && card.response.rect.contains(pointer)
+    {
+        *drop_target = Some((Some(group.id.clone()), members.len()));
+        ui.painter().rect_stroke(
+            card.response.rect,
+            GROUP_RADIUS,
+            egui::Stroke::new(DROP_INDICATOR, to_color32(palette.accent)),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     ui.add_space(GROUP_GAP);
     action
@@ -854,6 +861,111 @@ mod tests {
         assert!(state.collapsed, "the sidebar leaves the toggle to the shell");
     }
 
+    /// Draw one frame of the sidebar with `events` and return what it asked for.
+    fn drag_frame(
+        ctx: &egui::Context,
+        screen: &egui::RawInput,
+        hosts: &HostsDocument,
+        state: &mut SidebarState,
+        events: Vec<egui::Event>,
+    ) -> Option<SidebarAction> {
+        let palette = Palette::dark();
+        let mut action = None;
+        let output = ctx.run_ui(egui::RawInput { events, ..screen.clone() }, |ui| {
+            action = sidebar(ui, &palette, hosts, &[], state);
+        });
+        output.drop_without_applying_deltas();
+        action
+    }
+
+    #[test]
+    fn a_host_can_be_dragged_into_an_empty_group() {
+        let hosts = HostsDocument {
+            groups: vec![HostGroup {
+                id: "spare".to_owned(),
+                name: "Spare".to_owned(),
+                color: None,
+                collapsed: false,
+            }],
+            hosts: vec![HostProfile {
+                id: "h1".to_owned(),
+                name: "Dev".to_owned(),
+                ..Default::default()
+            }],
+            ungrouped_host_ids: vec!["h1".to_owned()],
+            ..Default::default()
+        }
+        .normalized();
+        let mut state = SidebarState::new();
+        let ctx = egui::Context::default();
+        let screen = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(SIDEBAR_WIDTH, 700.0),
+            )),
+            ..Default::default()
+        };
+        let places = label_positions(&screen, &hosts, &mut state);
+        let row = places
+            .iter()
+            .find(|(text, _)| text == "Dev")
+            .map(|(_, pos)| *pos)
+            .expect("the host row");
+        let card = places
+            .iter()
+            .find(|(text, _)| text.contains("SPARE"))
+            .map(|(_, pos)| *pos)
+            .expect("the empty group");
+
+        let from = row + Vec2::new(8.0, 4.0);
+        let to = card + Vec2::new(8.0, 4.0);
+        drag_frame(&ctx, &screen, &hosts, &mut state, vec![egui::Event::PointerMoved(from)]);
+        drag_frame(
+            &ctx,
+            &screen,
+            &hosts,
+            &mut state,
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        );
+        // Past the drag threshold, then onto the group card.
+        drag_frame(
+            &ctx,
+            &screen,
+            &hosts,
+            &mut state,
+            vec![egui::Event::PointerMoved(from + Vec2::new(0.0, 20.0))],
+        );
+        assert!(state.is_dragging(), "the row did not start a drag");
+        drag_frame(&ctx, &screen, &hosts, &mut state, vec![egui::Event::PointerMoved(to)]);
+        let action = drag_frame(
+            &ctx,
+            &screen,
+            &hosts,
+            &mut state,
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+
+        assert_eq!(
+            action,
+            Some(SidebarAction::MoveHost {
+                host: "h1".to_owned(),
+                group: Some("spare".to_owned()),
+                index: 0,
+            }),
+            "dropping on an empty group was ignored"
+        );
+    }
+
     fn hosts_doc() -> HostsDocument {
         let mut group = HostGroup {
             id: "g1".to_owned(),
@@ -1019,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_without_hosts_are_hidden() {
+    fn groups_without_hosts_are_listed_too() {
         let ctx = egui::Context::default();
         let hosts = HostsDocument {
             groups: vec![
@@ -1031,7 +1143,7 @@ mod tests {
                 },
                 HostGroup {
                     id: "empty".to_owned(),
-                    name: "UNGROUPED".to_owned(),
+                    name: "Spare".to_owned(),
                     color: None,
                     collapsed: false,
                 },
@@ -1047,11 +1159,15 @@ mod tests {
         let mut state = SidebarState::new();
         let labels = painted_text(&ctx, &hosts, &mut state);
         assert!(labels.iter().any(|label| label.contains("DUBBELANKA")));
+        // A group a host can be dragged into must stay on screen even while it is empty.
         assert!(
-            !labels.iter().any(|label| label.contains("UNGROUPED")),
-            "the empty group still painted: {labels:?}"
+            labels.iter().any(|label| label.contains("SPARE")),
+            "the empty group is missing: {labels:?}"
         );
-        assert!(!labels.iter().any(|label| label == "No hosts"));
+        assert!(
+            labels.iter().any(|label| label == "No hosts"),
+            "the empty group does not say it is empty: {labels:?}"
+        );
     }
 
     #[test]

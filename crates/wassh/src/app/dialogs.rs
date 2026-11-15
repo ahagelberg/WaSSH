@@ -86,11 +86,18 @@ const FOCUS_RING_GAP: f32 = 2.0;
 /// Width of that outline.
 const FOCUS_RING_WIDTH: f32 = 2.0;
 
-/// A group being edited in its own dialog.
+/// Name a group starts from when the field is left empty.
+const NEW_GROUP_NAME: &str = "New group";
+/// Colour preset a new group starts from.
+const NEW_GROUP_COLOR: Rgba = wassh_core::colors::GROUP_COLOR_PRESETS[4];
+
+/// A group being created or edited in its own dialog.
 #[derive(Clone, Debug)]
 pub struct GroupEditState {
-    /// Group being edited.
+    /// Group being edited; empty while creating one.
     pub group_id: String,
+    /// Whether the dialog creates a group rather than renaming one.
+    pub creating: bool,
     /// Name as it is stored, restored when the field is emptied.
     pub original_name: String,
     /// Draft name.
@@ -106,10 +113,23 @@ impl GroupEditState {
     pub fn new(group: &wassh_core::HostGroup) -> Self {
         Self {
             group_id: group.id.clone(),
+            creating: false,
             original_name: group.name.clone(),
             name: group.name.clone(),
             color: group.color,
             hex: group.color.map(|color| color.to_hex()).unwrap_or_default(),
+        }
+    }
+
+    /// Start a new group: an empty field, renamed to the default when left blank.
+    pub fn creating() -> Self {
+        Self {
+            group_id: String::new(),
+            creating: true,
+            original_name: NEW_GROUP_NAME.to_owned(),
+            name: String::new(),
+            color: Some(NEW_GROUP_COLOR),
+            hex: NEW_GROUP_COLOR.to_hex(),
         }
     }
 
@@ -124,8 +144,12 @@ impl GroupEditState {
     }
 
     /// The colour the dialog would commit, shown as the current swatch.
+    ///
+    /// The hex text is the source of truth while it holds a complete colour, so a picked
+    /// colour survives the next frame instead of falling back to the stored one.
     pub fn shown_color(&self) -> Rgba {
-        self.color
+        wassh_ui::widgets::parse_hex_draft(&self.hex)
+            .or(self.color)
             .unwrap_or(wassh_core::colors::GROUP_COLOR_FALLBACK)
     }
 }
@@ -236,6 +260,11 @@ pub enum DialogAction {
     /// Rename a group and set (or clear) its colour.
     SaveGroup {
         group_id: String,
+        name: String,
+        color: Option<Rgba>,
+    },
+    /// Add a new group to the saved hosts.
+    CreateGroup {
         name: String,
         color: Option<Rgba>,
     },
@@ -3456,8 +3485,9 @@ fn colour_row(
     }
 }
 
-/// The edit-group dialog: name plus the same colour picker as the appearance
-/// rows in Host settings, committed with OK and dropped with Cancel.
+/// The group dialog: name plus the same colour picker as the appearance rows in
+/// Host settings, committed with Create (a new group) or OK (a rename) and dropped
+/// with Cancel.
 fn group_edit_dialog(
     ctx: &Context,
     palette: &Palette,
@@ -3467,9 +3497,15 @@ fn group_edit_dialog(
     let mut ok = false;
     let mut cancel = false;
     let mut clear = false;
+    // Read from the state every frame: `hex_color_input` writes a picked colour back into
+    // the draft, so the swatch keeps it instead of resetting to the stored colour.
     let mut value = state.shown_color();
-    let before = value;
-    let response = modal(ctx, "group-edit", palette, "Edit group", 440.0, |ui| {
+    let (title, commit_label) = if state.creating {
+        ("New group", "Create")
+    } else {
+        ("Edit group", "OK")
+    };
+    let response = modal(ctx, "group-edit", palette, title, 440.0, |ui| {
         row(
             ui,
             palette,
@@ -3496,31 +3532,30 @@ fn group_edit_dialog(
             if Button::new("Cancel").show(ui, palette).clicked() {
                 cancel = true;
             }
-            if Button::new("OK").primary().show(ui, palette).clicked() {
+            if Button::new(commit_label).primary().show(ui, palette).clicked() {
                 ok = true;
             }
         });
     });
     if response.dismissed || cancel {
         actions.push(DialogAction::Close);
-    } else if clear {
-        actions.push(DialogAction::SaveGroup {
-            group_id: state.group_id.clone(),
-            name: state.committed_name().to_owned(),
-            color: None,
-        });
-    } else if ok {
-        // The swatch or hex field wins; an untouched dialog keeps the old colour.
-        let color = if value != before || !state.hex.trim().is_empty() {
-            Some(value)
+    } else if clear || ok {
+        // The typed or picked colour wins; an empty field keeps the stored one.
+        let color = if clear {
+            None
         } else {
-            state.color
+            wassh_ui::widgets::parse_hex_draft(&state.hex).or(state.color)
         };
-        actions.push(DialogAction::SaveGroup {
-            group_id: state.group_id.clone(),
-            name: state.committed_name().to_owned(),
-            color,
-        });
+        let name = state.committed_name().to_owned();
+        if state.creating {
+            actions.push(DialogAction::CreateGroup { name, color });
+        } else {
+            actions.push(DialogAction::SaveGroup {
+                group_id: state.group_id.clone(),
+                name,
+                color,
+            });
+        }
     }
     actions
 }
@@ -5320,6 +5355,7 @@ mod tests {
         let palette = Palette::dark();
         let mut state = GroupEditState {
             group_id: "g1".to_owned(),
+            creating: false,
             original_name: "Ops".to_owned(),
             name: "Ops".to_owned(),
             color: Some(Rgba::rgb(0x3d8bfd)),
@@ -5339,6 +5375,41 @@ mod tests {
         assert!(has("OK"));
         assert_eq!(state.hex, "#3d8bfd");
         assert_eq!(state.name, "Ops");
+    }
+
+    #[test]
+    fn a_new_group_dialog_offers_create_and_cancel() {
+        let ctx = Context::default();
+        let palette = Palette::dark();
+        let mut state = GroupEditState::creating();
+        let rows = painted_rows(&ctx, Vec2::new(900.0, 700.0), |ctx| {
+            let actions = group_edit_dialog(ctx, &palette, &mut state);
+            assert!(actions.is_empty(), "drawing commits nothing");
+        });
+        let has = |needle: &str| rows.iter().any(|(_, _, text)| text == needle);
+        assert!(has("New group"), "rows: {rows:?}");
+        assert!(has("Cancel"), "there is no way out: {rows:?}");
+        assert!(has("Create"), "there is no way to create it: {rows:?}");
+        assert!(!has("OK"), "a new group is not an edit: {rows:?}");
+        // A blank field still names the group.
+        assert_eq!(state.committed_name(), NEW_GROUP_NAME);
+    }
+
+    #[test]
+    fn a_picked_group_colour_survives_the_next_frame() {
+        let group = wassh_core::HostGroup {
+            id: "g1".to_owned(),
+            name: "Ops".to_owned(),
+            color: Some(Rgba::rgb(0x16a34a)),
+            collapsed: false,
+        };
+        let mut state = GroupEditState::new(&group);
+        // The picker writes the colour into the hex draft, which is what the swatch reads.
+        state.hex = "#f0b429".to_owned();
+        assert_eq!(state.shown_color(), Rgba::rgb(0xf0b429));
+        // A half-typed draft keeps showing the stored colour.
+        state.hex = "#f0b4".to_owned();
+        assert_eq!(state.shown_color(), Rgba::rgb(0x16a34a));
     }
 
     #[test]
