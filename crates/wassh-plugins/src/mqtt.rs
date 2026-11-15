@@ -15,7 +15,8 @@ use wassh_core::{Palette, SessionStatus};
 use wassh_mqtt::{MqttEvent, MqttOptions, MqttSession};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, MenuItem, MenuState, checkbox, select, text_area, text_input,
+    Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, MenuItem, MenuState, checkbox,
+    copy_button, copy_button_at, select, text_area, text_input,
 };
 
 use wassh_ui::to_color32;
@@ -89,8 +90,6 @@ const SAVED_CARD_MIN: f32 = 160.0;
 const SAVED_CARD_GAP: f32 = 4.0;
 /// `.mqtt-msg-row`: 4 px padding + a 12 px and an 11 px line.
 const SAVED_CARD_HEIGHT: f32 = 34.0;
-/// `.mqtt-copy-btn { width/height: 18px }`.
-const COPY_BUTTON: f32 = 18.0;
 /// Height of a `.mqtt-field` caption (`font-size: 11px`).
 const FIELD_LABEL_HEIGHT: f32 = 13.0;
 /// Height of `.mqtt-field input` (4 px padding + a 12 px mono line + border).
@@ -105,15 +104,10 @@ const SAVED_HEAD_HEIGHT: f32 = 20.0;
 const ADD_BUTTON_HEIGHT: f32 = 26.0;
 /// `MQTT_ANALYSER_BLINK_MS`: how long a topic stays highlighted.
 const BLINK_MS: u64 = 500;
-/// `COPY_FEEDBACK_MS`: how long a copy button confirms.
-const COPY_FEEDBACK_MS: u64 = 1500;
 /// How often a connected pane looks for messages the broker thread pushed.
 const BROKER_POLL: Duration = Duration::from_millis(200);
 /// How often a blinking or copying topic is repainted, and how often the file picker is polled.
 const BLINK_POLL: Duration = Duration::from_millis(100);
-/// Copy button glyphs, as in the reference.
-const COPY_GLYPH: &str = "\u{29c9}";
-const COPIED_GLYPH: &str = "\u{2713}";
 /// `MQTT_SPLIT_DEFAULT_RATIO` / `_MIN_RATIO` / `_MAX_RATIO`.
 const SPLIT_DEFAULT_RATIO: f32 = 0.42;
 const SPLIT_MIN_RATIO: f32 = 0.18;
@@ -1532,7 +1526,7 @@ impl MqttAnalyser {
                 let start = ui.cursor().min.y;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = PANE_GAP;
-                    let buttons = COPY_BUTTON + PANE_GAP + DELETE_BUTTON_WIDTH + PANE_GAP * 2.0;
+                    let buttons = COPY_BUTTON_SIZE + PANE_GAP + DELETE_BUTTON_WIDTH + PANE_GAP * 2.0;
                     let topic_room = (ui.available_width() - buttons).max(24.0);
                     topic_text(ui, palette, display, topic_room);
                     let token = format!("topic|{path}");
@@ -2196,29 +2190,6 @@ fn field_caption(ui: &mut Ui, palette: &Palette, text: &str) {
     ui.label(muted_label(text.to_owned(), 11.0, palette));
 }
 
-/// `.mqtt-copy-btn`: an 18 px flat button that confirms briefly.
-fn copy_button(ui: &mut Ui, palette: &Palette, copied: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(COPY_BUTTON), Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let colour = if copied {
-        to_color32(palette.accent)
-    } else if response.hovered() {
-        to_color32(palette.text)
-    } else {
-        to_color32(palette.text_muted)
-    };
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        if copied { COPIED_GLYPH } else { COPY_GLYPH },
-        FontId::proportional(11.0),
-        colour,
-    );
-    response.clicked()
-}
-
 /// `.mqtt-detail-topic`: mono 12 px, broken anywhere so a long path wraps.
 fn topic_text(ui: &mut Ui, palette: &Palette, text: &str, width: f32) {
     let mut job = egui::text::LayoutJob::simple(
@@ -2465,11 +2436,15 @@ fn history_item(
     }
 
     let copy_rect = Rect::from_min_size(
-        egui::pos2(inner.right() - COPY_BUTTON, inner.top() + (HISTORY_HEAD_HEIGHT - COPY_BUTTON) / 2.0),
-        Vec2::splat(COPY_BUTTON),
+        egui::pos2(
+            inner.right() - COPY_BUTTON_SIZE,
+            inner.top() + (HISTORY_HEAD_HEIGHT - COPY_BUTTON_SIZE) / 2.0,
+        ),
+        Vec2::splat(COPY_BUTTON_SIZE),
     );
     let mut copy = false;
-    if copy_button_in(ui, palette, copy_rect, token, copied) {
+    let copy_id = ui.scope_id().with(("mqtt-copy", token));
+    if copy_button_at(ui, palette, copy_rect, copy_id, copied) {
         ui.ctx().copy_text(payload.clone());
         copy = true;
     }
@@ -2523,35 +2498,6 @@ fn history_item(
             .galley(payload_rect.min, galley, to_color32(palette.text));
     }
     copy
-}
-
-/// A copy button the caller positions itself.
-fn copy_button_in(
-    ui: &mut Ui,
-    palette: &Palette,
-    rect: Rect,
-    token: &str,
-    copied: bool,
-) -> bool {
-    let response = ui.interact(rect, ui.scope_id().with(("mqtt-copy", token)), Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let colour = if copied {
-        to_color32(palette.accent)
-    } else if response.hovered() {
-        to_color32(palette.text)
-    } else {
-        to_color32(palette.text_muted)
-    };
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        if copied { COPIED_GLYPH } else { COPY_GLYPH },
-        FontId::proportional(11.0),
-        colour,
-    );
-    response.clicked()
 }
 
 /// What the pointer did to a saved-message card.

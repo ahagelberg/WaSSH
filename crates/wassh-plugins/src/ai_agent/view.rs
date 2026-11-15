@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use wassh_core::{Palette, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, password_input, select_str, select_width, small_button,
-    small_button_enabled, text_area, text_area_with_id,
+    Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
+    select_str, select_width, small_button, small_button_enabled, text_area, text_area_with_id,
 };
 
 use super::agent::{
@@ -70,6 +70,14 @@ const USER_BUBBLE_TAG_ALPHA: u8 = 200;
 const BADGE_TINT: f32 = 0.25;
 /// Characters kept from one tool's output.
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
+/// Widest the output text gets before it has to shrink for its copy button.
+const MIN_OUTPUT_WIDTH: f32 = 60.0;
+/// What a card with nothing to show says instead of an empty box.
+const NO_OUTPUT: &str = "(no output)";
+/// Prompt marker the shell tools put in front of the command they ran.
+const COMMAND_PROMPT: &str = "$ ";
+/// Marker a Local-PC command adds in front of that prompt.
+const LOCAL_COMMAND_PREFIX: &str = "local ";
 /// Characters shown from a queued message.
 const QUEUE_PREVIEW_MAX_CHARS: usize = 120;
 const QUESTION_INDEX_OFFSET: usize = 1;
@@ -293,6 +301,8 @@ pub struct AiAgent {
     applied: Option<serde_json::Map<String, Value>>,
     /// Search key the agent's tools were last given.
     applied_web_key: Option<String>,
+    /// Tool card whose copy button confirmed: which card, which button, and when.
+    copied: Option<(usize, CopyTarget, u64)>,
 }
 
 impl Default for AiAgent {
@@ -323,6 +333,7 @@ impl Default for AiAgent {
             synced_secrets: std::collections::BTreeMap::new(),
             applied: None,
             applied_web_key: None,
+            copied: None,
         }
     }
 }
@@ -1141,6 +1152,7 @@ impl AiAgent {
         let mut rewind = None;
         let mut bubbles = Vec::new();
         let mut stop_command = false;
+        let mut copy_output = None;
         let running = self.agent.running_command();
         let last_user = self
             .agent
@@ -1177,25 +1189,32 @@ impl AiAgent {
                     label,
                     output,
                     failed,
-                } => stop_command |= tool_card(
-                    ui,
-                    palette,
-                    name,
-                    label,
-                    output,
-                    ToolCardState {
-                        failed: *failed,
-                        running: running == Some(index),
-                        turn_index: index,
-                        collapsed: tool_output_is_collapsed(
-                            name,
-                            output,
-                            index,
-                            last_user,
-                            turn_finished,
-                        ),
-                    },
-                ),
+                } => {
+                    let reply = tool_card(
+                        ui,
+                        palette,
+                        name,
+                        label,
+                        output,
+                        ToolCardState {
+                            failed: *failed,
+                            running: running == Some(index),
+                            turn_index: index,
+                            collapsed: tool_output_is_collapsed(
+                                name,
+                                output,
+                                index,
+                                last_user,
+                                turn_finished,
+                            ),
+                            copied: self.copied_recently(index),
+                        },
+                    );
+                    stop_command |= reply.stop;
+                    if let Some((target, text)) = reply.copy {
+                        copy_output = Some((index, target, text));
+                    }
+                }
                 Turn::Denied(reason) => {
                     ui.add(
                         egui::Label::new(
@@ -1268,7 +1287,27 @@ impl AiAgent {
         if stop_command {
             self.agent.stop_command(session);
         }
+        if let Some((index, target, text)) = copy_output {
+            ui.ctx().copy_text(text);
+            self.mark_copied(index, target);
+            // Come back once the tick has to turn back into a copy glyph.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+                COPY_FEEDBACK_MS,
+            ));
+        }
         bubbles
+    }
+
+    /// Remember that a tool card's copy button confirmed.
+    fn mark_copied(&mut self, turn_index: usize, target: CopyTarget) {
+        self.copied = Some((turn_index, target, self.agent.now_ms));
+    }
+
+    /// The copy button of `turn_index` that is still showing its confirmation, if any.
+    fn copied_recently(&self, turn_index: usize) -> Option<CopyTarget> {
+        let (saved, target, at) = self.copied?;
+        (saved == turn_index && self.agent.now_ms.saturating_sub(at) < COPY_FEEDBACK_MS)
+            .then_some(target)
     }
 
     /// Take the conversation back to the message at `index`, its text back in the composer.
@@ -1420,13 +1459,31 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
     });
 }
 
+/// Which of a tool card's copy buttons a click belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyTarget {
+    /// The command line the card ran.
+    Command,
+    /// What the command printed.
+    Output,
+}
+
 /// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
-/// and the output. Returns whether its Stop button was clicked.
+/// and the output.
 struct ToolCardState {
     failed: bool,
     running: bool,
     turn_index: usize,
     collapsed: bool,
+    /// Copy button still showing its confirmation, if any.
+    copied: Option<CopyTarget>,
+}
+
+/// What the pointer did to a tool card this frame.
+struct ToolCardReply {
+    stop: bool,
+    /// The copy button that was clicked, with what it should put on the clipboard.
+    copy: Option<(CopyTarget, String)>,
 }
 
 fn tool_card(
@@ -1436,17 +1493,21 @@ fn tool_card(
     label: &str,
     output: &str,
     state: ToolCardState,
-) -> bool {
+) -> ToolCardReply {
     let ToolCardState {
         failed,
         running,
         turn_index,
         collapsed,
+        copied,
     } = state;
+    let shell = is_shell_tool(name);
+    let command = command_text(label);
     let (badge, colour) = tool_badge(name, palette);
     let muted = to_color32(palette.text_muted);
     let output_id = ui.make_persistent_id(("ai-command-output", turn_index));
     let mut stop = false;
+    let mut copy = None;
     egui::Frame::new()
         .fill(to_color32(palette.bg_input))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
@@ -1476,6 +1537,11 @@ fn tool_card(
                     .show_header(ui, |ui| {
                         badge_pill(ui, palette, badge, colour);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if shell
+                                && copy_button(ui, palette, copied == Some(CopyTarget::Command))
+                            {
+                                copy = Some((CopyTarget::Command, command.to_owned()));
+                            }
                             ui.label(
                                 egui::RichText::new(outcome)
                                     .size(10.0)
@@ -1496,16 +1562,15 @@ fn tool_card(
                         });
                     })
                     .body(|ui| {
-                        ui.label(
-                            egui::RichText::new(if output.is_empty() {
-                                "(no output)"
-                            } else {
-                                &shown
-                            })
-                            .size(11.0)
-                            .monospace()
-                            .color(muted),
-                        );
+                        if tool_output(
+                            ui,
+                            palette,
+                            &shown,
+                            shell && !output.trim().is_empty(),
+                            copied == Some(CopyTarget::Output),
+                        ) {
+                            copy = Some((CopyTarget::Output, output.to_owned()));
+                        }
                     });
             } else {
                 ui.horizontal(|ui| {
@@ -1537,20 +1602,86 @@ fn tool_card(
                     {
                         stop = true;
                     }
+                    // The command line itself; its output has the button on its own row.
+                    if shell && row_copy_button(ui, palette, copied == Some(CopyTarget::Command)) {
+                        copy = Some((CopyTarget::Command, command.to_owned()));
+                    }
                 });
-                ui.label(
-                    egui::RichText::new(if output.is_empty() {
-                        "(no output)"
-                    } else {
-                        &shown
-                    })
-                    .size(11.0)
-                    .monospace()
-                    .color(muted),
-                );
+                if tool_output(
+                    ui,
+                    palette,
+                    &shown,
+                    shell && !output.trim().is_empty(),
+                    copied == Some(CopyTarget::Output),
+                ) {
+                    copy = Some((CopyTarget::Output, output.to_owned()));
+                }
             }
         });
-    stop
+    ToolCardReply { stop, copy }
+}
+
+/// The output text, with the button that copies all of it level with its first line.
+///
+/// Returns whether that button was clicked.
+fn tool_output(ui: &mut Ui, palette: &Palette, shown: &str, copyable: bool, copied: bool) -> bool {
+    let mut copy = false;
+    ui.horizontal_top(|ui| {
+        let room = if copyable {
+            // Both children: the gap between them is part of the budget.
+            (ui.available_width() - COPY_BUTTON_SIZE - ui.spacing().item_spacing.x)
+                .max(MIN_OUTPUT_WIDTH)
+        } else {
+            ui.available_width()
+        };
+        ui.allocate_ui_with_layout(
+            egui::Vec2::new(room, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(room);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(if shown.is_empty() { NO_OUTPUT } else { shown })
+                            .size(11.0)
+                            .monospace()
+                            .color(to_color32(palette.text_muted)),
+                    )
+                    .wrap(),
+                );
+            },
+        );
+        if copyable && copy_button(ui, palette, copied) {
+            copy = true;
+        }
+    });
+    copy
+}
+
+/// A copy button pushed to the right edge of the row being drawn.
+fn row_copy_button(ui: &mut Ui, palette: &Palette, copied: bool) -> bool {
+    let room = ui.available_width() - COPY_BUTTON_SIZE;
+    if room > 0.0 {
+        ui.add_space(room);
+    }
+    copy_button(ui, palette, copied)
+}
+
+/// The command a shell card shows, without its prompt marker, ready to paste.
+fn command_text(label: &str) -> &str {
+    let label = label
+        .strip_prefix(LOCAL_COMMAND_PREFIX)
+        .unwrap_or(label);
+    label.strip_prefix(COMMAND_PROMPT).unwrap_or(label)
+}
+
+/// Whether `name` is a tool that runs a shell command, whose card carries its output.
+fn is_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        super::protocol::TOOL_RUN_COMMAND
+            | super::protocol::TOOL_RUN_SUDO
+            | super::protocol::TOOL_LOCAL_RUN
+    )
 }
 
 fn tool_output_is_collapsed(
@@ -1560,12 +1691,7 @@ fn tool_output_is_collapsed(
     last_user: Option<usize>,
     turn_finished: bool,
 ) -> bool {
-    let collapse_by_tool = matches!(
-        name,
-        super::protocol::TOOL_RUN_COMMAND
-            | super::protocol::TOOL_RUN_SUDO
-            | super::protocol::TOOL_LOCAL_RUN
-    ) || name.starts_with("remote_fs_");
+    let collapse_by_tool = is_shell_tool(name) || name.starts_with("remote_fs_");
     let has_lots_of_output = output.chars().count() > TOOL_OUTPUT_MAX_CHARS;
     (collapse_by_tool || has_lots_of_output)
         && (turn_finished || last_user.is_some_and(|last_user| index < last_user))
@@ -2631,6 +2757,7 @@ mod tests {
     use super::super::settings_ui::{API_KEYS_KEY, provider_secret_field};
     use super::*;
     use wassh_core::Palette;
+    use wassh_ui::widgets::{COPIED_GLYPH, COPY_GLYPH};
 
     /// Draw two frames and return the painted text.
     fn draw(plugin: &mut AiAgent, settings: &mut serde_json::Map<String, Value>) -> Vec<String> {
@@ -2699,6 +2826,18 @@ mod tests {
         events: Vec<egui::Event>,
         width: f32,
     ) -> Vec<(i32, i32, String)> {
+        frame_commands(plugin, settings, ctx, events, width).0
+    }
+
+    /// One frame drawn `width` points wide: every painted text and what it asked the
+    /// platform to do (a clipboard copy, say).
+    fn frame_commands(
+        plugin: &mut AiAgent,
+        settings: &mut serde_json::Map<String, Value>,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> (Vec<(i32, i32, String)>, Vec<egui::OutputCommand>) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -2722,6 +2861,7 @@ mod tests {
             secret_writes: Vec::new(),
         };
         let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
+        let commands = std::mem::take(&mut output.platform_output.commands);
         let shapes = std::mem::take(&mut output.shapes);
         output.drop_without_applying_deltas();
         let mut rows: Vec<_> = shapes
@@ -2736,7 +2876,26 @@ mod tests {
             })
             .collect();
         rows.sort();
-        rows
+        (rows, commands)
+    }
+
+    /// The events that click once at `pos`.
+    fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
     }
 
     /// A provider stand-in: lists `models` and answers one chat call with `chat`, then
@@ -3056,6 +3215,163 @@ mod tests {
         assert!(texts.contains(&"$ uptime"), "label missing: {texts:?}");
         assert!(texts.contains(&"SSH"), "request type missing: {texts:?}");
         assert!(!texts.contains(&"up 3 days"), "output is not collapsed: {texts:?}");
+        assert!(texts.contains(&COPY_GLYPH), "a command cannot be copied: {texts:?}");
+    }
+
+    #[test]
+    fn only_shell_cards_offer_a_copy_button() {
+        for (name, copies) in [
+            ("web_fetch", false),
+            ("remote_fs_read_file", false),
+            (super::super::protocol::TOOL_RUN_SUDO, true),
+            (super::super::protocol::TOOL_LOCAL_RUN, true),
+        ] {
+            // A fresh map each time: the pane keeps the transcript in the settings.
+            let mut settings = serde_json::Map::new();
+            let mut plugin = AiAgent::default();
+            plugin.agent.turns.push(Turn::Tool {
+                name: name.to_owned(),
+                label: name.to_owned(),
+                output: "some output".to_owned(),
+                failed: false,
+            });
+            let painted = draw(&mut plugin, &mut settings);
+            let has_button = painted.iter().any(|text| text == COPY_GLYPH);
+            assert_eq!(has_button, copies, "{name}: {painted:?}");
+        }
+    }
+
+    #[test]
+    fn clicking_the_header_button_copies_the_command() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::Tool {
+            name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+            label: "$ uptime".to_owned(),
+            output: "up 3 days".to_owned(),
+            failed: false,
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        // The transcript settles on its scroll position before the button has a rect.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let button = rows
+            .iter()
+            .find(|(_, _, text)| text == COPY_GLYPH)
+            .cloned()
+            .unwrap_or_else(|| panic!("no copy button on the card: {rows:?}"));
+        let pos = egui::Pos2::new(button.1 as f32 + 4.0, button.0 as f32 + 4.0);
+        let (_, commands) = frame_commands(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            click_events(pos),
+            WIDE_PANE,
+        );
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, egui::OutputCommand::CopyText(text)
+                    if text == "uptime")),
+            "the command was not copied: {commands:?}"
+        );
+        // The confirmation is painted from the next frame on.
+        let (after, _) = frame_commands(&mut plugin, &mut settings, &ctx, Vec::new(), WIDE_PANE);
+        assert!(
+            after.iter().any(|(_, _, text)| text == COPIED_GLYPH),
+            "the button did not confirm: {after:?}"
+        );
+    }
+
+    #[test]
+    fn the_output_has_its_own_copy_button_on_the_next_row() {
+        /// Painted text with its position, and what a copy button asked for.
+        type CardFrame = (Vec<(i32, i32, String)>, Option<(CopyTarget, String)>);
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let draw = |events: Vec<egui::Event>| -> CardFrame {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(WIDE_PANE, 240.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut reply = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                reply = Some(tool_card(
+                    ui,
+                    &palette,
+                    super::super::protocol::TOOL_RUN_COMMAND,
+                    "$ uptime",
+                    "up 3 days",
+                    ToolCardState {
+                        failed: false,
+                        running: false,
+                        turn_index: 7,
+                        collapsed: false,
+                        copied: None,
+                    },
+                ));
+            });
+            let mut rows: Vec<_> = std::mem::take(&mut output.shapes)
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.pos.y as i32,
+                        text.pos.x as i32,
+                        text.galley.text().to_owned(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            output.drop_without_applying_deltas();
+            rows.sort();
+            (rows, reply.and_then(|reply| reply.copy))
+        };
+        draw(Vec::new());
+        let (rows, _) = draw(Vec::new());
+        let buttons: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, text)| text == COPY_GLYPH)
+            .cloned()
+            .collect();
+        assert_eq!(
+            buttons.len(),
+            2,
+            "the card needs a command and an output button: {rows:?}"
+        );
+        let output_text = rows
+            .iter()
+            .find(|(_, _, text)| text == "up 3 days")
+            .cloned()
+            .expect("the output text");
+        let output_button = &buttons[1];
+        assert!(
+            (output_button.0 - output_text.0).abs() <= 8,
+            "the output button is not level with the first output line: {rows:?}"
+        );
+
+        let (_, copied) = draw(click_events(egui::Pos2::new(
+            output_button.1 as f32 + 4.0,
+            output_button.0 as f32 + 4.0,
+        )));
+        assert_eq!(
+            copied,
+            Some((CopyTarget::Output, "up 3 days".to_owned())),
+            "the output button did not copy the output"
+        );
+    }
+
+    #[test]
+    fn a_shell_card_copies_the_command_without_its_prompt() {
+        assert_eq!(super::command_text("$ uptime"), "uptime");
+        assert_eq!(super::command_text("$ sudo apt update"), "sudo apt update");
+        assert_eq!(super::command_text("local $ ls -la"), "ls -la");
+        // A command that happens to start with the Local marker keeps it.
+        assert_eq!(super::command_text("$ local echo hi"), "local echo hi");
     }
 
     #[test]
@@ -3733,10 +4049,10 @@ mod tests {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         user_bubble(ui, &palette, &prompt, UserMeta::default());
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
-                            failed: false, running: false, turn_index: 0, collapsed: false,
+                            failed: false, running: false, turn_index: 0, collapsed: false, copied: None,
                         });
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
-                            failed: false, running: false, turn_index: 1, collapsed: true,
+                            failed: false, running: false, turn_index: 1, collapsed: true, copied: None,
                         });
                     });
                 });
@@ -4119,6 +4435,7 @@ mod tests {
                         running,
                         turn_index: 0,
                         collapsed: false,
+                        copied: None,
                     },
                 );
             });
@@ -4167,6 +4484,7 @@ mod tests {
                         running: false,
                         turn_index: 4,
                         collapsed: true,
+                        copied: None,
                     },
                 );
             });

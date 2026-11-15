@@ -8,6 +8,7 @@ pub mod button;
 pub mod chart;
 pub mod checkbox;
 pub mod color;
+pub mod copy;
 pub mod field;
 pub mod menu;
 pub mod meter;
@@ -28,6 +29,9 @@ pub use chart::line_chart;
 pub use meter::{RING_STROKE, bar_meter, faded, ring_gauge, segmented_bar};
 pub use checkbox::checkbox;
 pub use color::{color_picker_button, hex_color_input, parse_hex_draft, rgba_from_color32};
+pub use copy::{
+    COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, COPY_GLYPH, COPIED_GLYPH, copy_button, copy_button_at,
+};
 pub use field::{field, password_input, search_input, text_area, text_area_with_id, text_input};
 pub use menu::{MenuItem, MenuState, context_menu};
 pub use modal::{ModalResponse, dialog_width, footer, modal, modal_shown};
