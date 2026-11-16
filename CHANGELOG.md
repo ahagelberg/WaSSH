@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.0.11] - 2026-11-16
+
+### Added
+
+- Compact a long AI agent chat: once the conversation would outgrow the model's context
+  window, the older messages are summarised and dropped, and the summary is carried in the
+  prompt. Each model's window is a row in Options — 128 000 tokens for models without one —
+  and automatic compaction can be switched off.
+
 ## [2.0.10] - 2026-11-13
 
 ### Added
