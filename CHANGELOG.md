@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.0.12] - 2026-11-16
+
+### Changed
+
+- Set the AI agent chat's text with more room between the lines: body text, list items,
+  quotes and fenced code all move from egui's default line height to 1.4× the font size.
+
+### Fixed
+
+- Stop the panes from rebuilding what has not changed on every frame. Each of these now
+  works from a cached result and refreshes only when its input changes:
+  - the file browser's table sorts and formats its rows per listing, instead of formatting
+    and measuring every entry and lowercasing names inside the sort comparator on each frame;
+  - the Docker pane's container list applies its search and ordering when the list or the
+    search changes, instead of cloning every container and sorting it every frame;
+  - the Connection Log's timeline, step chart and heatmap are folded from the log once per
+    log change or second, instead of walking every entry on each frame;
+  - the AI agent parses each message's Markdown once and keeps it until that message's text
+    changes, so a long chat no longer re-parses its whole transcript per frame;
+  - the AI agent's header caption is built from the run state, the session state and the
+    first question, instead of copying the first message every frame;
+  - the AI agent's context budget keeps the conversation's size with the change it was
+    counted at, instead of adding up every message on each frame;
+  - the Server Monitor orders and formats the process table per sample and per sort column,
+    instead of sorting and formatting all eight cells of every row on each frame;
+  - command rules are compiled once per pattern, instead of once per rule per tool call;
+  - the terminal draws each style run into one reused buffer, instead of allocating a string
+    for every run of every row on each frame;
+  - the settings dialogs borrow the host list instead of cloning every host per frame.
+
 ## [2.0.11] - 2026-11-16
 
 ### Added
