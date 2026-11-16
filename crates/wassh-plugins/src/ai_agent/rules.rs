@@ -73,9 +73,30 @@ pub fn matches_any(rules: Option<&[String]>, command: &str) -> bool {
     let Some(rules) = rules else {
         return false;
     };
-    rules.iter().any(|rule| {
-        rule_to_regexp(rule).is_some_and(|regex| regex.is_match(command))
-    })
+    rules
+        .iter()
+        .any(|rule| compiled(rule).is_some_and(|regex| regex.is_match(command)))
+}
+
+/// The regex of one rule, compiled once per pattern.
+///
+/// The same few rules are matched against every command the agent wants to run, and
+/// compiling a regular expression costs far more than using one.
+fn compiled(raw: &str) -> Option<Regex> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(found) = cache.get(raw) {
+        return found.clone();
+    }
+    let compiled = rule_to_regexp(raw);
+    cache.insert(raw.to_owned(), compiled.clone());
+    compiled
 }
 
 /// The words of a command, with runs of whitespace collapsed away.

@@ -523,12 +523,41 @@ const AI_AGENT_TIME_PERMISSION: SettingsField = permission(
     "Get the current date, time, timezone, and Unix timestamp from the local client system.",
 );
 
+/// One row of the AI agent's per-model context windows.
+const MODEL_CONTEXT_ITEM: &[SettingsField] = &[
+    text(
+        "model",
+        "Model",
+        "",
+        "Model name or its beginning, e.g. \"claude\" for every Claude model.",
+    ),
+    number(
+        "tokens",
+        "Context window (tokens)",
+        0,
+        "Tokens this model can take; 0 leaves it on the default window.",
+    ),
+];
+
 const AI_AGENT_APP: &[SettingsField] = &[
     text_area(
         "globalPrompt",
         "Global prompt text",
         "",
         "Text included in every AI agent prompt.",
+    ),
+    item_list(
+        "modelContexts",
+        "Model context windows",
+        "How many tokens each model can take before the chat is compacted into a summary. A row matches a model whose name starts with its own, so \"claude\" covers every Claude model; the first match wins. Models with no row use the default window.",
+        "model",
+        MODEL_CONTEXT_ITEM,
+    ),
+    boolean(
+        "autoCompact",
+        "Compact long chats",
+        true,
+        "Summarise the older part of the chat into the prompt once it would no longer fit the model's context window.",
     ),
     group(
         "globalKnowledgeGroup",
@@ -1319,6 +1348,8 @@ mod tests {
             labels,
             [
                 "Global prompt text",
+                "Model context windows",
+                "Compact long chats",
                 "Global knowledge",
                 "Default allow rules",
                 "Default deny rules",

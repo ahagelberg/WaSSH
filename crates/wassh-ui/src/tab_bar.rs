@@ -44,6 +44,16 @@ const NEW_TAB_INSET: Vec2 = Vec2::new(3.0, 7.0);
 const NEW_TAB_GLYPH_SIZE: f32 = 14.0;
 /// Font size of the tab title.
 const TAB_TITLE_SIZE: f32 = 12.0;
+/// Font size of the session-type tag.
+const TAB_TAG_SIZE: f32 = 8.5;
+/// Horizontal padding inside the session-type tag.
+const TAB_TAG_PADDING: f32 = 4.0;
+/// Height of the session-type tag.
+const TAB_TAG_HEIGHT: f32 = 13.0;
+/// Corner radius of the session-type tag.
+const TAB_TAG_RADIUS: u8 = 3;
+/// Share of the tag's colour mixed into its background, like the tool badges in the chat.
+const TAB_TAG_TINT: f32 = 0.25;
 
 /// One tab to draw.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +62,8 @@ pub struct TabView<'a> {
     pub id: &'a str,
     /// Title shown in the strip.
     pub title: &'a str,
+    /// Session type, e.g. `SSH`, `WSL` or `SER`, shown before the title.
+    pub kind: &'a str,
     /// Session status, controlling the dot colour.
     pub status: SessionStatus,
     /// Whether this is the visible tab.
@@ -386,6 +398,33 @@ fn draw_tab(
     );
     left += STATUS_DOT + TAB_GAP_ITEMS;
 
+    // Session type: three letters in a pill, so a strip of mixed tabs reads at a glance.
+    let tag_colour = if tab.active {
+        palette.accent
+    } else {
+        palette.text_muted
+    };
+    let tag = ui.painter().layout_no_wrap(
+        tab.kind.to_owned(),
+        FontId::proportional(TAB_TAG_SIZE),
+        to_color32(tag_colour),
+    );
+    let tag_rect = Rect::from_center_size(
+        Pos2::new(left + tag.size().x / 2.0 + TAB_TAG_PADDING, rect.center().y),
+        Vec2::new(tag.size().x + TAB_TAG_PADDING * 2.0, TAB_TAG_HEIGHT),
+    );
+    ui.painter().rect_filled(
+        tag_rect,
+        TAB_TAG_RADIUS,
+        to_color32(colors::tint(tag_colour, palette.bg_panel_2, TAB_TAG_TINT)),
+    );
+    ui.painter().galley(
+        tag_rect.center() - tag.size() / 2.0,
+        tag,
+        to_color32(tag_colour),
+    );
+    left += tag_rect.width() + TAB_GAP_ITEMS;
+
     // Close button.
     let close_rect = Rect::from_center_size(
         Pos2::new(rect.right() - TAB_PADDING_X - 5.0, rect.center().y),
@@ -483,6 +522,7 @@ mod tests {
             .map(|title| TabView {
                 id: title,
                 title,
+                kind: "SSH",
                 status: SessionStatus::Connected,
                 active: false,
                 accent: None,
@@ -574,6 +614,87 @@ mod tests {
             "expected {expected}, got {}",
             state.scroll
         );
+    }
+
+    #[test]
+    fn every_tab_shows_its_session_type_before_the_title() {
+        let ctx = egui::Context::default();
+        let mut state = TabBarState::new();
+        let tabs = vec![
+            TabView {
+                id: "ssh",
+                title: "prod-server",
+                kind: "SSH",
+                status: SessionStatus::Connected,
+                active: true,
+                accent: None,
+            },
+            TabView {
+                id: "wsl",
+                title: "Ubuntu",
+                kind: "WSL",
+                status: SessionStatus::Connected,
+                active: false,
+                accent: None,
+            },
+        ];
+        let input = egui::RawInput {
+            screen_rect: Some(SCREEN),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            tab_bar(ui, &Palette::dark(), &tabs, &mut state);
+        });
+        let palette = Palette::dark();
+        let pill_fill = |colour: Rgba| {
+            to_color32(colors::tint(colour, palette.bg_panel_2, TAB_TAG_TINT))
+        };
+        let mut pills = Vec::new();
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::Shape::Rect(rect) => pills.push((rect.rect, rect.fill)),
+                egui::Shape::Text(text) => texts.push((text.pos, text.galley.text().to_owned())),
+                _ => {}
+            }
+        }
+        output.drop_without_applying_deltas();
+
+        // One pill per tab: the active tab's takes the accent, the other stays muted.
+        assert_eq!(
+            pills
+                .iter()
+                .filter(|(_, fill)| *fill == pill_fill(palette.accent))
+                .count(),
+            1,
+            "the active tab's tag is accent coloured"
+        );
+        assert_eq!(
+            pills
+                .iter()
+                .filter(|(_, fill)| *fill == pill_fill(palette.text_muted))
+                .count(),
+            1,
+            "the other tab's tag is muted"
+        );
+
+        for (kind, title) in [("SSH", "prod-server"), ("WSL", "Ubuntu")] {
+            let (tag, _) = texts
+                .iter()
+                .find(|(_, text)| text == kind)
+                .unwrap_or_else(|| panic!("{kind} is not written: {texts:?}"));
+            let (heading, _) = texts
+                .iter()
+                .find(|(_, text)| text == title)
+                .unwrap_or_else(|| panic!("{title} is not written: {texts:?}"));
+            assert!(tag.x < heading.x, "the tag comes before the title");
+            assert!(
+                pills
+                    .iter()
+                    .any(|(rect, _)| rect.contains(*tag)),
+                "the tag sits inside a pill: {tag:?} in {pills:?}"
+            );
+        }
     }
 
     #[test]

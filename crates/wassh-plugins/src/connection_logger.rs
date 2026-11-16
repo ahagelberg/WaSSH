@@ -29,6 +29,8 @@ pub const ENABLED_KEY: &str = "enabled";
 pub const MAX_ENTRIES_KEY: &str = "maxEntries";
 /// Entries kept when the settings say nothing.
 pub const DEFAULT_MAX_ENTRIES: usize = 500;
+/// Milliseconds in a second, for the cache key's whole-second bucket.
+const MS_PER_SECOND: u64 = 1_000;
 
 /// Height of the timeline bar, and the shortest it shrinks to in a low pane.
 const TIMELINE_HEIGHT: f32 = 28.0;
@@ -470,6 +472,24 @@ pub struct ConnectionLogger {
     window: TimeWindow,
     /// Whether the Clear button is asking for a second click.
     clear_confirm: bool,
+    /// Bumped whenever the entries change, so what was derived from them is rebuilt.
+    revision: u64,
+    /// The log folded up for drawing, and what it was folded from.
+    cache: Option<LogCache>,
+}
+
+/// The log as one frame draws it: the window, the spans, the summary and the heatmap's
+/// buckets.
+///
+/// Building them walks the whole log and formats each entry's message, so they are held
+/// until the log, the window, the graph, the session state or the second changes.
+struct LogCache {
+    /// Revision, window, graph mode, session status and whole second they belong to.
+    key: (u64, TimeWindow, GraphMode, SessionStatus, u64),
+    range: Range,
+    spans: Vec<Span>,
+    summary: Summary,
+    buckets: Vec<Bucket>,
 }
 
 impl ConnectionLogger {
@@ -517,6 +537,7 @@ impl ConnectionLogger {
             let excess = self.entries.len() - max_entries;
             self.entries.drain(..excess);
         }
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -524,11 +545,13 @@ impl ConnectionLogger {
     fn clear(&mut self) {
         self.entries.clear();
         self.connected_since = None;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Read the stored log and rebuild the current connection's start time.
     fn load(&mut self, stored: Option<&serde_json::Value>) {
         self.entries = parse_log(stored);
+        self.revision = self.revision.wrapping_add(1);
         self.connected_since = self
             .entries
             .last()
@@ -537,10 +560,17 @@ impl ConnectionLogger {
         self.loaded = true;
     }
 
-    /// Fold in everything new from the session, returning whether the log changed.
+    /// Fold in everything newer than the log, returning whether it changed.
+    ///
+    /// The host offers the session's whole history on every poll, so anything the log
+    /// already holds has to be skipped — not just an immediate repeat of the newest entry.
     fn absorb(&mut self, events: &[ConnectionEvent], max_entries: usize) -> bool {
+        let newest = self.entries.last().map(|entry| entry.at_ms);
         let mut changed = false;
         for event in events {
+            if newest.is_some_and(|at_ms| event.at_ms < at_ms) {
+                continue;
+            }
             changed |= self.merge(event, max_entries);
         }
         changed
@@ -552,12 +582,10 @@ impl Plugin for ConnectionLogger {
         PluginId::ConnectionLogger.manifest()
     }
 
-    fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
-        let palette = context.palette;
+    fn poll(&mut self, context: &mut PluginContext<'_>) {
         if !self.loaded {
             self.load(context.value(LOG_KEY));
         }
-
         let enabled = context
             .value(ENABLED_KEY)
             .and_then(serde_json::Value::as_bool)
@@ -568,10 +596,21 @@ impl Plugin for ConnectionLogger {
             .map(|value| value as usize)
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_ENTRIES);
-
         if enabled && self.absorb(context.events, max_entries) {
             context.set_value(LOG_KEY, to_value(&self.entries));
         }
+    }
+
+    fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
+        let palette = context.palette;
+        // The pane records exactly what a closed pane records, so the log is the same
+        // whichever way it was fed.
+        self.poll(context);
+
+        let enabled = context
+            .value(ENABLED_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
 
         // The graph and the cards above it all read the same window of the log.
         if self.controls(ui, &palette, enabled) {
@@ -579,27 +618,46 @@ impl Plugin for ConnectionLogger {
             context.set_value(LOG_KEY, to_value(&self.entries));
         }
         let now = now_ms();
-        let range = window_range(self.window, &self.entries, now);
-        let spans = build_spans(&self.entries, range, context.status);
-        let summary = summarise(&spans, range, &self.entries, now);
+        let key = (
+            self.revision,
+            self.window,
+            self.graph,
+            context.status,
+            now / MS_PER_SECOND,
+        );
+        if self.cache.as_ref().is_none_or(|cache| cache.key != key) {
+            let range = window_range(self.window, &self.entries, now);
+            let spans = build_spans(&self.entries, range, context.status);
+            let summary = summarise(&spans, range, &self.entries, now);
+            let buckets = hourly_buckets(range, &spans);
+            self.cache = Some(LogCache {
+                key,
+                range,
+                spans,
+                summary,
+                buckets,
+            });
+        }
+        let cache = std::mem::take(&mut self.cache).expect("just built");
 
         ui.add_space(BLOCK_GAP);
-        self.metrics(ui, &palette, context.status, &summary);
+        self.metrics(ui, &palette, context.status, &cache.summary);
         ui.add_space(BLOCK_GAP);
         match self.graph {
             GraphMode::Timeline => {
                 let height = graph_height(ui, TIMELINE_HEIGHT, TIMELINE_MIN_HEIGHT);
-                timeline(ui, &palette, range, &spans, height);
+                timeline(ui, &palette, cache.range, &cache.spans, height);
             }
             GraphMode::Step => {
                 let height = graph_height(ui, STEP_HEIGHT, STEP_MIN_HEIGHT);
-                step_chart(ui, &palette, range, &spans, height);
+                step_chart(ui, &palette, cache.range, &cache.spans, height);
             }
             GraphMode::Heatmap => {
                 let height = graph_height(ui, HEAT_MAX_HEIGHT, HEAT_MIN_HEIGHT);
-                heatmap(ui, &palette, range, &spans, height);
+                heatmap(ui, &palette, cache.range, &cache.buckets, height);
             }
         }
+        self.cache = Some(cache);
         ui.add_space(BLOCK_GAP);
         self.list(ui, &palette);
         // "Now" and the current duration move on their own.
@@ -1178,8 +1236,13 @@ fn with_alpha(colour: egui::Color32, alpha: f32) -> egui::Color32 {
 }
 
 /// The heatmap: one cell per hour, shaded by how much of it the session was up.
-fn heatmap(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span], max_height: f32) {
-    let buckets = hourly_buckets(range, spans);
+fn heatmap(
+    ui: &mut Ui,
+    palette: &Palette,
+    range: Range,
+    buckets: &[Bucket],
+    max_height: f32,
+) {
     let width = ui.available_width();
     let columns = (((width + HEAT_GAP) / (HEAT_CELL + HEAT_GAP)).floor() as usize).max(1);
     let cell_width =
@@ -1393,6 +1456,28 @@ mod tests {
             assert!(!logger.merge(&event(1_000, status, None), 10), "{status:?}");
         }
         assert!(logger.entries().is_empty());
+    }
+
+    #[test]
+    fn a_replayed_history_adds_nothing() {
+        // The host offers the session's whole history on every poll, so the same events
+        // arrive again and again; only what the log does not hold may be appended.
+        let mut logger = ConnectionLogger::default();
+        let events = vec![
+            event(1_000, SessionStatus::Connected, None),
+            event(2_000, SessionStatus::Reconnecting, None),
+            event(3_000, SessionStatus::Connected, None),
+        ];
+        assert!(logger.absorb(&events, 10));
+        assert_eq!(logger.entries().len(), 3);
+
+        assert!(!logger.absorb(&events, 10), "a replay changes nothing");
+        assert_eq!(logger.entries().len(), 3, "{:?}", logger.entries());
+
+        let mut grown = events.clone();
+        grown.push(event(9_000, SessionStatus::Disconnected, None));
+        assert!(logger.absorb(&grown, 10));
+        assert_eq!(logger.entries().len(), 4);
     }
 
     #[test]

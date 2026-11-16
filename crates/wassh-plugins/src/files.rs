@@ -453,6 +453,40 @@ struct SaveRequest {
     name: String,
 }
 
+/// A listing as the table measured it: the row order, the text of the three narrow
+/// columns and the width each column asks for.
+///
+/// Measuring an entry lays out four galleys and formats three strings, and the order is a
+/// sort that lowercases names, so it is all held until the listing or the pane width
+/// changes.
+#[derive(Default)]
+struct TableCache {
+    /// Listing revision the measurements belong to.
+    revision: u64,
+    /// Pane width they were measured at.
+    width: f32,
+    /// Row order, as indices into the listing's entries.
+    order: Vec<usize>,
+    /// Size, permissions and modified text per entry, in listing order.
+    cells: Vec<CellTexts>,
+    /// Widest name, icon and trailing gap included.
+    name_need: f32,
+    /// What the size, permissions and modified columns need.
+    narrow: [f32; 3],
+}
+
+/// The text of one row's columns, formatted once per listing.
+struct CellTexts {
+    /// Name with the link mark, as the name column draws it.
+    name: String,
+    /// Size column.
+    size: String,
+    /// Permissions column.
+    mode: String,
+    /// Modified column.
+    date: String,
+}
+
 /// Where the browser is looking, and what it remembers between frames.
 pub struct Files {
     /// Directory currently shown.
@@ -500,6 +534,8 @@ pub struct Files {
     picker_selected: Vec<String>,
     /// State line the pane header shows: the text and how it reads.
     caption: (String, HeaderHealth),
+    /// What the table measured for the listing on screen.
+    table: TableCache,
 }
 
 impl Default for Files {
@@ -528,6 +564,7 @@ impl Default for Files {
             save_dir: String::new(),
             picker_selected: Vec::new(),
             caption: (String::new(), HeaderHealth::Bad),
+            table: TableCache::default(),
         }
     }
 }
@@ -1148,22 +1185,43 @@ impl Files {
         // Every column asks for what its widest value needs; the name asks for
         // its longest row. The priorities decide who gives way: name first,
         // then the size, then the permissions and the date.
-        let icon_width = measure(&cell_font, "📁 ");
-        let mut name_need = icon_width + measure(&heading_font, "Name");
-        let mut narrow = [
-            measure(&heading_font, "Size"),
-            measure(&heading_font, "Permissions"),
-            measure(&heading_font, "Modified"),
-        ];
-        for entry in &listing.entries {
-            let link_mark = if entry.is_link { " →" } else { "" };
-            name_need = name_need
-                .max(icon_width + measure(&cell_font, &format!("{}{link_mark}", entry.name)) + 8.0);
-            narrow[0] = narrow[0].max(measure(&mono_font, &size_cell(entry)));
-            narrow[1] = narrow[1].max(measure(&mono_font, &mode_symbolic(entry)));
-            narrow[2] = narrow[2].max(measure(&mono_font, &date_cell(entry)));
+        let stale = self.table.revision != self.listing_revision
+            || (self.table.width - content).abs() > COLUMN_SLACK
+            || self.table.order.len() != listing.entries.len()
+            || self.table.cells.len() != listing.entries.len();
+        if stale {
+            let icon_width = measure(&cell_font, "📁 ");
+            let mut name_need = icon_width + measure(&heading_font, "Name");
+            let mut narrow = [
+                measure(&heading_font, "Size"),
+                measure(&heading_font, "Permissions"),
+                measure(&heading_font, "Modified"),
+            ];
+            let mut cells = Vec::with_capacity(listing.entries.len());
+            for entry in &listing.entries {
+                let link_mark = if entry.is_link { " →" } else { "" };
+                let cell = CellTexts {
+                    name: format!("{}{link_mark}", entry.name),
+                    size: size_cell(entry),
+                    mode: mode_symbolic(entry),
+                    date: date_cell(entry),
+                };
+                name_need = name_need.max(icon_width + measure(&cell_font, &cell.name) + 8.0);
+                narrow[0] = narrow[0].max(measure(&mono_font, &cell.size));
+                narrow[1] = narrow[1].max(measure(&mono_font, &cell.mode));
+                narrow[2] = narrow[2].max(measure(&mono_font, &cell.date));
+                cells.push(cell);
+            }
+            self.table = TableCache {
+                revision: self.listing_revision,
+                width: content,
+                order: sort_entries(&listing.entries),
+                cells,
+                name_need,
+                narrow,
+            };
         }
-        let widths = column_widths(content, name_need, &narrow);
+        let widths = column_widths(content, self.table.name_need, &self.table.narrow);
         let mut offsets = [0.0_f32; 4];
         let mut left = 0.0;
         for (index, width) in widths.iter().enumerate() {
@@ -1252,12 +1310,16 @@ impl Files {
             }
         }
 
-        let order = sort_entries(&listing.entries);
+        // The order and the row texts are moved out for the loop, which edits the
+        // selection as it draws, and put back before the pane returns.
+        let order = std::mem::take(&mut self.table.order);
+        let cells = std::mem::take(&mut self.table.cells);
         let visible: Vec<&str> = order
             .iter()
             .map(|index| listing.entries[*index].path.as_str())
             .collect();
-        for index in order {
+        let icon_width = measure(&cell_font, "📁 ");
+        for index in order.iter().copied() {
             let entry = &listing.entries[index];
             let (rect, response) =
                 ui.allocate_exact_size(egui::Vec2::new(content, ROW_HEIGHT), egui::Sense::click());
@@ -1320,37 +1382,27 @@ impl Files {
                 cell_font.clone(),
                 colour,
             );
-            let icon_width = measure(&cell_font, "📁 ");
             let name_room = widths[0] - icon_width - 8.0;
-            let link_mark = if entry.is_link { " →" } else { "" };
             // The name owns the whole column: the permission string has its own.
+            let cell = &cells[index];
             painter.text(
                 egui::pos2(rect.left() + 4.0 + icon_width, rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                ellipsize(
-                    painter,
-                    &format!("{}{link_mark}", entry.name),
-                    cell_font.clone(),
-                    name_room.max(24.0),
-                ),
+                ellipsize(painter, &cell.name, cell_font.clone(), name_room.max(24.0)),
                 cell_font.clone(),
                 colour,
             );
-            let cells = [
-                (1, size_cell(entry), true),
-                (2, mode_symbolic(entry), false),
-                (3, date_cell(entry), false),
-            ];
-            for (index, value, right_aligned) in cells {
-                if widths[index] <= 0.0 {
+            let values = [(1, &cell.size, true), (2, &cell.mode, false), (3, &cell.date, false)];
+            for (column, value, right_aligned) in values {
+                if widths[column] <= 0.0 {
                     continue;
                 }
                 cell_paint(
                     painter,
                     rect,
-                    offsets[index],
-                    widths[index],
-                    &value,
+                    offsets[column],
+                    widths[column],
+                    value,
                     &mono_font,
                     muted,
                     right_aligned,
@@ -1358,6 +1410,8 @@ impl Files {
                 );
             }
         }
+        self.table.order = order;
+        self.table.cells = cells;
 
         // Loading, empty and failed states sit over the table like the
         // reference's centred `.sftp-empty` block.
@@ -2750,6 +2804,8 @@ const ROW_HEIGHT: f32 = 18.0;
 /// Below this a column cannot show anything useful, so it is dropped and its
 /// width goes back to the name.
 const MIN_COLUMN_WIDTH: f32 = 44.0;
+/// How far the pane width may drift before the columns are measured again.
+const COLUMN_SLACK: f32 = 0.5;
 
 /// Lay the four columns out in priority order.
 ///

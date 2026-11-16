@@ -19,6 +19,8 @@ const PARAGRAPH_SPACE: f32 = 7.0;
 const LIST_ITEM_SPACE: f32 = 2.0;
 const LIST_MARKER_WIDTH: f32 = 24.0;
 const CODE_TEXT_SIZE: f32 = 12.0;
+/// Line height as a multiple of the text size; egui's own is tighter than a chat reads well.
+const LINE_SPACING: f32 = 1.4;
 /// Alpha of a fenced block's and a bold run's plate on the pane.
 const PLATE_ALPHA: u8 = 18;
 /// Alpha of an inline code plate on the pane.
@@ -263,6 +265,7 @@ pub fn inline_job(line: &str, ink: Ink, size: f32) -> LayoutJob {
         let mut format = TextFormat {
             font_id: FontId::proportional(size),
             color: ink.text,
+            line_height: Some(size * LINE_SPACING),
             ..Default::default()
         };
         match kind {
@@ -308,27 +311,40 @@ fn render_list_item(ui: &mut Ui, marker: String, item: &str, ink: Ink) {
 
 /// Draw a Markdown document in `ink`.
 pub fn render(ui: &mut Ui, ink: Ink, text: &str) {
-    for block in blocks(text) {
+    draw(ui, ink, &blocks(text));
+}
+
+/// Fingerprint of a document's text, so a frame can tell whether it is already parsed.
+pub fn fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Draw blocks that are already parsed.
+pub fn draw(ui: &mut Ui, ink: Ink, blocks: &[Block]) {
+    for block in blocks {
         match block {
             Block::Heading(level, title) => {
                 ui.add_space(HEADING_TOP_SPACE);
                 ui.label(
                     egui::RichText::new(title)
-                        .size(heading_size(level))
+                        .size(heading_size(*level))
                         .strong()
                         .color(ink.text),
                 );
                 ui.add_space(HEADING_BOTTOM_SPACE);
             }
             Block::Paragraph(line) => {
-                ui.add(egui::Label::new(inline_job(&line, ink, BODY_TEXT_SIZE)).wrap());
+                ui.add(egui::Label::new(inline_job(line, ink, BODY_TEXT_SIZE)).wrap());
                 ui.add_space(PARAGRAPH_SPACE);
             }
             Block::Bullet(item) => {
-                render_list_item(ui, "•".to_owned(), &item, ink);
+                render_list_item(ui, "•".to_owned(), item, ink);
             }
             Block::Numbered(number, item) => {
-                render_list_item(ui, format!("{number}."), &item, ink);
+                render_list_item(ui, format!("{number}."), item, ink);
             }
             Block::Quote(line) => {
                 ui.horizontal_top(|ui| {
@@ -338,7 +354,7 @@ pub fn render(ui: &mut Ui, ink: Ink, text: &str) {
                             egui::RichText::new("▏").size(BODY_TEXT_SIZE).color(ink.muted),
                         ),
                     );
-                    ui.add(egui::Label::new(inline_job(&line, ink, BODY_TEXT_SIZE)).wrap());
+                    ui.add(egui::Label::new(inline_job(line, ink, BODY_TEXT_SIZE)).wrap());
                 });
                 ui.add_space(PARAGRAPH_SPACE);
             }
@@ -353,6 +369,7 @@ pub fn render(ui: &mut Ui, ink: Ink, text: &str) {
                         ui.label(
                             egui::RichText::new(lines.join("\n"))
                                 .size(CODE_TEXT_SIZE)
+                                .line_height(Some(CODE_TEXT_SIZE * LINE_SPACING))
                                 .monospace()
                                 .color(ink.text),
                         );
@@ -380,6 +397,20 @@ mod tests {
         let palette = Palette::dark();
         assert_eq!(Ink::pane(&palette).text, to_color32(palette.text));
         assert_ne!(Ink::pane(&palette).code_bg, ink.code_bg);
+    }
+
+    #[test]
+    fn chat_text_is_set_with_room_between_its_lines() {
+        let job = inline_job("one line", Ink::pane(&Palette::dark()), BODY_TEXT_SIZE);
+        let height = job.sections[0]
+            .format
+            .line_height
+            .expect("the body sets a line height");
+        assert!(
+            height > BODY_TEXT_SIZE * 1.3,
+            "a line is taller than the text: {height}"
+        );
+        assert!(height < BODY_TEXT_SIZE * 1.5, "{height}");
     }
 
     #[test]

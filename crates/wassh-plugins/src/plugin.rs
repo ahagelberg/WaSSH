@@ -199,6 +199,14 @@ pub trait Plugin {
     /// Draw the pane. The host draws the frame, title bar and close button.
     fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>);
 
+    /// Do the pane's background work for one frame, whether or not it is drawn.
+    ///
+    /// The host calls this after the session's status changed, for every enabled plugin of
+    /// every tab: a pane that records history (the connection log) keeps up while it is
+    /// closed or its tab sits in the background. Drawing is not involved, so a pane that
+    /// only works when drawn leaves this alone.
+    fn poll(&mut self, _context: &mut PluginContext<'_>) {}
+
     /// Short state line for the pane header: the text and how it reads.
     ///
     /// The host paints it in the header strip next to the title, so a pane does

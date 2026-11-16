@@ -287,6 +287,8 @@ pub struct SessionEntry {
     files: RemoteFiles,
     /// Status changes this session went through, for the connection log plugin.
     status_history: std::sync::Arc<Vec<wassh_core::ConnectionEvent>>,
+    /// Whether a status change is waiting to be folded into the panes' background work.
+    plugins_dirty: bool,
     /// Commands other panes asked the session to run.
     commands: RemoteCommands,
     /// Loopback forwards panes asked for (MQTT broker, and any later pane).
@@ -459,6 +461,7 @@ impl SessionEntry {
             pending_open: None,
             files: RemoteFiles::default(),
             status_history: std::sync::Arc::new(Vec::new()),
+            plugins_dirty: false,
             commands: RemoteCommands::default(),
             forwards: RemoteForwards::default(),
             login: None,
@@ -982,6 +985,7 @@ impl SessionEntry {
             let excess = history.len() - MAX_STATUS_HISTORY;
             history.drain(..excess);
         }
+        self.plugins_dirty = true;
     }
 
     /// Send encoded input to the transport.
@@ -1656,11 +1660,57 @@ impl SessionEntry {
         }
     }
 
+    /// Take the "a status change is waiting for the panes" flag.
+    pub fn take_plugin_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.plugins_dirty)
+    }
+
+    /// Let every enabled pane do its background work for one frame.
+    ///
+    /// Called after the session's status changed, so a pane that records history — the
+    /// connection log — keeps going while it is closed or its tab is in the background.
+    pub fn poll_plugins(
+        &mut self,
+        store: Option<&wassh_store::Config>,
+        values: &PluginValues,
+        enabled: &[String],
+    ) {
+        let scope = self.plugin_scope();
+        let events = std::sync::Arc::clone(&self.status_history);
+        for id in PluginId::ALL {
+            if !enabled.iter().any(|name| name == id.as_str()) {
+                continue;
+            }
+            let slot = self.ensure_pane(id);
+            self.load_pane_data(slot, store, values);
+            let secrets = values.secrets.get(id.as_str()).unwrap_or(&NO_SECRETS);
+            let Some(pane) = self.panes.get_mut(slot) else {
+                continue;
+            };
+            let mut context = PluginContext {
+                palette: self.palette,
+                host_label: self.title.clone(),
+                environment: self.connection.environment(),
+                status: self.status,
+                settings: &mut pane.data.values,
+                scope: scope.clone(),
+                session: None,
+                events: &events,
+                pending_input: Vec::new(),
+                repaint_after: None,
+                secrets,
+                secret_writes: Vec::new(),
+            };
+            pane.plugin.poll(&mut context);
+            let writes = std::mem::take(&mut context.secret_writes);
+            pane.secret_writes.extend(writes);
+        }
+    }
+
     /// Panes whose data changed since the last save, ready to be written.
     pub fn take_dirty_plugins(
         &mut self,
-    ) -> Vec<(PluginId, String, serde_json::Map<String, serde_json::Value>)> {
-        let scope = self.plugin_scope();
+    ) -> Vec<(PluginId, String, serde_json::Map<String, serde_json::Value>)> {        let scope = self.plugin_scope();
         let mut dirty = Vec::new();
         for pane in &mut self.panes {
             if let Some(payload) = pane.data.take_changes() {
@@ -3700,6 +3750,60 @@ mod tests {
         entry.status = SessionStatus::Authenticating;
         entry.pump("xterm-256color");
         assert_eq!(entry.status_history.len(), 2);
+    }
+
+    /// The connection logger's stored entries.
+    fn connection_log(entry: &SessionEntry) -> Vec<serde_json::Value> {
+        entry
+            .panes
+            .iter()
+            .find(|pane| pane.id == wassh_plugins::PluginId::ConnectionLogger)
+            .and_then(|pane| {
+                pane.data
+                    .values
+                    .get(wassh_plugins::connection_logger::LOG_KEY)
+            })
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_closed_connection_log_still_records_the_session() {
+        let mut entry = SessionEntry::new_local(
+            "t-log-closed",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            "xterm-256color",
+            TerminalSize::new(80, 24),
+            local_params(),
+        );
+        entry.pump("xterm-256color");
+        assert!(entry.take_plugin_dirty(), "the connect waits for the panes");
+        assert!(
+            connection_log(&entry).is_empty(),
+            "nothing is recorded until the panes are polled"
+        );
+
+        let enabled = vec![wassh_plugins::PluginId::ConnectionLogger
+            .as_str()
+            .to_owned()];
+        entry.poll_plugins(None, &PluginValues::default(), &enabled);
+        let log = connection_log(&entry);
+        assert_eq!(log.len(), 1, "the connect is in the log: {log:?}");
+        assert_eq!(log[0]["kind"], serde_json::json!("connected"));
+        assert!(
+            entry
+                .take_dirty_plugins()
+                .iter()
+                .any(|(id, _, _)| *id == wassh_plugins::PluginId::ConnectionLogger),
+            "the pane was never drawn, so its data is offered for saving here"
+        );
+
+        // The same history, offered again, writes nothing.
+        entry.poll_plugins(None, &PluginValues::default(), &enabled);
+        assert!(entry.take_dirty_plugins().is_empty());
+        assert_eq!(connection_log(&entry).len(), 1);
     }
 
     #[test]

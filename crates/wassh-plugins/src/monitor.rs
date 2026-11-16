@@ -1515,6 +1515,17 @@ enum ProcIntent {
     Signal(u32, &'static str),
 }
 
+/// The process table, ordered and formatted for one sample.
+#[derive(Clone, Debug)]
+struct ProcessRows {
+    /// Sample time, sort column and direction they belong to.
+    key: (u64, ProcessColumn, bool),
+    /// Row order, as indices into the sample's processes.
+    order: Vec<usize>,
+    /// Text of every row's columns, in `order`.
+    cells: Vec<[String; PROCESS_CELLS]>,
+}
+
 /// What the pane remembers between frames.
 #[derive(Clone, Debug)]
 struct PaneState {
@@ -1526,6 +1537,8 @@ struct PaneState {
     /// Process table sort column and direction.
     sort: ProcessColumn,
     descending: bool,
+    /// The process table as the last frame drew it, ordered and formatted.
+    rows: Option<ProcessRows>,
     /// Row whose context menu is open, and where it was opened.
     menu: Option<(egui::Pos2, u32)>,
     /// Details dialog, when open.
@@ -1547,6 +1560,7 @@ impl Default for PaneState {
             last_at: 0,
             sort: ProcessColumn::default(),
             descending: default_descending(ProcessColumn::default()),
+            rows: None,
             menu: None,
             details: None,
             status: None,
@@ -2659,8 +2673,11 @@ const COMMAND_MIN: f32 = 60.0;
 /// Space reserved beside the active heading for its sort arrow.
 const SORT_ARROW_WIDTH: f32 = 12.0;
 
+/// Cells one process row draws.
+const PROCESS_CELLS: usize = 8;
+
 /// The eight cells of one process row, in column order.
-fn process_cells(process: &Process) -> [String; 8] {
+fn process_cells(process: &Process) -> [String; PROCESS_CELLS] {
     [
         process.pid.to_string(),
         process.user.clone(),
@@ -2844,8 +2861,18 @@ fn processes_card(
         ui.painter()
             .hline(0.0..=content, heading_top + HEADING_HEIGHT, egui::Stroke::new(1.0, rule));
 
-        let order = sort_processes(&sample.processes, state.sort, state.descending);
-        for index in order {
+        // Sorting and formatting every row walks the process list, so the table is only
+        // rebuilt when a new sample arrives or a heading is clicked.
+        let key = (sample.at_ms, state.sort, state.descending);
+        let rows = state.rows.take().filter(|rows| rows.key == key).unwrap_or_else(|| {
+            let order = sort_processes(&sample.processes, state.sort, state.descending);
+            let cells = order
+                .iter()
+                .map(|index| process_cells(&sample.processes[*index]))
+                .collect();
+            ProcessRows { key, order, cells }
+        });
+        for (position, index) in rows.order.iter().copied().enumerate() {
             let process = &sample.processes[index];
             let (rect, response) = ui.allocate_exact_size(
                 egui::Vec2::new(content, ROW_HEIGHT),
@@ -2870,12 +2897,12 @@ fn processes_card(
             } else if response.clicked() {
                 state.menu = None;
             }
-            let cells = process_cells(process);
-            for (position, cell) in cells.iter().enumerate() {
-                let (left, column_width) = columns[position];
-                let font = cell_font_for(position);
+            let cells = &rows.cells[position];
+            for (column, cell) in cells.iter().enumerate() {
+                let (left, column_width) = columns[column];
+                let font = cell_font_for(column);
                 // The state column reads as a qualifier, like the reference.
-                let colour = if position == 2 { muted } else { text };
+                let colour = if column == 2 { muted } else { text };
                 // One layout per cell, cut by the layout itself: measuring a long
                 // command line once per dropped character is gigabytes of glyphs.
                 let galley = truncating_galley_with(ui, cell, font, colour, column_width - 4.0);
@@ -2886,6 +2913,7 @@ fn processes_card(
                 );
             }
         }
+        state.rows = Some(rows);
     });
 
     if let Some((position, pid)) = state.menu {

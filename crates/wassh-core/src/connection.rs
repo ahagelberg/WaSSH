@@ -559,6 +559,21 @@ impl ConnectionParams {
         }
     }
 
+    /// Three letters naming the transport or shell, for the tab strip.
+    pub fn tab_tag(&self) -> &'static str {
+        match self.kind {
+            ConnectionType::Ssh => "SSH",
+            ConnectionType::Telnet => "TEL",
+            ConnectionType::Serial => "SER",
+            ConnectionType::Local => match self.local {
+                LocalShell::Cmd => "CMD",
+                LocalShell::Wsl { .. } => "WSL",
+                LocalShell::System if cfg!(windows) => "PS",
+                LocalShell::System => "TER",
+            },
+        }
+    }
+
     /// Sidebar subtitle.
     pub fn subtitle(&self) -> String {
         match self.kind {
@@ -592,6 +607,37 @@ impl ConnectionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_session_kind_has_a_tab_tag() {
+        let tag = |kind, local| {
+            ConnectionParams {
+                kind,
+                local,
+                ..ConnectionParams::default()
+            }
+            .tab_tag()
+        };
+        assert_eq!(tag(ConnectionType::Ssh, LocalShell::System), "SSH");
+        assert_eq!(tag(ConnectionType::Telnet, LocalShell::System), "TEL");
+        assert_eq!(tag(ConnectionType::Serial, LocalShell::System), "SER");
+        assert_eq!(tag(ConnectionType::Local, LocalShell::Cmd), "CMD");
+        assert_eq!(
+            tag(ConnectionType::Local, LocalShell::Wsl { distro: None }),
+            "WSL"
+        );
+        assert_eq!(
+            tag(
+                ConnectionType::Local,
+                LocalShell::Wsl {
+                    distro: Some("Ubuntu".to_owned())
+                }
+            ),
+            "WSL"
+        );
+        let system = if cfg!(windows) { "PS" } else { "TER" };
+        assert_eq!(tag(ConnectionType::Local, LocalShell::System), system);
+    }
 
     #[test]
     fn identity_references_round_trip_and_old_connections_load() {

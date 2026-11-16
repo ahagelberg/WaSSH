@@ -200,6 +200,9 @@ pub struct Shell {
     data_generation: u64,
     /// The program icon, uploaded once for the header bar's corner.
     header_icon: Option<egui::TextureHandle>,
+    /// Whether the window icon has been handed to the window a second time, once it was
+    /// on screen; see [`Shell::refresh_window_icon`].
+    icon_refreshed: bool,
     /// Plugin labels the Plugins menu ticks and shows a gear for, reused per frame.
     checked_labels: Vec<&'static str>,
     gear_labels: Vec<&'static str>,
@@ -589,6 +592,7 @@ impl Shell {
             plugin_values_key: None,
             data_generation: 0,
             header_icon: None,
+            icon_refreshed: false,
             checked_labels: Vec::new(),
             gear_labels: Vec::new(),
             toolbar_buttons: Vec::new(),
@@ -1135,6 +1139,29 @@ impl Shell {
             return;
         }
         self.write_settings();
+    }
+
+    /// Maximise the window, or put it back on the rectangle it had before.
+    ///
+    /// Windows does not record the restore rectangle of a borderless window that the shell
+    /// snapped (Win+Left and friends): asking it to restore a maximized window lands on the
+    /// rectangle from before the snap. The rectangle the app tracked while the window was
+    /// last normal is applied after the restore instead, in the same units the launch
+    /// restore uses.
+    fn toggle_maximize(&mut self, ctx: &egui::Context, maximized: bool) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        let Some(bounds) = self.window.normal.filter(|_| maximized) else {
+            return;
+        };
+        let pixels_per_point = ctx.pixels_per_point();
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            bounds.x as f32 / pixels_per_point,
+            bounds.y as f32 / pixels_per_point,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            bounds.width as f32,
+            bounds.height as f32,
+        )));
     }
 
     // --- persistence -------------------------------------------------------
@@ -2022,14 +2049,23 @@ impl Shell {
         }
         let term_type = self.settings.term_type.clone();
         let mut results = Vec::with_capacity(self.sessions.len());
+        let mut changed = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             results.push((index, session.pump(&term_type)));
+            if session.take_plugin_dirty() {
+                changed.push(index);
+            }
             // Collect any finished remote-file or monitoring requests.
             session.poll_files();
             session.poll_commands();
             if session.requests_pending() {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
+        }
+        // A pane that records history does it whether or not it is drawn, so every tab
+        // whose status changed hands its events on here.
+        for index in changed {
+            self.poll_session_plugins(index);
         }
         let mut exited = Vec::new();
         for (index, pumped) in results {
@@ -2353,6 +2389,21 @@ impl Shell {
 
     // --- drawing -----------------------------------------------------------
 
+    /// Let the panes of session `index` fold in what happened while they were not drawn.
+    ///
+    /// The values come through the same cache the drawn tab uses, and whatever the panes
+    /// wrote is saved straight away, because an undrawn tab never reaches
+    /// [`Self::persist_plugin_data`].
+    fn poll_session_plugins(&mut self, index: usize) {
+        let values = self.take_plugin_values(index);
+        let enabled = self.settings.enabled_plugins.clone();
+        if let Some(session) = self.sessions.get_mut(index) {
+            session.poll_plugins(self.config.as_ref(), &values, &enabled);
+        }
+        self.plugin_values = Some(values);
+        self.persist_plugin_data(index);
+    }
+
     /// Write any plugin data that changed while the tab was drawn.
     fn persist_plugin_data(&mut self, index: usize) {
         let Some(session) = self.sessions.get_mut(index) else {
@@ -2537,6 +2588,7 @@ impl Shell {
             .map(|(index, session)| wassh_ui::TabView {
                 id: &session.id,
                 title: &session.title,
+                kind: session.connection.tab_tag(),
                 status: session.status,
                 active: active == Some(index),
                 accent: session.accent(),
@@ -3153,16 +3205,12 @@ impl Shell {
         }
         let palette = self.palette;
         let matches = self.find_matches;
-        // Only Host settings reads the host list, so the other dialogs do not clone it.
-        let hosts = if self.dialogs.host.is_some() {
-            self.hosts.hosts.clone()
-        } else {
-            Vec::new()
-        };
+        // The host list is borrowed, not copied: Host settings is the only dialog that reads
+        // it, and it is drawn every frame.
         let actions = self.dialogs.show(
             ctx,
             &palette,
-            &hosts,
+            &self.hosts.hosts,
             &self.settings.enabled_plugins,
             matches,
         );
@@ -3297,8 +3345,15 @@ impl Shell {
             self.styled_palette = Some(self.palette);
             apply_visuals(&ctx, self.palette);
         }
+        // Windows makes the task bar button from the window icon while the window is being
+        // created, before winit has set that icon, so the button keeps the generic program
+        // icon until the window is activated. Setting the icon again once the window is on
+        // screen makes the shell take it for the button.
         if self.first_frame_ms.is_none() {
             self.first_frame_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
+        } else if !self.icon_refreshed {
+            self.icon_refreshed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(window_icon()))));
         }
         if let Some(fullscreen) = self.fullscreen_request.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
@@ -3402,7 +3457,7 @@ impl Shell {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
             Some(wassh_ui::TitlebarAction::ToggleMaximize) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                self.toggle_maximize(&ctx, maximized);
             }
             Some(wassh_ui::TitlebarAction::Close) => self.quit_requested = true,
             None => {}
@@ -4638,9 +4693,12 @@ mod tests {
 
     fn scratch_config() -> Config {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Windows hands a dead process's id to the next one, so the pid alone can land on
+        // the directory a previous run left behind: the millisecond keeps it fresh.
         let dir = std::env::temp_dir().join(format!(
-            "wassh-shell-{}-{n}",
-            std::process::id()
+            "wassh-shell-{}-{n}-{}",
+            std::process::id(),
+            wassh_core::time::now_ms()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut config = Config::open(&dir).expect("config");
@@ -5266,6 +5324,75 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         assert_eq!(shell.window.offset, None, "a refused move teaches nothing");
+    }
+
+    #[test]
+    fn unmaximizing_puts_the_window_back_on_the_tracked_rectangle() {
+        // Windows keeps a borderless window's restore rectangle from before the shell
+        // snapped it, so the rectangle tracked while the window was last normal is applied
+        // after the restore.
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(2048.0, 1232.0));
+        let tiled = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 1232.0));
+        let viewport = |inner: egui::Rect, maximized: bool| egui::ViewportInfo {
+            outer_rect: Some(inner),
+            inner_rect: Some(inner),
+            maximized: Some(maximized),
+            ..Default::default()
+        };
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .insert(egui::ViewportId::ROOT, viewport(tiled, false));
+        let output = ctx.run_ui(input.clone(), |ui| {
+            let ctx = ui.ctx().clone();
+            shell.track_window_bounds(&ctx);
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(shell.window.normal.map(|bounds| bounds.width), Some(1024));
+
+        let mut maximize = |maximized: bool| {
+            input
+                .viewports
+                .insert(egui::ViewportId::ROOT, viewport(screen, maximized));
+            let output = ctx.run_ui(input.clone(), |ui| {
+                let ctx = ui.ctx().clone();
+                shell.toggle_maximize(&ctx, maximized);
+            });
+            let commands: Vec<egui::ViewportCommand> = output
+                .viewport_output
+                .values()
+                .flat_map(|viewport| viewport.commands.iter().cloned())
+                .collect();
+            output.drop_without_applying_deltas();
+            commands
+        };
+
+        let commands = maximize(false);
+        assert!(commands.contains(&egui::ViewportCommand::Maximized(true)));
+
+        let commands = maximize(true);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, egui::ViewportCommand::OuterPosition(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0))],
+            "the restore lands where the window was before it was maximized"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![egui::ViewportCommand::InnerSize(egui::vec2(1024.0, 1232.0))]
+        );
     }
 
     #[test]

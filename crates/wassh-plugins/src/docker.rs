@@ -490,6 +490,13 @@ pub struct DockerManager {
     section: Section,
     shell: usize,
     containers: Vec<Container>,
+    /// Bumped whenever [`Self::containers`] is replaced, so the drawn order is rebuilt
+    /// only then.
+    containers_revision: u64,
+    /// Containers the search keeps, in the order they are drawn.
+    rows: ContainerRows,
+    /// Revision and search the rows were built for.
+    rows_key: (u64, String),
     /// Each container's restart policy, by name.
     policies: BTreeMap<String, String>,
     images: Vec<Image>,
@@ -537,6 +544,16 @@ pub struct DockerManager {
     pending: Option<(Action, String, String)>,
     /// State line the pane header shows, refreshed once per draw.
     caption: Option<(String, HeaderHealth)>,
+}
+
+/// The container list as the pane draws it: the search applied and the two groups
+/// ordered the way the reference listed them.
+#[derive(Default)]
+struct ContainerRows {
+    /// Running (and paused) containers first.
+    up: Vec<usize>,
+    /// Everything else.
+    down: Vec<usize>,
 }
 
 /// The create-container form.
@@ -857,7 +874,10 @@ impl DockerManager {
         if let Some(outcome) = self.take(access, LIST_KEY) {
             match outcome.error {
                 Some(error) => self.failed(LIST_KEY, error),
-                None => self.containers = model::parse_containers(&outcome.stdout),
+                None => {
+                    self.containers = model::parse_containers(&outcome.stdout);
+                    self.containers_revision = self.containers_revision.wrapping_add(1);
+                }
             }
             if let Some(expanded) = &self.expanded
                 && !self.containers.iter().any(|item| &item.id == expanded)
@@ -1219,7 +1239,7 @@ impl DockerManager {
                 self.pull_queue = images;
                 self.notify("Checking the registry for newer images…".to_owned());
             }
-            let stale = self.stale.clone();
+            let stale = std::mem::take(&mut self.stale);
             let label = format!("Update all ({})", stale.len());
             if small_button_enabled(
                 ui,
@@ -1229,26 +1249,38 @@ impl DockerManager {
             ) {
                 self.queue_updates(&stale);
             }
+            self.stale = stale;
         });
         ui.add_space(6.0);
 
-        let needle = self.filter.trim().to_lowercase();
-        let mut rows: Vec<Container> = self
-            .containers
-            .iter()
-            .filter(|container| {
+        // The search and the order are rebuilt only when the list or the search changes.
+        let key = (self.containers_revision, self.filter.trim().to_lowercase());
+        if self.rows_key != key {
+            let needle = key.1.as_str();
+            let keeps = |container: &Container| {
                 needle.is_empty()
-                    || container.name.to_lowercase().contains(&needle)
-                    || container.image.to_lowercase().contains(&needle)
-            })
-            .cloned()
-            .collect();
-        // Running containers first, then by name, as the reference listed them.
-        rows.sort_by(|a, b| a.rank().cmp(&b.rank()).then_with(|| a.name.cmp(&b.name)));
-        let (up, down): (Vec<&Container>, Vec<&Container>) =
-            rows.iter().partition(|container| is_up(container));
+                    || container.name.to_lowercase().contains(needle)
+                    || container.image.to_lowercase().contains(needle)
+            };
+            let mut found: Vec<usize> = (0..self.containers.len())
+                .filter(|index| keeps(&self.containers[*index]))
+                .collect();
+            // Running containers first, then by name, as the reference listed them.
+            found.sort_by(|left, right| {
+                let (left, right) = (&self.containers[*left], &self.containers[*right]);
+                left.rank()
+                    .cmp(&right.rank())
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            let (up, down) = found
+                .into_iter()
+                .partition(|index| is_up(&self.containers[*index]));
+            self.rows = ContainerRows { up, down };
+            self.rows_key = key;
+        }
+        let matches = self.rows.up.len() + self.rows.down.len();
 
-        if rows.is_empty() {
+        if matches == 0 {
             if self.containers.is_empty() && !access.is_running(LIST_KEY) {
                 empty_state(
                     ui,
@@ -1266,16 +1298,20 @@ impl DockerManager {
                 empty_state(ui, palette, "Nothing matches", "Change the search to see more.");
             }
         }
-        let stale = self.stale.clone();
+        // Moved out for the cards, which borrow the pane mutably, and put back after.
+        let stale = std::mem::take(&mut self.stale);
+        let rows = std::mem::take(&mut self.rows);
+        let containers = std::mem::take(&mut self.containers);
         let mut events = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("docker-containers")
             .max_height(ui.available_height())
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if !up.is_empty() {
-                    group_heading(ui, palette, "Running", up.len());
-                    for container in &up {
+                if !rows.up.is_empty() {
+                    group_heading(ui, palette, "Running", rows.up.len());
+                    for index in &rows.up {
+                        let container = &containers[*index];
                         let has_update = stale.contains(&container.id);
                         if let Some(event) =
                             self.container_card(ui, palette, access, container, has_update)
@@ -1284,12 +1320,13 @@ impl DockerManager {
                         }
                     }
                 }
-                if !down.is_empty() {
-                    if !up.is_empty() {
+                if !rows.down.is_empty() {
+                    if !rows.up.is_empty() {
                         ui.add_space(6.0);
                     }
-                    group_heading(ui, palette, "Stopped", down.len());
-                    for container in &down {
+                    group_heading(ui, palette, "Stopped", rows.down.len());
+                    for index in &rows.down {
+                        let container = &containers[*index];
                         let has_update = stale.contains(&container.id);
                         if let Some(event) =
                             self.container_card(ui, palette, access, container, has_update)
@@ -1299,6 +1336,9 @@ impl DockerManager {
                     }
                 }
             });
+        self.rows = rows;
+        self.stale = stale;
+        self.containers = containers;
 
         let mut typed = None;
         for event in events {
