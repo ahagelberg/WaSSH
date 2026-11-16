@@ -337,6 +337,9 @@ pub struct Agent {
     pub last_command: Option<String>,
     /// Tool calls still to run for the current reply.
     queue: VecDeque<ApiToolCall>,
+    /// The conversation's size in characters, with the length and last-message size it was
+    /// counted at; see [`Agent::history_chars`].
+    history_count: Option<(usize, usize, usize)>,
     /// Summary of the part of the conversation that was compacted away.
     ///
     /// It travels in the system prompt rather than the history, so the transcript and the
@@ -1914,24 +1917,23 @@ impl Agent {
     }
 
     /// Rough size of the provider history in characters, for the context budget.
-    pub fn history_chars(&self) -> usize {
-        self.history
-            .iter()
-            .map(|message| match message {
-                ApiMessage::User { content } => content.len(),
-                ApiMessage::Assistant {
-                    content,
-                    tool_calls,
-                } => {
-                    content.len()
-                        + tool_calls
-                            .iter()
-                            .map(|call| call.name.len() + call.arguments.len())
-                            .sum::<usize>()
-                }
-                ApiMessage::Tool { content, .. } => content.len(),
-            })
-            .sum()
+    ///
+    /// Counting it means walking the whole conversation, and the budget is checked on every
+    /// frame, so the total is kept with the history length and last-message size it was
+    /// counted at: a run appends messages or grows the last one, and nothing edits an
+    /// earlier message in place.
+    pub fn history_chars(&mut self) -> usize {
+        let length = self.history.len();
+        let last = self.history.last().map_or(0, message_chars);
+        if let Some((counted_length, counted_last, chars)) = self.history_count
+            && counted_length == length
+            && counted_last == last
+        {
+            return chars;
+        }
+        let chars = self.history.iter().map(message_chars).sum();
+        self.history_count = Some((length, last, chars));
+        chars
     }
 
     /// Where the conversation splits when it is compacted: the message the tail starts at.
@@ -1991,6 +1993,24 @@ impl Agent {
         self.turns.drain(..turns);
         self.compacted = Some(summary.to_owned());
         turns
+    }
+}
+
+/// Characters one provider message carries, tool calls included.
+fn message_chars(message: &ApiMessage) -> usize {
+    match message {
+        ApiMessage::User { content } => content.len(),
+        ApiMessage::Assistant {
+            content,
+            tool_calls,
+        } => {
+            content.len()
+                + tool_calls
+                    .iter()
+                    .map(|call| call.name.len() + call.arguments.len())
+                    .sum::<usize>()
+        }
+        ApiMessage::Tool { content, .. } => content.len(),
     }
 }
 
@@ -2983,6 +3003,24 @@ mod tests {
         agent.compacted = Some("older context".to_owned());
         agent.clear();
         assert_eq!(agent.compacted, None);
+    }
+
+    #[test]
+    fn the_conversation_size_follows_every_append_and_growth() {
+        let mut agent = Agent::new();
+        assert_eq!(agent.history_chars(), 0);
+        assert!(agent.push_user("hello", UserMeta::default()));
+        assert_eq!(agent.history_chars(), 5);
+        agent.history.push(ApiMessage::Assistant {
+            content: "hi".to_owned(),
+            tool_calls: Vec::new(),
+        });
+        assert_eq!(agent.history_chars(), 7);
+        // A streaming reply grows the last message without adding one.
+        if let Some(ApiMessage::Assistant { content, .. }) = agent.history.last_mut() {
+            content.push_str(" there");
+        }
+        assert_eq!(agent.history_chars(), 13);
     }
 
     #[test]
