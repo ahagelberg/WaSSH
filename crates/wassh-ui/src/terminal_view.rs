@@ -29,6 +29,8 @@ pub struct TerminalView {
     /// Cell size measured at a given font size; the glyphs are laid out once, not once
     /// per call, because every frame asks for the cell size several times.
     metrics: Cell<Option<(f32, (f32, f32))>>,
+    /// Text of one style run, reused so a frame does not allocate once per run.
+    run: std::cell::RefCell<String>,
 }
 
 impl Default for TerminalView {
@@ -37,6 +39,7 @@ impl Default for TerminalView {
             font_size: 14.0,
             padding: 4.0,
             metrics: Cell::new(None),
+            run: std::cell::RefCell::new(String::new()),
         }
     }
 }
@@ -169,11 +172,15 @@ impl TerminalView {
                     );
                 }
 
-                let text: String = (col..end)
-                    .filter_map(|c| snapshot.cell(row, c))
-                    .filter(|c| !c.style.wide_spacer)
-                    .map(|c| c.ch)
-                    .collect();
+                let mut text = self.run.borrow_mut();
+                text.clear();
+                for run_column in col..end {
+                    if let Some(cell) = snapshot.cell(row, run_column)
+                        && !cell.style.wide_spacer
+                    {
+                        text.push(cell.ch);
+                    }
+                }
                 if !text.trim().is_empty() {
                     let color = if style.hidden {
                         to_color32(style.bg)
@@ -183,7 +190,7 @@ impl TerminalView {
                     painter.text(
                         egui::pos2(x, y),
                         Align2::LEFT_TOP,
-                        &text,
+                        &*text,
                         font.clone(),
                         color,
                     );
