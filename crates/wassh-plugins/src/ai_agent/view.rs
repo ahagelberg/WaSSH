@@ -27,8 +27,9 @@ use super::protocol::{
     MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
     SAFE_RULES, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
     SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
-    SETTING_HOST_RAG_FOLDER, SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER,
-    SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS,
+    SETTING_AUTO_COMPACT, SETTING_HOST_RAG_FOLDER, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
+    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER,
+    TITLE_MAX_CHARS,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
 use super::settings_ui::{PROVIDERS_KEY, provider_secret_field};
@@ -54,6 +55,18 @@ const DERIVED_SETTINGS: &[&str] = &[
 ];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
+/// Characters a token is estimated at when sizing the conversation.
+const CHARS_PER_TOKEN: usize = 4;
+/// Tokens the system prompt and the tool schemas take out of the window.
+const PROMPT_OVERHEAD_TOKENS: usize = 4_000;
+/// Context window of a model the settings do not name.
+const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
+/// Messages that stay when the conversation is compacted.
+const COMPACT_KEEP_MESSAGES: usize = 6;
+/// Where the compacted part of the conversation sits in the system prompt.
+const COMPACTED_HEADING: &str = "Earlier conversation, compacted:";
+/// Transcript note left where the conversation was compacted.
+const COMPACTED_NOTICE: &str = "Earlier messages were compacted into a summary:";
 /// Gap between the provider and model dropdowns under the composer.
 const FOOTER_GAP: f32 = 6.0;
 /// Type size of the two dropdowns.
@@ -207,10 +220,16 @@ enum SummaryMode {
     Summary,
     /// Show it, then start a new chat carrying it.
     Transfer,
+    /// Fold the conversation up to a point into it, and keep going in this chat.
+    Compact,
 }
 
 /// A model-list fetch running on its own thread: the provider index and the worker.
 type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
+
+/// A summary running on its own thread: what it is for, the history index it folds up to,
+/// and the worker.
+type SummaryJob = (SummaryMode, usize, Receiver<Result<String, String>>);
 
 /// A previous conversation, kept so the user can go back to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,6 +246,8 @@ pub struct StoredChat {
     pub model: String,
     /// Provider id it used.
     pub provider: String,
+    /// Summary of the part of it that was compacted away.
+    pub compacted: Option<String>,
 }
 
 /// A message typed while a run was in flight.
@@ -281,8 +302,8 @@ pub struct AiAgent {
     refreshed: std::collections::BTreeSet<String>,
     /// App-wide settings this pane changed, handed to the host after drawing.
     app_writes: Vec<(String, Value)>,
-    /// A summary running on its own thread.
-    summary: Option<(SummaryMode, Receiver<Result<String, String>>)>,
+    /// A summary running on its own thread, with the history index it folds up to.
+    summary: Option<SummaryJob>,
     /// The question composer, while `ask_user` waits.
     questions: QuestionWizard,
     /// The prompt opened for editing in the transcript, if any.
@@ -355,6 +376,28 @@ fn setting_text(settings: &serde_json::Map<String, Value>, key: &str) -> String 
         .to_owned()
 }
 
+/// How many tokens `model` can take, from the settings rows, else the default.
+fn context_window(settings: &serde_json::Map<String, Value>, model: &str) -> usize {
+    let model = model.trim().to_lowercase();
+    let rows = settings.get(SETTING_MODEL_CONTEXTS).and_then(Value::as_array);
+    for row in rows.into_iter().flatten() {
+        let name = row
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        let tokens = row.get("tokens").and_then(Value::as_i64).unwrap_or_default();
+        if name.is_empty() || tokens <= 0 {
+            continue;
+        }
+        if model.starts_with(&name) {
+            return tokens as usize;
+        }
+    }
+    DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
 /// Read a settings value as a rule list: one pattern per line or array item.
 fn setting_rules(settings: &serde_json::Map<String, Value>, key: &str) -> Option<Vec<String>> {
     let lines: Vec<String> = match settings.get(key)? {
@@ -397,6 +440,7 @@ impl AiAgent {
                 .active()
                 .map(|provider| provider.id.clone())
                 .unwrap_or_default(),
+            compacted: self.agent.compacted.clone(),
         }
     }
 
@@ -431,6 +475,7 @@ impl AiAgent {
         self.agent.turns = chat.turns;
         self.agent.history = chat.history;
         self.agent.cwd = chat.cwd;
+        self.agent.compacted = chat.compacted;
         if !chat.model.is_empty() {
             self.model = chat.model;
         }
@@ -497,6 +542,11 @@ impl AiAgent {
             if !host_text.is_empty() {
                 lines.push(format!("[Host prompt]\n{host_text}"));
             }
+        }
+        if let Some(summary) = &self.agent.compacted {
+            lines.push(String::new());
+            lines.push(COMPACTED_HEADING.to_owned());
+            lines.push(summary.clone());
         }
         lines.join("\n")
     }
@@ -897,6 +947,11 @@ impl AiAgent {
         if let Some(history) = stored.get("history").and_then(Value::as_array) {
             self.agent.history = history_from_json(history);
         }
+        self.agent.compacted = stored
+            .get("compacted")
+            .and_then(Value::as_str)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_owned);
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
             self.chats = chats
                 .iter()
@@ -916,6 +971,10 @@ impl AiAgent {
                         .as_array()
                         .map(|history| history_from_json(history))
                         .unwrap_or_default(),
+                    compacted: chat["compacted"]
+                        .as_str()
+                        .filter(|summary| !summary.is_empty())
+                        .map(str::to_owned),
                 })
                 .collect();
         }
@@ -941,9 +1000,13 @@ impl AiAgent {
     }
 
     /// Start a summary of the conversation on a worker thread.
+    ///
+    /// `cut` is the history index a compaction folds up to; the other modes summarise the
+    /// whole transcript.
     fn start_summary(
         &mut self,
         mode: SummaryMode,
+        cut: usize,
         settings: &serde_json::Map<String, Value>,
         host: &str,
     ) {
@@ -954,7 +1017,10 @@ impl AiAgent {
             self.error = Some("Add a provider first.".to_owned());
             return;
         };
-        let transcript = self.agent.transcript_text();
+        let transcript = match mode {
+            SummaryMode::Compact => self.agent.folded_text(cut),
+            _ => self.agent.transcript_text(),
+        };
         let model = self.model.clone();
         let key = self.keys.get(&provider.id).cloned().unwrap_or_default();
         let (sender, events) = std::sync::mpsc::channel();
@@ -977,12 +1043,40 @@ impl AiAgent {
                 complete_blocking(&request).map(|completion| completion.text.trim().to_owned());
             let _ = sender.send(result);
         });
-        self.summary = Some((mode, events));
+        self.summary = Some((mode, cut, events));
+    }
+
+    /// Compact the conversation once it would no longer fit the model's context window.
+    ///
+    /// The model's window comes from the per-model settings rows, so a local model with a
+    /// small window is compacted far earlier than a long-context one. Only an idle chat is
+    /// compacted: folding under a running turn would take away what it is answering.
+    fn compact_if_needed(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
+        if self.summary.is_some()
+            || self.agent.blocked()
+            || self.agent.needs_reply
+            || self.queued.is_some()
+            || !settings
+                .get(SETTING_AUTO_COMPACT)
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        {
+            return;
+        }
+        let window = context_window(settings, &self.model);
+        let budget = window.saturating_sub(MAX_TOKENS as usize + PROMPT_OVERHEAD_TOKENS);
+        if self.agent.history_chars() / CHARS_PER_TOKEN <= budget {
+            return;
+        }
+        let Some(cut) = self.agent.compact_split(COMPACT_KEEP_MESSAGES) else {
+            return;
+        };
+        self.start_summary(SummaryMode::Compact, cut, settings, host);
     }
 
     /// Collect a finished summary.
     fn poll_summary(&mut self) {
-        let Some((mode, events)) = &self.summary else {
+        let Some((mode, cut, events)) = &self.summary else {
             return;
         };
         let ready = match events.try_recv() {
@@ -996,6 +1090,7 @@ impl AiAgent {
             return;
         };
         let mode = *mode;
+        let cut = *cut;
         self.summary = None;
         match result {
             Err(error) => self.error = Some(error),
@@ -1003,7 +1098,12 @@ impl AiAgent {
                 self.error = Some("The provider returned an empty summary.".to_owned());
             }
             Ok(summary) => {
-                if mode == SummaryMode::Transfer {
+                if mode == SummaryMode::Compact {
+                    self.agent.fold(cut, &summary);
+                    self.agent
+                        .turns
+                        .insert(0, Turn::Notice(format!("{COMPACTED_NOTICE}\n{summary}")));
+                } else if mode == SummaryMode::Transfer {
                     self.begin_new_chat();
                     self.agent.turns.push(Turn::Notice(format!(
                         "Chat transferred. Carried over:\n{summary}"
@@ -1129,8 +1229,8 @@ impl AiAgent {
         self.draft.clear();
         match command.name {
             "new" => self.begin_new_chat(),
-            "summary" | "context" => self.start_summary(SummaryMode::Summary, settings, host),
-            "transfer" => self.start_summary(SummaryMode::Transfer, settings, host),
+            "summary" | "context" => self.start_summary(SummaryMode::Summary, 0, settings, host),
+            "transfer" => self.start_summary(SummaryMode::Transfer, 0, settings, host),
             _ => {}
         }
     }
@@ -2293,6 +2393,7 @@ impl Plugin for AiAgent {
         self.agent.now_ms = wassh_core::time::now_ms();
         self.poll_summary();
         self.poll_picker();
+        self.compact_if_needed(context.settings, &context.host_label);
 
         // Drain workers, then answer any tool result it produced.
         self.agent.poll(&mut session);
@@ -2754,7 +2855,8 @@ impl Plugin for AiAgent {
                     "model": chat.model,
                     "provider": chat.provider,
                     "turns": turns_to_json(&chat.turns),
-                    "history": history_to_json(&chat.history)
+                    "history": history_to_json(&chat.history),
+                    "compacted": chat.compacted
                 })
             })
             .collect();
@@ -2768,6 +2870,7 @@ impl Plugin for AiAgent {
                 "cwd": self.agent.cwd,
                 "turns": turns_to_json(&self.agent.turns),
                 "history": history_to_json(&self.agent.history),
+                "compacted": self.agent.compacted,
                 "chats": chats
             }),
         );
@@ -2914,6 +3017,17 @@ mod tests {
         chat: &'static str,
         models: &'static str,
     ) -> (String, std::sync::mpsc::Receiver<String>) {
+        answering("text/event-stream", chat, models)
+    }
+
+    /// A provider stand-in whose chat call answers with `body` of `content_type`.
+    ///
+    /// Summaries ask for a plain JSON completion rather than a stream.
+    fn answering(
+        content_type: &'static str,
+        body: &'static str,
+        models: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
         let port = listener.local_addr().expect("the bound address").port();
@@ -2932,7 +3046,7 @@ mod tests {
                 let reply = if path.contains("models") {
                     http_response("application/json", models)
                 } else {
-                    http_response("text/event-stream", chat)
+                    http_response(content_type, body)
                 };
                 let _ = stream.write_all(reply.as_bytes());
                 if !path.contains("models") {
@@ -3138,6 +3252,157 @@ mod tests {
             plugin.header_status(),
             Some((DEFAULT_CHAT_TITLE, HeaderHealth::Ok))
         );
+    }
+
+    /// A chat stored far over its model's window, on a provider at `base_url`.
+    fn chat_over_its_window(
+        base_url: &str,
+        auto_compact: bool,
+    ) -> (serde_json::Map<String, Value>, AiAgent) {
+        let mut settings: serde_json::Map<String, Value> = [
+            (
+                PROVIDERS_KEY.to_owned(),
+                json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                         "baseUrl": base_url, "models": ["test-model"] }]),
+            ),
+            // A window small enough that the stored conversation is already over it.
+            (
+                SETTING_MODEL_CONTEXTS.to_owned(),
+                json!([{ "model": "test-model", "tokens": 9_000 }]),
+            ),
+            (SETTING_AUTO_COMPACT.to_owned(), json!(auto_compact)),
+        ]
+        .into_iter()
+        .collect();
+
+        let filler = "detail ".repeat(400);
+        let mut history = Vec::new();
+        let mut turns = Vec::new();
+        for step in 0..5 {
+            history.push(json!({ "role": "user", "content": format!("question {step} {filler}") }));
+            history.push(json!({
+                "role": "assistant",
+                "content": format!("answer {step} {filler}"),
+                "toolCalls": []
+            }));
+            turns.push(json!({ "role": "user", "text": format!("question {step}") }));
+            turns.push(json!({ "role": "assistant", "text": format!("answer {step}") }));
+        }
+        settings.insert(
+            CONVERSATION_KEY.to_owned(),
+            json!({
+                "version": DATA_VERSION,
+                "model": "test-model",
+                "provider": "local",
+                "cwd": "/srv/app",
+                "turns": turns,
+                "history": history
+            }),
+        );
+        (settings, AiAgent::default())
+    }
+
+    #[test]
+    fn a_conversation_over_the_model_window_is_compacted_into_a_summary() {
+        const SUMMARY: &str = "{\"choices\":[{\"message\":{\"content\":\"Goal: ship the daemon\"}}]}";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, requests) = answering("application/json", SUMMARY, MODELS);
+        let (mut settings, mut plugin) = chat_over_its_window(&base_url, true);
+        let filler = "detail ".repeat(400);
+        let ctx = egui::Context::default();
+        for _ in 0..50 {
+            frame(&mut plugin, &mut settings, &ctx, Vec::new());
+            if plugin.agent.compacted.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            plugin.agent.compacted.as_deref(),
+            Some("Goal: ship the daemon"),
+            "the summary never came back: error {:?}, pending {}, history {}",
+            plugin.error,
+            plugin.summary.is_some(),
+            plugin.agent.history.len()
+        );
+        assert_eq!(
+            plugin.agent.history.len(),
+            COMPACT_KEEP_MESSAGES,
+            "the recent messages stay in the history"
+        );
+        let first = plugin.agent.history.first().cloned();
+        assert_eq!(
+            first,
+            Some(crate::ai_agent::protocol::ApiMessage::User {
+                content: format!("question 2 {filler}")
+            }),
+            "the history keeps the messages after the fold point"
+        );
+        assert!(
+            plugin.agent.turns.iter().any(
+                |turn| matches!(turn, Turn::Notice(text) if text.starts_with(COMPACTED_NOTICE))
+            ),
+            "the transcript says the chat was compacted: {:?}",
+            plugin.agent.turns
+        );
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the summariser was called");
+        assert!(
+            request.contains("Summarise the conversation above"),
+            "the model was asked for a summary: {request}"
+        );
+        assert!(
+            !request.contains("question 4"),
+            "only what is being folded goes to the summariser: {request}"
+        );
+    }
+
+    #[test]
+    fn switching_compaction_off_leaves_a_long_chat_alone() {
+        const SUMMARY: &str = "{\"choices\":[{\"message\":{\"content\":\"Goal: ship the daemon\"}}]}";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, requests) = answering("application/json", SUMMARY, MODELS);
+        let (mut settings, mut plugin) = chat_over_its_window(&base_url, false);
+        let ctx = egui::Context::default();
+        for _ in 0..5 {
+            frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        }
+
+        assert_eq!(plugin.agent.compacted, None, "the chat is kept whole");
+        assert_eq!(plugin.agent.history.len(), 10);
+        assert!(plugin.summary.is_none(), "nothing was sent to summarise");
+        assert!(
+            requests.try_recv().is_err(),
+            "the provider was not asked for a summary"
+        );
+    }
+
+    #[test]
+    fn the_context_window_comes_from_the_models_own_row() {
+        let mut settings = serde_json::Map::new();
+        assert_eq!(
+            context_window(&settings, "anything"),
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "a model with no row gets the default window"
+        );
+        settings.insert(
+            SETTING_MODEL_CONTEXTS.to_owned(),
+            json!([
+                { "model": "claude", "tokens": 200_000 },
+                { "model": "llama3.1", "tokens": 8_192 },
+                { "model": "no-window", "tokens": 0 }
+            ]),
+        );
+        assert_eq!(context_window(&settings, "claude-sonnet-4-5"), 200_000);
+        assert_eq!(context_window(&settings, "llama3.1:8b"), 8_192);
+        assert_eq!(
+            context_window(&settings, "no-window"),
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "a row without a window is no row"
+        );
+        assert_eq!(context_window(&settings, "gpt-4o"), DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
 
     #[test]

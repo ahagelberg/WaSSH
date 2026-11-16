@@ -34,6 +34,10 @@ pub const SETTING_HOST_RAG_FOLDER: &str = "hostRagFolder";
 pub const SETTING_WEB_SEARCH_PROVIDER: &str = "webSearchProvider";
 /// Setting key: the search engine's API key.
 pub const SETTING_WEB_SEARCH_KEY: &str = "webSearchApiKey";
+/// Setting key: context windows per model, as rows of `{ model, tokens }`.
+pub const SETTING_MODEL_CONTEXTS: &str = "modelContexts";
+/// Setting key: whether a chat that outgrows its model's window is compacted.
+pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";

@@ -337,6 +337,11 @@ pub struct Agent {
     pub last_command: Option<String>,
     /// Tool calls still to run for the current reply.
     queue: VecDeque<ApiToolCall>,
+    /// Summary of the part of the conversation that was compacted away.
+    ///
+    /// It travels in the system prompt rather than the history, so the transcript and the
+    /// history keep one user turn per user message.
+    pub compacted: Option<String>,
 }
 
 impl Agent {
@@ -399,6 +404,7 @@ impl Agent {
         self.error = None;
         self.queue.clear();
         self.needs_reply = false;
+        self.compacted = None;
     }
 
     /// Add the user's turn, if the conversation is idle.
@@ -1906,6 +1912,86 @@ impl Agent {
         }
         out
     }
+
+    /// Rough size of the provider history in characters, for the context budget.
+    pub fn history_chars(&self) -> usize {
+        self.history
+            .iter()
+            .map(|message| match message {
+                ApiMessage::User { content } => content.len(),
+                ApiMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    content.len()
+                        + tool_calls
+                            .iter()
+                            .map(|call| call.name.len() + call.arguments.len())
+                            .sum::<usize>()
+                }
+                ApiMessage::Tool { content, .. } => content.len(),
+            })
+            .sum()
+    }
+
+    /// Where the conversation splits when it is compacted: the message the tail starts at.
+    ///
+    /// The tail begins with a user message, so no tool result is left without the call it
+    /// answers, and the last `keep` messages are never folded.
+    pub fn compact_split(&self, keep: usize) -> Option<usize> {
+        let last = self.history.len().checked_sub(keep)?;
+        (1..=last)
+            .rev()
+            .find(|index| matches!(self.history[*index], ApiMessage::User { .. }))
+    }
+
+    /// The part of the conversation folding takes out, as text for the summariser.
+    pub fn folded_text(&self, cut: usize) -> String {
+        let mut out = String::new();
+        for message in &self.history[..cut] {
+            match message {
+                ApiMessage::User { content } => out.push_str(&format!("User: {content}\n")),
+                ApiMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    out.push_str(&format!("Assistant: {content}\n"));
+                    for call in tool_calls {
+                        out.push_str(&format!(
+                            "Assistant called {}: {}\n",
+                            call.name, call.arguments
+                        ));
+                    }
+                }
+                ApiMessage::Tool { content, .. } => {
+                    out.push_str(&format!("Tool result: {content}\n"));
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold the conversation up to `cut` into `summary`, returning the turns dropped.
+    ///
+    /// The transcript loses the turns folded with it, so the two stay one user turn per
+    /// user message; the summary itself travels in the system prompt.
+    pub fn fold(&mut self, cut: usize, summary: &str) -> usize {
+        let users = self.history[..cut]
+            .iter()
+            .filter(|message| matches!(message, ApiMessage::User { .. }))
+            .count();
+        let turns = self
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(_, turn)| matches!(turn, Turn::User { .. }))
+            .nth(users)
+            .map_or(self.turns.len(), |(index, _)| index);
+        self.history.drain(..cut);
+        self.turns.drain(..turns);
+        self.compacted = Some(summary.to_owned());
+        turns
+    }
 }
 
 /// The label shown for a tool call.
@@ -2807,6 +2893,127 @@ mod tests {
         let mut session: Option<&mut dyn SessionAccess> = None;
         assert_eq!(agent.running_command(), None);
         agent.stop_command(&mut session);
+    }
+
+    #[test]
+    fn folding_keeps_the_recent_exchange_and_carries_the_summary() {
+        let mut agent = Agent::new();
+        for step in 0..4 {
+            assert!(agent.push_user(&format!("question {step}"), UserMeta::default()));
+            agent.history.push(ApiMessage::Assistant {
+                content: format!("answer {step}"),
+                tool_calls: Vec::new(),
+            });
+            agent.turns.push(Turn::Assistant {
+                text: format!("answer {step}"),
+                stopped: false,
+            });
+        }
+
+        // Four exchanges, the last two kept: the cut lands on a user message.
+        let cut = agent.compact_split(4).expect("half the chat can be folded");
+        assert_eq!(cut, 4);
+        assert!(agent.folded_text(cut).contains("question 0"));
+
+        assert_eq!(agent.fold(cut, "Goal: nothing yet"), 4);
+        assert_eq!(agent.compacted.as_deref(), Some("Goal: nothing yet"));
+        assert_eq!(
+            agent.history.first(),
+            Some(&ApiMessage::User {
+                content: "question 2".to_owned()
+            }),
+            "the kept tail starts at the first message that stays"
+        );
+        assert_eq!(
+            agent.turns.first(),
+            Some(&Turn::User {
+                text: "question 2".to_owned(),
+                meta: UserMeta::default()
+            }),
+            "the transcript loses the turns folded with it, so it still lines up"
+        );
+        assert_eq!(agent.history.len(), 4);
+        assert_eq!(agent.turns.len(), 4);
+    }
+
+    #[test]
+    fn a_short_conversation_is_left_alone() {
+        let mut agent = Agent::new();
+        assert!(agent.push_user("hello", UserMeta::default()));
+        assert_eq!(agent.compact_split(6), None, "nothing to fold yet");
+    }
+
+    #[test]
+    fn the_fold_never_separates_a_tool_result_from_its_call() {
+        let mut agent = Agent::new();
+        assert!(agent.push_user("first", UserMeta::default()));
+        agent.history.push(ApiMessage::Assistant {
+            content: String::new(),
+            tool_calls: vec![ApiToolCall {
+                id: "call-1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+        });
+        agent.history.push(ApiMessage::Tool {
+            tool_call_id: "call-1".to_owned(),
+            content: "uptime output".to_owned(),
+        });
+        assert!(agent.push_user("second", UserMeta::default()));
+        agent.turns.push(Turn::Assistant {
+            text: "answer".to_owned(),
+            stopped: false,
+        });
+        agent.history.push(ApiMessage::Assistant {
+            content: "answer".to_owned(),
+            tool_calls: Vec::new(),
+        });
+
+        // The tail has to start at a user message, never at a tool result.
+        let cut = agent.compact_split(2).expect("one exchange can be folded");
+        assert_eq!(cut, 3, "the tail starts at the second question");
+        assert!(matches!(agent.history[cut], ApiMessage::User { .. }));
+        agent.fold(cut, "Goal: uptime checked");
+        assert!(matches!(agent.history.first(), Some(ApiMessage::User { .. })));
+    }
+
+    #[test]
+    fn a_clear_drops_the_compacted_summary() {
+        let mut agent = Agent::new();
+        agent.compacted = Some("older context".to_owned());
+        agent.clear();
+        assert_eq!(agent.compacted, None);
+    }
+
+    #[test]
+    fn rewinding_after_a_compaction_lines_up_with_the_history() {
+        let mut agent = Agent::new();
+        for step in 0..4 {
+            assert!(agent.push_user(&format!("question {step}"), UserMeta::default()));
+            agent.history.push(ApiMessage::Assistant {
+                content: format!("answer {step}"),
+                tool_calls: Vec::new(),
+            });
+            agent.turns.push(Turn::Assistant {
+                text: format!("answer {step}"),
+                stopped: false,
+            });
+        }
+        let cut = agent.compact_split(2).expect("the older half can be folded");
+        agent.fold(cut, "Goal: earlier questions");
+        // Transcript and history carry the same user turns again.
+        let index = agent
+            .turns
+            .iter()
+            .position(|turn| matches!(turn, Turn::User { text, .. } if text == "question 3"))
+            .expect("the last question is still there");
+        assert_eq!(agent.rewind_to(index).as_deref(), Some("question 3"));
+        assert!(agent.history.is_empty(), "the question is being rewritten");
+        assert_eq!(
+            agent.compacted.as_deref(),
+            Some("Goal: earlier questions"),
+            "what was compacted away is still the work behind the chat"
+        );
     }
 
     #[test]
