@@ -20,7 +20,7 @@ use super::agent::{
     Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, ToolSettings, Turn, UserMeta,
     history_from_json, history_to_json, turns_from_json, turns_to_json,
 };
-use super::markdown::Ink;
+use super::markdown::{Block, Ink};
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, MAX_ATTACHMENT_BYTES,
@@ -261,6 +261,16 @@ struct Queued {
     meta: UserMeta,
 }
 
+/// One turn's Markdown, with the fingerprint of the text it was parsed from.
+///
+/// Markdown parsing splits every line into styled runs and allocates for each of them, so
+/// the result is kept in step with the transcript rather than rebuilt every frame.
+#[derive(Default)]
+struct ParsedTurn {
+    fingerprint: u64,
+    blocks: Vec<Block>,
+}
+
 /// What the user did with the sudo card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SudoAnswer {
@@ -304,6 +314,8 @@ pub struct AiAgent {
     app_writes: Vec<(String, Value)>,
     /// A summary running on its own thread, with the history index it folds up to.
     summary: Option<SummaryJob>,
+    /// Each turn's Markdown, parsed once so a frame does not parse the whole transcript.
+    parsed: Vec<ParsedTurn>,
     /// The question composer, while `ask_user` waits.
     questions: QuestionWizard,
     /// The prompt opened for editing in the transcript, if any.
@@ -314,6 +326,9 @@ pub struct AiAgent {
     loaded: bool,
     /// Caption and health for the pane header.
     caption: (String, HeaderHealth),
+    /// What the caption was built from: running, summarising, session state and the
+    /// fingerprint of the first question.
+    caption_for: Option<(bool, bool, SessionStatus, u64)>,
     /// Last problem reported to the user.
     error: Option<String>,
     /// Provider list and keys [`AiAgent::sync_providers`] last derived its state from.
@@ -345,11 +360,13 @@ impl Default for AiAgent {
             refreshed: std::collections::BTreeSet::new(),
             app_writes: Vec::new(),
             summary: None,
+            parsed: Vec::new(),
             questions: QuestionWizard::default(),
             editing: None,
             sudo: String::new(),
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
+            caption_for: None,
             error: None,
             synced_providers: None,
             synced_secrets: std::collections::BTreeMap::new(),
@@ -1235,6 +1252,36 @@ impl AiAgent {
         }
     }
 
+    /// Keep the parsed Markdown of each turn in step with the transcript.
+    ///
+    /// Only text that changed is parsed again: a settled message is drawn from what an
+    /// earlier frame parsed, and a streaming reply re-parses the one turn that is growing.
+    fn parse_transcript(&mut self) {
+        for index in 0..self.agent.turns.len() {
+            let text = match &self.agent.turns[index] {
+                Turn::User { text, .. } | Turn::Assistant { text, .. } => text.as_str(),
+                _ => "",
+            };
+            let fingerprint = super::markdown::fingerprint(text);
+            if self
+                .parsed
+                .get(index)
+                .is_some_and(|parsed| parsed.fingerprint == fingerprint)
+            {
+                continue;
+            }
+            let parsed = ParsedTurn {
+                fingerprint,
+                blocks: super::markdown::blocks(text),
+            };
+            match self.parsed.get_mut(index) {
+                Some(cached) => *cached = parsed,
+                None => self.parsed.push(parsed),
+            }
+        }
+        self.parsed.truncate(self.agent.turns.len());
+    }
+
     /// Paint the transcript, answering where each user bubble landed on screen.
     fn transcript(
         &mut self,
@@ -1243,6 +1290,7 @@ impl AiAgent {
         muted: egui::Color32,
         session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
     ) -> TranscriptReply {
+        self.parse_transcript();
         if self.agent.turns.is_empty() {
             let empty = if self.providers.is_empty() {
                 "No model providers configured yet. Configure one in Options."
@@ -1265,13 +1313,13 @@ impl AiAgent {
         let turn_finished = self.agent.phase.is_none();
         for (index, turn) in self.agent.turns.iter().enumerate() {
             match turn {
-                Turn::User { text, meta } => {
+                Turn::User { meta, .. } => {
                     if editing == Some(index)
                         && let Some(edit) = self.editing.as_mut()
                     {
                         edit_action = prompt_editor(ui, palette, edit);
                     } else {
-                        let reply = user_bubble(ui, palette, text, *meta);
+                        let reply = user_bubble(ui, palette, &self.parsed[index].blocks, *meta);
                         if reply.clicked {
                             open = Some(index);
                         }
@@ -1282,7 +1330,7 @@ impl AiAgent {
                     // A reply waiting for its first token, or one that only asked for
                     // tools, has no words to show: no bubble for it.
                     if !text.trim().is_empty() {
-                        assistant_bubble(ui, palette, text);
+                        assistant_bubble(ui, palette, &self.parsed[index].blocks);
                     }
                     if *stopped {
                         ui.label(
@@ -1454,17 +1502,18 @@ impl AiAgent {
     /// A pinned copy is opaque, so the transcript scrolls under it. Coming back into view
     /// releases it, and the message before it takes its place.
     fn pinned_bubble(
-        &self,
+        &mut self,
         ui: &mut Ui,
         palette: &wassh_core::Palette,
         viewport: egui::Rect,
         bubbles: &[(usize, egui::Rect)],
     ) -> Option<PinnedBubble> {
+        self.parse_transcript();
         let (index, _) = bubbles
             .iter()
             .rev()
             .find(|(_, rect)| rect.top() < viewport.top())?;
-        let Some(Turn::User { text, meta }) = self.agent.turns.get(*index) else {
+        let Some(Turn::User { meta, .. }) = self.agent.turns.get(*index) else {
             return None;
         };
         let mut pinned = ui.new_child(
@@ -1479,7 +1528,7 @@ impl AiAgent {
                 // The backdrop spans the whole transcript, so nothing shows beside the
                 // pinned bubble where it scrolls underneath.
                 ui.set_min_width(ui.available_width());
-                user_bubble(ui, palette, text, *meta).clicked
+                user_bubble(ui, palette, &self.parsed[*index].blocks, *meta).clicked
             })
             .inner;
         Some(PinnedBubble {
@@ -1607,7 +1656,7 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
 
 /// A user message: a bubble against the right edge, filled with the accent like a primary
 /// button and carrying white ink. Clicking it opens the prompt for editing.
-fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> BubbleReply {
+fn user_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block], meta: UserMeta) -> BubbleReply {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
     let response = ui
         .with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
@@ -1638,7 +1687,7 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> Bu
                                     .color(egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA)),
                             );
                         }
-                        super::markdown::render(ui, Ink::on_accent(), text);
+                        super::markdown::draw(ui, Ink::on_accent(), blocks);
                     });
                 })
                 .response
@@ -1655,7 +1704,7 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, text: &str, meta: UserMeta) -> Bu
 }
 
 /// An assistant response: Markdown in a neutral bubble against the left edge.
-fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
+fn assistant_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block]) {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
     ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
         egui::Frame::new()
@@ -1666,7 +1715,7 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, text: &str) {
             .show(ui, |ui| {
                 ui.set_max_width(room);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    super::markdown::render(ui, Ink::pane(palette), text);
+                    super::markdown::draw(ui, Ink::pane(palette), blocks);
                 });
             });
     });
@@ -2426,13 +2475,33 @@ impl Plugin for AiAgent {
                 }
             }
         }
-        self.caption = if self.agent.busy() || self.summary.is_some() {
-            ("Thinking…".to_owned(), HeaderHealth::Warn)
-        } else if context.status == SessionStatus::Connected {
-            (self.title(), HeaderHealth::Ok)
-        } else {
-            ("Session not connected".to_owned(), HeaderHealth::Warn)
-        };
+        // The caption only changes when the run state, the session or the first question
+        // does, so its text is built then rather than every frame.
+        let first_question = self
+            .agent
+            .turns
+            .iter()
+            .find_map(|turn| match turn {
+                Turn::User { text, .. } => Some(super::markdown::fingerprint(text)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let caption_for = (
+            self.agent.busy(),
+            self.summary.is_some(),
+            context.status,
+            first_question,
+        );
+        if self.caption_for != Some(caption_for) {
+            self.caption_for = Some(caption_for);
+            self.caption = if caption_for.0 || caption_for.1 {
+                ("Thinking…".to_owned(), HeaderHealth::Warn)
+            } else if context.status == SessionStatus::Connected {
+                (self.title(), HeaderHealth::Ok)
+            } else {
+                ("Session not connected".to_owned(), HeaderHealth::Warn)
+            };
+        }
 
         let busy = self.agent.busy();
 
@@ -3406,6 +3475,47 @@ mod tests {
     }
 
     #[test]
+    fn a_message_is_parsed_once_and_only_again_when_its_text_changes() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "**bold** prompt".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.parse_transcript();
+        assert_eq!(plugin.parsed.len(), 1);
+        assert!(
+            !plugin.parsed[0].blocks.is_empty(),
+            "the message was parsed: {:?}",
+            plugin.parsed[0].blocks
+        );
+
+        // An unchanged message keeps what was parsed, even if that is nonsense.
+        plugin.parsed[0].blocks.clear();
+        plugin.parse_transcript();
+        assert!(
+            plugin.parsed[0].blocks.is_empty(),
+            "an unchanged message is not parsed again"
+        );
+
+        // A growing reply is parsed again on the next frame.
+        plugin.agent.turns.push(Turn::Assistant {
+            text: "one".to_owned(),
+            stopped: false,
+        });
+        plugin.parse_transcript();
+        assert_eq!(plugin.parsed.len(), 2);
+        plugin.agent.turns[1] = Turn::Assistant {
+            text: "one two".to_owned(),
+            stopped: false,
+        };
+        plugin.parse_transcript();
+        assert_eq!(
+            plugin.parsed[1].blocks,
+            crate::ai_agent::markdown::blocks("one two")
+        );
+    }
+
+    #[test]
     fn a_stored_conversation_comes_back_and_the_title_follows_it() {
         let mut settings = serde_json::Map::new();
         settings.insert(
@@ -4198,7 +4308,7 @@ mod tests {
                 user_bubble(
                     ui,
                     &Palette::dark(),
-                    &message,
+                    &crate::ai_agent::markdown::blocks(&message),
                     UserMeta {
                         attachments: 0,
                         terminal: true,
@@ -4253,7 +4363,12 @@ mod tests {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
                     right = ui.max_rect().right();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        user_bubble(ui, &palette, &prompt, UserMeta::default());
+                        user_bubble(
+                            ui,
+                            &palette,
+                            &crate::ai_agent::markdown::blocks(&prompt),
+                            UserMeta::default(),
+                        );
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
                             failed: false, running: false, turn_index: 0, collapsed: false,
                         });
@@ -4358,7 +4473,11 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(input, |ui| {
-            assistant_bubble(ui, &palette, "Agent response");
+            assistant_bubble(
+                ui,
+                &palette,
+                &crate::ai_agent::markdown::blocks("Agent response"),
+            );
         });
         let mut bubble = None;
         let mut response = None;
@@ -4397,7 +4516,12 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(input, |ui| {
-            user_bubble(ui, &palette, "hello", UserMeta::default());
+            user_bubble(
+                ui,
+                &palette,
+                &crate::ai_agent::markdown::blocks("hello"),
+                UserMeta::default(),
+            );
         });
         let mut fill = None;
         let mut ink = None;
@@ -4426,7 +4550,7 @@ mod tests {
     /// A frame of the pinned copy: which message pinned, where each painted text landed,
     /// and the bubble's backdrop.
     fn pinned_frame(
-        plugin: &AiAgent,
+        plugin: &mut AiAgent,
         viewport: egui::Rect,
         bubbles: &[(usize, egui::Rect)],
     ) -> (Option<usize>, Vec<(f32, String)>, Option<egui::Rect>) {
@@ -4477,7 +4601,7 @@ mod tests {
         let second = egui::Rect::from_min_size(egui::pos2(0.0, 10.0), egui::vec2(120.0, 30.0));
 
         // Both are above the viewport: the newest one is the one that pins.
-        let (pinned, texts, backdrop) = pinned_frame(&plugin, viewport, &[(0, first), (1, second)]);
+        let (pinned, texts, backdrop) = pinned_frame(&mut plugin, viewport, &[(0, first), (1, second)]);
         assert_eq!(pinned, Some(1));
         let (y, text) = texts.first().expect("the pinned copy is drawn");
         assert_eq!(text, "second question");
@@ -4495,7 +4619,7 @@ mod tests {
         // The newest came back into view: the message before it takes over.
         let visible = egui::Rect::from_min_size(egui::pos2(0.0, 150.0), egui::vec2(120.0, 30.0));
         let inside = egui::Rect::from_min_size(egui::pos2(0.0, 250.0), egui::vec2(120.0, 30.0));
-        let (pinned, texts, _) = pinned_frame(&plugin, viewport, &[(0, first), (1, visible)]);
+        let (pinned, texts, _) = pinned_frame(&mut plugin, viewport, &[(0, first), (1, visible)]);
         assert_eq!(pinned, Some(0));
         assert_eq!(
             texts.first().map(|(_, text)| text.as_str()),
@@ -4503,7 +4627,7 @@ mod tests {
         );
 
         // Nothing scrolled past the top: nothing is pinned.
-        let (pinned, texts, _) = pinned_frame(&plugin, viewport, &[(0, visible), (1, inside)]);
+        let (pinned, texts, _) = pinned_frame(&mut plugin, viewport, &[(0, visible), (1, inside)]);
         assert_eq!(pinned, None);
         assert!(texts.is_empty(), "nothing is drawn: {texts:?}");
     }
