@@ -3204,16 +3204,12 @@ impl Shell {
         }
         let palette = self.palette;
         let matches = self.find_matches;
-        // Only Host settings reads the host list, so the other dialogs do not clone it.
-        let hosts = if self.dialogs.host.is_some() {
-            self.hosts.hosts.clone()
-        } else {
-            Vec::new()
-        };
+        // The host list is borrowed, not copied: Host settings is the only dialog that reads
+        // it, and it is drawn every frame.
         let actions = self.dialogs.show(
             ctx,
             &palette,
-            &hosts,
+            &self.hosts.hosts,
             &self.settings.enabled_plugins,
             matches,
         );
