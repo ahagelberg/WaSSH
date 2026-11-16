@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.0.13] - 2026-11-16
+
+### Added
+
+- Give every shell card in the AI chat two copy buttons: one for the command it ran, and one
+  level with the first line of its output for everything it printed.
+
+### Fixed
+
+- Create groups from a dialog with Cancel and Create, and keep a group on screen — and open to a
+  dragged host — while it is still empty.
+- Keep the colour picked for a group instead of resetting it to the stored one.
+- Select the first character of a line: dragging a selection back towards column 0 used to drop
+  the cell under the pointer.
+
 ## [2.0.12] - 2026-11-16
 
 ### Changed
