@@ -29,6 +29,8 @@ pub const ENABLED_KEY: &str = "enabled";
 pub const MAX_ENTRIES_KEY: &str = "maxEntries";
 /// Entries kept when the settings say nothing.
 pub const DEFAULT_MAX_ENTRIES: usize = 500;
+/// Milliseconds in a second, for the cache key's whole-second bucket.
+const MS_PER_SECOND: u64 = 1_000;
 
 /// Height of the timeline bar, and the shortest it shrinks to in a low pane.
 const TIMELINE_HEIGHT: f32 = 28.0;
@@ -470,6 +472,24 @@ pub struct ConnectionLogger {
     window: TimeWindow,
     /// Whether the Clear button is asking for a second click.
     clear_confirm: bool,
+    /// Bumped whenever the entries change, so what was derived from them is rebuilt.
+    revision: u64,
+    /// The log folded up for drawing, and what it was folded from.
+    cache: Option<LogCache>,
+}
+
+/// The log as one frame draws it: the window, the spans, the summary and the heatmap's
+/// buckets.
+///
+/// Building them walks the whole log and formats each entry's message, so they are held
+/// until the log, the window, the graph, the session state or the second changes.
+struct LogCache {
+    /// Revision, window, graph mode, session status and whole second they belong to.
+    key: (u64, TimeWindow, GraphMode, SessionStatus, u64),
+    range: Range,
+    spans: Vec<Span>,
+    summary: Summary,
+    buckets: Vec<Bucket>,
 }
 
 impl ConnectionLogger {
@@ -517,6 +537,7 @@ impl ConnectionLogger {
             let excess = self.entries.len() - max_entries;
             self.entries.drain(..excess);
         }
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -524,11 +545,13 @@ impl ConnectionLogger {
     fn clear(&mut self) {
         self.entries.clear();
         self.connected_since = None;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Read the stored log and rebuild the current connection's start time.
     fn load(&mut self, stored: Option<&serde_json::Value>) {
         self.entries = parse_log(stored);
+        self.revision = self.revision.wrapping_add(1);
         self.connected_since = self
             .entries
             .last()
@@ -595,27 +618,46 @@ impl Plugin for ConnectionLogger {
             context.set_value(LOG_KEY, to_value(&self.entries));
         }
         let now = now_ms();
-        let range = window_range(self.window, &self.entries, now);
-        let spans = build_spans(&self.entries, range, context.status);
-        let summary = summarise(&spans, range, &self.entries, now);
+        let key = (
+            self.revision,
+            self.window,
+            self.graph,
+            context.status,
+            now / MS_PER_SECOND,
+        );
+        if self.cache.as_ref().is_none_or(|cache| cache.key != key) {
+            let range = window_range(self.window, &self.entries, now);
+            let spans = build_spans(&self.entries, range, context.status);
+            let summary = summarise(&spans, range, &self.entries, now);
+            let buckets = hourly_buckets(range, &spans);
+            self.cache = Some(LogCache {
+                key,
+                range,
+                spans,
+                summary,
+                buckets,
+            });
+        }
+        let cache = std::mem::take(&mut self.cache).expect("just built");
 
         ui.add_space(BLOCK_GAP);
-        self.metrics(ui, &palette, context.status, &summary);
+        self.metrics(ui, &palette, context.status, &cache.summary);
         ui.add_space(BLOCK_GAP);
         match self.graph {
             GraphMode::Timeline => {
                 let height = graph_height(ui, TIMELINE_HEIGHT, TIMELINE_MIN_HEIGHT);
-                timeline(ui, &palette, range, &spans, height);
+                timeline(ui, &palette, cache.range, &cache.spans, height);
             }
             GraphMode::Step => {
                 let height = graph_height(ui, STEP_HEIGHT, STEP_MIN_HEIGHT);
-                step_chart(ui, &palette, range, &spans, height);
+                step_chart(ui, &palette, cache.range, &cache.spans, height);
             }
             GraphMode::Heatmap => {
                 let height = graph_height(ui, HEAT_MAX_HEIGHT, HEAT_MIN_HEIGHT);
-                heatmap(ui, &palette, range, &spans, height);
+                heatmap(ui, &palette, cache.range, &cache.buckets, height);
             }
         }
+        self.cache = Some(cache);
         ui.add_space(BLOCK_GAP);
         self.list(ui, &palette);
         // "Now" and the current duration move on their own.
@@ -1194,8 +1236,13 @@ fn with_alpha(colour: egui::Color32, alpha: f32) -> egui::Color32 {
 }
 
 /// The heatmap: one cell per hour, shaded by how much of it the session was up.
-fn heatmap(ui: &mut Ui, palette: &Palette, range: Range, spans: &[Span], max_height: f32) {
-    let buckets = hourly_buckets(range, spans);
+fn heatmap(
+    ui: &mut Ui,
+    palette: &Palette,
+    range: Range,
+    buckets: &[Bucket],
+    max_height: f32,
+) {
     let width = ui.available_width();
     let columns = (((width + HEAT_GAP) / (HEAT_CELL + HEAT_GAP)).floor() as usize).max(1);
     let cell_width =
