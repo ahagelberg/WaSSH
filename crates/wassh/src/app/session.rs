@@ -235,6 +235,8 @@ pub struct SessionEntry {
     pub id: String,
     /// Title shown in the tab strip.
     pub title: String,
+    /// Whether the title came from the shell rather than from the connection.
+    title_from_shell: bool,
     /// Current lifecycle state.
     pub status: SessionStatus,
     /// Last error message, if any.
@@ -434,6 +436,7 @@ impl SessionEntry {
         let mut entry = Self {
             id: id.into(),
             title,
+            title_from_shell: false,
             status: SessionStatus::Connecting,
             error: None,
             terminal,
@@ -641,7 +644,7 @@ impl SessionEntry {
                     jump_error: self.jump_error.clone(),
                 };
                 if self.jump_error.is_none()
-                    && self.resolved.as_ref().unwrap_or(&self.connection).auth == AuthMethod::Password
+                    && self.resolved_params().auth == AuthMethod::Password
                     && self.secrets.password.is_empty()
                 {
                     // Nothing to reuse: ask again in the terminal.
@@ -702,7 +705,7 @@ impl SessionEntry {
         secrets: &Secrets,
         known_hosts: Arc<KnownHosts>,
     ) -> SshOptions {
-        let params = self.resolved.as_ref().unwrap_or(&self.connection);
+        let params = self.resolved_params();
         let auth = match params.auth {
             AuthMethod::Password => SshAuth::Password(secrets.password.clone()),
             AuthMethod::PrivateKey => SshAuth::PrivateKey {
@@ -933,6 +936,7 @@ impl SessionEntry {
                     pumped.wake = true;
                     if self.accepts_title(&title) {
                         self.title = Self::titled(&self.connection, title);
+                        self.title_from_shell = true;
                     }
                 }
                 TerminalEvent::Bell => {
@@ -1144,7 +1148,24 @@ impl SessionEntry {
             self.identity_prompt_password = false;
         }
         self.connection = connection;
+        // What the previous parameters resolved to says nothing about the new ones.
+        self.resolved = None;
+        self.refresh_title();
         self.apply_style(defaults);
+    }
+
+    /// Parameters the session connects with: the connection as the host saved it, with the
+    /// identity's user, auth method and key applied when one is chosen.
+    pub fn resolved_params(&self) -> &ConnectionParams {
+        self.resolved.as_ref().unwrap_or(&self.connection)
+    }
+
+    /// Rename the tab after the host and user this session actually connects with, unless the
+    /// shell has named itself.
+    fn refresh_title(&mut self) {
+        if !self.title_from_shell {
+            self.title = self.resolved_params().subtitle();
+        }
     }
 
     pub fn set_resolved_auth(&mut self, resolved: Option<ConnectionParams>, mut secrets: Secrets, jumps: Vec<wassh_ssh::JumpHop>, error: Option<String>) {
@@ -1157,6 +1178,7 @@ impl SessionEntry {
         self.secrets = secrets;
         self.jumps = jumps;
         self.jump_error = error;
+        self.refresh_title();
     }
 
     /// Recompute what the renderer shows from this session's overrides plus the app defaults.
