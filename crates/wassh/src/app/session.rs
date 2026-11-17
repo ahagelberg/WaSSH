@@ -25,6 +25,12 @@ use wassh_ui::TerminalView;
 /// How many status changes one session keeps for the connection log plugin.
 const MAX_STATUS_HISTORY: usize = 200;
 
+/// Prompt shown when the host has no user name to log in as.
+const USERNAME_PROMPT: &str = "login as: ";
+
+/// What a retried password attempt is told after the server rejected the last one.
+const PASSWORD_DENIED: &str = "\r\nPermission denied, please try again.\r\n";
+
 /// Secrets map for a pane that declares none, so the context can borrow a reference.
 static NO_SECRETS: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
@@ -142,6 +148,17 @@ pub struct LoginPrompt {
     attempts: u32,
     /// True while waiting for typing, false once the attempt is running.
     active: bool,
+    /// What the user is being asked for.
+    stage: LoginStage,
+}
+
+/// What the in-terminal login prompt wants next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginStage {
+    /// The user name to log in as, when the host does not name one.
+    Username,
+    /// The password.
+    Password,
 }
 
 /// What the user did at a login prompt.
@@ -229,12 +246,33 @@ pub struct SshOpen {
     pub jump_error: Option<String>,
 }
 
+impl SshOpen {
+    /// Parameters the attempt connects with.
+    fn resolved_params(&self) -> &ConnectionParams {
+        self.resolved.as_ref().unwrap_or(&self.params)
+    }
+
+    /// Whether the tab has to ask for a user name or password before it can connect.
+    pub fn needs_login(&self) -> bool {
+        self.jump_error.is_none() && login_required(self.resolved_params(), &self.secrets)
+    }
+}
+
+/// Whether a session with these parameters and credentials must ask for a user name or a
+/// password before it can connect.
+pub fn login_required(params: &ConnectionParams, secrets: &Secrets) -> bool {
+    params.username.trim().is_empty()
+        || (params.auth == AuthMethod::Password && secrets.password.is_empty())
+}
+
 /// A tab's worth of session state.
 pub struct SessionEntry {
     /// Stable id, also used as the egui id salt.
     pub id: String,
     /// Title shown in the tab strip.
     pub title: String,
+    /// Whether the title came from the shell rather than from the connection.
+    title_from_shell: bool,
     /// Current lifecycle state.
     pub status: SessionStatus,
     /// Last error message, if any.
@@ -434,6 +472,7 @@ impl SessionEntry {
         let mut entry = Self {
             id: id.into(),
             title,
+            title_from_shell: false,
             status: SessionStatus::Connecting,
             error: None,
             terminal,
@@ -640,10 +679,7 @@ impl SessionEntry {
                     jumps: self.jumps.clone(),
                     jump_error: self.jump_error.clone(),
                 };
-                if self.jump_error.is_none()
-                    && self.resolved.as_ref().unwrap_or(&self.connection).auth == AuthMethod::Password
-                    && self.secrets.password.is_empty()
-                {
+                if open.needs_login() {
                     // Nothing to reuse: ask again in the terminal.
                     self.prompt_login(open);
                 } else {
@@ -702,7 +738,7 @@ impl SessionEntry {
         secrets: &Secrets,
         known_hosts: Arc<KnownHosts>,
     ) -> SshOptions {
-        let params = self.resolved.as_ref().unwrap_or(&self.connection);
+        let params = self.resolved_params();
         let auth = match params.auth {
             AuthMethod::Password => SshAuth::Password(secrets.password.clone()),
             AuthMethod::PrivateKey => SshAuth::PrivateKey {
@@ -933,6 +969,7 @@ impl SessionEntry {
                     pumped.wake = true;
                     if self.accepts_title(&title) {
                         self.title = Self::titled(&self.connection, title);
+                        self.title_from_shell = true;
                     }
                 }
                 TerminalEvent::Bell => {
@@ -1144,7 +1181,24 @@ impl SessionEntry {
             self.identity_prompt_password = false;
         }
         self.connection = connection;
+        // What the previous parameters resolved to says nothing about the new ones.
+        self.resolved = None;
+        self.refresh_title();
         self.apply_style(defaults);
+    }
+
+    /// Parameters the session connects with: the connection as the host saved it, with the
+    /// identity's user, auth method and key applied when one is chosen.
+    pub fn resolved_params(&self) -> &ConnectionParams {
+        self.resolved.as_ref().unwrap_or(&self.connection)
+    }
+
+    /// Rename the tab after the host and user this session actually connects with, unless the
+    /// shell has named itself.
+    fn refresh_title(&mut self) {
+        if !self.title_from_shell {
+            self.title = self.resolved_params().subtitle();
+        }
     }
 
     pub fn set_resolved_auth(&mut self, resolved: Option<ConnectionParams>, mut secrets: Secrets, jumps: Vec<wassh_ssh::JumpHop>, error: Option<String>) {
@@ -1157,6 +1211,7 @@ impl SessionEntry {
         self.secrets = secrets;
         self.jumps = jumps;
         self.jump_error = error;
+        self.refresh_title();
     }
 
     /// Recompute what the renderer shows from this session's overrides plus the app defaults.
@@ -1795,25 +1850,35 @@ impl SessionEntry {
         self.login.as_ref().is_some_and(|login| login.active)
     }
 
-    /// Print the password prompt into the terminal and wait for typing.
+    /// Print the user-name or password prompt into the terminal and wait for typing.
     ///
     /// Nothing is echoed while the user types, and a retry prints the same
     /// "Permission denied" line OpenSSH and PuTTY use.
     pub fn prompt_login(&mut self, open: SshOpen) {
         let attempts = self.login.as_ref().map_or(0, |login| login.attempts);
+        let stage = if open.resolved_params().username.trim().is_empty() {
+            LoginStage::Username
+        } else {
+            LoginStage::Password
+        };
         let mut text = String::new();
         if attempts > 0 {
-            text.push_str("\r\nPermission denied, please try again.\r\n");
+            text.push_str(PASSWORD_DENIED);
         }
-        text.push_str(&format!(
-            "{}@{}'s password: ",
-            open.resolved.as_ref().unwrap_or(&open.params).username, open.params.host
-        ));
+        text.push_str(&match stage {
+            LoginStage::Username => USERNAME_PROMPT.to_owned(),
+            LoginStage::Password => format!(
+                "{}@{}'s password: ",
+                open.resolved_params().username,
+                open.params.host
+            ),
+        });
         self.login = Some(LoginPrompt {
             open,
             buffer: String::new(),
             attempts,
             active: true,
+            stage,
         });
         self.status = SessionStatus::Authenticating;
         self.error = None;
@@ -1889,12 +1954,40 @@ impl SessionEntry {
         self.terminal.feed(b"\r\nLogin cancelled.\r\n");
     }
 
-    /// Hand the typed password to a fresh connection attempt.
+    /// Hand what was typed to the step it belongs to: the user name, then the password.
     fn submit_login(&mut self, term_type: &str) {
         let Some(mut login) = self.login.take() else {
             return;
         };
-        let password = std::mem::take(&mut login.buffer);
+        let typed = std::mem::take(&mut login.buffer);
+        if login.stage == LoginStage::Username {
+            let username = typed.trim().to_owned();
+            // A blank answer would only repeat the question.
+            if username.is_empty() {
+                self.login = Some(login);
+                return;
+            }
+            login.open.params.username.clone_from(&username);
+            if let Some(resolved) = login.open.resolved.as_mut() {
+                resolved.username.clone_from(&username);
+            }
+            login.stage = LoginStage::Password;
+            let open = login.open.clone();
+            self.connection.username.clone_from(&username);
+            if let Some(resolved) = self.resolved.as_mut() {
+                resolved.username = username;
+            }
+            self.login = Some(login);
+            self.refresh_title();
+            self.terminal.feed(b"\r\n");
+            if self.secrets.password.is_empty() {
+                self.prompt_login(open);
+            } else {
+                self.begin(term_type, open);
+            }
+            return;
+        }
+        let password = typed;
         login.active = false;
         login.attempts += 1;
         login.open.secrets.password.clone_from(&password);
@@ -3317,9 +3410,6 @@ pub fn resolve_auth(
             key_passphrase: host_id.and_then(|id| vault.and_then(|vault| vault.passphrase(id))).unwrap_or_default(),
         }
     };
-    if resolved.username.trim().is_empty() {
-        resolved.username = local_username();
-    }
     Ok((resolved, secrets))
 }
 

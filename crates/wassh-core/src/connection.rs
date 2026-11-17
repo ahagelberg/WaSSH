@@ -482,6 +482,11 @@ impl ConnectionParams {
             self.remote_session.enabled = false;
             self.jump_host_id = None;
         }
+        if self.identity_id.is_some() {
+            // The identity supplies the user, so a username typed before one was chosen would be
+            // stale: it would name the tab and read back as this host's user.
+            self.username.clear();
+        }
         self.serial = self.serial.clone().normalized();
         self.style = self.style.clone().normalized();
         self.tunnels.retain(|tunnel| tunnel.listen_port != 0);
@@ -700,6 +705,19 @@ mod tests {
         assert_eq!(telnet.port, 23);
         assert!(telnet.tunnels.is_empty());
         assert!(!telnet.x11);
+    }
+
+    #[test]
+    fn an_identity_supplies_the_user_so_a_stored_one_is_dropped() {
+        let params = ConnectionParams {
+            host: "example.com".to_owned(),
+            username: "root".to_owned(),
+            identity_id: Some("shared".to_owned()),
+            ..Default::default()
+        }
+        .normalized();
+        assert!(params.username.is_empty());
+        assert_eq!(params.endpoint(), "example.com:22");
     }
 
     #[test]

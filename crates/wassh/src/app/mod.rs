@@ -19,8 +19,8 @@ use eframe::egui;
 use egui::{Key, Modifiers, Pos2, Vec2};
 
 use wassh_core::{
-    APP_NAME, AppSettings, AuthMethod, ConnectionParams, ConnectionType, HostProfile,
-    HostsDocument, LocalShell, Palette, SessionStatus, WindowBounds,
+    APP_NAME, AppSettings, ConnectionParams, ConnectionType, HostProfile, HostsDocument,
+    LocalShell, Palette, SessionStatus, WindowBounds,
 };
 use wassh_plugins::PluginId;
 use wassh_ssh::KnownHosts;
@@ -35,7 +35,8 @@ use self::dialogs::{
 };
 use self::quick_connect::{QuickAction, QuickForm, quick_connect};
 use self::session::{
-    PluginValues, Secrets, SessionEntry, SshOpen, jump_chain, open_host_sessions, resolve_auth,
+    PluginValues, Secrets, SessionEntry, SshOpen, jump_chain, login_required, open_host_sessions,
+    resolve_auth,
 };
 
 /// How long the window must stay put before its geometry is written to `settings.json`.
@@ -757,10 +758,7 @@ impl Shell {
                     jump_error,
                 };
                 // With no stored password the tab reopens and asks in the terminal.
-                let entry = if open.jump_error.is_none()
-                    && open.resolved.as_ref().unwrap_or(&open.params).auth == AuthMethod::Password
-                    && open.secrets.password.is_empty()
-                {
+                let entry = if open.needs_login() {
                     SessionEntry::new_ssh_prompt(
                         id,
                         &self.palette,
@@ -839,7 +837,9 @@ impl Shell {
             ConnectionType::Serial => self.open_serial(connection, host_id),
             ConnectionType::Ssh => {
                 match resolve_auth(&connection, host_id.as_deref(), self.identities(), self.secrets.as_ref()) {
-                    Ok((resolved, secrets)) if resolved.auth == AuthMethod::Password && secrets.password.is_empty() => self.open_ssh_prompt(connection, host_id),
+                    Ok((resolved, secrets)) if login_required(&resolved, &secrets) => {
+                        self.open_ssh_prompt(connection, host_id)
+                    }
                     Ok((_, secrets)) => self.start_ssh(connection, host_id, secrets),
                     Err(error) => self.toasts.push(ToastKind::Error, error),
                 }
@@ -4688,6 +4688,7 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use wassh_core::AuthMethod;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -4775,6 +4776,115 @@ mod tests {
         shell.restart(0, Secrets::default());
         assert_eq!(shell.sessions[0].secrets.password, "updated");
         assert!(!shell.sessions[0].awaiting_login());
+        let dir = shell.config.as_ref().unwrap().dir.clone();
+        shell.close(0);
+        drop(shell);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_ssh_session_without_a_user_asks_for_one_before_the_password() {
+        let mut shell = Shell::new_with(Some(scratch_config()), false);
+        let connection = ConnectionParams { host: "127.0.0.1".to_owned(), port: 1, ..Default::default() };
+        shell.open(connection, None);
+        assert!(shell.sessions[0].awaiting_login());
+        assert!(
+            shell.sessions[0].visible_text().contains("login as: "),
+            "the tab must ask for a user name, not fall back to this machine's account: {:?}",
+            shell.sessions[0].visible_text()
+        );
+
+        let typed = [wassh_ui::TerminalInput::Text("alice\r".to_owned())];
+        shell.sessions[0].login_input(&typed, &shell.settings.term_type);
+        assert!(shell.sessions[0].awaiting_login(), "the password is still to come");
+        assert_eq!(shell.sessions[0].resolved_params().username, "alice");
+        assert_eq!(shell.sessions[0].title, "alice@127.0.0.1:1");
+        assert!(
+            shell.sessions[0].visible_text().contains("alice@127.0.0.1's password: "),
+            "{:?}",
+            shell.sessions[0].visible_text()
+        );
+
+        let typed = [wassh_ui::TerminalInput::Text("secret\r".to_owned())];
+        shell.sessions[0].login_input(&typed, &shell.settings.term_type);
+        assert!(!shell.sessions[0].awaiting_login());
+        assert_eq!(shell.sessions[0].secrets.password, "secret");
+        let dir = shell.config.as_ref().unwrap().dir.clone();
+        shell.close(0);
+        drop(shell);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn switching_a_host_to_an_identity_renames_its_tabs_and_logs_in_as_it() {
+        let mut config = scratch_config();
+        config
+            .identities
+            .set(vec![wassh_core::Identity {
+                id: "shared".to_owned(),
+                name: "Shared".to_owned(),
+                username: "alice".to_owned(),
+                auth: wassh_core::AuthMethod::Password,
+                ..Default::default()
+            }])
+            .unwrap();
+        let mut shell = Shell::new_with(Some(config), false);
+        // A host that logs in as root with its own password.
+        let mut host = HostProfile {
+            id: "h1".to_owned(),
+            name: "Box".to_owned(),
+            connection: ConnectionParams {
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+                username: "root".to_owned(),
+                auth: wassh_core::AuthMethod::Password,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        shell.save_host(host.clone());
+        shell
+            .secrets
+            .as_mut()
+            .unwrap()
+            .set_password("h1", Some("old-secret"))
+            .unwrap();
+        shell.open(host.connection.clone(), Some(host.id.clone()));
+        assert!(
+            shell.sessions[0].title.starts_with("root@"),
+            "{}",
+            shell.sessions[0].title
+        );
+
+        // The host dialog switches it to the shared identity and saves, which drops the user
+        // name it had, then the change is pushed onto the open session.
+        host.connection.identity_id = Some("shared".to_owned());
+        host.connection = host.connection.normalized();
+        shell.save_host(host.clone());
+        shell.apply_host_to_sessions(&host);
+
+        assert_eq!(
+            shell.sessions[0].title, "127.0.0.1:1",
+            "the tab must not keep naming a user the session no longer connects as"
+        );
+        // A tab that still holds the host's own password must not carry it into the identity's
+        // login.
+        shell.sessions[0].secrets.password = "old-secret".to_owned();
+        shell.restart(0, Secrets::default());
+        assert_eq!(
+            shell.sessions[0].resolved_params().username.as_str(),
+            "alice",
+            "the connection goes out as the identity's user"
+        );
+        assert_eq!(
+            shell.sessions[0].title, "alice@127.0.0.1:1",
+            "the tab is named after the identity it connects with"
+        );
+        assert!(
+            shell.sessions[0].secrets.password.is_empty(),
+            "the host's own password must not be reused: {:?}",
+            shell.sessions[0].secrets
+        );
         let dir = shell.config.as_ref().unwrap().dir.clone();
         shell.close(0);
         drop(shell);
