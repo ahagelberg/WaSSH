@@ -115,6 +115,10 @@ pub const TOOL_SYSTEM_PROCESSES: &str = "system_process_list";
 pub const TOOL_SYSTEM_DISK: &str = "system_disk_usage";
 /// Tool: the memory report.
 pub const TOOL_SYSTEM_MEMORY: &str = "system_memory_report";
+/// Tool: bring a scope's tools into the conversation.
+pub const TOOL_LOAD_SCOPE: &str = "load_scope";
+/// Tool: take a scope's tools back out.
+pub const TOOL_UNLOAD_SCOPE: &str = "unload_scope";
 
 /// Prefix that marks a rule list entry as a regular expression.
 pub const RULE_REGEX_PREFIX: &str = "regex:";

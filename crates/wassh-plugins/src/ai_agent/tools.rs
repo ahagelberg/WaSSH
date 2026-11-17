@@ -21,17 +21,18 @@ use serde_json::{Value, json};
 
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
+    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOAD_SCOPE, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
     TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
     TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
     TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
     TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 use super::agent::shell_quote;
-use super::permissions::{Permission, Permissions};
+use super::permissions::Permissions;
+use super::scopes::{Loaded, scope_of};
 use crate::plugin::PluginTool;
 
 /// Longest body a fetch may return.
@@ -283,6 +284,26 @@ impl ToolSpec {
     }
 }
 
+/// The tools that move along the scope graph. They are sent in every request: without them
+/// the model could never reach anything a scope holds.
+pub const SCOPE_TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: TOOL_LOAD_SCOPE,
+        description: "Load a scope so its tools can be called. Ask for one of the scopes listed \
+as available; its tools are offered from the next turn on.",
+    },
+    ToolSpec {
+        name: TOOL_UNLOAD_SCOPE,
+        description: "Drop a loaded scope and everything inside it, freeing the room its tools \
+took in this conversation.",
+    },
+];
+
+/// Whether `name` is one of the scope tools.
+pub fn is_scope_tool(name: &str) -> bool {
+    SCOPE_TOOLS.iter().any(|spec| spec.name == name)
+}
+
 /// Parameter schemas per tool, mirroring the reference's argument names.
 fn parameters(name: &str) -> (Value, Value) {
     let string = |description: &str| json!({ "type": "string", "description": description });
@@ -369,6 +390,10 @@ fn parameters(name: &str) -> (Value, Value) {
             json!(["path", "oldText", "newText"]),
         ),
         TOOL_CURRENT_TIME => (json!({}), json!([])),
+        TOOL_LOAD_SCOPE | TOOL_UNLOAD_SCOPE => (
+            json!({ "scope": string("Id of the scope, exactly as the scope index lists it.") }),
+            json!(["scope"]),
+        ),
         TOOL_RAG_SEARCH => (
             json!({
                 "query": string("What to look for in the knowledge base."),
@@ -533,19 +558,41 @@ fn parameters(name: &str) -> (Value, Value) {
 }
 
 /// Every tool schema this host may use, ready for the provider.
-pub fn specs(permissions: &Permissions, allow_all: bool) -> Vec<Value> {
-    let mut specs: Vec<Value> = TOOL_SPECS
-        .iter()
-        .filter(|spec| {
-            permissions.offers(spec.name)
-                || (allow_all && permissions.decision(spec.name) == Permission::Ask)
-        })
-        .map(|spec| spec.schema())
-        .collect();
+/// Every tool schema this conversation sends: the scope tools plus what the loaded scopes
+/// hold and the host may use.
+///
+/// Tools of scopes that are not loaded are left out on purpose — that is what keeps the
+/// prompt from carrying the whole toolset whether or not it is needed.
+pub fn specs(permissions: &Permissions, loaded: &Loaded) -> Vec<Value> {
+    let mut specs: Vec<Value> = SCOPE_TOOLS.iter().map(|spec| spec.schema()).collect();
+    specs.extend(
+        TOOL_SPECS
+            .iter()
+            .filter(|spec| loaded.holds(spec.name) && permissions.offers(spec.name))
+            .map(|spec| spec.schema()),
+    );
     // Tools a pane offers are listed as they are: their calls run commands, which the
     // approval rules already gate.
-    specs.extend(crate::plugin::tools().map(PluginTool::schema));
+    for scope in loaded.scopes() {
+        let Some(pane) = scope.pane else {
+            continue;
+        };
+        specs.extend(
+            crate::plugin::tools_of(pane)
+                .iter()
+                .filter(|tool| permissions.offers(tool.name))
+                .map(PluginTool::schema),
+        );
+    }
     specs
+}
+
+/// Characters the tool schemas and `system` take out of one request.
+///
+/// Counted from the payload that is actually sent, so a conversation carrying two scopes is
+/// measured at two scopes and not at the whole toolset.
+pub fn prompt_chars(tools: &[Value], system: &str) -> usize {
+    system.len() + tools.iter().map(|tool| tool.to_string().len()).sum::<usize>()
 }
 
 /// The tool a pane offers under `name`, if there is one.
@@ -555,7 +602,15 @@ pub fn plugin_tool(name: &str) -> Option<&'static PluginTool> {
 
 /// Whether a tool exists.
 pub fn is_tool(name: &str) -> bool {
-    TOOL_SPECS.iter().any(|spec| spec.name == name) || plugin_tool(name).is_some()
+    is_scope_tool(name)
+        || TOOL_SPECS.iter().any(|spec| spec.name == name)
+        || plugin_tool(name).is_some()
+}
+
+/// The scope a tool is reached through, for telling the model how to get at one it does not
+/// have yet.
+pub fn scope_for(name: &str) -> Option<&'static str> {
+    scope_of(name).map(|scope| scope.id)
 }
 
 /// Whether a tool needs the connected session.
@@ -1685,11 +1740,49 @@ pub fn keys_sequence(keys: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_agent::permissions::{
+        GROUP_KNOWLEDGE_BASE, GROUP_LOCAL_FS, GROUP_REMOTE_FS, GROUP_TERMINAL, GROUP_WEB_ACCESS,
+        Permission, group_key, method_key,
+    };
+
+    /// Every scope loaded, so every tool is in the payload.
+    fn everything_loaded() -> Loaded {
+        let mut loaded = Loaded::new();
+        for scope in super::super::scopes::SCOPES {
+            loaded.load(scope);
+        }
+        loaded
+    }
+
+    /// A host with every capability switched on.
+    fn everything_allowed() -> Permissions {
+        let settings = [
+            GROUP_TERMINAL,
+            GROUP_REMOTE_FS,
+            GROUP_LOCAL_FS,
+            GROUP_WEB_ACCESS,
+            GROUP_KNOWLEDGE_BASE,
+        ]
+        .into_iter()
+        .map(|group| (group_key(group), Value::Bool(true)))
+        .collect();
+        Permissions::from_settings(&settings)
+    }
+
+    fn names(schemas: &[Value]) -> Vec<&str> {
+        schemas
+            .iter()
+            .map(|schema| schema["name"].as_str().unwrap())
+            .collect()
+    }
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs(&Permissions::default(), false);
-        assert_eq!(schemas.len(), TOOL_SPECS.len() + crate::plugin::tools().count());
+        let schemas = specs(&everything_allowed(), &everything_loaded());
+        assert_eq!(
+            schemas.len(),
+            TOOL_SPECS.len() + crate::plugin::tools().count() + SCOPE_TOOLS.len()
+        );
         // The tools a pane offers are listed alongside the agent's own.
         let docker = schemas
             .iter()
@@ -1698,10 +1791,7 @@ mod tests {
         assert_eq!(docker["parameters"]["type"], "object");
         assert!(is_tool("docker_containers"));
         assert!(needs_session("docker_containers"));
-        let names: Vec<&str> = schemas
-            .iter()
-            .map(|schema| schema["name"].as_str().unwrap())
-            .collect();
+        let names = names(&schemas);
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"run_sudo"));
         assert!(names.contains(&"dev_grep_search"));
@@ -1726,22 +1816,60 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_offers_ask_tools_but_not_denied_tools() {
+    fn a_fresh_conversation_carries_the_scope_tools_and_the_root_only() {
+        let schemas = specs(&everything_allowed(), &Loaded::new());
+        assert_eq!(
+            names(&schemas),
+            [
+                TOOL_LOAD_SCOPE,
+                TOOL_UNLOAD_SCOPE,
+                TOOL_RUN_COMMAND,
+                TOOL_RUN_SUDO,
+                TOOL_ASK_USER,
+                TOOL_CURRENT_TIME,
+            ]
+        );
+    }
+
+    #[test]
+    fn loading_a_scope_is_what_puts_its_schemas_in_the_request() {
+        let permissions = everything_allowed();
+        let mut loaded = Loaded::new();
+        loaded.load(super::super::scopes::find("host-files").unwrap());
+        let schemas = specs(&permissions, &loaded);
+        assert!(names(&schemas).contains(&TOOL_DEV_VIEW));
+        assert!(!names(&schemas).contains(&TOOL_LOCAL_READ));
+        loaded.load(super::super::scopes::find("docker").unwrap());
+        assert!(names(&specs(&permissions, &loaded)).contains(&"docker_containers"));
+    }
+
+    #[test]
+    fn the_root_request_costs_a_fraction_of_the_loadouts() {
+        let permissions = everything_allowed();
+        let base = specs(&permissions, &Loaded::new());
+        let all = specs(&permissions, &everything_loaded());
+        let base = prompt_chars(&base, "");
+        let all = prompt_chars(&all, "");
+        assert!(
+            base * 5 < all,
+            "the base request is {base} chars of {all}, which is not a saving worth the hop"
+        );
+    }
+
+    #[test]
+    fn denied_tools_never_reach_the_request() {
         let permissions = Permissions::from_settings(&serde_json::Map::from_iter([
+            (group_key(GROUP_TERMINAL), Value::Bool(true)),
             (
-                super::super::permissions::group_key(super::super::permissions::GROUP_TERMINAL),
-                Value::Bool(true),
-            ),
-            (
-                super::super::permissions::method_key(TOOL_TERMINAL_WRITE),
+                method_key(TOOL_TERMINAL_WRITE),
                 Value::String("deny".to_owned()),
             ),
         ]));
         assert_eq!(permissions.decision(TOOL_TERMINAL_KEYS), Permission::Ask);
         assert_eq!(permissions.decision(TOOL_TERMINAL_WRITE), Permission::Deny);
-        let schemas = specs(&permissions, true);
-        assert!(schemas.iter().any(|schema| schema["name"] == TOOL_TERMINAL_KEYS));
-        assert!(!schemas.iter().any(|schema| schema["name"] == TOOL_TERMINAL_WRITE));
+        let schemas = specs(&permissions, &everything_loaded());
+        assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
+        assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
     }
 
     #[test]

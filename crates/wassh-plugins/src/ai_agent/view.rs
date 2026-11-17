@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use wassh_core::{Palette, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
+    Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, chip, copy_button, password_input,
     select_str, select_width, small_button, small_button_enabled, text_area, text_area_with_id,
 };
 
@@ -32,6 +32,7 @@ use super::protocol::{
     TITLE_MAX_CHARS,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
+use super::scopes::{self, Loaded};
 use super::settings_ui::{PROVIDERS_KEY, provider_secret_field};
 use super::tools;
 use wassh_ui::to_color32;
@@ -57,7 +58,8 @@ const DERIVED_SETTINGS: &[&str] = &[
 const MAX_TOKENS: u32 = 4096;
 /// Characters a token is estimated at when sizing the conversation.
 const CHARS_PER_TOKEN: usize = 4;
-/// Tokens the system prompt and the tool schemas take out of the window.
+/// Tokens the system prompt and the tool schemas take out of the window, until a request has
+/// been measured.
 const PROMPT_OVERHEAD_TOKENS: usize = 4_000;
 /// Context window of a model the settings do not name.
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
@@ -256,6 +258,8 @@ pub struct StoredChat {
     pub provider: String,
     /// Summary of the part of it that was compacted away.
     pub compacted: Option<String>,
+    /// Scopes it carried tools from.
+    pub scopes: Loaded,
 }
 
 /// A message typed while a run was in flight.
@@ -469,6 +473,7 @@ impl AiAgent {
                 .map(|provider| provider.id.clone())
                 .unwrap_or_default(),
             compacted: self.agent.compacted.clone(),
+            scopes: self.agent.scopes.clone(),
         }
     }
 
@@ -504,6 +509,7 @@ impl AiAgent {
         self.agent.history = chat.history;
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
+        self.agent.scopes = chat.scopes;
         if !chat.model.is_empty() {
             self.model = chat.model;
         }
@@ -539,15 +545,29 @@ impl AiAgent {
             format!("Environment: {environment}."),
             format!("Current working directory: {}", self.agent.cwd),
             String::new(),
-            "Available tools:".to_owned(),
+            // Tools arrive by scope: sending every schema on every turn would spend the
+            // prompt on tools nobody asked for.
+            "Tools come in scopes, and only a loaded scope's tools can be called. Bring in \
+another scope with load_scope and drop one with unload_scope."
+                .to_owned(),
+            String::new(),
+            "Loaded scopes:".to_owned(),
         ];
         // Only what the request actually sends: naming a tool this host may not call just
         // invites the model to try it and fall back to the shell.
-        for spec in tools::TOOL_SPECS
-            .iter()
-            .filter(|spec| self.agent.offers_tool(spec.name))
-        {
-            lines.push(format!("- {}: {}", spec.name, spec.description));
+        for scope in self.agent.scopes.scopes() {
+            let names = self.scope_tools(scope);
+            if !names.is_empty() {
+                lines.push(format!("- {}: {}", scope.id, names.join(", ")));
+            }
+        }
+        let loadable = scopes::visible(&self.agent.scopes, &self.agent.permissions);
+        if !loadable.is_empty() {
+            lines.push(String::new());
+            lines.push("Scopes to load, by id:".to_owned());
+            for scope in loadable {
+                lines.push(format!("- {}: {}", scope.id, scope.summary));
+            }
         }
         lines.push(String::new());
         lines.push("Guidelines:".to_owned());
@@ -577,6 +597,16 @@ impl AiAgent {
             lines.push(summary.clone());
         }
         lines.join("\n")
+    }
+
+    /// The tools of `scope` this conversation can call, as the model names them.
+    fn scope_tools(&self, scope: &scopes::Scope) -> Vec<&'static str> {
+        let mut names = scope.tools.to_vec();
+        if let Some(pane) = scope.pane {
+            names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
+        }
+        names.retain(|name| self.agent.offers_tool(name));
+        names
     }
 
     /// How to choose between this session's tools, named as they are offered here.
@@ -645,8 +675,9 @@ impl AiAgent {
             );
         }
         lines.push(
-            "- If a file tool you need is not in the list above, tell the user which capability \
-             is switched off instead of doing the same job with a shell command."
+            "- If a file tool you need is missing from the loaded scopes, load the scope that \
+             holds it. If no scope offers it, the capability is switched off on this host — say \
+             so instead of doing the same job with a shell command."
                 .to_owned(),
         );
         lines
@@ -757,15 +788,20 @@ impl AiAgent {
         environment: &str,
     ) -> Option<CompletionRequest> {
         self.agent.repair_history();
+        let system = self.system_prompt(settings, host, environment);
+        let tools = tools::specs(&self.agent.permissions, &self.agent.scopes);
+        // Kept so compaction measures the scopes this conversation really carries.
+        self.agent.prompt_chars = tools::prompt_chars(&tools, &system);
         let provider = self.active()?;
+        let api_key = self.keys.get(&provider.id).cloned().unwrap_or_default();
         Some(CompletionRequest {
             base_url: provider.base_url.clone(),
-            api_key: self.keys.get(&provider.id).cloned().unwrap_or_default(),
+            api_key,
             protocol: provider.protocol,
             model: self.model.trim().to_owned(),
-            system: self.system_prompt(settings, host, environment),
+            system,
             messages: self.agent.history.clone(),
-            tools: tools::specs(&self.agent.permissions, self.agent.allow_all),
+            tools,
             max_tokens: MAX_TOKENS,
         })
     }
@@ -980,6 +1016,7 @@ impl AiAgent {
             .and_then(Value::as_str)
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
+        self.agent.scopes = Loaded::from_json(stored.get("scopes"));
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
             self.chats = chats
                 .iter()
@@ -1003,6 +1040,7 @@ impl AiAgent {
                         .as_str()
                         .filter(|summary| !summary.is_empty())
                         .map(str::to_owned),
+                    scopes: Loaded::from_json(chat.get("scopes")),
                 })
                 .collect();
         }
@@ -1092,7 +1130,14 @@ impl AiAgent {
             return;
         }
         let window = context_window(settings, &self.model);
-        let budget = window.saturating_sub(MAX_TOKENS as usize + PROMPT_OVERHEAD_TOKENS);
+        // Measured from the last request, so a conversation is compacted against what its
+        // loaded scopes actually cost rather than a guess.
+        let overhead = if self.agent.prompt_chars == 0 {
+            PROMPT_OVERHEAD_TOKENS
+        } else {
+            self.agent.prompt_chars / CHARS_PER_TOKEN
+        };
+        let budget = window.saturating_sub(MAX_TOKENS as usize + overhead);
         if self.agent.history_chars() / CHARS_PER_TOKEN <= budget {
             return;
         }
@@ -2050,6 +2095,9 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
         super::protocol::TOOL_RAG_SEARCH => ("RAG", rgb(0xc084fc)),
         other if other.starts_with("system_") => ("System", rgb(0x2dd4bf)),
         other if other.starts_with("terminal_") => ("Your terminal", rgb(0xf472b6)),
+        super::protocol::TOOL_LOAD_SCOPE | super::protocol::TOOL_UNLOAD_SCOPE => {
+            ("Scope", palette.text_muted)
+        }
         _ => ("Tool", palette.text_muted),
     }
 }
@@ -2771,6 +2819,31 @@ impl Plugin for AiAgent {
                     }
                 }
 
+                // Scopes this conversation carries; a click drops one and the room its tools
+                // took goes with it.
+                let loaded: Vec<&'static str> = self
+                    .agent
+                    .scopes
+                    .ids()
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != scopes::ROOT)
+                    .collect();
+                if !loaded.is_empty() {
+                    let mut unload = None;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Scopes").size(10.0).color(muted));
+                        for id in loaded {
+                            if chip(ui, palette, id, true) {
+                                unload = Some(id);
+                            }
+                        }
+                    });
+                    if let Some(id) = unload {
+                        let _ = self.agent.unload_scope(id);
+                    }
+                }
+
                 // Composer: the include tools stack in a column beside the prompt, both
                 // starting at the prompt's top edge.
                 ui.separator();
@@ -3051,7 +3124,8 @@ impl Plugin for AiAgent {
                     "provider": chat.provider,
                     "turns": turns_to_json(&chat.turns),
                     "history": history_to_json(&chat.history),
-                    "compacted": chat.compacted
+                    "compacted": chat.compacted,
+                    "scopes": chat.scopes.to_json()
                 })
             })
             .collect();
@@ -3066,6 +3140,7 @@ impl Plugin for AiAgent {
                 "turns": turns_to_json(&self.agent.turns),
                 "history": history_to_json(&self.agent.history),
                 "compacted": self.agent.compacted,
+                "scopes": self.agent.scopes.to_json(),
                 "chats": chats
             }),
         );
@@ -5245,49 +5320,58 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_offers_only_the_tools_the_host_may_use() {
+    fn the_prompt_names_the_loaded_scopes_and_what_can_be_loaded_next() {
         use super::super::permissions::{GROUP_LOCAL_FS, GROUP_REMOTE_FS, Permissions, group_key};
-        let prompt_for = |groups: Vec<&str>| {
-            let settings: serde_json::Map<String, Value> =
-                groups.into_iter().map(|group| (group_key(group), json!(true))).collect();
+        let prompt_for = |groups: Vec<&str>, load: &[&str]| {
+            let settings: serde_json::Map<String, Value> = groups
+                .into_iter()
+                .map(|group| (group_key(group), json!(true)))
+                .collect();
             let mut plugin = AiAgent::default();
             plugin.agent.permissions = Permissions::from_settings(&settings);
+            for id in load {
+                plugin.agent.scopes.load(super::scopes::find(id).unwrap());
+            }
             plugin.system_prompt(&serde_json::Map::new(), "dev", "a test shell")
         };
 
-        // With both filesystem groups on, both families are named and the shell is not
-        // offered as a way to read files.
-        let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS]);
+        // Nothing loaded beyond the root: the prompt offers the next stops and names no
+        // tool of a scope that is not loaded.
+        let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &[]);
         assert!(both.contains("Environment: a test shell."), "{both}");
-        assert!(both.contains("- dev_grep_search:"), "{both}");
-        assert!(both.contains("- local_fs_grep_search:"), "{both}");
-        assert!(both.contains("Files on the connected host:"), "{both}");
-        assert!(both.contains("Files on this computer:"), "{both}");
         assert!(
-            both.contains("Do not reach for cat, head, tail, ls, find, grep/rg, sed or awk"),
+            both.contains("- core: run_command, run_sudo, ask_user, get_current_time"),
             "{both}"
         );
-        assert!(both.contains("Not for reading or editing files"), "{both}");
+        assert!(both.contains("- host: "), "{both}");
+        assert!(both.contains("- local: "), "{both}");
+        assert!(!both.contains("remote_fs_read_file"), "{both}");
+        assert!(!both.contains("local_fs_grep_search"), "{both}");
 
-        // With only the local group on, the host's tools are not advertised at all.
-        let local_only = prompt_for(vec![GROUP_LOCAL_FS]);
-        assert!(local_only.contains("- local_fs_grep_search:"), "{local_only}");
+        // Loading a scope names its tools and the guidance for them.
+        let loaded = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &["host", "host-files"]);
+        assert!(
+            loaded.contains("- host-files: remote_fs_read_file"),
+            "{loaded}"
+        );
+        assert!(loaded.contains("dev_grep_search"), "{loaded}");
+        assert!(loaded.contains("Files on the connected host:"), "{loaded}");
+        assert!(
+            loaded.contains("Do not reach for cat, head, tail, ls, find, grep/rg, sed or awk"),
+            "{loaded}"
+        );
+
+        // A capability the host may not use never shows up, not even as a scope.
+        let local_only = prompt_for(vec![GROUP_LOCAL_FS], &[]);
+        assert!(local_only.contains("- local: "), "{local_only}");
+        assert!(!local_only.contains("- host-files: "), "{local_only}");
         assert!(!local_only.contains("dev_view_file"), "{local_only}");
-        assert!(
-            !local_only.contains("Files on the connected host:"),
-            "{local_only}"
-        );
-        // …and the agent is told to say a capability is off rather than shell around it.
-        assert!(
-            local_only.contains("tell the user which capability is switched off"),
-            "{local_only}"
-        );
 
-        // A host with nothing switched on gets the shells and no file tools.
-        let bare = prompt_for(Vec::new());
-        assert!(bare.contains("- run_command:"), "{bare}");
+        // A host with nothing switched on keeps the commands and loses the file scopes.
+        let bare = prompt_for(Vec::new(), &[]);
+        assert!(bare.contains("- core: run_command"), "{bare}");
+        assert!(!bare.contains("- local: "), "{bare}");
         assert!(!bare.contains("local_fs_read_file"), "{bare}");
-        assert!(!bare.contains("dev_view_file"), "{bare}");
     }
 
     #[test]
@@ -5436,6 +5520,51 @@ mod tests {
             settings[CONVERSATION_KEY]["chats"].as_array().map(Vec::len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn loaded_scopes_are_written_back_and_read_again() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            CONVERSATION_KEY.to_owned(),
+            json!({
+                "model": "llama3.1",
+                "turns": [],
+                "history": [],
+                "scopes": [scopes::ROOT, "web", "not-a-scope"]
+            }),
+        );
+        let mut plugin = AiAgent::default();
+        draw(&mut plugin, &mut settings);
+        assert!(plugin.agent.scopes.contains("web"));
+        assert!(!plugin.agent.scopes.contains("not-a-scope"));
+        assert!(plugin.agent.scopes.contains(scopes::ROOT));
+        // Written back in graph order, with the unknown id dropped.
+        assert_eq!(settings[CONVERSATION_KEY]["scopes"], json!([scopes::ROOT, "web"]));
+    }
+
+    #[test]
+    fn the_loaded_scopes_show_over_the_composer_and_a_click_drops_one() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.scopes.load(super::scopes::find("host").unwrap());
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        // The composer panel settles its height on the first frame.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(rows.iter().any(|(_, _, text)| text == "Scopes"), "{rows:?}");
+        let chip = rows
+            .iter()
+            .find(|(_, _, text)| text == "host")
+            .cloned()
+            .unwrap_or_else(|| panic!("no chip for the loaded scope: {rows:?}"));
+        let pos = egui::Pos2::new(chip.1 as f32 + 4.0, chip.0 as f32 + 4.0);
+        frame(&mut plugin, &mut settings, &ctx, click_events(pos));
+        assert!(
+            !plugin.agent.scopes.contains("host"),
+            "the chip did not drop the scope"
+        );
+        assert!(plugin.agent.scopes.contains(scopes::ROOT));
     }
 
     #[test]

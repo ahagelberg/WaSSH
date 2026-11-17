@@ -11,6 +11,7 @@ mod protocol;
 mod providers;
 mod rag;
 mod rules;
+mod scopes;
 mod settings_ui;
 mod tools;
 mod view;

@@ -13,19 +13,20 @@ use super::permissions::{Permission, Permissions};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
     TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
-    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
-    TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
-    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ,
-    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
-    TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
-    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_LOAD_SCOPE, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST,
+    TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE,
+    TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT,
+    TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO,
+    TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
+    TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
+    TOOL_UNLOAD_SCOPE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
 use super::rules::{
     ApprovalScope, RuleDecision, approval_scopes, decide_command,
 };
+use super::scopes::{self, Loaded, Scope};
 use super::tools::{self, ToolResult};
 use super::web;
 use crate::plugin::SessionAccess;
@@ -323,6 +324,10 @@ pub struct Agent {
     pub tools: ToolSettings,
     /// What this host may do, read from the plugin settings.
     pub permissions: Permissions,
+    /// The scopes whose tools this conversation carries.
+    pub scopes: Loaded,
+    /// Characters the last request spent on the system prompt and the tool schemas.
+    pub prompt_chars: usize,
     /// Set when the model owes an answer to a tool result.
     pub needs_reply: bool,
     /// Messages the user typed while a run was in flight, in order.
@@ -408,6 +413,7 @@ impl Agent {
         self.queue.clear();
         self.needs_reply = false;
         self.compacted = None;
+        self.scopes = Loaded::new();
     }
 
     /// Add the user's turn, if the conversation is idle.
@@ -1008,8 +1014,88 @@ impl Agent {
     }
 
     /// Whether a tool should be offered to the model for this session.
+    ///
+    /// A tool exists, belongs to a scope this conversation loaded, and the host may use it.
+    /// That one answer decides both what the request carries and what the prompt names.
     pub fn offers_tool(&self, tool: &str) -> bool {
-        self.permission(tool) != Permission::Deny
+        (tools::is_scope_tool(tool) || self.scopes.holds(tool)) && self.permission(tool) != Permission::Deny
+    }
+
+    /// Bring a scope's tools into the conversation.
+    ///
+    /// The answer is what the model reads as the tool result: which scope it got, what it
+    /// holds, and what else it may load next. A scope it cannot see yet is refused here —
+    /// loading is how the graph is walked, not a way around it.
+    pub fn load_scope(&mut self, id: &str) -> Result<String, String> {
+        let Some(scope) = scopes::find(id.trim()) else {
+            return Err(self.scope_problem(id));
+        };
+        if self.scopes.contains(scope.id) {
+            return Ok(format!("{} is loaded already.", scope.id));
+        }
+        if !self.reachable(scope) {
+            return Err(self.scope_problem(id));
+        }
+        self.scopes.load(scope);
+        Ok(format!(
+            "Loaded {} ({} tools): {}.",
+            scope.id,
+            self.scope_tool_count(scope),
+            self.scope_names(scope)
+        ))
+    }
+
+    /// Take a loaded scope, and everything it nests, back out.
+    pub fn unload_scope(&mut self, id: &str) -> Result<String, String> {
+        if id == scopes::ROOT {
+            return Err(format!(
+                "{} holds the commands this conversation runs on and stays loaded.",
+                scopes::ROOT
+            ));
+        }
+        if !self.scopes.contains(id.trim()) {
+            return Err(self.scope_problem(id));
+        }
+        let removed = self.scopes.unload(id.trim());
+        Ok(format!("Unloaded {}.", removed.join(", ")))
+    }
+
+    /// Whether the graph lets this conversation load `scope` next.
+    fn reachable(&self, scope: &'static Scope) -> bool {
+        scopes::visible(&self.scopes, &self.permissions)
+            .iter()
+            .any(|candidate| candidate.id == scope.id)
+    }
+
+    /// What to tell the model about a scope it asked for and cannot have.
+    fn scope_problem(&self, id: &str) -> String {
+        let visible = scopes::visible(&self.scopes, &self.permissions);
+        let names: Vec<&str> = visible.iter().map(|scope| scope.id).collect();
+        if names.is_empty() {
+            return format!("'{}' is not available here, and nothing else can be loaded.", id.trim());
+        }
+        format!(
+            "'{}' is not available here. Loadable now: {}.",
+            id.trim(),
+            names.join(", ")
+        )
+    }
+
+    /// The tools a scope holds, as the model names them.
+    fn scope_names(&self, scope: &'static Scope) -> String {
+        let mut names = scope.tools.to_vec();
+        if let Some(pane) = scope.pane {
+            names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
+        }
+        names.join(", ")
+    }
+
+    /// How many tools a scope holds.
+    fn scope_tool_count(&self, scope: &'static Scope) -> usize {
+        scope.tools.len()
+            + scope
+                .pane
+                .map_or(0, |pane| crate::plugin::tools_of(pane).len())
     }
 
     /// Session-wide allow answers Ask decisions but leaves command Deny rules intact.
@@ -1045,6 +1131,21 @@ impl Agent {
             );
             return;
         }
+        // A tool the conversation never loaded is not in the request, so a model that
+        // names one is recalling it from earlier: say which scope brings it back.
+        if !tools::is_scope_tool(&name) && !self.scopes.holds(&name) {
+            let scope = tools::scope_for(&name).unwrap_or(scopes::ROOT);
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                format!("{name} is not loaded in this conversation. Call load_scope with \"{scope}\" first."),
+                true,
+                session,
+            );
+            return;
+        }
 
         // Everything that needs the session checks once, up front.
         // `run_command` asks for approval first, so it keeps its own check.
@@ -1064,6 +1165,24 @@ impl Agent {
         }
 
         match name.as_str() {
+            TOOL_LOAD_SCOPE => {
+                let asked = arguments["scope"].as_str().unwrap_or_default().to_owned();
+                let (output, failed) = match self.load_scope(&asked) {
+                    Ok(message) => (message, false),
+                    Err(problem) => (problem, true),
+                };
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, failed, session);
+            }
+            TOOL_UNLOAD_SCOPE => {
+                let asked = arguments["scope"].as_str().unwrap_or_default().to_owned();
+                let (output, failed) = match self.unload_scope(&asked) {
+                    Ok(message) => (message, false),
+                    Err(problem) => (problem, true),
+                };
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, failed, session);
+            }
             TOOL_ASK_USER => {
                 let questions = arguments["questions"]
                     .as_array()
@@ -2081,6 +2200,8 @@ pub fn call_label(call: &ApiToolCall) -> String {
         TOOL_SYSTEM_DISK => "disk usage".to_owned(),
         TOOL_SYSTEM_MEMORY => "memory report".to_owned(),
         TOOL_ASK_USER => "question".to_owned(),
+        TOOL_LOAD_SCOPE => format!("load {}", arguments["scope"].as_str().unwrap_or_default()),
+        TOOL_UNLOAD_SCOPE => format!("unload {}", arguments["scope"].as_str().unwrap_or_default()),
         other => other.to_owned(),
     }
 }
@@ -2827,6 +2948,7 @@ mod tests {
     #[test]
     fn a_pane_tool_runs_the_command_it_builds_once_approved() {
         let mut agent = Agent::new();
+        when_offered(&mut agent, "docker_start");
         let mut fake = FakeSession::default();
         fake.answers.insert(
             EXEC_KEY.to_owned(),
@@ -3237,6 +3359,7 @@ mod tests {
             ),
         ]));
         agent.app_deny = vec!["systemctl stop*".to_owned()];
+        agent.scopes.load(scopes::find("host-terminal").unwrap());
         assert!(agent.offers_tool(TOOL_TERMINAL_KEYS));
         assert!(!agent.offers_tool(TOOL_TERMINAL_WRITE));
 
@@ -3313,6 +3436,7 @@ mod tests {
             Value::Bool(true),
         )]));
         agent.tools.rag_folders = vec![std::env::temp_dir().display().to_string()];
+        when_offered(&mut agent, TOOL_RAG_SEARCH);
         let mut session: Option<&mut dyn SessionAccess> = None;
         agent.begin_tool(
             ApiToolCall {
@@ -3326,6 +3450,76 @@ mod tests {
             matches!(agent.phase, Some(Phase::Running { .. })),
             "no approval"
         );
+    }
+
+    #[test]
+    fn the_scope_tools_walk_the_graph_and_carry_the_tools_along() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_REMOTE_FS),
+            Value::Bool(true),
+        )]));
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        let mut ask = |agent: &mut Agent, name: &str, scope: &str| {
+            agent.begin_tool(
+                ApiToolCall {
+                    id: format!("{name} {scope}"),
+                    name: name.to_owned(),
+                    arguments: format!(r#"{{"scope":"{scope}"}}"#),
+                },
+                &mut session,
+            );
+            match agent.turns.last() {
+                Some(Turn::Tool { output, failed, .. }) => (*failed, output.clone()),
+                other => panic!("expected a tool turn, got {other:?}"),
+            }
+        };
+
+        // A child is only reachable once the scope above it is loaded.
+        let (failed, output) = ask(&mut agent, TOOL_LOAD_SCOPE, "host-files");
+        assert!(failed, "{output}");
+        assert!(output.contains("Loadable now: host"), "{output}");
+
+        // A tool the host may use, in a scope that is not loaded, is answered instead of run.
+        let mut fake = FakeSession::default();
+        let mut connected: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "read".to_owned(),
+                name: TOOL_REMOTE_READ.to_owned(),
+                arguments: r#"{"path":"/etc/hosts"}"#.to_owned(),
+            },
+            &mut connected,
+        );
+        assert!(
+            matches!(
+                agent.turns.last(),
+                Some(Turn::Tool { failed: true, output, .. })
+                    if output.contains("load_scope") && output.contains("host-files")
+            ),
+            "{:?}",
+            agent.turns.last()
+        );
+
+        let (failed, output) = ask(&mut agent, TOOL_LOAD_SCOPE, "host");
+        assert!(!failed, "{output}");
+        assert!(agent.scopes.contains("host"));
+        let (failed, output) = ask(&mut agent, TOOL_LOAD_SCOPE, "host");
+        assert!(!failed, "{output}");
+        assert!(output.contains("already"), "{output}");
+        let (failed, output) = ask(&mut agent, TOOL_LOAD_SCOPE, "host-files");
+        assert!(!failed, "{output}");
+        assert!(output.contains("12 tools"), "{output}");
+        assert!(agent.offers_tool(TOOL_DEV_VIEW));
+
+        // Unloading takes the tools back out; the root stays whatever is asked.
+        let (failed, output) = ask(&mut agent, TOOL_UNLOAD_SCOPE, "host");
+        assert!(!failed, "{output}");
+        assert!(!agent.offers_tool(TOOL_DEV_VIEW));
+        let (failed, output) = ask(&mut agent, TOOL_UNLOAD_SCOPE, scopes::ROOT);
+        assert!(failed, "{output}");
+        assert!(agent.scopes.contains(scopes::ROOT));
+        assert!(agent.offers_tool(TOOL_RUN_COMMAND));
     }
 
     #[test]
@@ -3353,6 +3547,7 @@ mod tests {
     #[test]
     fn a_remote_tool_without_a_session_says_so() {
         let mut agent = Agent::new();
+        when_offered(&mut agent, TOOL_REMOTE_LIST);
         let mut session: Option<&mut dyn SessionAccess> = None;
         agent.begin_tool(
             ApiToolCall {
@@ -3509,8 +3704,16 @@ mod tests {
         }
     }
 
+    /// Load the scope a tool lives in, the way a request carrying that tool would have.
+    fn when_offered(agent: &mut Agent, tool: &str) {
+        if let Some(scope) = super::scopes::scope_of(tool) {
+            agent.scopes.load(scope);
+        }
+    }
+
     /// Drive one tool call against `fake` until it settles.
     fn run_tool(agent: &mut Agent, fake: &mut FakeSession, name: &str, arguments: &str) -> String {
+        when_offered(agent, name);
         let mut session: Option<&mut dyn SessionAccess> = Some(fake);
         agent.begin_tool(
             ApiToolCall {
@@ -3584,6 +3787,7 @@ mod tests {
     #[test]
     fn a_remote_edit_writes_owned_bytes_and_reports_the_diff() {
         let mut agent = Agent::new();
+        when_offered(&mut agent, TOOL_REMOTE_EDIT);
         let mut fake = FakeSession::default();
         // The edit resolves `translated.txt` against the working directory.
         fake.contents
@@ -3788,6 +3992,7 @@ mod tests {
     fn a_wait_returns_once_the_screen_changes() {
         let mut agent = Agent::new();
         agent.now_ms = 1_000;
+        when_offered(&mut agent, TOOL_TERMINAL_WAIT);
         let mut fake = FakeSession {
             screen: "working".to_owned(),
             ..FakeSession::default()

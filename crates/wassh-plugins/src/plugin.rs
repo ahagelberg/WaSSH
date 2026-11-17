@@ -184,11 +184,15 @@ impl PluginTool {
 
 /// Every tool the built-in panes offer the AI agent.
 pub fn tools() -> impl Iterator<Item = &'static PluginTool> {
-    let none: &'static [PluginTool] = &[];
-    PluginId::ALL.into_iter().flat_map(move |id| match id {
+    PluginId::ALL.into_iter().flat_map(tools_of)
+}
+
+/// The tools one pane offers the AI agent.
+pub fn tools_of(id: PluginId) -> &'static [PluginTool] {
+    match id {
         PluginId::DockerManager => crate::docker::TOOLS.as_slice(),
-        _ => none,
-    })
+        _ => &[],
+    }
 }
 
 /// A built-in plugin view.
