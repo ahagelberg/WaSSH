@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.0.14] - 2026-11-18
+
+### Added
+
+- Give the AI agent's tools a graph of scopes the model walks on demand, instead of sending the
+  schemas of all 48 tools on every request. A chat starts with the commands themselves plus two
+  new tools, `load_scope` and `unload_scope`; a scope is loaded when the model needs it and can be
+  dropped again.
+  - The graph nests — `host` holds files, system statistics and the terminal — and carries "see
+    also" edges, so a scope related to a loaded one can be loaded without walking through its
+    parent. An edge only widens what may be loaded next and never loads anything itself.
+  - Only what a loaded scope holds is sent, only the scopes this host may use are offered at all,
+    and a scope whose capability is switched off in the host settings never appears.
+  - What a conversation loaded travels with it: the live chat and every chat in the history keep
+    their own set, and a reload restores it.
+  - The pane shows the loaded scopes as chips over the composer; a click unloads one, along with
+    everything inside it, and frees the room its schemas took in the prompt.
+  - A call to a tool from a scope that is not loaded is answered with the scope to load rather
+    than being run.
+
+### Changed
+
+- The AI agent's prompt names the loaded scopes and their tools and lists what can be loaded
+  next, instead of describing every tool on every turn. The guidance for a family of tools
+  (files, terminal, shells) appears once that family is loaded, so a switched-off capability is
+  never named.
+- Auto-compaction measures the request that is actually sent — the loaded schemas and the prompt
+  — instead of reserving a fixed 4 000 tokens for the whole toolset, giving a conversation that
+  carries one or two scopes its room back.
+
 ## [2.0.13] - 2026-11-16
 
 ### Added
