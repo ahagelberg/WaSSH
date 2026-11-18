@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.0.15] - 2026-11-18
+
+### Added
+
+- Give the agent an environment map of the host, built once and answered from its own tools:
+  `env_scan` walks a root in two passes (one `find` for files with size and age, one `grep` for
+  declarations) and stores the result, `env_search` ranks a phrase against the mapped files, and
+  `env_find`, `env_outline` and `env_overview` answer from the map without touching the host, so
+  "where is this handled?" no longer costs a grep per question. `env_system` records the operating
+  system, the listening sockets and the running services, and answers from what it holds
+  afterwards. The map lives in the host's plugin data, survives a restart, is shared by every chat
+  on that connection and is invalidated path by path as the agent writes.
+- Loaded scopes are quiet neutral tags under a "Loaded scopes:" caption over the composer, with a
+  tooltip saying a click removes the scope from the context. A click opens the scope's details —
+  its summary, how many tools it carries, their names, and a "Turn off" action — instead of
+  dropping it straight away.
+- The AI chat list works like the reference: a chat shows only a back button and its own title in
+  place of the title in the pane header, and the back button files the settled chat and shows the
+  list newest first. The list shares the composer, where a typed prompt starts and enters a new
+  chat while a run in flight stays in its own conversation.
+- Draw the interface in the platform's own UI face: the window installs the system font first in
+  the proportional family and keeps egui's own behind it for the glyphs a system face lacks, so
+  labels, dialogs and chat text belong to the desktop instead of to the bundled font.
+- Options and a host's Appearance offer the installed font families in a dropdown, and the terminal
+  draws, measures and caches its cells in the family a session names instead of egui's monospace.
+  Registration happens in the frame loop, so a family chosen in Options reaches the tabs already
+  open.
+
+### Changed
+
+- Steer the agent to the file tools instead of the shell: the scope index names the `dev_*` tools
+  the host scope holds, `run_command` says what it is not for, and the guidelines lead with tools
+  over `cat`, `grep` and `sed` and name the scope to load when the file tools are not loaded yet.
+- The AI pane's back button is drawn at its own size in the pane's colours, instead of a glyph that
+  came out too small in whatever colour the font gave it.
+- OpenAI-compatible providers get a reply's `reasoning_content` echoed back with the assistant turn,
+  so a model that reasons before answering keeps that context across tool calls.
+
 ## [2.0.14] - 2026-11-18
 
 ### Added
