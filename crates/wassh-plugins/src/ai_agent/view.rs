@@ -44,6 +44,8 @@ use crate::{PluginId, PluginManifest};
 const CONVERSATION_KEY: &str = "conversation";
 /// Key the host's environment map is stored under.
 const MAP_KEY: &str = "envMap";
+/// Key the host's ports and services are stored under.
+const SYSTEM_KEY: &str = "envSystem";
 /// The scope that holds the environment map.
 const ENV_SCOPE: &str = "env";
 /// Settings [`AiAgent::apply_settings`] derives the agent's rules and tools from, besides
@@ -75,6 +77,8 @@ const COMPACTED_HEADING: &str = "Earlier conversation, compacted:";
 /// Heading of the environment map's digest in the system prompt.
 const MAP_HEADING: &str =
     "Environment map (query it with env_find and env_outline; refresh with env_scan):";
+/// Heading of the host's ports and services in the system prompt.
+const SYSTEM_HEADING: &str = "Host setup (from env_system):";
 /// Transcript note left where the conversation was compacted.
 const COMPACTED_NOTICE: &str = "Earlier messages were compacted into a summary:";
 /// Gap between the provider and model dropdowns under the composer.
@@ -398,6 +402,8 @@ pub struct AiAgent {
     scope_popup: Option<ScopePopup>,
     /// Map revision the host's plugin data holds, so a change is written once.
     map_saved: u64,
+    /// System-facts revision the host's plugin data holds.
+    system_saved: u64,
     /// Set by the popup: rebuild the map on the next frame.
     map_rebuild: bool,
     /// Which of the pane's two views is drawn.
@@ -456,6 +462,7 @@ impl Default for AiAgent {
             copied: None,
             scope_popup: None,
             map_saved: 0,
+            system_saved: 0,
             map_rebuild: false,
             view: ChatView::List,
         }
@@ -675,6 +682,11 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             lines.push(MAP_HEADING.to_owned());
             lines.push(self.agent.map.overview());
         }
+        if self.agent.scopes.contains(ENV_SCOPE) && !self.agent.system.is_empty() {
+            lines.push(String::new());
+            lines.push(SYSTEM_HEADING.to_owned());
+            lines.push(self.agent.system.summary());
+        }
         lines.push(String::new());
         lines.push("Guidelines:".to_owned());
         lines.extend(self.tool_guidance());
@@ -781,11 +793,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         if self.agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
             lines.push(
-                "- Look in the environment map before searching the tree: env_find answers \
-                 \"where is X\" without touching the host, and env_outline describes a file \
-                 without reading it. Call env_scan for a directory the map does not hold yet, \
-                 and again once the tree has changed much. The dev_* search and read tools are \
-                 for what the map cannot answer."
+                "- Look in the environment map before searching the tree: env_search ranks \
+                 files by how well their path and declarations answer a phrase, env_find \
+                 answers \"where is X\", and env_outline describes a file, all without touching \
+                 the host. Call env_scan for a directory the map does not hold yet. env_system \
+                 says what listens on a port and which services run. The dev_* search and read \
+                 tools are for what the map cannot answer."
                     .to_owned(),
             );
         }
@@ -1139,6 +1152,8 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         // The map belongs to the host, so it survives every chat on the connection.
         self.agent.map = super::map::EnvMap::from_json(settings.get(MAP_KEY));
         self.map_saved = self.agent.map.revision;
+        self.agent.system = super::map::SystemFacts::from_json(settings.get(SYSTEM_KEY));
+        self.system_saved = self.agent.system.revision;
         // The pane opens on the conversation it was in, or on the list when there is none.
         if !self.agent.turns.is_empty() {
             self.view = ChatView::Chat;
@@ -3636,6 +3651,10 @@ impl Plugin for AiAgent {
             self.map_saved = self.agent.map.revision;
             context.set_value(MAP_KEY, self.agent.map.to_json());
         }
+        if self.agent.system.revision != self.system_saved {
+            self.system_saved = self.agent.system.revision;
+            context.set_value(SYSTEM_KEY, self.agent.system.to_json());
+        }
         // A run in flight, a summary or an attachment being read all finish outside a frame.
         if self.agent.busy()
             || self.summary.is_some()
@@ -6095,12 +6114,35 @@ mod tests {
         assert!(with.contains(MAP_HEADING), "{with}");
         assert!(with.contains("/srv/app (2 files"), "{with}");
         assert!(with.contains("src/  2"), "{with}");
-        assert!(with.contains("env_find answers"), "{with}");
+        assert!(with.contains("env_search ranks files"), "{with}");
 
         // An empty map says nothing rather than costing prompt room.
         plugin.agent.map.clear();
         let empty = plugin.system_prompt(&settings, "dev", "a test shell");
         assert!(!empty.contains(MAP_HEADING), "{empty}");
+        settings.clear();
+    }
+
+    #[test]
+    fn the_prompt_carries_the_host_setup_once_it_has_been_scanned() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        plugin.agent.scopes.load(super::super::scopes::find("host").unwrap());
+        plugin.agent.scopes.load(super::super::scopes::find("env").unwrap());
+        let without = plugin.system_prompt(&settings, "dev", "a test shell");
+        assert!(
+            !without.contains(SYSTEM_HEADING),
+            "nothing scanned, nothing claimed: {without}"
+        );
+
+        plugin.agent.system = super::super::map::SystemFacts::parse(
+            1,
+            "__wassh_os__\nLinux 6.1\n__wassh_ports__\n:8080 nginx\n__wassh_units__\nnginx.service\n",
+        );
+        let with = plugin.system_prompt(&settings, "dev", "a test shell");
+        assert!(with.contains(SYSTEM_HEADING), "{with}");
+        assert!(with.contains(":8080 nginx"), "{with}");
+        assert!(with.contains("nginx.service"), "{with}");
         settings.clear();
     }
 

@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
-    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_LOAD_SCOPE, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
+    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
     TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
     TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
     TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
@@ -247,6 +248,16 @@ its declarations with line numbers, without reading the file.",
         name: TOOL_ENV_OVERVIEW,
         description: "The environment map's directory digest: how many files each directory holds \
 and which files changed most recently.",
+    },
+    ToolSpec {
+        name: TOOL_ENV_SEARCH,
+        description: "Rank mapped files by how well their path and declarations answer a phrase, \
+best first. The way to start an \"where is this handled\" question: no host call, no grep.",
+    },
+    ToolSpec {
+        name: TOOL_ENV_SYSTEM,
+        description: "Read how the host is set up: its operating system, the sockets it listens \
+on and the services it runs. Answers \"what serves :8080\" without an ss or systemctl call.",
     },
     ToolSpec {
         name: TOOL_TERMINAL_READ,
@@ -499,6 +510,14 @@ fn parameters(name: &str) -> (Value, Value) {
             json!(["path"]),
         ),
         TOOL_ENV_OVERVIEW => (json!({}), json!([])),
+        TOOL_ENV_SEARCH => (
+            json!({
+                "query": string("What to look for, in a few words: \"tab title\", \"auth resolve\"."),
+                "limit": number("Most files to return (default 10, cap 100).")
+            }),
+            json!(["query"]),
+        ),
+        TOOL_ENV_SYSTEM => (json!({}), json!([])),
         TOOL_LOCAL_RUN => (
             json!({
                 "command": string("The command line to run, exactly as it would be typed."),
@@ -667,6 +686,7 @@ pub fn needs_session(name: &str) -> bool {
         || matches!(
             name,
         TOOL_ENV_SCAN
+            | TOOL_ENV_SYSTEM
             | TOOL_RUN_COMMAND
             | TOOL_RUN_SUDO
             | TOOL_REMOTE_READ

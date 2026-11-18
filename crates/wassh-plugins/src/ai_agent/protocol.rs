@@ -107,6 +107,10 @@ pub const TOOL_ENV_FIND: &str = "env_find";
 pub const TOOL_ENV_OUTLINE: &str = "env_outline";
 /// Tool: the map's directory digest.
 pub const TOOL_ENV_OVERVIEW: &str = "env_overview";
+/// Tool: rank mapped files by how well they answer a phrase.
+pub const TOOL_ENV_SEARCH: &str = "env_search";
+/// Tool: the host's ports and running services.
+pub const TOOL_ENV_SYSTEM: &str = "env_system";
 /// Tool: read the terminal screen.
 pub const TOOL_TERMINAL_READ: &str = "terminal_read";
 /// Tool: type into the terminal.

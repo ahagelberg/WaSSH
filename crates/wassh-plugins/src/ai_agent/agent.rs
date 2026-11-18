@@ -10,11 +10,12 @@ use std::sync::mpsc::Receiver;
 use serde_json::Value;
 
 use super::permissions::{Permission, Permissions};
-use super::map::EnvMap;
+use super::map::{EnvMap, SystemFacts};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
     TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
-    TOOL_ENV_FIND, TOOL_ENV_OUTLINE, TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_LOAD_SCOPE,
+    TOOL_ENV_FIND, TOOL_ENV_OUTLINE, TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH,
+    TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
@@ -43,6 +44,8 @@ type Session<'a, 'b> = &'a mut Option<&'b mut dyn SessionAccess>;
 pub const MAX_OUTPUT_CHARS: usize = 64_000;
 /// Hits `env_find` returns when the call does not say.
 const ENV_FIND_HITS_DEFAULT: usize = 30;
+/// Files `env_search` ranks when the call does not say.
+const ENV_SEARCH_HITS_DEFAULT: usize = 10;
 /// How much of the raw tail is kept so the markers are never cut off.
 pub const MARKER_TAIL_CHARS: usize = 4_000;
 /// Key the session caches the running command under.
@@ -252,6 +255,8 @@ pub enum CommandThen {
         /// Directory the scan walked.
         root: String,
     },
+    /// Read the output as the host's ports and services.
+    ScanSystem,
     /// Write a remote file once the probe says whether it exists.
     WriteRemote {
         /// Destination.
@@ -363,6 +368,8 @@ pub struct Agent {
     pub compacted: Option<String>,
     /// The environment map of the host, which outlives the conversation.
     pub map: EnvMap,
+    /// How the host is set up: its ports and services, which also outlive the conversation.
+    pub system: SystemFacts,
     /// A map scan the pane asked for: the root, until its output arrives.
     pub map_scan: Option<String>,
 }
@@ -641,6 +648,18 @@ impl Agent {
                             self.label(turn),
                             command_result_text(&visible, exit_code, truncated),
                             exit_code.is_some_and(|code| code != 0) || refused_sudo,
+                        )
+                    }
+                    CommandThen::ScanSystem => {
+                        let text = output
+                            .as_ref()
+                            .map(|output| format!("{}{}", output.stdout, output.stderr))
+                            .unwrap_or_else(|| failure.unwrap_or_default());
+                        self.system = SystemFacts::parse(self.now_ms, &text);
+                        Ready::Settle(
+                            "env_system".to_owned(),
+                            self.system.summary(),
+                            false,
                         )
                     }
                     CommandThen::ScanMap { root } => {
@@ -1801,6 +1820,38 @@ impl Agent {
                 let failed = self.map.is_empty();
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
+            }
+            TOOL_ENV_SEARCH => {
+                let query = arguments["query"].as_str().unwrap_or_default();
+                let limit = arguments["limit"]
+                    .as_u64()
+                    .map_or(ENV_SEARCH_HITS_DEFAULT, |value| value as usize);
+                let hits = self.map.search(query, limit);
+                let (output, failed) = if hits.is_empty() {
+                    (
+                        format!(
+                            "Nothing in the environment map answers \"{query}\". Try \
+                             env_find, or env_scan the directory if it is not mapped."
+                        ),
+                        false,
+                    )
+                } else {
+                    (hits.join("\n"), false)
+                };
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, failed, session);
+            }
+            TOOL_ENV_SYSTEM => {
+                // One scan per conversation is enough: it is host state, and env_system
+                // returns what it holds rather than re-reading the host every turn.
+                if self.system.is_empty() {
+                    let command = SystemFacts::scan_command();
+                    self.run_probe(call, turn, CommandThen::ScanSystem, command, session);
+                } else {
+                    let output = self.system.summary();
+                    let label = call_label(&call);
+                    self.settle(call, turn, label, output, false, session);
+                }
             }
             _ => {
                 let label = call_label(&call);

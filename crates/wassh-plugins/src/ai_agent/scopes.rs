@@ -14,7 +14,8 @@ use super::permissions::Permissions;
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
-    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOCAL_DELETE,
+    TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP,
     TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ,
     TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
     TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND,
@@ -67,9 +68,17 @@ system statistics, the live terminal.",
     Scope {
         id: "env",
         summary: "The environment map: every file under a root with its size, age and \
-declarations, built by env_scan and queried with env_find, env_outline and env_overview \
-without touching the host. Cheaper than dev_grep_search or dev_find_files for \"where is X\".",
-        tools: &[TOOL_ENV_SCAN, TOOL_ENV_FIND, TOOL_ENV_OUTLINE, TOOL_ENV_OVERVIEW],
+declarations, built by env_scan and queried with env_search, env_find, env_outline and \
+env_overview without touching the host, plus env_system for the host's ports and services. \
+Cheaper than dev_grep_search or dev_find_files for \"where is X\".",
+        tools: &[
+            TOOL_ENV_SCAN,
+            TOOL_ENV_SEARCH,
+            TOOL_ENV_FIND,
+            TOOL_ENV_OUTLINE,
+            TOOL_ENV_OVERVIEW,
+            TOOL_ENV_SYSTEM,
+        ],
         pane: None,
         children: &[],
         related: &["host-files", "host-system"],

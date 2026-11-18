@@ -26,6 +26,12 @@ pub const MAX_SCAN_SYMBOLS: usize = 4_000;
 pub const MAX_SYMBOL_CHARS: usize = 120;
 /// Hits `env_find` reports at most.
 pub const MAX_FIND_HITS: usize = 100;
+/// Score a query token adds when a file's path holds it.
+const PATH_WEIGHT: usize = 3;
+/// Score a query token adds when one of a file's declarations holds it.
+const SYMBOL_WEIGHT: usize = 2;
+/// Entries one system scan keeps per section.
+pub const MAX_SYSTEM_ENTRIES: usize = 60;
 /// Directories between two lines of an overview.
 pub const OVERVIEW_DEPTH: usize = 2;
 /// Group name for the files that sit in the root itself.
@@ -266,6 +272,48 @@ impl EnvMap {
             .collect()
     }
 
+    /// Files ranked by how well their path and declarations answer `query`.
+    ///
+    /// A token in the path counts for more than one in a declaration, and every token a
+    /// file matches adds to its score, so a phrase like "render tab title" puts the file
+    /// that names both first.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
+        let tokens: Vec<String> = query
+            .to_lowercase()
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let limit = limit.clamp(1, MAX_FIND_HITS);
+        let mut scored: Vec<(usize, String)> = Vec::new();
+        for (path, node) in &self.nodes {
+            let name = path.to_lowercase();
+            let symbols: String = node.symbols.join(" ").to_lowercase();
+            let mut score = 0usize;
+            for token in &tokens {
+                if name.contains(token.as_str()) {
+                    score += PATH_WEIGHT;
+                }
+                if symbols.contains(token.as_str()) {
+                    score += SYMBOL_WEIGHT;
+                }
+            }
+            if score > 0 {
+                scored.push((score, path.clone()));
+            }
+        }
+        // Best first, and alphabetical among equals so the answer is stable.
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, path)| path)
+            .collect()
+    }
+
     /// What the map knows about one file: its size, age and declarations.
     pub fn outline(&self, path: &str) -> Option<String> {
         let node = self.nodes.get(path)?;
@@ -345,6 +393,152 @@ fn outline_of(symbols: &[String]) -> Option<String> {
             .join("\n")
     })
 }
+
+/// How the host itself is set up: what it runs and what listens.
+///
+/// The second half of the map. A files map answers "where is this code"; these facts answer
+/// "what serves that port", which otherwise costs the agent a handful of `ss` and
+/// `systemctl` calls per conversation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemFacts {
+    /// Kernel and operating system line.
+    pub os: String,
+    /// When the scan ran, in milliseconds since the epoch.
+    pub built_ms: u64,
+    /// Listening sockets: address, port and process.
+    pub listening: Vec<String>,
+    /// Running services.
+    pub services: Vec<String>,
+    /// Bumped on every change, so the pane knows when its stored copy is stale.
+    pub revision: u64,
+}
+
+impl SystemFacts {
+    /// Whether nothing has been scanned yet.
+    pub fn is_empty(&self) -> bool {
+        self.os.is_empty() && self.listening.is_empty() && self.services.is_empty()
+    }
+
+    /// One command that prints the three sections, each optional on a host that lacks it.
+    pub fn scan_command() -> String {
+        format!(
+            "echo {os}; uname -srm 2>/dev/null; \
+             echo {ports}; (ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null) \
+             | tail -n +2 | head -n {max}; \
+             echo {units}; (systemctl list-units --type=service --state=running \
+             --no-legend --no-pager 2>/dev/null || service --status-all 2>/dev/null) \
+             | head -n {max}",
+            os = SYSTEM_OS_MARKER,
+            ports = SYSTEM_PORTS_MARKER,
+            units = SYSTEM_UNITS_MARKER,
+            max = MAX_SYSTEM_ENTRIES,
+        )
+    }
+
+    /// Read a scan's output back.
+    pub fn parse(built_ms: u64, output: &str) -> Self {
+        let mut facts = Self {
+            built_ms,
+            revision: 1,
+            ..Self::default()
+        };
+        let mut section = "";
+        for line in output.lines() {
+            match line.trim() {
+                SYSTEM_OS_MARKER => section = "os",
+                SYSTEM_PORTS_MARKER => section = "listening",
+                SYSTEM_UNITS_MARKER => section = "services",
+                _ => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match section {
+                        "os" => {
+                            if facts.os.is_empty() {
+                                facts.os = line.to_owned();
+                            }
+                        }
+                        "listening" if facts.listening.len() < MAX_SYSTEM_ENTRIES => {
+                            facts.listening.push(line.to_owned());
+                        }
+                        "services" if facts.services.len() < MAX_SYSTEM_ENTRIES => {
+                            facts.services.push(line.to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        facts
+    }
+
+    /// What the prompt and the popup say about it.
+    pub fn summary(&self) -> String {
+        if self.is_empty() {
+            return "Nothing scanned yet. env_system reads the host's ports and services."
+                .to_owned();
+        }
+        let mut lines = vec![format!("Host: {}", self.os)];
+        if !self.listening.is_empty() {
+            lines.push("Listening:".to_owned());
+            lines.extend(self.listening.iter().cloned());
+        }
+        if !self.services.is_empty() {
+            lines.push("Running services:".to_owned());
+            lines.extend(self.services.iter().cloned());
+        }
+        lines.join("\n")
+    }
+
+    /// Forget everything.
+    pub fn clear(&mut self) {
+        let revision = self.revision + 1;
+        *self = Self {
+            revision,
+            ..Self::default()
+        };
+    }
+
+    /// The stored shape.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "version": MAP_VERSION,
+            "os": self.os,
+            "builtMs": self.built_ms,
+            "revision": self.revision,
+            "listening": self.listening,
+            "services": self.services,
+        })
+    }
+
+    /// Read a stored copy back.
+    pub fn from_json(value: Option<&Value>) -> Self {
+        let Some(value) = value else {
+            return Self::default();
+        };
+        let lines = |key: &str| -> Vec<String> {
+            value[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|line| line.as_str().map(str::to_owned))
+                .collect()
+        };
+        Self {
+            os: value["os"].as_str().unwrap_or_default().to_owned(),
+            built_ms: value["builtMs"].as_u64().unwrap_or_default(),
+            revision: value["revision"].as_u64().unwrap_or_default(),
+            listening: lines("listening"),
+            services: lines("services"),
+        }
+    }
+}
+
+/// Section markers the system scan prints.
+const SYSTEM_OS_MARKER: &str = "__wassh_os__";
+const SYSTEM_PORTS_MARKER: &str = "__wassh_ports__";
+const SYSTEM_UNITS_MARKER: &str = "__wassh_units__";
 
 /// Directories a scan leaves alone: the same set the search tools skip.
 const SKIPPED_DIRS: &str =
@@ -472,5 +666,63 @@ __wassh_symbols__
         assert!(map.nodes.contains_key("/srv/app/src/main.rs"));
         map.forget_suffix("/");
         assert_eq!(map.len(), 2, "a bare slash forgets nothing");
+    }
+
+    #[test]
+    fn search_weights_the_path_above_the_declarations() {
+        let map = EnvMap::parse("/srv/app", 0, SCAN);
+        let hits = map.search("main.rs", 10);
+        assert_eq!(hits.first().map(String::as_str), Some("/srv/app/src/main.rs"));
+        // "run" is only a declaration, so it still finds the file.
+        assert_eq!(map.search("run", 10), ["/srv/app/src/lib.rs"]);
+        assert!(map.search("   ", 10).is_empty());
+        assert!(map.search("nothing-like-this", 10).is_empty());
+    }
+
+    #[test]
+    fn a_system_scan_becomes_ports_and_services() {
+        const OUTPUT: &str = "__wassh_os__\nLinux 6.1.0 x86_64\n__wassh_ports__\n\
+                              tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\n\
+                              tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* users:((\"nginx\",pid=2,fd=6))\n\
+                              __wassh_units__\n\
+                              ssh.service loaded active running OpenBSD Secure Shell server\n";
+        let facts = SystemFacts::parse(7, OUTPUT);
+        assert_eq!(facts.os, "Linux 6.1.0 x86_64");
+        assert_eq!(facts.listening.len(), 2);
+        assert!(facts.listening[1].contains(":8080"), "{:?}", facts.listening);
+        assert_eq!(facts.services.len(), 1);
+        let summary = facts.summary();
+        assert!(summary.contains("Listening:"), "{summary}");
+        assert!(summary.contains("Running services:"), "{summary}");
+        assert!(!facts.is_empty());
+    }
+
+    #[test]
+    fn a_host_without_ss_or_systemd_scans_empty_but_says_what_it_found() {
+        let facts = SystemFacts::parse(0, "__wassh_os__\nLinux 6.1\n__wassh_ports__\n\
+                                       __wassh_units__\n");
+        assert_eq!(facts.os, "Linux 6.1");
+        assert!(facts.listening.is_empty());
+        assert!(!facts.is_empty());
+        assert!(SystemFacts::default().summary().contains("Nothing scanned"));
+    }
+
+    #[test]
+    fn system_facts_survive_a_round_trip_and_clearing_bumps_the_revision() {
+        let mut facts = SystemFacts::parse(5, "__wassh_os__\nLinux\n__wassh_ports__\n:22\n");
+        let restored = SystemFacts::from_json(Some(&facts.to_json()));
+        assert_eq!(restored, facts);
+        facts.clear();
+        assert!(facts.is_empty());
+        assert_eq!(facts.revision, 2);
+        assert_eq!(SystemFacts::from_json(None), SystemFacts::default());
+    }
+
+    #[test]
+    fn the_system_scan_asks_for_the_three_sections() {
+        let command = SystemFacts::scan_command();
+        assert!(command.contains(SYSTEM_OS_MARKER));
+        assert!(command.contains("ss -lntup"), "{command}");
+        assert!(command.contains("systemctl list-units"), "{command}");
     }
 }
