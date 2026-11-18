@@ -422,6 +422,19 @@ fn derived_setting(key: &str) -> bool {
         || key.starts_with(METHOD_KEY_PREFIX)
 }
 
+/// Whether `name` is a tool that reads, searches or changes files on the connected host.
+///
+/// The `dev_*` tools are the richer set; the `remote_fs_*` ones cover what they do not,
+/// such as deleting.
+fn is_host_file_tool(name: &str) -> bool {
+    name.starts_with("dev_") || name.starts_with("remote_fs_")
+}
+
+/// Whether `name` is a tool that works on the files of this computer.
+fn is_local_file_tool(name: &str) -> bool {
+    name.starts_with("local_fs_")
+}
+
 /// Read a settings value as trimmed text.
 fn setting_text(settings: &serde_json::Map<String, Value>, key: &str) -> String {
     settings
@@ -585,7 +598,9 @@ impl AiAgent {
             // Tools arrive by scope: sending every schema on every turn would spend the
             // prompt on tools nobody asked for.
             "Tools come in scopes, and only a loaded scope's tools can be called. Bring in \
-another scope with load_scope and drop one with unload_scope."
+another scope with load_scope and drop one with unload_scope. Loading the scope a task \
+needs is the normal first step: the shell is the fallback, not the first choice. A scope \
+that shows no tools of its own is a step on the way: loading it opens the scopes it nests."
                 .to_owned(),
             String::new(),
             "Loaded scopes:".to_owned(),
@@ -646,34 +661,64 @@ another scope with load_scope and drop one with unload_scope."
         names
     }
 
+    /// The scope this conversation would load to get at the host's files, and the file tools
+    /// it holds.
+    ///
+    /// Naming them while they are not loaded is what stops the agent from reading, searching
+    /// and editing files with `cat`, `grep` and `sed` instead of loading the scope.
+    fn host_file_scope(&self) -> Option<(&'static str, String)> {
+        let scope = scopes::visible(&self.agent.scopes, &self.agent.permissions)
+            .into_iter()
+            .find(|scope| scope.tools.iter().any(|name| is_host_file_tool(name)))?;
+        let names: Vec<&str> = scope
+            .tools
+            .iter()
+            .copied()
+            .filter(|name| is_host_file_tool(name))
+            .collect();
+        Some((scope.id, names.join(", ")))
+    }
+
     /// How to choose between this session's tools, named as they are offered here.
     ///
     /// A family the host has switched off is not mentioned, so the agent never reads about
     /// a capability it cannot use; a file tool that is missing is reported as such rather
     /// than worked around with a shell command.
     fn tool_guidance(&self) -> Vec<String> {
-        let offered = |prefix: &str| -> Vec<&'static str> {
+        let offered = |keep: fn(&str) -> bool| -> Vec<&'static str> {
             tools::TOOL_SPECS
                 .iter()
                 .map(|spec| spec.name)
-                .filter(|name| name.starts_with(prefix) && self.agent.offers_tool(name))
+                .filter(|name| keep(name) && self.agent.offers_tool(name))
                 .collect()
         };
-        let mut lines = Vec::new();
-        // The developer tools are the richer set; the plain remote ones cover what they do
-        // not, such as deleting.
-        let mut host_files = offered("dev_");
-        host_files.extend(offered("remote_fs_"));
+        let mut lines = vec![
+            "- Reach for a tool before a shell command wherever one fits: tools cannot hang on \
+             a pager, they answer with structured output, and the user sees exactly what was \
+             read or changed."
+                .to_owned(),
+            "- A tool you want but do not have is not an invitation to improvise in the shell. \
+             If it belongs to a scope listed above, load that scope with load_scope first."
+                .to_owned(),
+        ];
+        let host_files = offered(is_host_file_tool);
         if !host_files.is_empty() {
             lines.push(format!(
-                "- Files on the connected host: {}. Read, search and change them with these \
-                 tools. Do not reach for cat, head, tail, ls, find, grep/rg, sed or awk through a \
-                 shell command: the tools are quicker, they cannot hang on a pager, and they show \
-                 the user what changed.",
+                "- Files on the connected host: {}. Every read, listing, search and change of a \
+                 file goes through these tools. Do not reach for cat, head, tail, ls, find, \
+                 grep/rg, sed, awk or shell redirection for file work: the tools are quicker, \
+                 they cannot hang on a pager, and they show the user what changed.",
                 host_files.join(", ")
             ));
+        } else if let Some((scope, names)) = self.host_file_scope() {
+            lines.push(format!(
+                "- Files on the connected host are read, searched and changed with {names}, \
+                 which the '{scope}' scope holds. Load that scope before touching a file there; \
+                 do not use cat, head, tail, ls, find, grep/rg, sed, awk or shell redirection \
+                 in its place."
+            ));
         }
-        let local_files = offered("local_fs_");
+        let local_files = offered(is_local_file_tool);
         if !local_files.is_empty() {
             lines.push(format!(
                 "- Files on this computer: {}.",
@@ -691,7 +736,7 @@ another scope with load_scope and drop one with unload_scope."
         if !shells.is_empty() {
             lines.push(format!(
                 "- {} {} for work no tool covers: builds, tests, services, package managers and \
-                 version control. Not for reading or editing files.",
+                 version control. Never for reading, listing, searching or editing files.",
                 shells.join(", "),
                 if shells.len() == 1 { "is" } else { "are" }
             ));
@@ -5478,9 +5523,19 @@ mod tests {
         assert!(loaded.contains("dev_grep_search"), "{loaded}");
         assert!(loaded.contains("Files on the connected host:"), "{loaded}");
         assert!(
-            loaded.contains("Do not reach for cat, head, tail, ls, find, grep/rg, sed or awk"),
+            loaded.contains("sed, awk or shell redirection"),
             "{loaded}"
         );
+
+        // One stop earlier: the file tools are not loaded, so the prompt names the scope
+        // that holds them instead of leaving the agent to guess with the shell.
+        let one_step = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &["host"]);
+        assert!(
+            one_step.contains("which the 'host-files' scope holds"),
+            "{one_step}"
+        );
+        assert!(one_step.contains("dev_view_file"), "{one_step}");
+        assert!(!one_step.contains("Files on the connected host:"), "{one_step}");
 
         // A capability the host may not use never shows up, not even as a scope.
         let local_only = prompt_for(vec![GROUP_LOCAL_FS], &[]);

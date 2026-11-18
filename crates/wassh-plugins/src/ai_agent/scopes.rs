@@ -55,8 +55,8 @@ question, read the clock.",
     },
     Scope {
         id: "host",
-        summary: "Work with the connected host: its files, its system statistics, the live \
-terminal.",
+        summary: "Work with the connected host: its files (dev_view, dev_edit, dev_create, \
+dev_list, dev_grep, dev_find, dev_diff), its system statistics, the live terminal.",
         tools: &[],
         pane: None,
         children: &["host-files", "host-system", "host-terminal"],
@@ -64,7 +64,10 @@ terminal.",
     },
     Scope {
         id: "host-files",
-        summary: "Read, search and change files on the connected host.",
+        summary: "Read, search and change files on the connected host with dev_view (line \
+numbers), dev_edit (replacement, reported as a diff), dev_create, dev_list (tree), \
+dev_grep, dev_find and dev_diff, plus remote_fs_* for writing and deleting. Use these \
+instead of cat, grep, ls, find or sed.",
         tools: &[
             TOOL_REMOTE_READ,
             TOOL_REMOTE_WRITE,
