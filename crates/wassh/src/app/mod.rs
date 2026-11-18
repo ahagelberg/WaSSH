@@ -526,6 +526,8 @@ impl Shell {
     ) -> Self {
         let mut shell = Self::new_for_test(config, perf, perf_tabs);
         shell.window = WindowGeometry::new(bounds);
+        // Before the first frame, so no frame is painted in egui's own face.
+        wassh_ui::fonts::install(&cc.egui_ctx);
         let system_dark = system_prefers_dark(&cc.egui_ctx);
         shell.system_dark = Some(system_dark);
         if shell.settings.theme == wassh_core::ThemeMode::System {

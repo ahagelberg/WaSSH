@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dock;
+pub mod fonts;
 pub mod input;
 pub mod plugin_toolbar;
 pub mod sidebar;
