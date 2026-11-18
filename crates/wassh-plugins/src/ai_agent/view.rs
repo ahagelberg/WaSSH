@@ -9,11 +9,12 @@ use std::sync::mpsc::Receiver;
 
 use egui::Ui;
 use serde_json::{Value, json};
-use wassh_core::{Palette, SessionStatus};
+use wassh_core::{Palette, RADIUS, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, chip, copy_button, password_input,
-    select_str, select_width, small_button, small_button_enabled, text_area, text_area_with_id,
+    select_width, small_button, small_button_enabled, text_area, text_area_with_id,
+    truncating_galley,
 };
 
 use super::agent::{
@@ -120,6 +121,18 @@ const PROMPT_COMMAND_MAX_CHARS: usize = 400;
 const SCOPE_LABEL_MAX_CHARS: usize = 56;
 /// Padding inside a prompt card.
 const PROMPT_CARD_PADDING: i8 = 10;
+/// Caption of the button that leaves a chat for the list.
+const BACK_GLYPH: &str = "\u{25c0}";
+/// Heading of the chat list.
+const CHAT_LIST_HEADING: &str = "Chats";
+/// What the chat list says when there is nothing to reopen.
+const CHAT_LIST_EMPTY: &str = "No previous chats yet.";
+/// Height of one row of the chat list.
+const CHAT_ROW_HEIGHT: f32 = 26.0;
+/// Type size of a chat's name in the list and of the open chat's title.
+const CHAT_TITLE_TEXT_SIZE: f32 = 12.0;
+/// Side padding inside a chat list row.
+const CHAT_ROW_PADDING: f32 = 6.0;
 
 /// How long one dot of the animated "Thinking…" stays on.
 const THINKING_DOT_MS: u64 = 400;
@@ -338,9 +351,8 @@ pub struct AiAgent {
     loaded: bool,
     /// Caption and health for the pane header.
     caption: (String, HeaderHealth),
-    /// What the caption was built from: running, summarising, session state and the
-    /// fingerprint of the first question.
-    caption_for: Option<(bool, bool, SessionStatus, u64)>,
+    /// What the caption was built from: running, summarising and session state.
+    caption_for: Option<(bool, bool, SessionStatus)>,
     /// Last problem reported to the user.
     error: Option<String>,
     /// Provider list and keys [`AiAgent::sync_providers`] last derived its state from.
@@ -353,6 +365,17 @@ pub struct AiAgent {
     applied_web_key: Option<String>,
     /// Tool card whose copy button confirmed: which card, which button, and when.
     copied: Option<(usize, CopyTarget, u64)>,
+    /// Which of the pane's two views is drawn.
+    view: ChatView,
+}
+
+/// Which of the pane's two views is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatView {
+    /// The chat list, with the composer that starts a new chat.
+    List,
+    /// The conversation itself.
+    Chat,
 }
 
 impl Default for AiAgent {
@@ -387,6 +410,7 @@ impl Default for AiAgent {
             applied: None,
             applied_web_key: None,
             copied: None,
+            view: ChatView::List,
         }
     }
 }
@@ -477,20 +501,32 @@ impl AiAgent {
         }
     }
 
-    /// Set the live conversation aside and start an empty one.
-    fn begin_new_chat(&mut self) {
-        if !self.agent.turns.is_empty() {
-            self.chats.push(self.stored_chat());
-            let over = self.chats.len().saturating_sub(CONVERSATIONS_PER_HOST_MAX);
-            if over > 0 {
-                self.chats.drain(..over);
-            }
+    /// Set the live conversation aside so the chat list can reopen it.
+    fn file_chat(&mut self) {
+        if self.agent.turns.is_empty() {
+            return;
         }
+        self.chats.push(self.stored_chat());
+        let over = self.chats.len().saturating_sub(CONVERSATIONS_PER_HOST_MAX);
+        if over > 0 {
+            self.chats.drain(..over);
+        }
+    }
+
+    /// Drop the live conversation, keeping whatever the composer holds.
+    fn reset_chat(&mut self) {
         self.agent.clear();
-        self.attachments.clear();
         self.error = None;
         self.questions = QuestionWizard::default();
         self.editing = None;
+    }
+
+    /// Set the live conversation aside and start an empty one, in the conversation view.
+    fn begin_new_chat(&mut self) {
+        self.file_chat();
+        self.reset_chat();
+        self.attachments.clear();
+        self.view = ChatView::Chat;
     }
 
     /// Swap a stored conversation back into the pane.
@@ -523,6 +559,7 @@ impl AiAgent {
         self.attachments.clear();
         self.error = None;
         self.editing = None;
+        self.view = ChatView::Chat;
     }
 
     /// The provider in use.
@@ -987,9 +1024,17 @@ another scope with load_scope and drop one with unload_scope."
             return;
         }
         self.loaded = true;
-        let Some(stored) = settings.get(CONVERSATION_KEY) else {
-            return;
-        };
+        if let Some(stored) = settings.get(CONVERSATION_KEY) {
+            self.restore(stored);
+        }
+        // The pane opens on the conversation it was in, or on the list when there is none.
+        if !self.agent.turns.is_empty() {
+            self.view = ChatView::Chat;
+        }
+    }
+
+    /// Take the stored conversation and the chats filed under it.
+    fn restore(&mut self, stored: &Value) {
         if let Some(model) = stored.get("model").and_then(Value::as_str)
             && !model.is_empty()
         {
@@ -1581,6 +1626,36 @@ another scope with load_scope and drop one with unload_scope."
         self.send_message(text, UserMeta::default(), settings, host, environment);
     }
 
+    /// Draw the list of earlier chats, newest first, and open the one the user picks.
+    fn chat_list(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
+        if self.chats.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(CHAT_LIST_EMPTY)
+                        .size(CHAT_TITLE_TEXT_SIZE)
+                        .color(muted),
+                )
+                .wrap(),
+            );
+            return;
+        }
+        let mut open = None;
+        egui::ScrollArea::vertical()
+            .id_salt("ai-chats")
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for index in (0..self.chats.len()).rev() {
+                    if chat_row(ui, palette, &self.chats[index].title) {
+                        open = Some(index);
+                    }
+                }
+            });
+        if let Some(index) = open {
+            self.open_chat(index);
+        }
+    }
+
     /// Draw the newest message that scrolled past the top of `viewport` again, pinned there.
     ///
     /// A pinned copy is opaque, so the transcript scrolls under it. Coming back into view
@@ -1622,6 +1697,43 @@ another scope with load_scope and drop one with unload_scope."
     }
 }
 
+/// One chat in the list: its title across the row, which the user can click.
+fn chat_row(ui: &mut Ui, palette: &Palette, title: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::new(ui.available_width(), CHAT_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, RADIUS, to_color32(palette.bg_panel_2));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let colour = to_color32(if hovered {
+        palette.text
+    } else {
+        palette.text_muted
+    });
+    // Painted rather than laid out as a widget: a label over the row would take the
+    // pointer and the row would never see the click.
+    let galley = truncating_galley(
+        ui,
+        title,
+        CHAT_TITLE_TEXT_SIZE,
+        colour,
+        rect.width() - CHAT_ROW_PADDING * 2.0,
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + CHAT_ROW_PADDING,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        colour,
+    );
+    response.clicked()
+}
+
 /// A dropdown that never grows past `width`: a long label is cropped rather than
 /// pushing whatever follows it out of the row.
 fn cropped_select<T: Clone + PartialEq>(
@@ -1660,6 +1772,7 @@ struct PinnedBubble {
 
 /// What the transcript reports after a frame: where each prompt landed, and the edited
 /// prompt the pane still has to send.
+#[derive(Default)]
 struct TranscriptReply {
     /// Screen rect of every user bubble drawn.
     bubbles: Vec<(usize, egui::Rect)>,
@@ -2649,29 +2762,16 @@ impl Plugin for AiAgent {
                 }
             }
         }
-        // The caption only changes when the run state, the session or the first question
-        // does, so its text is built then rather than every frame.
-        let first_question = self
-            .agent
-            .turns
-            .iter()
-            .find_map(|turn| match turn {
-                Turn::User { text, .. } => Some(super::markdown::fingerprint(text)),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let caption_for = (
-            self.agent.busy(),
-            self.summary.is_some(),
-            context.status,
-            first_question,
-        );
+        // The caption only changes when the run state or the session does, so its text is
+        // built then rather than every frame. The chat's own title sits in the body beside
+        // the back button, so an idle pane says nothing here.
+        let caption_for = (self.agent.busy(), self.summary.is_some(), context.status);
         if self.caption_for != Some(caption_for) {
             self.caption_for = Some(caption_for);
             self.caption = if caption_for.0 || caption_for.1 {
                 ("Thinking…".to_owned(), HeaderHealth::Warn)
             } else if context.status == SessionStatus::Connected {
-                (self.title(), HeaderHealth::Ok)
+                (String::new(), HeaderHealth::Ok)
             } else {
                 ("Session not connected".to_owned(), HeaderHealth::Warn)
             };
@@ -2679,33 +2779,35 @@ impl Plugin for AiAgent {
 
         let busy = self.agent.busy();
 
-        // The pane controls; provider and model live under the composer.
-        ui.horizontal(|ui| {
-            if small_button_enabled(
-                ui,
-                palette,
-                "New chat",
-                !busy && !self.agent.turns.is_empty(),
-            ) {
-                self.begin_new_chat();
+        // A chat leads with a way back to the list and the chat's own title; the list leads
+        // with its heading. Provider and model live under the composer.
+        let mut back = false;
+        ui.horizontal(|ui| match self.view {
+            ChatView::Chat => {
+                back = Button::new(BACK_GLYPH).compact().ghost().show(ui, palette).clicked();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(self.title()).size(CHAT_TITLE_TEXT_SIZE),
+                    )
+                    .truncate(),
+                );
+            }
+            ChatView::List => {
+                ui.label(
+                    egui::RichText::new(CHAT_LIST_HEADING)
+                        .size(FOOTER_TEXT_SIZE)
+                        .color(muted),
+                );
             }
         });
-
-        // Previous conversations.
-        if !self.chats.is_empty() {
-            let chosen = {
-                let titles: Vec<&str> = self.chats.iter().map(|chat| chat.title.as_str()).collect();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Chats").size(11.0).color(muted));
-                    select_str(ui, "ai-chats", "", &titles)
-                })
-                .inner
-            };
-            if let Some(chosen) = chosen
-                && let Some(index) = self.chats.iter().position(|chat| chat.title == chosen)
-            {
-                self.open_chat(index);
+        if back {
+            // Leaving a settled chat files it, so the list holds everything the pane has.
+            // A run still going stays open: clearing the conversation would end it.
+            if !busy {
+                self.file_chat();
+                self.reset_chat();
             }
+            self.view = ChatView::List;
         }
 
         // The provider, model and keys are configured in Options → AI agent; the pane
@@ -2987,37 +3089,43 @@ impl Plugin for AiAgent {
                 }
             });
 
-        // Transcript.
-        let scroll = egui::ScrollArea::vertical()
-            .id_salt("ai-transcript")
-            .max_height(ui.available_height())
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                let reply = self.transcript(ui, palette, muted, &mut session);
+        // The chat list, or the transcript of the open chat.
+        let mut reply = TranscriptReply::default();
+        if self.view == ChatView::List {
+            self.chat_list(ui, palette, muted);
+        } else {
+            let scroll = egui::ScrollArea::vertical()
+                .id_salt("ai-transcript")
+                .max_height(ui.available_height())
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    let reply = self.transcript(ui, palette, muted, &mut session);
 
-                if let Some(error) = &self.error {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("⚠ {error}"))
-                                .size(11.0)
-                                .color(to_color32(palette.danger)),
-                        )
-                        .wrap(),
-                    );
-                }
-                reply
-            });
-        let reply = scroll.inner;
+                    if let Some(error) = &self.error {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("⚠ {error}"))
+                                    .size(11.0)
+                                    .color(to_color32(palette.danger)),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    reply
+                });
+            reply = scroll.inner;
 
-        // The message the transcript scrolled past the top stays pinned there, as in the
-        // reference chat: a long reply cannot push it out of sight. It opens the same
-        // editor as the message it copies.
-        if self.editing.is_none()
-            && let Some(pinned) = self.pinned_bubble(ui, palette, scroll.inner_rect, &reply.bubbles)
-            && pinned.clicked
-        {
-            self.edit_prompt(pinned.index);
+            // The message the transcript scrolled past the top stays pinned there, as in the
+            // reference chat: a long reply cannot push it out of sight. It opens the same
+            // editor as the message it copies.
+            if self.editing.is_none()
+                && let Some(pinned) =
+                    self.pinned_bubble(ui, palette, scroll.inner_rect, &reply.bubbles)
+                && pinned.clicked
+            {
+                self.edit_prompt(pinned.index);
+            }
         }
         if let Some((index, text)) = reply.submitted {
             self.replace_prompt(
@@ -3074,6 +3182,14 @@ impl Plugin for AiAgent {
             if let Err(error) = self.ready() {
                 self.error = Some(error.to_owned());
             } else {
+                // A prompt typed on the chat list starts a new chat instead of joining the
+                // one the list holds; a run still going in the background keeps its
+                // conversation.
+                if self.view == ChatView::List && !self.agent.blocked() {
+                    self.file_chat();
+                    self.reset_chat();
+                }
+                self.view = ChatView::Chat;
                 // The toggle attaches the live terminal screen to this one message.
                 let terminal = self.attach_terminal.then(|| {
                     session
@@ -3528,7 +3644,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pane_opens_on_a_provider_with_a_hint() {
+    fn the_pane_opens_on_the_chat_list_with_a_hint() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
         // Nothing is configured yet, so the pane says where to add a provider.
@@ -3538,10 +3654,17 @@ mod tests {
             texts.contains(&"No model providers configured — add one in Options."),
             "the missing-provider hint is not shown: {texts:?}"
         );
+        assert_eq!(plugin.view, ChatView::List, "the list opens when no chat does");
         assert!(
-            texts.contains(&"No model providers configured yet. Configure one in Options."),
-            "empty hint missing: {texts:?}"
+            texts.contains(&CHAT_LIST_HEADING),
+            "the chat list is not shown: {texts:?}"
         );
+        assert!(
+            texts.contains(&CHAT_LIST_EMPTY),
+            "an empty list says so: {texts:?}"
+        );
+        // An idle pane says nothing in the header: the title sits in the body.
+        assert_eq!(plugin.header_status(), None);
         assert!(texts.contains(&"Send"), "composer missing: {texts:?}");
         assert!(
             texts.contains(&ATTACH_GLYPH),
@@ -3550,10 +3673,6 @@ mod tests {
         assert!(
             texts.contains(&TERMINAL_ATTACH_GLYPH),
             "terminal-context toggle missing: {texts:?}"
-        );
-        assert_eq!(
-            plugin.header_status(),
-            Some((DEFAULT_CHAT_TITLE, HeaderHealth::Ok))
         );
     }
 
@@ -3788,10 +3907,7 @@ mod tests {
         assert_eq!(plugin.model, "llama3.1");
         assert_eq!(plugin.agent.cwd, "/srv/app");
         assert_eq!(plugin.agent.history.len(), 2);
-        assert_eq!(
-            plugin.header_status(),
-            Some(("how much disk is left", HeaderHealth::Ok))
-        );
+        assert_eq!(plugin.view, ChatView::Chat, "a stored chat reopens in its transcript");
     }
 
     #[test]
@@ -4849,7 +4965,7 @@ mod tests {
                 assert!(text.pos.x + text.galley.size().x <= limit, "text exceeds pane: {} > {limit}", text.pos.x + text.galley.size().x);
             }
         }
-        assert_eq!(found, 2);
+        assert_eq!(found, 3, "the prompt, the tool output and the chat title stay inside");
     }
 
     #[test]
@@ -5093,9 +5209,14 @@ mod tests {
             pinned < PINNED_TOP_MAX,
             "the newest message is pinned at the top of the transcript: {rows:?}"
         );
-        assert!(
-            !rows.iter().any(|(_, text)| text == "first question"),
-            "only the newest message pins: {rows:?}"
+        // The first question names the chat, which the title row shows; its own bubble has
+        // scrolled away.
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, text)| text == "first question")
+                .count(),
+            1,
+            "only the chat title names the first question: {rows:?}"
         );
     }
 
@@ -5470,6 +5591,92 @@ mod tests {
         assert_eq!(plugin.agent.turns.len(), 1);
         assert_eq!(plugin.agent.history.len(), 1);
         assert!(plugin.chats.is_empty(), "the empty chat is not kept");
+    }
+
+    #[test]
+    fn the_back_button_lists_the_chats_and_a_row_opens_one() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "first question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.begin_new_chat();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let back = rows
+            .iter()
+            .find(|(_, _, text)| text == BACK_GLYPH)
+            .cloned()
+            .unwrap_or_else(|| panic!("the open chat has no back button: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(back));
+        assert_eq!(plugin.view, ChatView::List, "back leaves the chat");
+
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter().any(|(_, _, text)| text == CHAT_LIST_HEADING),
+            "the chat list is not shown: {rows:?}"
+        );
+        let row = rows
+            .iter()
+            .find(|(_, _, text)| text == "first question")
+            .cloned()
+            .unwrap_or_else(|| panic!("the filed chat is not listed: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(row));
+        assert_eq!(plugin.view, ChatView::Chat, "a row opens its chat");
+        assert_eq!(plugin.agent.turns.len(), 1, "the chat came back");
+    }
+
+    #[test]
+    fn a_prompt_typed_on_the_chat_list_starts_a_new_chat() {
+        const CHAT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, _requests) = provider(CHAT, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "earlier question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let back = rows
+            .iter()
+            .find(|(_, _, text)| text == BACK_GLYPH)
+            .cloned()
+            .expect("the open chat has a back button");
+        frame(&mut plugin, &mut settings, &ctx, click(back));
+        assert_eq!(plugin.view, ChatView::List);
+
+        plugin.draft = "hello".to_owned();
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let send = rows
+            .iter()
+            .find(|(_, _, text)| text == "Send")
+            .cloned()
+            .expect("the list has a composer");
+        frame(&mut plugin, &mut settings, &ctx, click(send));
+        assert_eq!(plugin.view, ChatView::Chat, "the new chat is entered");
+        assert_eq!(plugin.chats.len(), 1, "the chat left behind is filed");
+        assert_eq!(plugin.chats[0].title, "earlier question");
+        assert!(
+            plugin
+                .agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User { text, .. } if text == "hello")),
+            "the prompt starts the new chat: {:?}",
+            plugin.agent.turns
+        );
     }
 
     #[test]
