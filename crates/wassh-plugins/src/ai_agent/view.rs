@@ -42,6 +42,10 @@ use crate::{PluginId, PluginManifest};
 
 /// Key the conversation is stored under.
 const CONVERSATION_KEY: &str = "conversation";
+/// Key the host's environment map is stored under.
+const MAP_KEY: &str = "envMap";
+/// The scope that holds the environment map.
+const ENV_SCOPE: &str = "env";
 /// Settings [`AiAgent::apply_settings`] derives the agent's rules and tools from, besides
 /// the per-group and per-tool permission keys it reads through [`Permissions`].
 const DERIVED_SETTINGS: &[&str] = &[
@@ -68,6 +72,9 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 const COMPACT_KEEP_MESSAGES: usize = 6;
 /// Where the compacted part of the conversation sits in the system prompt.
 const COMPACTED_HEADING: &str = "Earlier conversation, compacted:";
+/// Heading of the environment map's digest in the system prompt.
+const MAP_HEADING: &str =
+    "Environment map (query it with env_find and env_outline; refresh with env_scan):";
 /// Transcript note left where the conversation was compacted.
 const COMPACTED_NOTICE: &str = "Earlier messages were compacted into a summary:";
 /// Gap between the provider and model dropdowns under the composer.
@@ -389,6 +396,10 @@ pub struct AiAgent {
     copied: Option<(usize, CopyTarget, u64)>,
     /// The scope popup a tag click opened, if any.
     scope_popup: Option<ScopePopup>,
+    /// Map revision the host's plugin data holds, so a change is written once.
+    map_saved: u64,
+    /// Set by the popup: rebuild the map on the next frame.
+    map_rebuild: bool,
     /// Which of the pane's two views is drawn.
     view: ChatView,
 }
@@ -444,6 +455,8 @@ impl Default for AiAgent {
             applied_web_key: None,
             copied: None,
             scope_popup: None,
+            map_saved: 0,
+            map_rebuild: false,
             view: ChatView::List,
         }
     }
@@ -655,6 +668,13 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 lines.push(format!("- {}: {}", scope.id, scope.summary));
             }
         }
+        // The map's digest: the tree this conversation already knows, so its turns go on
+        // the work rather than on finding the files again.
+        if self.agent.scopes.contains(ENV_SCOPE) && !self.agent.map.is_empty() {
+            lines.push(String::new());
+            lines.push(MAP_HEADING.to_owned());
+            lines.push(self.agent.map.overview());
+        }
         lines.push(String::new());
         lines.push("Guidelines:".to_owned());
         lines.extend(self.tool_guidance());
@@ -758,6 +778,16 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 "- Files on this computer: {}.",
                 local_files.join(", ")
             ));
+        }
+        if self.agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
+            lines.push(
+                "- Look in the environment map before searching the tree: env_find answers \
+                 \"where is X\" without touching the host, and env_outline describes a file \
+                 without reading it. Call env_scan for a directory the map does not hold yet, \
+                 and again once the tree has changed much. The dev_* search and read tools are \
+                 for what the map cannot answer."
+                    .to_owned(),
+            );
         }
         let shells: Vec<&str> = [
             super::protocol::TOOL_RUN_COMMAND,
@@ -1106,6 +1136,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if let Some(stored) = settings.get(CONVERSATION_KEY) {
             self.restore(stored);
         }
+        // The map belongs to the host, so it survives every chat on the connection.
+        self.agent.map = super::map::EnvMap::from_json(settings.get(MAP_KEY));
+        self.map_saved = self.agent.map.revision;
         // The pane opens on the conversation it was in, or on the list when there is none.
         if !self.agent.turns.is_empty() {
             self.view = ChatView::Chat;
@@ -1719,6 +1752,8 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let loaded = self.agent.scopes.contains(scope.id);
         let tools = self.scope_tool_names(scope);
         let mut turn_off = false;
+        let mut rebuild = false;
+        let mut clear = false;
         let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
@@ -1771,6 +1806,29 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                                 .wrap(),
                             );
                         }
+                        if scope.id == ENV_SCOPE {
+                            ui.separator();
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.map_summary())
+                                        .size(10.0)
+                                        .color(to_color32(palette.text_muted)),
+                                )
+                                .wrap(),
+                            );
+                            ui.horizontal(|ui| {
+                                rebuild = Button::new("Rebuild")
+                                    .compact()
+                                    .enabled(self.agent.map_scan.is_none())
+                                    .show(ui, palette)
+                                    .clicked();
+                                clear = Button::new("Clear")
+                                    .compact()
+                                    .enabled(!self.agent.map.is_empty())
+                                    .show(ui, palette)
+                                    .clicked();
+                            });
+                        }
                         if loaded {
                             ui.separator();
                             turn_off = Button::new("Turn off").compact().show(ui, palette).clicked();
@@ -1779,6 +1837,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             });
         if turn_off {
             let _ = self.agent.unload_scope(scope.id);
+        }
+        if clear {
+            self.agent.map.clear();
+        }
+        if rebuild {
+            self.map_rebuild = true;
         }
         let rect = area.response.rect;
         let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
@@ -1790,9 +1854,36 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 .flatten()
                 .is_some_and(|pos| !rect.contains(pos) && !anchor.contains(pos))
         });
-        if turn_off || escape || pressed_outside {
+        if turn_off || rebuild || clear || escape || pressed_outside {
             self.scope_popup = None;
         }
+    }
+
+    /// Where a scan starts: the map's own root, else the directory the agent works in.
+    fn map_root(&self) -> String {
+        if self.agent.map.root.is_empty() {
+            self.agent.cwd.clone()
+        } else {
+            self.agent.map.root.clone()
+        }
+    }
+
+    /// One line about the map for its scope popup.
+    fn map_summary(&self) -> String {
+        if self.agent.map_scan.is_some() {
+            return "Scanning…".to_owned();
+        }
+        if self.agent.map.is_empty() {
+            return format!("Nothing mapped yet. A scan starts at {}.", self.map_root());
+        }
+        let map = &self.agent.map;
+        format!(
+            "{} files under {} ({}), built {} min ago",
+            map.len(),
+            map.root,
+            if map.truncated { "capped" } else { "complete" },
+            map.age_minutes(self.agent.now_ms)
+        )
     }
 
     /// The tools `scope` holds that this host may call, loaded or not.
@@ -2996,6 +3087,14 @@ impl Plugin for AiAgent {
 
         // Drain workers, then answer any tool result it produced.
         self.agent.poll(&mut session);
+        // The environment map belongs to the host, so the pane scans it outside a turn.
+        self.agent.poll_map_scan(&mut session);
+        if std::mem::take(&mut self.map_rebuild) {
+            let root = self.map_root();
+            if let Err(error) = self.agent.start_map_scan(&root, &mut session) {
+                self.error = Some(error);
+            }
+        }
         // A message typed during the last run joins the conversation before the next
         // request is built, so the model sees it.
         self.agent.flush_injected();
@@ -3532,6 +3631,11 @@ impl Plugin for AiAgent {
             }),
         );
         context.session = session;
+        // The map is host state: written once per change, not once per frame.
+        if self.agent.map.revision != self.map_saved {
+            self.map_saved = self.agent.map.revision;
+            context.set_value(MAP_KEY, self.agent.map.to_json());
+        }
         // A run in flight, a summary or an attachment being read all finish outside a frame.
         if self.agent.busy()
             || self.summary.is_some()
@@ -5960,6 +6064,97 @@ mod tests {
         }
         assert_eq!(plugin.chats.len(), CONVERSATIONS_PER_HOST_MAX);
         assert_eq!(plugin.chats[0].title, "question 3");
+    }
+
+    /// A map with two files, as a scan would leave it.
+    fn a_scanned_map() -> super::super::map::EnvMap {
+        super::super::map::EnvMap::parse(
+            "/srv/app",
+            1_700_000_000_000,
+            "1200 1700000000 /srv/app/src/main.rs\n\
+             430 1700000001 /srv/app/src/lib.rs\n\
+             __wassh_symbols__\n\
+             /srv/app/src/lib.rs:4:pub fn run() {\n",
+        )
+    }
+
+    #[test]
+    fn the_prompt_carries_the_map_once_its_scope_is_loaded() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        plugin.agent.map = a_scanned_map();
+        plugin.agent.scopes.load(super::super::scopes::find("host").unwrap());
+        let without = plugin.system_prompt(&settings, "dev", "a test shell");
+        assert!(
+            !without.contains(MAP_HEADING),
+            "the map is not the conversation's until its scope is loaded: {without}"
+        );
+
+        plugin.agent.scopes.load(super::super::scopes::find("env").unwrap());
+        let with = plugin.system_prompt(&settings, "dev", "a test shell");
+        assert!(with.contains(MAP_HEADING), "{with}");
+        assert!(with.contains("/srv/app (2 files"), "{with}");
+        assert!(with.contains("src/  2"), "{with}");
+        assert!(with.contains("env_find answers"), "{with}");
+
+        // An empty map says nothing rather than costing prompt room.
+        plugin.agent.map.clear();
+        let empty = plugin.system_prompt(&settings, "dev", "a test shell");
+        assert!(!empty.contains(MAP_HEADING), "{empty}");
+        settings.clear();
+    }
+
+    #[test]
+    fn the_map_is_host_state_and_survives_a_reload() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
+        let mut plugin = AiAgent::default();
+        draw(&mut plugin, &mut settings);
+        assert_eq!(plugin.agent.map.len(), 2, "the host's map came back");
+        assert_eq!(plugin.agent.map.root, "/srv/app");
+
+        // Forgetting a path is written back on the next frame, once.
+        plugin.agent.map.forget("/srv/app/src/main.rs");
+        draw(&mut plugin, &mut settings);
+        assert_eq!(
+            settings[MAP_KEY]["nodes"].as_array().map(Vec::len),
+            Some(1),
+            "the shorter map was stored"
+        );
+    }
+
+    #[test]
+    fn the_map_scope_popup_clears_the_map() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
+        let mut plugin = AiAgent::default();
+        plugin.agent.scopes.load(super::super::scopes::find("host").unwrap());
+        plugin.agent.scopes.load(super::super::scopes::find("env").unwrap());
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let tag = rows
+            .iter()
+            .find(|(_, _, text)| text == ENV_SCOPE)
+            .cloned()
+            .expect("the env scope has a tag");
+        frame(&mut plugin, &mut settings, &ctx, click(tag));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter().any(|(_, _, text)| text.contains("files under /srv/app")),
+            "the popup does not describe the map: {rows:?}"
+        );
+        let clear = rows
+            .iter()
+            .find(|(_, _, text)| text == "Clear")
+            .cloned()
+            .expect("the map popup offers Clear");
+        frame(&mut plugin, &mut settings, &ctx, click(clear));
+        assert!(plugin.agent.map.is_empty(), "Clear did not empty the map");
+        assert!(
+            plugin.agent.scopes.contains(ENV_SCOPE),
+            "clearing is not unloading"
+        );
     }
 
     #[test]

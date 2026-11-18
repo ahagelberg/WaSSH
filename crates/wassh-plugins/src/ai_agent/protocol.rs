@@ -99,6 +99,14 @@ pub const TOOL_DEV_GREP: &str = "dev_grep_search";
 pub const TOOL_DEV_FIND: &str = "dev_find_files";
 /// Tool: diff a file on the connected host.
 pub const TOOL_DEV_DIFF: &str = "dev_diff_file";
+/// Tool: build or refresh the environment map.
+pub const TOOL_ENV_SCAN: &str = "env_scan";
+/// Tool: look a path or a declaration up in the environment map.
+pub const TOOL_ENV_FIND: &str = "env_find";
+/// Tool: what the map knows about one file.
+pub const TOOL_ENV_OUTLINE: &str = "env_outline";
+/// Tool: the map's directory digest.
+pub const TOOL_ENV_OVERVIEW: &str = "env_overview";
 /// Tool: read the terminal screen.
 pub const TOOL_TERMINAL_READ: &str = "terminal_read";
 /// Tool: type into the terminal.
@@ -348,6 +356,8 @@ pub enum ApiMessage {
     Assistant {
         /// Text it wrote.
         content: String,
+        /// Provider-specific reasoning that must be echoed in later requests.
+        reasoning_content: Option<String>,
         /// Tools it wants run.
         tool_calls: Vec<ApiToolCall>,
     },
@@ -365,6 +375,8 @@ pub enum ApiMessage {
 pub struct Completion {
     /// Assistant text.
     pub text: String,
+    /// Provider-specific reasoning that must be echoed in later requests.
+    pub reasoning_content: Option<String>,
     /// Tools it asked for.
     pub tool_calls: Vec<ApiToolCall>,
     /// Provider stop reason, when it sent one.

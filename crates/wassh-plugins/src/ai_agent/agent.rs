@@ -10,16 +10,18 @@ use std::sync::mpsc::Receiver;
 use serde_json::Value;
 
 use super::permissions::{Permission, Permissions};
+use super::map::EnvMap;
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
     TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
-    TOOL_LOAD_SCOPE, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST,
-    TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE,
-    TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT,
-    TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO,
-    TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
-    TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
-    TOOL_UNLOAD_SCOPE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_ENV_FIND, TOOL_ENV_OUTLINE, TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_LOAD_SCOPE,
+    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
+    TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
+    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
+    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK,
+    TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS,
+    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE,
+    TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
@@ -39,12 +41,16 @@ type Session<'a, 'b> = &'a mut Option<&'b mut dyn SessionAccess>;
 
 /// Longest command output handed to the model.
 pub const MAX_OUTPUT_CHARS: usize = 64_000;
+/// Hits `env_find` returns when the call does not say.
+const ENV_FIND_HITS_DEFAULT: usize = 30;
 /// How much of the raw tail is kept so the markers are never cut off.
 pub const MARKER_TAIL_CHARS: usize = 4_000;
 /// Key the session caches the running command under.
 pub const EXEC_KEY: &str = "ai.run_command";
 /// Key the session caches a probe under (existence checks and system reports).
 pub const PROBE_KEY: &str = "ai.probe";
+/// Key the session caches a map scan the pane asked for under.
+pub const MAP_KEY: &str = "ai.env_scan";
 /// Marker the sudo preamble prints when the password was refused.
 pub const SUDO_AUTH_FAILED_MARKER: &str = "__WASSH_SUDO_FAILED__";
 /// What the user is told when `sudo` refused the password they typed.
@@ -241,6 +247,11 @@ pub enum Waiting {
 pub enum CommandThen {
     /// Return the output.
     Return,
+    /// Read the output as a scan of `root` and store it as the environment map.
+    ScanMap {
+        /// Directory the scan walked.
+        root: String,
+    },
     /// Write a remote file once the probe says whether it exists.
     WriteRemote {
         /// Destination.
@@ -350,6 +361,10 @@ pub struct Agent {
     /// It travels in the system prompt rather than the history, so the transcript and the
     /// history keep one user turn per user message.
     pub compacted: Option<String>,
+    /// The environment map of the host, which outlives the conversation.
+    pub map: EnvMap,
+    /// A map scan the pane asked for: the root, until its output arrives.
+    pub map_scan: Option<String>,
 }
 
 impl Agent {
@@ -628,6 +643,29 @@ impl Agent {
                             exit_code.is_some_and(|code| code != 0) || refused_sudo,
                         )
                     }
+                    CommandThen::ScanMap { root } => {
+                        let text = output
+                            .as_ref()
+                            .map(|output| format!("{}{}", output.stdout, output.stderr))
+                            .unwrap_or_else(|| failure.unwrap_or_default());
+                        let scanned = EnvMap::parse(&root, self.now_ms, &text);
+                        let found = scanned.len();
+                        let truncated = scanned.truncated;
+                        self.map = scanned;
+                        Ready::Settle(
+                            format!("env_scan {root}"),
+                            format!(
+                                "Mapped {root}: {found} files{}. Query it with env_find, \
+                                 env_outline or env_overview.",
+                                if truncated {
+                                    " (capped, the tree is bigger)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            found == 0,
+                        )
+                    }
                     CommandThen::WriteRemote {
                         path,
                         content,
@@ -830,6 +868,60 @@ impl Agent {
         true
     }
 
+    /// Start a scan the pane asked for, apart from any tool call.
+    ///
+    /// The map is host state, so the pane can rebuild it without a conversation turn; the
+    /// answer lands through [`Agent::poll_map_scan`].
+    pub fn start_map_scan(&mut self, root: &str, session: Session<'_, '_>) -> Result<(), String> {
+        if self.map_scan.is_some() {
+            return Err("A scan is already running.".to_owned());
+        }
+        let Some(access) = session.as_mut() else {
+            return Err("The session is not connected.".to_owned());
+        };
+        let root = root.trim().to_owned();
+        if root.is_empty() || root == "/" {
+            return Err("Pick a directory other than the root to map.".to_owned());
+        }
+        access.exec(MAP_KEY, &EnvMap::scan_command(&shell_quote(&root)));
+        self.map_scan = Some(root);
+        Ok(())
+    }
+
+    /// Collect a pane scan that finished. Returns whether the map changed.
+    pub fn poll_map_scan(&mut self, session: Session<'_, '_>) -> bool {
+        let Some(root) = self.map_scan.clone() else {
+            return false;
+        };
+        let (output, failure) = match session.as_ref() {
+            Some(access) => (
+                access.output(MAP_KEY).cloned(),
+                access.failure(MAP_KEY).map(str::to_owned),
+            ),
+            None => (None, None),
+        };
+        if output.is_none() && failure.is_none() {
+            return false;
+        }
+        self.map_scan = None;
+        let text = match output {
+            Some(output) => format!("{}{}", output.stdout, output.stderr),
+            None => failure.unwrap_or_default(),
+        };
+        self.map = EnvMap::parse(&root, self.now_ms, &text);
+        true
+    }
+
+    /// A write, an edit or a delete leaves the map stale for that path alone.
+    fn forget_map_path(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        self.map.forget(&relative_remote(&self.cwd, path));
+        self.map.forget_suffix(path);
+    }
+
     /// The label of a tool turn, for the transcript.
     fn label(&self, turn: usize) -> String {
         self.turns
@@ -923,6 +1015,7 @@ impl Agent {
                 self.drop_empty_reply(turn);
                 self.history.push(ApiMessage::Assistant {
                     content: text,
+                    reasoning_content: completion.reasoning_content,
                     tool_calls: completion.tool_calls.clone(),
                 });
                 self.queue = completion.tool_calls.into_iter().collect();
@@ -1145,6 +1238,13 @@ impl Agent {
                 session,
             );
             return;
+        }
+
+        // A write, an edit or a delete leaves the map stale for that one path.
+        if is_writing_tool(&name)
+            && let Some(path) = arguments["path"].as_str()
+        {
+            self.forget_map_path(path);
         }
 
         // Everything that needs the session checks once, up front.
@@ -1648,6 +1748,60 @@ impl Agent {
                     Ok(rag::format_hits(&query, &hits))
                 });
             }
+            TOOL_ENV_SCAN => {
+                let root = arguments["path"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| relative_remote(&self.cwd, path))
+                    .or_else(|| (!self.map.root.is_empty()).then(|| self.map.root.clone()))
+                    .unwrap_or_else(|| self.cwd.clone());
+                // The scan is the one map tool that touches the host: one walk, no reads.
+                let command = EnvMap::scan_command(&shell_quote(&root));
+                self.run_probe(call, turn, CommandThen::ScanMap { root }, command, session);
+            }
+            TOOL_ENV_FIND => {
+                let query = arguments["query"].as_str().unwrap_or_default();
+                let limit = arguments["limit"]
+                    .as_u64()
+                    .map_or(ENV_FIND_HITS_DEFAULT, |value| value as usize);
+                let hits = self.map.find(query, limit);
+                let (output, failed) = if hits.is_empty() {
+                    (
+                        format!(
+                            "Nothing in the environment map matches \"{query}\". Scan a \
+                             directory with env_scan, or search the files themselves."
+                        ),
+                        false,
+                    )
+                } else {
+                    (hits.join("\n"), false)
+                };
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, failed, session);
+            }
+            TOOL_ENV_OUTLINE => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let (output, failed) = match self.map.outline(&path) {
+                    Some(outline) => (outline, false),
+                    None => (
+                        format!(
+                            "{path} is not in the environment map. Scan its directory with \
+                             env_scan, or read it with dev_view_file."
+                        ),
+                        true,
+                    ),
+                };
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, failed, session);
+            }
+            TOOL_ENV_OVERVIEW => {
+                let output = self.map.overview();
+                let failed = self.map.is_empty();
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, failed, session);
+            }
             _ => {
                 let label = call_label(&call);
                 match tools::run_local(name, arguments, self.now_ms) {
@@ -2004,6 +2158,7 @@ impl Agent {
             ApiMessage::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 tool_calls.retain(|call| answered.contains(&call.id));
                 !content.trim().is_empty() || !tool_calls.is_empty()
@@ -2075,6 +2230,7 @@ impl Agent {
                 ApiMessage::Assistant {
                     content,
                     tool_calls,
+                    ..
                 } => {
                     out.push_str(&format!("Assistant: {content}\n"));
                     for call in tool_calls {
@@ -2122,8 +2278,10 @@ fn message_chars(message: &ApiMessage) -> usize {
         ApiMessage::Assistant {
             content,
             tool_calls,
+            reasoning_content,
         } => {
             content.len()
+                + reasoning_content.as_ref().map_or(0, String::len)
                 + tool_calls
                     .iter()
                     .map(|call| call.name.len() + call.arguments.len())
@@ -2221,6 +2379,21 @@ pub fn relative_remote(cwd: &str, name: &str) -> String {
     } else {
         tools::join_path(cwd, name)
     }
+}
+
+/// Whether a tool changes a file, which makes the map stale for that path.
+fn is_writing_tool(name: &str) -> bool {
+    matches!(
+        name,
+        TOOL_DEV_EDIT
+            | TOOL_DEV_CREATE
+            | TOOL_REMOTE_WRITE
+            | TOOL_REMOTE_EDIT
+            | TOOL_REMOTE_DELETE
+            | TOOL_LOCAL_WRITE
+            | TOOL_LOCAL_EDIT
+            | TOOL_LOCAL_DELETE
+    )
 }
 
 /// Wrap a command so its exit status and working directory come back too.
@@ -2452,11 +2625,13 @@ pub fn history_to_json(messages: &[ApiMessage]) -> Vec<Value> {
             }
             ApiMessage::Assistant {
                 content,
+                reasoning_content,
                 tool_calls,
-            } => serde_json::json!({
-                "role": "assistant",
-                "content": content,
-                "toolCalls": tool_calls
+            } => {
+                let mut stored = serde_json::json!({
+                    "role": "assistant",
+                    "content": content,
+                    "toolCalls": tool_calls
                     .iter()
                     .map(|call| serde_json::json!({
                         "id": call.id,
@@ -2464,7 +2639,12 @@ pub fn history_to_json(messages: &[ApiMessage]) -> Vec<Value> {
                         "arguments": call.arguments
                     }))
                     .collect::<Vec<_>>()
-            }),
+                });
+                if let Some(reasoning_content) = reasoning_content {
+                    stored["reasoningContent"] = serde_json::json!(reasoning_content);
+                }
+                stored
+            }
             ApiMessage::Tool {
                 tool_call_id,
                 content,
@@ -2487,6 +2667,7 @@ pub fn history_from_json(items: &[Value]) -> Vec<ApiMessage> {
             }),
             "assistant" => Some(ApiMessage::Assistant {
                 content: item["content"].as_str().unwrap_or_default().to_owned(),
+                reasoning_content: item["reasoningContent"].as_str().map(str::to_owned),
                 tool_calls: item["toolCalls"]
                     .as_array()
                     .map(|calls| {
@@ -2523,6 +2704,31 @@ mod tests {
         assert!(wrapped.starts_with("cd '/srv/app' >/dev/null 2>&1 || true\nls -la\n"));
         assert!(wrapped.contains("__WASSH_STATUS:%s__"));
         assert!(wrapped.contains("__WASSH_PWD:%s__"));
+    }
+
+    #[test]
+    fn reasoning_content_survives_history_storage_and_older_chats_still_load() {
+        let history = vec![ApiMessage::Assistant {
+            content: String::new(),
+            reasoning_content: Some("thinking".to_owned()),
+            tool_calls: Vec::new(),
+        }];
+        let stored = history_to_json(&history);
+        assert_eq!(stored[0]["reasoningContent"], "thinking");
+        assert_eq!(history_from_json(&stored), history);
+
+        let older = history_from_json(&[serde_json::json!({
+            "role": "assistant",
+            "content": "legacy",
+            "toolCalls": []
+        })]);
+        assert!(matches!(
+            older.first(),
+            Some(ApiMessage::Assistant {
+                reasoning_content: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2654,6 +2860,7 @@ mod tests {
             },
             ApiMessage::Assistant {
                 content: String::new(),
+                reasoning_content: None,
                 tool_calls: vec![call("a"), call("b")],
             },
             ApiMessage::Tool {
@@ -2676,6 +2883,7 @@ mod tests {
         // An assistant turn with nothing but the unanswered call disappears entirely.
         agent.history.push(ApiMessage::Assistant {
             content: String::new(),
+            reasoning_content: None,
             tool_calls: vec![call("c")],
         });
         agent.repair_history();
@@ -2684,6 +2892,7 @@ mod tests {
         // Text the model already wrote survives.
         agent.history.push(ApiMessage::Assistant {
             content: "Let me check the logs.".to_owned(),
+            reasoning_content: None,
             tool_calls: vec![call("d")],
         });
         agent.repair_history();
@@ -2711,6 +2920,7 @@ mod tests {
         });
         agent.history.push(ApiMessage::Assistant {
             content: "Waiting.".to_owned(),
+            reasoning_content: None,
             tool_calls: vec![running.clone()],
         });
         agent.turns.push(Turn::Tool {
@@ -3044,6 +3254,7 @@ mod tests {
             assert!(agent.push_user(&format!("question {step}"), UserMeta::default()));
             agent.history.push(ApiMessage::Assistant {
                 content: format!("answer {step}"),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
             });
             agent.turns.push(Turn::Assistant {
@@ -3091,6 +3302,7 @@ mod tests {
         assert!(agent.push_user("first", UserMeta::default()));
         agent.history.push(ApiMessage::Assistant {
             content: String::new(),
+            reasoning_content: None,
             tool_calls: vec![ApiToolCall {
                 id: "call-1".to_owned(),
                 name: TOOL_RUN_COMMAND.to_owned(),
@@ -3108,6 +3320,7 @@ mod tests {
         });
         agent.history.push(ApiMessage::Assistant {
             content: "answer".to_owned(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
         });
 
@@ -3135,6 +3348,7 @@ mod tests {
         assert_eq!(agent.history_chars(), 5);
         agent.history.push(ApiMessage::Assistant {
             content: "hi".to_owned(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
         });
         assert_eq!(agent.history_chars(), 7);
@@ -3152,6 +3366,7 @@ mod tests {
             assert!(agent.push_user(&format!("question {step}"), UserMeta::default()));
             agent.history.push(ApiMessage::Assistant {
                 content: format!("answer {step}"),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
             });
             agent.turns.push(Turn::Assistant {
@@ -3200,6 +3415,7 @@ mod tests {
             0,
             Ok(Completion {
                 text: String::new(),
+                reasoning_content: Some("checking the environment".to_owned()),
                 tool_calls: vec![ApiToolCall {
                     id: "c1".to_owned(),
                     name: TOOL_RUN_COMMAND.to_owned(),
@@ -3216,7 +3432,11 @@ mod tests {
         );
         assert!(matches!(
             agent.history.first(),
-            Some(ApiMessage::Assistant { content, .. }) if content.is_empty()
+            Some(ApiMessage::Assistant {
+                content,
+                reasoning_content: Some(reasoning),
+                ..
+            }) if content.is_empty() && reasoning == "checking the environment"
         ));
 
         // Whitespace alone is no more a message than nothing at all.

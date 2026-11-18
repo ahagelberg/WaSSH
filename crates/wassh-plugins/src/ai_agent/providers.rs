@@ -68,9 +68,13 @@ pub fn openai_body(request: &CompletionRequest) -> Value {
             }),
             ApiMessage::Assistant {
                 content,
+                reasoning_content,
                 tool_calls,
             } => {
                 let mut assistant = json!({ "role": "assistant", "content": content });
+                if let Some(reasoning_content) = reasoning_content {
+                    assistant["reasoning_content"] = json!(reasoning_content);
+                }
                 if !tool_calls.is_empty() {
                     assistant["tool_calls"] = Value::Array(
                         tool_calls
@@ -164,6 +168,7 @@ pub fn anthropic_body(request: &CompletionRequest) -> Value {
             ApiMessage::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 let mut blocks = Vec::new();
                 if !content.is_empty() {
@@ -244,6 +249,7 @@ pub fn models_path(protocol: Protocol) -> &'static str {
 #[derive(Default)]
 pub struct OpenAiStream {
     text: String,
+    reasoning_content: String,
     fragments: std::collections::BTreeMap<u64, (String, String, String)>,
     stop_reason: Option<String>,
 }
@@ -264,6 +270,9 @@ impl OpenAiStream {
         {
             self.text.push_str(content);
             added = Some(content.to_owned());
+        }
+        if let Some(reasoning_content) = delta["reasoning_content"].as_str() {
+            self.reasoning_content.push_str(reasoning_content);
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
@@ -305,6 +314,8 @@ impl OpenAiStream {
             .collect();
         Completion {
             text: self.text,
+            reasoning_content: (!self.reasoning_content.is_empty())
+                .then_some(self.reasoning_content),
             tool_calls,
             stop_reason: self.stop_reason,
         }
@@ -371,6 +382,7 @@ impl AnthropicStream {
     pub fn finish(self) -> Completion {
         Completion {
             text: self.text,
+            reasoning_content: None,
             tool_calls: self
                 .blocks
                 .into_iter()
@@ -635,6 +647,7 @@ pub fn complete_blocking(request: &CompletionRequest) -> Result<Completion, Stri
                 .unwrap_or_default();
             Ok(Completion {
                 text: message["content"].as_str().unwrap_or_default().to_owned(),
+                reasoning_content: message["reasoning_content"].as_str().map(str::to_owned),
                 tool_calls,
                 stop_reason: json["choices"][0]["finish_reason"].as_str().map(str::to_owned),
             })
@@ -657,6 +670,7 @@ pub fn complete_blocking(request: &CompletionRequest) -> Result<Completion, Stri
             }
             Ok(Completion {
                 text,
+                reasoning_content: None,
                 tool_calls,
                 stop_reason: json["stop_reason"].as_str().map(str::to_owned),
             })
@@ -722,6 +736,7 @@ mod tests {
                 },
                 ApiMessage::Assistant {
                     content: "hello".to_owned(),
+                    reasoning_content: Some("thinking".to_owned()),
                     tool_calls: vec![ApiToolCall {
                         id: "c1".to_owned(),
                         name: "run_command".to_owned(),
@@ -749,6 +764,7 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hi");
+        assert_eq!(body["messages"][2]["reasoning_content"], "thinking");
         assert_eq!(body["messages"][2]["tool_calls"][0]["function"]["name"], "run_command");
         assert_eq!(body["messages"][3]["role"], "tool");
         assert_eq!(body["messages"][3]["tool_call_id"], "c1");
@@ -761,6 +777,7 @@ mod tests {
         let mut req = request(Protocol::Openai);
         req.messages = vec![ApiMessage::Assistant {
             content: "Let me check that.".to_owned(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
         }];
 
@@ -822,6 +839,8 @@ mod tests {
         let mut stream = OpenAiStream::default();
         let payloads = [
             r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"carefully"}}]}"#,
             r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"run_","arguments":"{\"comm"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"command","arguments":"and\":\"uptime\"}"}}]}}]}"#,
@@ -836,6 +855,10 @@ mod tests {
         let completion = stream.finish();
         assert_eq!(text, "Hello");
         assert_eq!(completion.text, "Hello");
+        assert_eq!(
+            completion.reasoning_content.as_deref(),
+            Some("think carefully")
+        );
         assert_eq!(completion.stop_reason.as_deref(), Some("tool_calls"));
         assert_eq!(completion.tool_calls.len(), 1);
         assert_eq!(completion.tool_calls[0].id, "c1");

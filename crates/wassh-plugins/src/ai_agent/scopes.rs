@@ -13,11 +13,12 @@
 use super::permissions::Permissions;
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
-    TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
-    TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
-    TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
-    TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP,
+    TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ,
+    TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
+    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND,
+    TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
     TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
@@ -55,12 +56,23 @@ question, read the clock.",
     },
     Scope {
         id: "host",
-        summary: "Work with the connected host: its files (dev_view, dev_edit, dev_create, \
-dev_list, dev_grep, dev_find, dev_diff), its system statistics, the live terminal.",
+        summary: "Work with the connected host: the environment map of its files, the files \
+themselves (dev_view, dev_edit, dev_create, dev_list, dev_grep, dev_find, dev_diff), its \
+system statistics, the live terminal.",
         tools: &[],
         pane: None,
-        children: &["host-files", "host-system", "host-terminal"],
+        children: &["env", "host-files", "host-system", "host-terminal"],
         related: &["local", "docker"],
+    },
+    Scope {
+        id: "env",
+        summary: "The environment map: every file under a root with its size, age and \
+declarations, built by env_scan and queried with env_find, env_outline and env_overview \
+without touching the host. Cheaper than dev_grep_search or dev_find_files for \"where is X\".",
+        tools: &[TOOL_ENV_SCAN, TOOL_ENV_FIND, TOOL_ENV_OUTLINE, TOOL_ENV_OVERVIEW],
+        pane: None,
+        children: &[],
+        related: &["host-files", "host-system"],
     },
     Scope {
         id: "host-files",
@@ -84,7 +96,7 @@ instead of cat, grep, ls, find or sed.",
         ],
         pane: None,
         children: &[],
-        related: &["host-terminal"],
+        related: &["host-terminal", "env"],
     },
     Scope {
         id: "host-system",
@@ -384,6 +396,7 @@ mod tests {
         assert_eq!(
             shown,
             [
+                "env",
                 "host-files",
                 "host-system",
                 "host-terminal",

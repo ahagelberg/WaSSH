@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOAD_SCOPE, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
+    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_LOAD_SCOPE, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
     TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
     TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
     TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
@@ -224,6 +225,28 @@ lines, using ripgrep when the host has it.",
     ToolSpec {
         name: TOOL_DEV_DIFF,
         description: "Show the difference between two versions of a file on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_ENV_SCAN,
+        description: "Build or refresh the environment map: one walk of a directory tree that \
+records every file with its size, age and declarations. Cheap enough to re-run; it needs no \
+reading of individual files. Do this before searching a tree you have not mapped yet.",
+    },
+    ToolSpec {
+        name: TOOL_ENV_FIND,
+        description: "Look a file up in the environment map by name or by a declaration inside it. \
+Answers with paths and line numbers without touching the host, so prefer it to dev_grep_search \
+or dev_find_files for \"where is X\" questions.",
+    },
+    ToolSpec {
+        name: TOOL_ENV_OUTLINE,
+        description: "What the environment map knows about one file: its size, when it changed and \
+its declarations with line numbers, without reading the file.",
+    },
+    ToolSpec {
+        name: TOOL_ENV_OVERVIEW,
+        description: "The environment map's directory digest: how many files each directory holds \
+and which files changed most recently.",
     },
     ToolSpec {
         name: TOOL_TERMINAL_READ,
@@ -458,6 +481,24 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["path"]),
         ),
+        TOOL_ENV_SCAN => (
+            json!({
+                "path": string("Directory to map (default: the map's root, else the home directory).")
+            }),
+            json!([]),
+        ),
+        TOOL_ENV_FIND => (
+            json!({
+                "query": string("Part of a file name, or part of a declaration to look for."),
+                "limit": number("Most hits to return (default 30, cap 100).")
+            }),
+            json!(["query"]),
+        ),
+        TOOL_ENV_OUTLINE => (
+            json!({ "path": string("File to describe.") }),
+            json!(["path"]),
+        ),
+        TOOL_ENV_OVERVIEW => (json!({}), json!([])),
         TOOL_LOCAL_RUN => (
             json!({
                 "command": string("The command line to run, exactly as it would be typed."),
@@ -625,7 +666,8 @@ pub fn needs_session(name: &str) -> bool {
     plugin_tool(name).is_some()
         || matches!(
             name,
-        TOOL_RUN_COMMAND
+        TOOL_ENV_SCAN
+            | TOOL_RUN_COMMAND
             | TOOL_RUN_SUDO
             | TOOL_REMOTE_READ
             | TOOL_REMOTE_WRITE
