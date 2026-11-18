@@ -527,7 +527,10 @@ impl Shell {
         let mut shell = Self::new_for_test(config, perf, perf_tabs);
         shell.window = WindowGeometry::new(bounds);
         // Before the first frame, so no frame is painted in egui's own face.
-        wassh_ui::fonts::install(&cc.egui_ctx);
+        wassh_ui::fonts::ensure(
+            &cc.egui_ctx,
+            &[shell.settings.session_style_defaults.font_family.clone()],
+        );
         let system_dark = system_prefers_dark(&cc.egui_ctx);
         shell.system_dark = Some(system_dark);
         if shell.settings.theme == wassh_core::ThemeMode::System {
@@ -3347,6 +3350,9 @@ impl Shell {
             self.styled_palette = Some(self.palette);
             apply_visuals(&ctx, self.palette);
         }
+        // The terminal draws in the monospace family its settings name; registering a family
+        // the atlas does not hold yet is what makes a change in Options show up.
+        self.install_terminal_fonts(&ctx);
         // Windows makes the task bar button from the window icon while the window is being
         // created, before winit has set that icon, so the button keeps the generic program
         // icon until the window is activated. Setting the icon again once the window is on
@@ -3379,6 +3385,20 @@ impl Shell {
             self.track_window_bounds(&ctx);
         }
         self.persist_window_bounds(false);
+    }
+
+    /// Register the monospace families the terminal settings name.
+    ///
+    /// The app default and every open session's own override, so a font picked in Options or
+    /// in a host's appearance applies to the tabs already open.
+    fn install_terminal_fonts(&self, ctx: &egui::Context) {
+        let mut families = vec![self.settings.session_style_defaults.font_family.clone()];
+        families.extend(
+            self.sessions
+                .iter()
+                .map(|session| session.view.font_family.clone()),
+        );
+        wassh_ui::fonts::ensure(ctx, &families);
     }
 
     /// The program icon, uploaded once for the header bar's corner.

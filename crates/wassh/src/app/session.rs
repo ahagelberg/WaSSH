@@ -1216,11 +1216,15 @@ impl SessionEntry {
 
     /// Recompute what the renderer shows from this session's overrides plus the app defaults.
     ///
-    /// Font size and the terminal colours apply immediately; scrollback and font family are
-    /// baked into the emulator and the font atlas at construction.
+    /// Font size, family and the terminal colours apply immediately; scrollback is baked
+    /// into the emulator at construction.
     pub fn apply_style(&mut self, defaults: &SessionStyleDefaults) {
         let style = &self.connection.style;
         self.view.font_size = f32::from(style.font_size.unwrap_or(defaults.font_size));
+        self.view.font_family = style
+            .font_family
+            .clone()
+            .unwrap_or_else(|| defaults.font_family.clone());
 
         let mut palette = self.palette;
         if let Some(colour) = style.term_background.or(defaults.term_background) {

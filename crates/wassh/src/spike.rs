@@ -147,7 +147,7 @@ impl SpikeApp {
         widgets: bool,
     ) -> Self {
         let palette = Palette::for_mode(ThemeMode::Dark);
-        wassh_ui::fonts::install(&cc.egui_ctx);
+        wassh_ui::fonts::ensure(&cc.egui_ctx, &[]);
         apply_visuals(&cc.egui_ctx, palette);
 
         let (tx, events) = channel();

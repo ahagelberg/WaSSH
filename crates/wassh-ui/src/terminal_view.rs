@@ -1,12 +1,13 @@
 //! Terminal widget: whole-cell layout and grid painting.
 //!
-//! The grid is painted per style run into egui's painter, using the platform monospace font.
-
-use std::cell::Cell;
+//! The grid is painted per style run into egui's painter, in the monospace family the
+//! session's settings name.
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Ui};
 use wassh_core::{Palette, Rgba};
 use wassh_term::{ScreenSnapshot, TerminalSize};
+
+use crate::fonts;
 
 /// Glyphs measured to derive one cell's width.
 const CELL_PROBE: &str = "MMMMMMMMMM";
@@ -25,20 +26,26 @@ pub fn with_alpha(color: Rgba, alpha: u8) -> Color32 {
 #[derive(Clone, Debug)]
 pub struct TerminalView {
     pub font_size: f32,
+    /// Monospace family from the session's style; empty means egui's own.
+    pub font_family: String,
     pub padding: f32,
-    /// Cell size measured at a given font size; the glyphs are laid out once, not once
+    /// Cell size measured at a given font; the glyphs are laid out once, not once
     /// per call, because every frame asks for the cell size several times.
-    metrics: Cell<Option<(f32, (f32, f32))>>,
+    metrics: std::cell::RefCell<Option<(FontKey, (f32, f32))>>,
     /// Text of one style run, reused so a frame does not allocate once per run.
     run: std::cell::RefCell<String>,
 }
+
+/// What a measured cell size belongs to: the font it was measured with.
+type FontKey = (String, f32);
 
 impl Default for TerminalView {
     fn default() -> Self {
         Self {
             font_size: 14.0,
+            font_family: String::new(),
             padding: 4.0,
-            metrics: Cell::new(None),
+            metrics: std::cell::RefCell::new(None),
             run: std::cell::RefCell::new(String::new()),
         }
     }
@@ -53,22 +60,27 @@ impl TerminalView {
         }
     }
 
+    /// The font the grid is drawn with.
+    fn font(&self) -> FontId {
+        FontId::new(self.font_size, fonts::terminal_family(&self.font_family))
+    }
+
     /// Character-cell size derived from the active font.
     pub fn cell_size(&self, ui: &Ui) -> (f32, f32) {
-        if let Some((measured, cell)) = self.metrics.get()
-            && measured == self.font_size
+        let key = (self.font_family.clone(), self.font_size);
+        if let Some((measured, cell)) = self.metrics.borrow().as_ref()
+            && *measured == key
         {
-            return cell;
+            return *cell;
         }
-        let font = FontId::monospace(self.font_size);
         let galley = ui
             .painter()
-            .layout_no_wrap(CELL_PROBE.to_owned(), font, Color32::WHITE);
+            .layout_no_wrap(CELL_PROBE.to_owned(), self.font(), Color32::WHITE);
         let cell = (
             (galley.size().x / CELL_PROBE.len() as f32).max(1.0),
             galley.size().y.max(1.0),
         );
-        self.metrics.set(Some((self.font_size, cell)));
+        self.metrics.replace(Some((key, cell)));
         cell
     }
 
@@ -122,7 +134,7 @@ impl TerminalView {
             selection.a.max(90),
         );
 
-        let font = FontId::monospace(self.font_size);
+        let font = self.font();
         let origin_x = rect.left() + self.padding;
         let origin_y = rect.top() + self.padding;
         let cols = usize::from(snapshot.size.cols);
@@ -229,5 +241,61 @@ impl TerminalView {
         }
 
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cell size of a view drawn with `family`.
+    fn cell_of(ctx: &egui::Context, family: &str) -> (f32, f32) {
+        let view = TerminalView {
+            font_family: family.to_owned(),
+            ..TerminalView::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut cell = (0.0, 0.0);
+        let output = ctx.run_ui(input, |ui| {
+            cell = view.cell_size(ui);
+        });
+        output.drop_without_applying_deltas();
+        cell
+    }
+
+    #[test]
+    fn the_cell_follows_the_family_the_session_names() {
+        // Only a host that has a second monospace face can tell the two apart.
+        let faces = fonts::installed();
+        let Some(other) = faces
+            .iter()
+            .find(|family| family.to_lowercase().contains("consolas"))
+        else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        fonts::ensure(&ctx, std::slice::from_ref(other));
+        assert_ne!(
+            cell_of(&ctx, other),
+            cell_of(&ctx, ""),
+            "{other} measures like egui's own face, so the setting is not in use"
+        );
+    }
+
+    #[test]
+    fn a_family_the_host_lacks_keeps_the_egui_cell() {
+        let ctx = egui::Context::default();
+        fonts::ensure(&ctx, &[]);
+        assert_eq!(
+            cell_of(&ctx, "no-such-font-anywhere"),
+            cell_of(&ctx, ""),
+            "an unknown family must fall back, not measure nothing"
+        );
     }
 }

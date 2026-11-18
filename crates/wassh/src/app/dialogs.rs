@@ -1700,10 +1700,8 @@ fn options_host_defaults(
         ui,
         palette,
         "Font family",
-        Some("Default monospace family for hosts using the default"),
-        |ui| {
-            text_input(ui, palette, &mut defaults.font_family, "JetBrains Mono");
-        },
+        Some("Monospace family the terminal draws with"),
+        |ui| font_family_select(ui, "default-terminal-font", &mut defaults.font_family),
     );
     row(ui, palette, "Font size", None, |ui| {
         let mut size = u32::from(defaults.font_size);
@@ -3276,9 +3274,7 @@ fn host_appearance(ui: &mut Ui, palette: &Palette, fields: &mut AppearanceFields
         "Monospace family used by the emulator",
         &mut style.font_family,
         defaults.font_family.clone(),
-        |ui, family| {
-            text_input(ui, palette, family, "default");
-        },
+        |ui, family| font_family_select(ui, "session-terminal-font", family),
     );
     override_row(
         ui,
@@ -3391,6 +3387,22 @@ fn defaultable_row(
         });
     });
     toggle
+}
+
+/// A dropdown of the fonts this computer has, for the terminal's monospace family.
+///
+/// The current value stays in the list even when the host does not have it, so a setting
+/// carried from another machine still shows what it asked for instead of silently changing.
+fn font_family_select(ui: &mut Ui, id: &str, family: &mut String) {
+    let installed = wassh_ui::fonts::installed();
+    let current = family.clone();
+    let mut options: Vec<&str> = installed.iter().map(String::as_str).collect();
+    if !options.iter().any(|name| name.eq_ignore_ascii_case(&current)) {
+        options.insert(0, current.as_str());
+    }
+    if let Some(chosen) = select_str(ui, id, &current, &options) {
+        *family = chosen;
+    }
 }
 
 /// A row whose value may be overridden, cleared back to `fallback` by "Use default".
