@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use wassh_core::{Palette, RADIUS, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
-    Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, chip, copy_button, password_input,
+    Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
     select_width, small_button, small_button_enabled, text_area, text_area_with_id,
     truncating_galley,
 };
@@ -119,10 +119,26 @@ const MIN_ANSWER_WIDTH: f32 = 80.0;
 const PROMPT_COMMAND_MAX_CHARS: usize = 400;
 /// Characters of a command kept in an "always allow" button's label.
 const SCOPE_LABEL_MAX_CHARS: usize = 56;
+/// What a loaded scope's chip says when hovered.
+const SCOPE_CHIP_HINT: &str = "Scope loaded. Click to remove from context";
+/// Caption of the row of loaded scopes over the composer.
+const SCOPE_LABEL: &str = "Loaded scopes:";
+/// Type size of a loaded scope's tag and of its caption.
+const SCOPE_TAG_TEXT_SIZE: f32 = 10.0;
+/// Height of a loaded scope's tag.
+const SCOPE_TAG_HEIGHT: f32 = 16.0;
+/// Side padding inside a loaded scope's tag.
+const SCOPE_TAG_PADDING: f32 = 6.0;
 /// Padding inside a prompt card.
 const PROMPT_CARD_PADDING: i8 = 10;
-/// Caption of the button that leaves a chat for the list.
-const BACK_GLYPH: &str = "\u{25c0}";
+/// Side the button that leaves a chat for the list is drawn at.
+const BACK_BUTTON_SIZE: f32 = 26.0;
+/// Half the arrow's shaft, from the centre of its button.
+const BACK_ARROW_SHAFT: f32 = 7.5;
+/// Length of each side of the arrow's head.
+const BACK_ARROW_HEAD: f32 = 4.5;
+/// Thickness of the arrow.
+const BACK_ARROW_WIDTH: f32 = 1.8;
 /// Heading of the chat list.
 const CHAT_LIST_HEADING: &str = "Chats";
 /// What the chat list says when there is nothing to reopen.
@@ -1742,6 +1758,90 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     }
 }
 
+/// The button that leaves a chat for the list.
+///
+/// The arrow is drawn rather than typed: a glyph like "◀" comes out of whichever font
+/// claims it, which is how it ends up in the wrong size and colour.
+fn back_button(ui: &mut Ui, palette: &Palette) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::splat(BACK_BUTTON_SIZE),
+        egui::Sense::click(),
+    );
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, RADIUS, to_color32(palette.bg_panel_2));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let colour = to_color32(if hovered {
+        palette.text
+    } else {
+        palette.text_muted
+    });
+    let stroke = egui::Stroke::new(BACK_ARROW_WIDTH, colour);
+    let centre = rect.center();
+    let tip = centre - egui::Vec2::new(BACK_ARROW_SHAFT, 0.0);
+    ui.painter().line_segment(
+        [centre + egui::Vec2::new(BACK_ARROW_SHAFT, 0.0), tip],
+        stroke,
+    );
+    for side in [-1.0, 1.0] {
+        ui.painter().line_segment(
+            [tip, tip + egui::Vec2::new(BACK_ARROW_HEAD, side * BACK_ARROW_HEAD)],
+            stroke,
+        );
+    }
+    response.clicked()
+}
+
+/// One loaded scope, as a small quiet tag beside the composer.
+///
+/// Neutral rather than accent-filled: a loaded scope is context the conversation carries,
+/// not a button, so only hovering gives it a surface.
+fn scope_tag(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(SCOPE_TAG_TEXT_SIZE);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), to_color32(palette.text))
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::new(text_width + SCOPE_TAG_PADDING * 2.0, SCOPE_TAG_HEIGHT),
+        egui::Sense::click(),
+    );
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, RADIUS, to_color32(palette.bg_panel_2));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect_stroke(
+        rect,
+        RADIUS,
+        egui::Stroke::new(
+            1.0,
+            to_color32(if hovered {
+                palette.text_muted
+            } else {
+                palette.border
+            }),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font,
+        to_color32(if hovered {
+            palette.text
+        } else {
+            palette.text_muted
+        }),
+    );
+    response
+}
+
 /// One chat in the list: its title across the row, which the user can click.
 fn chat_row(ui: &mut Ui, palette: &Palette, title: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(
@@ -2829,7 +2929,7 @@ impl Plugin for AiAgent {
         let mut back = false;
         ui.horizontal(|ui| match self.view {
             ChatView::Chat => {
-                back = Button::new(BACK_GLYPH).compact().ghost().show(ui, palette).clicked();
+                back = back_button(ui, palette);
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(self.title()).size(CHAT_TITLE_TEXT_SIZE),
@@ -2979,9 +3079,16 @@ impl Plugin for AiAgent {
                 if !loaded.is_empty() {
                     let mut unload = None;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Scopes").size(10.0).color(muted));
+                        ui.label(
+                            egui::RichText::new(SCOPE_LABEL)
+                                .size(SCOPE_TAG_TEXT_SIZE)
+                                .color(muted),
+                        );
                         for id in loaded {
-                            if chip(ui, palette, id, true) {
+                            if scope_tag(ui, palette, id)
+                                .on_hover_text(SCOPE_CHIP_HINT)
+                                .clicked()
+                            {
                                 unload = Some(id);
                             }
                         }
@@ -5659,13 +5766,7 @@ mod tests {
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let back = rows
-            .iter()
-            .find(|(_, _, text)| text == BACK_GLYPH)
-            .cloned()
-            .unwrap_or_else(|| panic!("the open chat has no back button: {rows:?}"));
-        frame(&mut plugin, &mut settings, &ctx, click(back));
+        frame(&mut plugin, &mut settings, &ctx, click_back());
         assert_eq!(plugin.view, ChatView::List, "back leaves the chat");
 
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
@@ -5703,13 +5804,7 @@ mod tests {
         });
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let back = rows
-            .iter()
-            .find(|(_, _, text)| text == BACK_GLYPH)
-            .cloned()
-            .expect("the open chat has a back button");
-        frame(&mut plugin, &mut settings, &ctx, click(back));
+        frame(&mut plugin, &mut settings, &ctx, click_back());
         assert_eq!(plugin.view, ChatView::List);
 
         plugin.draft = "hello".to_owned();
@@ -5814,17 +5909,20 @@ mod tests {
         // The composer panel settles its height on the first frame.
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert!(rows.iter().any(|(_, _, text)| text == "Scopes"), "{rows:?}");
-        let chip = rows
+        assert!(
+            rows.iter().any(|(_, _, text)| text == SCOPE_LABEL),
+            "{rows:?}"
+        );
+        let tag = rows
             .iter()
             .find(|(_, _, text)| text == "host")
             .cloned()
-            .unwrap_or_else(|| panic!("no chip for the loaded scope: {rows:?}"));
-        let pos = egui::Pos2::new(chip.1 as f32 + 4.0, chip.0 as f32 + 4.0);
+            .unwrap_or_else(|| panic!("no tag for the loaded scope: {rows:?}"));
+        let pos = egui::Pos2::new(tag.1 as f32 + 4.0, tag.0 as f32 + 4.0);
         frame(&mut plugin, &mut settings, &ctx, click_events(pos));
         assert!(
             !plugin.agent.scopes.contains("host"),
-            "the chip did not drop the scope"
+            "the tag did not drop the scope"
         );
         assert!(plugin.agent.scopes.contains(scopes::ROOT));
     }
@@ -6087,6 +6185,14 @@ mod tests {
         let (worker, events) = std::sync::mpsc::channel();
         plugin.agent.phase = Some(Phase::Streaming { turn: 1, events });
         (plugin, worker)
+    }
+
+    /// A click in the middle of the pane's back button, which is drawn rather than typed.
+    fn click_back() -> Vec<egui::Event> {
+        click_events(egui::Pos2::new(
+            BACK_BUTTON_SIZE / 2.0,
+            BACK_BUTTON_SIZE / 2.0,
+        ))
     }
 
     /// A click in the middle of a painted text.

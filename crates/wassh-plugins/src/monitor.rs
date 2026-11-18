@@ -1945,7 +1945,7 @@ fn draw(
             ("Net", &mut view.network),
         ];
         for (label, flag) in chips {
-            if chip(ui, palette, label, *flag) {
+            if chip(ui, palette, label, *flag).clicked() {
                 *flag = !*flag;
             }
         }

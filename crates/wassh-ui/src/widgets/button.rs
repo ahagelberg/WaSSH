@@ -229,9 +229,9 @@ pub fn small_button_enabled(ui: &mut Ui, palette: &Palette, label: &str, enabled
         .clicked()
 }
 
-/// A small pill used for view filters; returns true when clicked. `active`
-/// shows the accent tint.
-pub fn chip(ui: &mut Ui, palette: &Palette, label: &str, active: bool) -> bool {
+/// A small pill used for view filters. `active` shows the accent tint; hovering either
+/// state brightens it, so a chip that can be clicked looks like it.
+pub fn chip(ui: &mut Ui, palette: &Palette, label: &str, active: bool) -> Response {
     let font = FontId::proportional(11.0);
     let text_width = ui
         .painter()
@@ -240,31 +240,38 @@ pub fn chip(ui: &mut Ui, palette: &Palette, label: &str, active: bool) -> bool {
         .x;
     let size = Vec2::new(text_width + 20.0, 22.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let (fill, border, text) = if active {
-        (
+    let hovered = response.hovered();
+    let (fill, border, text) = match (active, hovered) {
+        (true, false) => (
             to_color32(palette.accent).gamma_multiply(0.22),
             to_color32(palette.accent),
             to_color32(palette.text),
-        )
-    } else if response.hovered() {
-        (
+        ),
+        (true, true) => (
+            to_color32(palette.accent).gamma_multiply(0.34),
+            to_color32(palette.accent_hover),
+            to_color32(palette.text),
+        ),
+        (false, true) => (
             to_color32(palette.bg_panel_2),
             to_color32(palette.border),
             to_color32(palette.text),
-        )
-    } else {
-        (
+        ),
+        (false, false) => (
             to_color32(palette.bg_input),
             to_color32(palette.border),
             to_color32(palette.text_muted),
-        )
+        ),
     };
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     ui.painter().rect_filled(rect, 11.0, fill);
     ui.painter()
         .rect_stroke(rect, 11.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
     ui.painter()
         .text(rect.center(), Align2::CENTER_CENTER, label, font, text);
-    response.clicked()
+    response
 }
 
 /// Convenience wrapper for the common secondary button.
