@@ -119,8 +119,8 @@ const MIN_ANSWER_WIDTH: f32 = 80.0;
 const PROMPT_COMMAND_MAX_CHARS: usize = 400;
 /// Characters of a command kept in an "always allow" button's label.
 const SCOPE_LABEL_MAX_CHARS: usize = 56;
-/// What a loaded scope's chip says when hovered.
-const SCOPE_CHIP_HINT: &str = "Scope loaded. Click to remove from context";
+/// What a loaded scope's tag says when hovered.
+const SCOPE_CHIP_HINT: &str = "Scope loaded. Click for its options";
 /// Caption of the row of loaded scopes over the composer.
 const SCOPE_LABEL: &str = "Loaded scopes:";
 /// Type size of a loaded scope's tag and of its caption.
@@ -129,6 +129,12 @@ const SCOPE_TAG_TEXT_SIZE: f32 = 10.0;
 const SCOPE_TAG_HEIGHT: f32 = 16.0;
 /// Side padding inside a loaded scope's tag.
 const SCOPE_TAG_PADDING: f32 = 6.0;
+/// Width of the popup a tag opens.
+const SCOPE_POPUP_WIDTH: f32 = 260.0;
+/// Padding inside that popup.
+const SCOPE_POPUP_PADDING: i8 = 10;
+/// Gap between the popup's lines.
+const SCOPE_POPUP_GAP: f32 = 6.0;
 /// Padding inside a prompt card.
 const PROMPT_CARD_PADDING: i8 = 10;
 /// Side the button that leaves a chat for the list is drawn at.
@@ -381,8 +387,19 @@ pub struct AiAgent {
     applied_web_key: Option<String>,
     /// Tool card whose copy button confirmed: which card, which button, and when.
     copied: Option<(usize, CopyTarget, u64)>,
+    /// The scope popup a tag click opened, if any.
+    scope_popup: Option<ScopePopup>,
     /// Which of the pane's two views is drawn.
     view: ChatView,
+}
+
+/// The popup a click on a loaded scope's tag opens.
+struct ScopePopup {
+    /// Scope it belongs to.
+    id: &'static str,
+    /// The tag it came from, so it sits under that tag and a press on it does not close the
+    /// popup it just opened.
+    anchor: egui::Rect,
 }
 
 /// Which of the pane's two views is drawn.
@@ -426,6 +443,7 @@ impl Default for AiAgent {
             applied: None,
             applied_web_key: None,
             copied: None,
+            scope_popup: None,
             view: ChatView::List,
         }
     }
@@ -1685,6 +1703,106 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         // The files and terminal tail the first version carried are not in the transcript,
         // so the edited prompt goes out as written.
         self.send_message(text, UserMeta::default(), settings, host, environment);
+    }
+
+    /// Draw the popup a tag opened: what the scope is, the tools it carries, and the way to
+    /// turn it off.
+    fn scope_popover(&mut self, ui: &mut Ui, palette: &Palette) {
+        let Some(popup) = self.scope_popup.as_ref() else {
+            return;
+        };
+        let Some(scope) = scopes::find(popup.id) else {
+            self.scope_popup = None;
+            return;
+        };
+        let anchor = popup.anchor;
+        let loaded = self.agent.scopes.contains(scope.id);
+        let tools = self.scope_tool_names(scope);
+        let mut turn_off = false;
+        let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(to_color32(palette.bg_panel))
+                    .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+                    .corner_radius(egui::CornerRadius::same(RADIUS as u8))
+                    .inner_margin(egui::Margin::same(SCOPE_POPUP_PADDING))
+                    .show(ui, |ui| {
+                        ui.set_width(SCOPE_POPUP_WIDTH);
+                        ui.spacing_mut().item_spacing.y = SCOPE_POPUP_GAP;
+                        ui.label(
+                            egui::RichText::new(scope.id)
+                                .size(12.0)
+                                .strong()
+                                .color(to_color32(palette.text)),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(scope.summary)
+                                    .size(11.0)
+                                    .color(to_color32(palette.text_muted)),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    if loaded {
+                                        "Loaded, carrying"
+                                    } else {
+                                        "Not loaded. Would carry"
+                                    },
+                                    tools.len()
+                                ))
+                                .size(10.0)
+                                .color(to_color32(palette.text_muted)),
+                            )
+                            .wrap(),
+                        );
+                        if !tools.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(tools.join(", "))
+                                        .size(10.0)
+                                        .color(to_color32(palette.accent)),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        if loaded {
+                            ui.separator();
+                            turn_off = Button::new("Turn off").compact().show(ui, palette).clicked();
+                        }
+                    });
+            });
+        if turn_off {
+            let _ = self.agent.unload_scope(scope.id);
+        }
+        let rect = area.response.rect;
+        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let pressed_outside = ui.input(|input| {
+            input
+                .pointer
+                .any_pressed()
+                .then(|| input.pointer.interact_pos())
+                .flatten()
+                .is_some_and(|pos| !rect.contains(pos) && !anchor.contains(pos))
+        });
+        if turn_off || escape || pressed_outside {
+            self.scope_popup = None;
+        }
+    }
+
+    /// The tools `scope` holds that this host may call, loaded or not.
+    fn scope_tool_names(&self, scope: &scopes::Scope) -> Vec<&'static str> {
+        let mut names = scope.tools.to_vec();
+        if let Some(pane) = scope.pane {
+            names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
+        }
+        names.retain(|name| self.agent.permissions.offers(name));
+        names
     }
 
     /// Draw the list of earlier chats, newest first, and open the one the user picks.
@@ -3077,7 +3195,7 @@ impl Plugin for AiAgent {
                     .filter(|id| *id != scopes::ROOT)
                     .collect();
                 if !loaded.is_empty() {
-                    let mut unload = None;
+                    let mut opened = None;
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new(SCOPE_LABEL)
@@ -3085,16 +3203,14 @@ impl Plugin for AiAgent {
                                 .color(muted),
                         );
                         for id in loaded {
-                            if scope_tag(ui, palette, id)
-                                .on_hover_text(SCOPE_CHIP_HINT)
-                                .clicked()
-                            {
-                                unload = Some(id);
+                            let tag = scope_tag(ui, palette, id).on_hover_text(SCOPE_CHIP_HINT);
+                            if tag.clicked() {
+                                opened = Some((id, tag.rect));
                             }
                         }
                     });
-                    if let Some(id) = unload {
-                        let _ = self.agent.unload_scope(id);
+                    if let Some((id, anchor)) = opened {
+                        self.scope_popup = Some(ScopePopup { id, anchor });
                     }
                 }
 
@@ -3288,6 +3404,9 @@ impl Plugin for AiAgent {
                 &context.environment,
             );
         }
+
+        // A popup the tags opened sits over the pane, so a press anywhere else closes it.
+        self.scope_popover(ui, palette);
 
         if let Some((allow, remember, everything)) = prompts.approval {
             if everything {
@@ -5901,7 +6020,7 @@ mod tests {
     }
 
     #[test]
-    fn the_loaded_scopes_show_over_the_composer_and_a_click_drops_one() {
+    fn a_scope_tag_opens_its_popup_and_turning_off_drops_it() {
         let mut plugin = AiAgent::default();
         plugin.agent.scopes.load(super::scopes::find("host").unwrap());
         let mut settings = serde_json::Map::new();
@@ -5918,13 +6037,28 @@ mod tests {
             .find(|(_, _, text)| text == "host")
             .cloned()
             .unwrap_or_else(|| panic!("no tag for the loaded scope: {rows:?}"));
-        let pos = egui::Pos2::new(tag.1 as f32 + 4.0, tag.0 as f32 + 4.0);
-        frame(&mut plugin, &mut settings, &ctx, click_events(pos));
+        frame(&mut plugin, &mut settings, &ctx, click(tag));
         assert!(
-            !plugin.agent.scopes.contains("host"),
-            "the tag did not drop the scope"
+            plugin.agent.scopes.contains("host"),
+            "clicking a tag asks, it does not unload"
         );
+
+        // The popup says what the scope is and offers to turn it off.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let scope = super::scopes::find("host").unwrap();
+        assert!(
+            rows.iter().any(|(_, _, text)| text == scope.summary),
+            "the popup does not describe the scope: {rows:?}"
+        );
+        let turn_off = rows
+            .iter()
+            .find(|(_, _, text)| text == "Turn off")
+            .cloned()
+            .unwrap_or_else(|| panic!("the popup offers no Turn off: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(turn_off));
+        assert!(!plugin.agent.scopes.contains("host"), "Turn off did nothing");
         assert!(plugin.agent.scopes.contains(scopes::ROOT));
+        assert!(plugin.scope_popup.is_none(), "the popup closed with the action");
     }
 
     #[test]
