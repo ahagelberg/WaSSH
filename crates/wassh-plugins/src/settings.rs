@@ -559,6 +559,13 @@ const AI_AGENT_APP: &[SettingsField] = &[
         true,
         "Summarise the older part of the chat into the prompt once it would no longer fit the model's context window.",
     ),
+    number(
+        "maxSubagents",
+        "Sub-agents at a time",
+        5,
+        "How many sub-agents may run in the background at once. A spawn beyond this is refused \
+and the model is told to wait for one to finish.",
+    ),
     group(
         "globalKnowledgeGroup",
         "Global knowledge",
@@ -1350,6 +1357,7 @@ mod tests {
                 "Global prompt text",
                 "Model context windows",
                 "Compact long chats",
+                "Sub-agents at a time",
                 "Global knowledge",
                 "Default allow rules",
                 "Default deny rules",

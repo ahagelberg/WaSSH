@@ -18,7 +18,10 @@ mod tools;
 mod view;
 mod web;
 
-pub use agent::{Agent, Phase, ToolSettings, Turn, Waiting};
+pub use agent::{
+    Agent, CommandKeys, Phase, SpawnRequest, Subagent, SubagentEnd, SubagentState, ToolSettings,
+    Turn, Waiting,
+};
 pub use permissions::{GATES, GROUPS, Permission, Permissions, group_key, setting_key};
 pub use protocol::{
     ApiMessage, ApiToolCall, Completion, DATA_VERSION, DEFAULT_CHAT_TITLE, PROVIDER_CUSTOM,

@@ -12,17 +12,17 @@ use serde_json::Value;
 use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
 use super::protocol::{
-    ApiMessage, ApiToolCall, Completion, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE,
-    TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW,
-    TOOL_ENV_FIND, TOOL_ENV_OUTLINE, TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH,
-    TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
+    ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, MAX_SUBAGENT_RESULT_CHARS,
+    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK,
-    TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS,
-    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE,
-    TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND,
+    TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
+    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
@@ -54,6 +54,12 @@ pub const EXEC_KEY: &str = "ai.run_command";
 pub const PROBE_KEY: &str = "ai.probe";
 /// Key the session caches a map scan the pane asked for under.
 pub const MAP_KEY: &str = "ai.env_scan";
+/// Prefix of the ids sub-agents are handed out.
+pub const SUBAGENT_ID_PREFIX: &str = "sub";
+/// Longest sub-agent name taken from its prompt.
+const SUBAGENT_TITLE_CHARS: usize = 48;
+/// Said to a model that asks a sub-agent to spawn one of its own.
+pub const NO_NESTED_SUBAGENTS: &str = "Sub-agents cannot start sub-agents; do the work yourself.";
 /// Marker the sudo preamble prints when the password was refused.
 pub const SUDO_AUTH_FAILED_MARKER: &str = "__WASSH_SUDO_FAILED__";
 /// What the user is told when `sudo` refused the password they typed.
@@ -206,9 +212,14 @@ pub enum Waiting {
     /// A shell command on the session.
     Command {
         /// Cache key it answers under.
-        key: &'static str,
+        key: String,
         /// What to do with the output.
         then: CommandThen,
+    },
+    /// A sub-agent, until it answers.
+    Subagent {
+        /// Id `wait_subagent` was given.
+        id: String,
     },
     /// A remote read.
     Read {
@@ -309,6 +320,233 @@ pub struct ToolSettings {
     pub embed: Option<EmbedConfig>,
 }
 
+/// Command cache keys, so agents running side by side never read each other's answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandKeys {
+    /// Key `run_command` answers under.
+    pub exec: String,
+    /// Key probes answer under.
+    pub probe: String,
+}
+
+impl Default for CommandKeys {
+    fn default() -> Self {
+        Self {
+            exec: EXEC_KEY.to_owned(),
+            probe: PROBE_KEY.to_owned(),
+        }
+    }
+}
+
+impl CommandKeys {
+    /// Keys of a sub-agent, kept apart from its parent's.
+    pub fn subagent(id: &str) -> Self {
+        Self {
+            exec: format!("{EXEC_KEY}#{id}"),
+            probe: format!("{PROBE_KEY}#{id}"),
+        }
+    }
+}
+
+/// What a sub-agent is doing, for the chat list and the parent's caption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubagentState {
+    /// Working.
+    Running,
+    /// Waiting for an answer the parent chat shows.
+    NeedsAnswer,
+    /// Finished.
+    Done,
+    /// Ended on an error.
+    Failed,
+    /// Stopped by the user.
+    Stopped,
+}
+
+impl SubagentState {
+    /// Short word shown beside the sub-agent's name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::NeedsAnswer => "needs answer",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// The stored spelling, for the plugin data.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::NeedsAnswer => "needs-answer",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// How a sub-agent's run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubagentEnd {
+    /// It answered.
+    Done,
+    /// It ended on an error.
+    Failed,
+    /// The user stopped it.
+    Stopped,
+}
+
+impl SubagentEnd {
+    /// How the plugin data stores it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// Read a stored one back.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "stopped" => Some(Self::Stopped),
+            _ => None,
+        }
+    }
+}
+
+/// One conversation the parent delegated work to.
+pub struct Subagent {
+    /// Id `wait_subagent` takes.
+    pub id: String,
+    /// Short name shown with the chats.
+    pub title: String,
+    /// The task it was given.
+    pub prompt: String,
+    /// Its own conversation.
+    pub agent: Agent,
+    /// How it ended, once it has.
+    pub end: Option<SubagentEnd>,
+    /// Whether the parent already said it is waiting for an answer.
+    waiting_announced: bool,
+}
+
+impl Subagent {
+    /// What it is doing now.
+    pub fn state(&self) -> SubagentState {
+        match self.end {
+            Some(SubagentEnd::Done) => SubagentState::Done,
+            Some(SubagentEnd::Failed) => SubagentState::Failed,
+            Some(SubagentEnd::Stopped) => SubagentState::Stopped,
+            None if self.agent.needs_user() => SubagentState::NeedsAnswer,
+            None => SubagentState::Running,
+        }
+    }
+
+    /// Whether it is still working.
+    pub fn running(&self) -> bool {
+        self.end.is_none()
+    }
+
+    /// The last prose it wrote, capped for the transcript and the model.
+    pub fn answer(&self) -> String {
+        let text = self
+            .agent
+            .turns
+            .iter()
+            .rev()
+            .find_map(|turn| match turn {
+                Turn::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        head_chars(text, MAX_SUBAGENT_RESULT_CHARS)
+    }
+}
+
+/// Its line in the parent transcript, once `sub` starts waiting for the user.
+///
+/// Says it once per wait, so a sub-agent that asks twice is not announced twice.
+pub fn announce_wait(sub: &mut Subagent) -> Option<Turn> {
+    if !sub.agent.needs_user() {
+        sub.waiting_announced = false;
+        return None;
+    }
+    if std::mem::replace(&mut sub.waiting_announced, true) {
+        return None;
+    }
+    let title = sub.title.clone();
+    Some(Turn::Notice(format!(
+        "Sub-agent \"{title}\" needs your answer."
+    )))
+}
+
+/// Record how `sub` ended: what its parent shows, and what its model reads next time.
+pub fn end_subagent(sub: &mut Subagent) -> (Turn, String) {
+    let answer = sub.answer();
+    let failed = sub.agent.error.is_some() && answer.is_empty();
+    let error = sub.agent.error.clone();
+    sub.end = Some(if failed {
+        SubagentEnd::Failed
+    } else {
+        SubagentEnd::Done
+    });
+    let title = sub.title.clone();
+    let (line, report) = if failed {
+        let error = error.unwrap_or_else(|| "it stopped without an answer.".to_owned());
+        (
+            format!("Sub-agent \"{title}\" failed: {error}"),
+            format!("[Sub-agent \"{title}\" failed]\n{error}"),
+        )
+    } else {
+        (
+            format!("Sub-agent \"{title}\" finished:\n{answer}"),
+            format!("[Sub-agent \"{title}\" finished]\n{answer}"),
+        )
+    };
+    (Turn::Notice(line), report)
+}
+
+/// A name for a sub-agent, from what it was asked to do.
+fn subagent_title(prompt: &str) -> String {
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    head_chars(first, SUBAGENT_TITLE_CHARS)
+}
+
+/// Cut `text` to `max_chars`, marking the cut.
+fn head_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(max_chars).collect();
+    cut.push('…');
+    cut
+}
+
+/// A spawn the pane still has to turn into a provider request.
+///
+/// The agent knows what to delegate but not which provider, model or prompt the request
+/// needs, so the pane builds it and hands the sub-agent back its first request.
+#[derive(Clone, Debug)]
+pub struct SpawnRequest {
+    /// Call being answered.
+    pub call: ApiToolCall,
+    /// Transcript line of the call.
+    pub turn: usize,
+    /// Name the sub-agent gets.
+    pub title: String,
+    /// Task it is given.
+    pub prompt: String,
+}
+
 /// One conversation's state.
 #[derive(Default)]
 pub struct Agent {
@@ -372,6 +610,21 @@ pub struct Agent {
     pub system: SystemFacts,
     /// A map scan the pane asked for: the root, until its output arrives.
     pub map_scan: Option<String>,
+    /// Sub-agents this conversation started, in the order they were started.
+    pub subagents: Vec<Subagent>,
+    /// Counter behind the sub-agent ids.
+    next_subagent: usize,
+    /// How many sub-agents may run at once.
+    pub max_subagents: usize,
+    /// Whether this conversation is itself a sub-agent.
+    pub subagent: bool,
+    /// Command cache keys, kept apart from every other agent's.
+    pub keys: CommandKeys,
+    /// A spawn the pane still has to launch.
+    spawn_request: Option<SpawnRequest>,
+    /// Answers from sub-agents, held until the conversation is between turns so a tool
+    /// call of its own is never separated from its result.
+    pending_reports: Vec<String>,
 }
 
 impl Agent {
@@ -379,6 +632,7 @@ impl Agent {
     pub fn new() -> Self {
         Self {
             cwd: "/".to_owned(),
+            max_subagents: DEFAULT_MAX_SUBAGENTS,
             ..Self::default()
         }
     }
@@ -416,6 +670,11 @@ impl Agent {
         }
     }
 
+    /// Whether the run is parked on the user rather than on a tool.
+    pub fn needs_user(&self) -> bool {
+        self.approving() || self.allowing() || self.asking() || self.sudo_prompt().is_some()
+    }
+
     /// Whether anything at all blocks a new message.
     pub fn blocked(&self) -> bool {
         self.busy()
@@ -423,6 +682,7 @@ impl Agent {
             || self.allowing()
             || self.asking()
             || self.sudo_prompt().is_some()
+            || self.spawning()
     }
 
     /// Throw the conversation away.
@@ -436,6 +696,15 @@ impl Agent {
         self.needs_reply = false;
         self.compacted = None;
         self.scopes = Loaded::new();
+        self.spawn_request = None;
+        self.pending_reports.clear();
+        for sub in &mut self.subagents {
+            if sub.running() {
+                sub.agent.stop();
+            }
+        }
+        self.subagents.clear();
+        self.next_subagent = 0;
     }
 
     /// Add the user's turn, if the conversation is idle.
@@ -530,6 +799,105 @@ impl Agent {
 
     /// Take in whatever the worker thread or the session has produced.
     pub fn poll(&mut self, session: Session<'_, '_>) -> bool {
+        self.flush_reports();
+        let mut progressed = self.poll_own(session);
+        progressed |= self.poll_subagents(session);
+        progressed
+    }
+
+    /// Fold the sub-agent answers that arrived mid-run into the history, now that the
+    /// conversation is between turns again.
+    fn flush_reports(&mut self) {
+        if self.phase.is_some() {
+            return;
+        }
+        for report in self.pending_reports.drain(..) {
+            self.history.push(ApiMessage::User { content: report });
+        }
+    }
+
+    /// Poll every sub-agent, and record the ones that have ended.
+    fn poll_subagents(&mut self, session: Session<'_, '_>) -> bool {
+        self.sync_subagents();
+        let mut progressed = false;
+        for index in 0..self.subagents.len() {
+            if !self.subagents[index].running() {
+                continue;
+            }
+            if self.subagents[index].agent.poll(session) {
+                progressed = true;
+            }
+            self.announce_subagent_wait(index);
+            let settled = self.subagents[index].agent.phase.is_none()
+                && !self.subagents[index].agent.needs_reply
+                && !self.subagents[index].agent.spawning();
+            if settled {
+                self.finish_subagent(index);
+                progressed = true;
+            }
+        }
+        progressed
+    }
+
+    /// Keep the running sub-agents on this conversation's rules and permissions.
+    ///
+    /// Copying rather than sharing is what lets an "always allow" answered later reach
+    /// every sub-agent: the pane answers on the parent, and the next frame carries it in.
+    fn sync_subagents(&mut self) {
+        let max_subagents = self.max_subagents;
+        for sub in self.subagents.iter_mut().filter(|sub| sub.running()) {
+            let agent = &mut sub.agent;
+            agent.max_subagents = max_subagents;
+            agent.now_ms = self.now_ms;
+            if agent.allow_all != self.allow_all {
+                agent.allow_all = self.allow_all;
+            }
+            if agent.permissions != self.permissions {
+                agent.permissions = self.permissions.clone();
+            }
+            if agent.app_allow != self.app_allow {
+                agent.app_allow = self.app_allow.clone();
+            }
+            if agent.app_deny != self.app_deny {
+                agent.app_deny = self.app_deny.clone();
+            }
+            if agent.host_allow != self.host_allow {
+                agent.host_allow = self.host_allow.clone();
+            }
+            if agent.host_deny != self.host_deny {
+                agent.host_deny = self.host_deny.clone();
+            }
+            if agent.session_allow != self.session_allow {
+                agent.session_allow = self.session_allow.clone();
+            }
+            if agent.session_deny != self.session_deny {
+                agent.session_deny = self.session_deny.clone();
+            }
+        }
+    }
+
+    /// Say once, in the parent transcript, that a sub-agent is waiting for an answer.
+    fn announce_subagent_wait(&mut self, index: usize) {
+        let Some(sub) = self.subagents.get_mut(index) else {
+            return;
+        };
+        if let Some(turn) = announce_wait(sub) {
+            self.turns.push(turn);
+        }
+    }
+
+    /// Record how a sub-agent ended, in the transcript and in what the model will read.
+    fn finish_subagent(&mut self, index: usize) {
+        let Some(sub) = self.subagents.get_mut(index) else {
+            return;
+        };
+        let (turn, report) = end_subagent(sub);
+        self.turns.push(turn);
+        self.pending_reports.push(report);
+    }
+
+    /// Take in whatever this conversation's own worker thread or tool produced.
+    fn poll_own(&mut self, session: Session<'_, '_>) -> bool {
         let mut progressed = false;
         match &self.phase {
             Some(Phase::Streaming { turn, .. }) => {
@@ -592,11 +960,11 @@ impl Agent {
         let (call, turn) = (call.clone(), *turn);
         let ready = match waiting {
             Waiting::Command { key, then } => {
-                let (key, then) = (*key, then.clone());
+                let (key, then) = (key.clone(), then.clone());
                 let (output, failure) = match session.as_ref() {
                     Some(access) => (
-                        access.output(key).cloned(),
-                        access.failure(key).map(str::to_owned),
+                        access.output(&key).cloned(),
+                        access.failure(&key).map(str::to_owned),
                     ),
                     None => (None, Some("The session is not connected.".to_owned())),
                 };
@@ -828,6 +1196,49 @@ impl Agent {
                 ),
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             },
+            Waiting::Subagent { id } => {
+                let id = id.clone();
+                let found = self
+                    .subagents
+                    .iter()
+                    .find(|sub| sub.id == id)
+                    .map(|sub| (sub.title.clone(), sub.answer(), sub.end));
+                match found {
+                    None => Ready::Settle(
+                        format!("wait {id}"),
+                        format!("There is no sub-agent '{id}' any more."),
+                        true,
+                    ),
+                    Some((_, _, None)) => return false,
+                    Some((title, answer, Some(end))) => {
+                        let label = format!("wait {title}");
+                        match end {
+                            SubagentEnd::Done => Ready::Settle(
+                                label,
+                                format!("Sub-agent \"{title}\" finished:\n{answer}"),
+                                false,
+                            ),
+                            SubagentEnd::Failed => Ready::Settle(
+                                label,
+                                format!(
+                                    "Sub-agent \"{title}\" failed:\n{}",
+                                    if answer.is_empty() {
+                                        "it stopped without an answer."
+                                    } else {
+                                        answer.as_str()
+                                    }
+                                ),
+                                true,
+                            ),
+                            SubagentEnd::Stopped => Ready::Settle(
+                                label,
+                                format!("Sub-agent \"{title}\" was stopped."),
+                                true,
+                            ),
+                        }
+                    }
+                }
+            }
             Waiting::Terminal { before, until_ms } => {
                 let (before, until_ms) = (before.clone(), *until_ms);
                 let screen = session
@@ -1888,6 +2299,87 @@ impl Agent {
                     self.settle(call, turn, label, output, false, session);
                 }
             }
+            TOOL_SPAWN_SUBAGENT => {
+                let label = call_label(&call);
+                if self.subagent {
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        NO_NESTED_SUBAGENTS.to_owned(),
+                        true,
+                        session,
+                    );
+                    return;
+                }
+                let prompt = arguments["prompt"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if prompt.is_empty() {
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        "spawn_subagent needs a prompt.".to_owned(),
+                        true,
+                        session,
+                    );
+                    return;
+                }
+                let running = self.subagents.iter().filter(|sub| sub.running()).count();
+                if running >= self.max_subagents {
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        format!(
+                            "{running} sub-agents are running, which is the limit. Wait for \
+                             one with wait_subagent before starting another."
+                        ),
+                        true,
+                        session,
+                    );
+                    return;
+                }
+                let title = arguments["title"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| subagent_title(&prompt));
+                self.spawn_request = Some(SpawnRequest {
+                    call,
+                    turn,
+                    title,
+                    prompt,
+                });
+            }
+            TOOL_WAIT_SUBAGENT => {
+                let id = arguments["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let label = call_label(&call);
+                if !self.subagents.iter().any(|sub| sub.id == id) {
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        format!("There is no sub-agent '{id}'."),
+                        true,
+                        session,
+                    );
+                    return;
+                }
+                self.phase = Some(Phase::Running {
+                    call,
+                    turn,
+                    waiting: Waiting::Subagent { id },
+                });
+            }
             _ => {
                 let label = call_label(&call);
                 match tools::run_local(name, arguments, self.now_ms) {
@@ -1896,6 +2388,146 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Whether a spawn is waiting for the pane to build its first request.
+    pub fn spawning(&self) -> bool {
+        self.spawn_request.is_some()
+    }
+
+    /// Take the spawn the pane has to launch.
+    pub fn take_spawn_request(&mut self) -> Option<SpawnRequest> {
+        self.spawn_request.take()
+    }
+
+    /// Create the sub-agent `request` describes, returning its index in [`Agent::subagents`].
+    ///
+    /// It starts with this conversation's working directory, scopes, permissions and rules;
+    /// the rules are re-read every frame, so later answers here reach it too.
+    pub fn begin_subagent(&mut self, title: &str, prompt: &str) -> usize {
+        self.next_subagent += 1;
+        let id = format!("{SUBAGENT_ID_PREFIX}-{}", self.next_subagent);
+        let mut agent = Agent::new();
+        agent.cwd = self.cwd.clone();
+        agent.subagent = true;
+        agent.keys = CommandKeys::subagent(&id);
+        agent.scopes = self.scopes.clone();
+        agent.map = self.map.clone();
+        agent.system = self.system.clone();
+        agent.permissions = self.permissions.clone();
+        agent.app_allow = self.app_allow.clone();
+        agent.app_deny = self.app_deny.clone();
+        agent.host_allow = self.host_allow.clone();
+        agent.host_deny = self.host_deny.clone();
+        agent.session_allow = self.session_allow.clone();
+        agent.session_deny = self.session_deny.clone();
+        agent.allow_all = self.allow_all;
+        agent.tools = self.tools.clone();
+        agent.max_subagents = self.max_subagents;
+        agent.push_user(prompt, UserMeta::default());
+        self.subagents.push(Subagent {
+            id: id.clone(),
+            title: title.to_owned(),
+            prompt: prompt.to_owned(),
+            agent,
+            end: None,
+            waiting_announced: false,
+        });
+        self.subagents.len() - 1
+    }
+
+    /// Hand a launched sub-agent its first request, answering the call that spawned it.
+    pub fn launch_subagent(
+        &mut self,
+        index: usize,
+        request: CompletionRequest,
+        call: ApiToolCall,
+        turn: usize,
+        session: &mut Option<&mut dyn SessionAccess>,
+    ) {
+        let Some(sub) = self.subagents.get_mut(index) else {
+            return;
+        };
+        let id = sub.id.clone();
+        let title = sub.title.clone();
+        sub.agent.start(request);
+        let label = call_label(&call);
+        self.settle(
+            call,
+            turn,
+            label,
+            format!(
+                "Started sub-agent \"{title}\" ({id}). Its work is listed with the chats; \
+                 call wait_subagent with \"{id}\" to collect its answer."
+            ),
+            false,
+            session,
+        );
+    }
+
+    /// Answer a spawn whose request could not be built.
+    pub fn fail_spawn(
+        &mut self,
+        request: SpawnRequest,
+        reason: String,
+        session: &mut Option<&mut dyn SessionAccess>,
+    ) {
+        let label = call_label(&request.call);
+        self.settle(request.call, request.turn, label, reason, true, session);
+    }
+
+    /// How many sub-agents are still working.
+    pub fn subagents_running(&self) -> usize {
+        self.subagents.iter().filter(|sub| sub.running()).count()
+    }
+
+    /// The first sub-agent waiting for the user.
+    pub fn waiting_subagent(&self) -> Option<usize> {
+        self.subagents
+            .iter()
+            .position(|sub| sub.state() == SubagentState::NeedsAnswer)
+    }
+
+    /// Take back the sub-agents a stored chat kept, continuing their numbering.
+    pub fn adopt_subagents(&mut self, subagents: Vec<Subagent>) {
+        self.next_subagent = subagents
+            .iter()
+            .filter_map(|sub| sub.id.rsplit('-').next()?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        self.subagents = subagents;
+    }
+
+    /// Fold the answers a sub-agent was given into this conversation's rules.
+    pub fn adopt_subagent_rules(&mut self, index: usize) {
+        let Some(sub) = self.subagents.get_mut(index) else {
+            return;
+        };
+        self.allow_all |= sub.agent.allow_all;
+        if self.session_allow != sub.agent.session_allow {
+            self.session_allow = sub.agent.session_allow.clone();
+        }
+        if self.session_deny != sub.agent.session_deny {
+            self.session_deny = sub.agent.session_deny.clone();
+        }
+    }
+
+    /// Stop every sub-agent still working, answering with how many were stopped.
+    pub fn stop_subagents(&mut self) -> usize {
+        let mut stopped = 0;
+        for sub in &mut self.subagents {
+            if !sub.running() {
+                continue;
+            }
+            sub.agent.stop();
+            sub.end = Some(SubagentEnd::Stopped);
+            stopped += 1;
+        }
+        if stopped > 0 {
+            self.turns
+                .push(Turn::Notice(format!("Stopped {stopped} sub-agent(s).")));
+        }
+        stopped
     }
 
     /// Run a shell command for `run_command`.
@@ -1931,18 +2563,18 @@ impl Agent {
         match &sudo_stdin {
             Some(password) => {
                 let wrapped = wrap_command_with_sudo(&self.cwd, &command);
-                access.exec_input(EXEC_KEY, &wrapped, password);
+                access.exec_input(&self.keys.exec, &wrapped, password);
             }
             None => {
                 let wrapped = wrap_command(&self.cwd, &command);
-                access.exec(EXEC_KEY, &wrapped);
+                access.exec(&self.keys.exec, &wrapped);
             }
         }
         self.phase = Some(Phase::Running {
             call,
             turn,
             waiting: Waiting::Command {
-                key: EXEC_KEY,
+                key: self.keys.exec.clone(),
                 then: CommandThen::Return,
             },
         });
@@ -1971,12 +2603,12 @@ impl Agent {
             shell_quote(&command)
         );
         let wrapped = wrap_command(&self.cwd, &launched);
-        access.exec(EXEC_KEY, &wrapped);
+        access.exec(&self.keys.exec, &wrapped);
         self.phase = Some(Phase::Running {
             call,
             turn,
             waiting: Waiting::Command {
-                key: EXEC_KEY,
+                key: self.keys.exec.clone(),
                 then: CommandThen::Return,
             },
         });
@@ -2003,12 +2635,12 @@ impl Agent {
             );
             return;
         };
-        access.exec(PROBE_KEY, &command);
+        access.exec(&self.keys.probe, &command);
         self.phase = Some(Phase::Running {
             call,
             turn,
             waiting: Waiting::Command {
-                key: PROBE_KEY,
+                key: self.keys.probe.clone(),
                 then,
             },
         });
@@ -2181,6 +2813,9 @@ impl Agent {
     /// one the provider accepts: an assistant turn that asked for a tool must be followed by
     /// that tool's result, or the next request fails with a 400.
     pub fn stop(&mut self) {
+        if let Some(spawn) = self.spawn_request.take() {
+            self.abandon_tool(spawn.call, spawn.turn);
+        }
         let Some(phase) = self.phase.take() else {
             return;
         };
@@ -2227,9 +2862,9 @@ impl Agent {
         else {
             return;
         };
-        let key = *key;
+        let key = key.clone();
         if let Some(access) = session.as_mut() {
-            access.cancel(key);
+            access.cancel(&key);
         }
     }
 
@@ -2424,6 +3059,20 @@ pub fn call_label(call: &ApiToolCall) -> String {
             "$ sudo {}",
             arguments["command"].as_str().unwrap_or_default()
         ),
+        TOOL_SPAWN_SUBAGENT => format!(
+            "spawn {}",
+            arguments["title"]
+                .as_str()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| subagent_title(
+                    arguments["prompt"].as_str().unwrap_or_default()
+                ))
+        ),
+        TOOL_WAIT_SUBAGENT => {
+            format!("wait for {}", arguments["id"].as_str().unwrap_or_default())
+        }
         TOOL_REMOTE_READ | TOOL_LOCAL_READ | TOOL_DEV_VIEW => {
             format!("read {}", arguments["path"].as_str().unwrap_or_default())
         }
@@ -2735,6 +3384,65 @@ pub fn turns_from_json(items: &[Value]) -> Vec<Turn> {
                 "notice" => Some(Turn::Notice(text())),
                 _ => None,
             }
+        })
+        .collect()
+}
+
+/// The sub-agents of one chat, as stored JSON.
+pub fn subagents_to_json(subagents: &[Subagent]) -> Vec<Value> {
+    subagents
+        .iter()
+        .map(|sub| {
+            serde_json::json!({
+                "id": sub.id,
+                "title": sub.title,
+                "prompt": sub.prompt,
+                "end": sub.end.map(SubagentEnd::as_str),
+                "turns": turns_to_json(&sub.agent.turns),
+                "history": history_to_json(&sub.agent.history),
+                "cwd": sub.agent.cwd,
+                "compacted": sub.agent.compacted,
+                "scopes": sub.agent.scopes.to_json()
+            })
+        })
+        .collect()
+}
+
+/// Read stored sub-agents back.
+///
+/// One that was still working when the data was written is restored as stopped: its run
+/// cannot be picked up again, but its transcript stays readable.
+pub fn subagents_from_json(value: Option<&Value>) -> Vec<Subagent> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let id = row["id"].as_str().filter(|id| !id.is_empty())?;
+            let mut agent = Agent::new();
+            agent.subagent = true;
+            agent.keys = CommandKeys::subagent(id);
+            agent.cwd = row["cwd"].as_str().unwrap_or("/").to_owned();
+            agent.compacted = row["compacted"].as_str().map(str::to_owned);
+            agent.scopes = Loaded::from_json(row.get("scopes"));
+            if let Some(turns) = row["turns"].as_array() {
+                agent.turns = turns_from_json(turns);
+            }
+            if let Some(history) = row["history"].as_array() {
+                agent.history = history_from_json(history);
+            }
+            let end = row["end"]
+                .as_str()
+                .and_then(SubagentEnd::parse)
+                .or(Some(SubagentEnd::Stopped));
+            Some(Subagent {
+                id: id.to_owned(),
+                title: row["title"].as_str().unwrap_or_default().to_owned(),
+                prompt: row["prompt"].as_str().unwrap_or_default().to_owned(),
+                agent,
+                end,
+                waiting_announced: false,
+            })
         })
         .collect()
 }
@@ -4545,6 +5253,166 @@ mod tests {
         }
         assert!(agent.sudo_prompt().is_none(), "no password is needed here");
         assert_eq!(fake.commands.len(), 1, "the command runs straight away");
+    }
+
+    #[test]
+    fn a_spawn_starts_a_background_subagent_that_inherits_the_conversation() {
+        let mut agent = Agent::new();
+        agent.scopes.load(super::scopes::find("web").unwrap());
+        agent.app_allow = vec!["uptime".to_owned()];
+        agent.session_allow = vec!["systemctl status*".to_owned()];
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_SPAWN_SUBAGENT.to_owned(),
+                arguments: r#"{"title":"check the logs","prompt":"Find the failing unit."}"#
+                    .to_owned(),
+            },
+            &mut session,
+        );
+
+        // The agent cannot build a provider request, so it hands the pane the spawn.
+        let spawn = agent.take_spawn_request().expect("a spawn");
+        assert_eq!(spawn.title, "check the logs");
+        let index = agent.begin_subagent(&spawn.title, &spawn.prompt);
+        let sub = &agent.subagents[index];
+        assert!(sub.agent.subagent, "it must not spawn anything of its own");
+        assert!(sub.agent.scopes.contains("web"), "the loadout is inherited");
+        assert_eq!(sub.agent.app_allow, ["uptime"]);
+        assert_eq!(sub.agent.session_allow, ["systemctl status*"]);
+        assert_eq!(sub.agent.cwd, agent.cwd);
+        assert_eq!(sub.agent.keys.exec, format!("{EXEC_KEY}#sub-1"));
+        assert_ne!(
+            sub.agent.keys.exec, agent.keys.exec,
+            "two agents may run commands at once"
+        );
+        assert!(sub.running());
+    }
+
+    #[test]
+    fn spawning_stops_at_the_limit_and_a_subagent_cannot_spawn() {
+        let mut agent = Agent::new();
+        agent.max_subagents = 1;
+        let first = agent.begin_subagent("one", "first task");
+        // A stream still open keeps the first one running.
+        let (_sender, events) = std::sync::mpsc::channel();
+        agent.subagents[first].agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        agent.subagents[first].agent.phase = Some(Phase::Streaming { turn: 1, events });
+        assert_eq!(agent.subagents_running(), 1);
+        let output = run_tool(
+            &mut agent,
+            &mut FakeSession::default(),
+            TOOL_SPAWN_SUBAGENT,
+            r#"{"prompt":"second task"}"#,
+        );
+        assert!(output.contains("limit"), "{output}");
+
+        let mut child = Agent::new();
+        child.subagent = true;
+        let output = run_tool(
+            &mut child,
+            &mut FakeSession::default(),
+            TOOL_SPAWN_SUBAGENT,
+            r#"{"prompt":"deeper"}"#,
+        );
+        assert_eq!(output, NO_NESTED_SUBAGENTS);
+    }
+
+    #[test]
+    fn waiting_for_a_subagent_answers_with_its_result() {
+        let mut agent = Agent::new();
+        let index = agent.begin_subagent("check the logs", "Find the failing unit.");
+        agent.subagents[index].agent.turns.push(Turn::Assistant {
+            text: "api.service is failing".to_owned(),
+            stopped: false,
+        });
+        agent.subagents[index].end = Some(SubagentEnd::Done);
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_WAIT_SUBAGENT.to_owned(),
+                arguments: r#"{"id":"sub-1"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        agent.poll(&mut session);
+        match agent
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| matches!(turn, Turn::Tool { .. }))
+        {
+            Some(Turn::Tool { output, failed, .. }) => {
+                assert!(!*failed);
+                assert!(output.contains("api.service is failing"), "{output}");
+            }
+            other => panic!("expected a tool turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_subagent_lands_in_the_transcript_and_the_history() {
+        let mut agent = Agent::new();
+        let index = agent.begin_subagent("check the logs", "Find the failing unit.");
+        let (sender, events) = std::sync::mpsc::channel();
+        agent.subagents[index].agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        agent.subagents[index].agent.phase = Some(Phase::Streaming { turn: 1, events });
+        sender
+            .send(StreamEvent::Done(Completion {
+                text: "api.service is failing".to_owned(),
+                ..Completion::default()
+            }))
+            .expect("send");
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.poll(&mut session);
+
+        assert_eq!(agent.subagents[index].state(), SubagentState::Done);
+        assert!(
+            agent.turns.iter().any(
+                |turn| matches!(turn, Turn::Notice(text) if text.contains("api.service is failing"))
+            ),
+            "{:?}",
+            agent.turns
+        );
+        // The answer joins the history once the conversation is between turns.
+        agent.poll(&mut session);
+        assert!(
+            matches!(agent.history.last(), Some(ApiMessage::User { content }) if content.contains("api.service is failing")),
+            "{:?}",
+            agent.history
+        );
+    }
+
+    #[test]
+    fn a_running_subagent_follows_the_permissions_the_parent_gains() {
+        let mut agent = Agent::new();
+        let index = agent.begin_subagent("check", "do it");
+        // A stream still open keeps it running across the poll.
+        let (_sender, events) = std::sync::mpsc::channel();
+        agent.subagents[index].agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        agent.subagents[index].agent.phase = Some(Phase::Streaming { turn: 1, events });
+        agent.session_allow = vec!["systemctl restart*".to_owned()];
+        agent.allow_all = true;
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.poll(&mut session);
+        assert_eq!(
+            agent.subagents[index].agent.session_allow,
+            ["systemctl restart*"]
+        );
+        assert!(agent.subagents[index].agent.allow_all);
     }
 
     #[test]

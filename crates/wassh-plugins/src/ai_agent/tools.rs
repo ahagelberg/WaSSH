@@ -23,13 +23,13 @@ use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
-    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
-    TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
-    TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
-    TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
-    TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
+    TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
+    TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
+    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND,
+    TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 use super::agent::shell_quote;
@@ -121,6 +121,17 @@ first, so use this only when run_command failed for lack of permissions.",
     ToolSpec {
         name: TOOL_ASK_USER,
         description: "Ask the user one or more questions and wait for every answer. Questions may offer choices; the user can also choose to write a free-text answer.",
+    },
+    ToolSpec {
+        name: TOOL_SPAWN_SUBAGENT,
+        description: "Start a sub-agent on a self-contained task and return at once. The sub-agent \
+runs in the background with this conversation's tools, model and permissions, and its progress is \
+listed with the chats. Collect its answer with wait_subagent.",
+    },
+    ToolSpec {
+        name: TOOL_WAIT_SUBAGENT,
+        description: "Wait for a sub-agent started with spawn_subagent and return its answer. \
+Returns as soon as it is done; a sub-agent still working keeps the call waiting.",
     },
     ToolSpec {
         name: TOOL_WEB_FETCH,
@@ -347,6 +358,14 @@ pub fn is_scope_tool(name: &str) -> bool {
     SCOPE_TOOLS.iter().any(|spec| spec.name == name)
 }
 
+/// The tools only the conversation that owns sub-agents is offered.
+pub const SUBAGENT_TOOLS: &[&str] = &[TOOL_SPAWN_SUBAGENT, TOOL_WAIT_SUBAGENT];
+
+/// Whether `name` drives sub-agents.
+pub fn is_subagent_tool(name: &str) -> bool {
+    SUBAGENT_TOOLS.contains(&name)
+}
+
 /// Parameter schemas per tool, mirroring the reference's argument names.
 fn parameters(name: &str) -> (Value, Value) {
     let string = |description: &str| json!({ "type": "string", "description": description });
@@ -388,6 +407,17 @@ fn parameters(name: &str) -> (Value, Value) {
                 }
             }),
             json!(["questions"]),
+        ),
+        TOOL_SPAWN_SUBAGENT => (
+            json!({
+                "title": string("Short name for the sub-agent, shown in the chat list."),
+                "prompt": string("The whole task, as if the user had typed it to a fresh agent.")
+            }),
+            json!(["prompt"]),
+        ),
+        TOOL_WAIT_SUBAGENT => (
+            json!({ "id": string("Id spawn_subagent returned.") }),
+            json!(["id"]),
         ),
         TOOL_WEB_FETCH => (
             json!({
@@ -636,11 +666,12 @@ fn parameters(name: &str) -> (Value, Value) {
 ///
 /// Tools of scopes that are not loaded are left out on purpose — that is what keeps the
 /// prompt from carrying the whole toolset whether or not it is needed.
-pub fn specs(permissions: &Permissions, loaded: &Loaded) -> Vec<Value> {
+pub fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool) -> Vec<Value> {
     let mut specs: Vec<Value> = SCOPE_TOOLS.iter().map(|spec| spec.schema()).collect();
     specs.extend(
         TOOL_SPECS
             .iter()
+            .filter(|spec| subagents || !is_subagent_tool(spec.name))
             .filter(|spec| loaded.holds(spec.name) && permissions.offers(spec.name))
             .map(|spec| spec.schema()),
     );
@@ -1854,7 +1885,7 @@ mod tests {
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs(&everything_allowed(), &everything_loaded());
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true);
         assert_eq!(
             schemas.len(),
             TOOL_SPECS.len() + crate::plugin::tools().count() + SCOPE_TOOLS.len()
@@ -1893,7 +1924,7 @@ mod tests {
 
     #[test]
     fn a_fresh_conversation_carries_the_scope_tools_and_the_root_only() {
-        let schemas = specs(&everything_allowed(), &Loaded::new());
+        let schemas = specs(&everything_allowed(), &Loaded::new(), true);
         assert_eq!(
             names(&schemas),
             [
@@ -1903,9 +1934,20 @@ mod tests {
                 TOOL_RUN_COMMAND_BACKGROUND,
                 TOOL_RUN_SUDO,
                 TOOL_ASK_USER,
+                TOOL_SPAWN_SUBAGENT,
+                TOOL_WAIT_SUBAGENT,
                 TOOL_CURRENT_TIME,
             ]
         );
+    }
+
+    #[test]
+    fn a_subagent_is_not_offered_the_tools_that_drive_subagents() {
+        let schemas = specs(&everything_allowed(), &everything_loaded(), false);
+        let names = names(&schemas);
+        assert!(!names.contains(&TOOL_SPAWN_SUBAGENT));
+        assert!(!names.contains(&TOOL_WAIT_SUBAGENT));
+        assert!(names.contains(&TOOL_RUN_COMMAND));
     }
 
     #[test]
@@ -1913,18 +1955,18 @@ mod tests {
         let permissions = everything_allowed();
         let mut loaded = Loaded::new();
         loaded.load(super::super::scopes::find("host-files").unwrap());
-        let schemas = specs(&permissions, &loaded);
+        let schemas = specs(&permissions, &loaded, true);
         assert!(names(&schemas).contains(&TOOL_DEV_VIEW));
         assert!(!names(&schemas).contains(&TOOL_LOCAL_READ));
         loaded.load(super::super::scopes::find("docker").unwrap());
-        assert!(names(&specs(&permissions, &loaded)).contains(&"docker_containers"));
+        assert!(names(&specs(&permissions, &loaded, true)).contains(&"docker_containers"));
     }
 
     #[test]
     fn the_root_request_costs_a_fraction_of_the_loadouts() {
         let permissions = everything_allowed();
-        let base = specs(&permissions, &Loaded::new());
-        let all = specs(&permissions, &everything_loaded());
+        let base = specs(&permissions, &Loaded::new(), true);
+        let all = specs(&permissions, &everything_loaded(), true);
         let base = prompt_chars(&base, "");
         let all = prompt_chars(&all, "");
         assert!(
@@ -1944,7 +1986,7 @@ mod tests {
         ]));
         assert_eq!(permissions.decision(TOOL_TERMINAL_KEYS), Permission::Ask);
         assert_eq!(permissions.decision(TOOL_TERMINAL_WRITE), Permission::Deny);
-        let schemas = specs(&permissions, &everything_loaded());
+        let schemas = specs(&permissions, &everything_loaded(), true);
         assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
         assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
     }

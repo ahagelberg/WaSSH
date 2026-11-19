@@ -17,21 +17,23 @@ use wassh_ui::widgets::{
 };
 
 use super::agent::{
-    Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, ToolSettings, Turn, UserMeta,
-    history_from_json, history_to_json, turns_from_json, turns_to_json,
+    Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, Subagent, SubagentEnd, SubagentState,
+    ToolSettings, Turn, UserMeta, announce_wait, end_subagent, history_from_json, history_to_json,
+    subagents_from_json, subagents_to_json, turns_from_json, turns_to_json,
 };
 use super::markdown::{Block, Ink};
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
-    CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
-    SAFE_RULES, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
-    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
-    SETTING_AUTO_COMPACT, SETTING_HOST_RAG_FOLDER, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
+    CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, DEFAULT_MAX_SUBAGENTS,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
+    SAFE_RULES, SETTING_AUTO_COMPACT, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES,
+    SETTING_GLOBAL_PROMPT, SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
+    SETTING_HOST_RAG_FOLDER, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
     SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER,
     TITLE_MAX_CHARS,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
+use super::rules::ApprovalScope;
 use super::scopes::{self, Loaded};
 use super::settings_ui::{PROVIDERS_KEY, provider_secret_field};
 use super::tools;
@@ -61,6 +63,7 @@ const DERIVED_SETTINGS: &[&str] = &[
     SETTING_RAG_MODEL,
     SETTING_HOST_RAG_FOLDER,
     SETTING_WEB_SEARCH_PROVIDER,
+    SETTING_MAX_SUBAGENTS,
 ];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
@@ -161,6 +164,8 @@ const BACK_ARROW_WIDTH: f32 = 1.8;
 const CHAT_LIST_HEADING: &str = "Chats";
 /// What the chat list says when there is nothing to reopen.
 const CHAT_LIST_EMPTY: &str = "No previous chats yet.";
+/// What the pane says while a sub-agent's transcript is on screen.
+const SUBAGENT_VIEW_NOTICE: &str = "Read-only: this sub-agent works on its own. Answers it needs are asked here; Back returns to the chat.";
 /// Type size of a chat's name in the list and of the open chat's title.
 const CHAT_TITLE_TEXT_SIZE: f32 = 12.0;
 /// Side padding inside a chat list row.
@@ -291,7 +296,6 @@ type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
 type SummaryJob = (SummaryMode, usize, Receiver<Result<String, String>>);
 
 /// A previous conversation, kept so the user can go back to it.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredChat {
     /// First question, for the picker.
     pub title: String,
@@ -299,6 +303,8 @@ pub struct StoredChat {
     pub turns: Vec<Turn>,
     /// The provider history.
     pub history: Vec<super::protocol::ApiMessage>,
+    /// Sub-agents it started, which may still be working.
+    pub subagents: Vec<Subagent>,
     /// Working directory it ended in.
     pub cwd: String,
     /// Model it used.
@@ -383,6 +389,8 @@ pub struct AiAgent {
     generated_title: Option<String>,
     /// Each turn's Markdown, parsed once so a frame does not parse the whole transcript.
     parsed: Vec<ParsedTurn>,
+    /// The same for the sub-agent transcript on screen, which is read-only.
+    parsed_sub: Vec<ParsedTurn>,
     /// The question composer, while `ask_user` waits.
     questions: QuestionWizard,
     /// The prompt opened for editing in the transcript, if any.
@@ -393,8 +401,8 @@ pub struct AiAgent {
     loaded: bool,
     /// Caption and health for the pane header.
     caption: (String, HeaderHealth),
-    /// What the caption was built from: running, summarising and session state.
-    caption_for: Option<(bool, bool, SessionStatus)>,
+    /// What the caption was built from: running, summarising, session state and sub-agents.
+    caption_for: Option<(bool, bool, SessionStatus, usize, bool)>,
     /// Last problem reported to the user.
     error: Option<String>,
     /// Problems raised in one frame, forwarded to the host as toasts.
@@ -430,13 +438,24 @@ struct ScopePopup {
     anchor: egui::Rect,
 }
 
-/// Which of the pane's two views is drawn.
+/// Which of the pane's three views is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChatView {
     /// The chat list, with the composer that starts a new chat.
     List,
     /// The conversation itself.
     Chat,
+    /// One sub-agent's transcript, read-only.
+    Subagent(usize),
+}
+
+/// Which conversation the transcript draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptSource {
+    /// The open chat.
+    Main,
+    /// One of its sub-agents.
+    Subagent(usize),
 }
 
 impl Default for AiAgent {
@@ -462,6 +481,7 @@ impl Default for AiAgent {
             title_prompt: None,
             generated_title: None,
             parsed: Vec::new(),
+            parsed_sub: Vec::new(),
             questions: QuestionWizard::default(),
             editing: None,
             sudo: String::new(),
@@ -554,6 +574,33 @@ fn setting_rules(settings: &serde_json::Map<String, Value>, key: &str) -> Option
     Some(lines)
 }
 
+/// The request one conversation sends, from the provider and model the pane picked.
+fn build_request(
+    agent: &mut Agent,
+    provider: &ProviderConfig,
+    api_key: String,
+    model: &str,
+    settings: &serde_json::Map<String, Value>,
+    host: &str,
+    environment: &str,
+) -> CompletionRequest {
+    agent.repair_history();
+    let system = AiAgent::system_prompt(agent, settings, host, environment);
+    let tools = tools::specs(&agent.permissions, &agent.scopes, !agent.subagent);
+    // Kept so compaction measures the scopes this conversation really carries.
+    agent.prompt_chars = tools::prompt_chars(&tools, &system);
+    CompletionRequest {
+        base_url: provider.base_url.clone(),
+        api_key,
+        protocol: provider.protocol,
+        model: model.to_owned(),
+        system,
+        messages: agent.history.clone(),
+        tools,
+        max_tokens: MAX_TOKENS,
+    }
+}
+
 /// The last `max_chars` characters of `text`.
 fn tail_chars(text: &str, max_chars: usize) -> &str {
     if max_chars == 0 {
@@ -566,20 +613,23 @@ fn tail_chars(text: &str, max_chars: usize) -> &str {
 }
 
 impl AiAgent {
-    /// Summarise the live conversation for the picker.
-    fn stored_chat(&self) -> StoredChat {
+    /// Move the live conversation into the shape the chat list keeps.
+    fn stored_chat(&mut self) -> StoredChat {
+        let title = self.title();
+        let provider = self
+            .active()
+            .map(|provider| provider.id.clone())
+            .unwrap_or_default();
         StoredChat {
-            title: self.title(),
-            turns: self.agent.turns.clone(),
-            history: self.agent.history.clone(),
-            cwd: self.agent.cwd.clone(),
+            title,
+            turns: std::mem::take(&mut self.agent.turns),
+            history: std::mem::take(&mut self.agent.history),
+            subagents: std::mem::take(&mut self.agent.subagents),
+            cwd: std::mem::take(&mut self.agent.cwd),
             model: self.model.clone(),
-            provider: self
-                .active()
-                .map(|provider| provider.id.clone())
-                .unwrap_or_default(),
-            compacted: self.agent.compacted.clone(),
-            scopes: self.agent.scopes.clone(),
+            provider,
+            compacted: self.agent.compacted.take(),
+            scopes: std::mem::take(&mut self.agent.scopes),
         }
     }
 
@@ -588,10 +638,17 @@ impl AiAgent {
         if self.agent.turns.is_empty() {
             return;
         }
-        self.chats.push(self.stored_chat());
+        let current = self.stored_chat();
+        self.chats.push(current);
         let over = self.chats.len().saturating_sub(CONVERSATIONS_PER_HOST_MAX);
         if over > 0 {
-            self.chats.drain(..over);
+            for chat in self.chats.drain(..over) {
+                for mut sub in chat.subagents {
+                    if sub.running() {
+                        sub.agent.stop();
+                    }
+                }
+            }
         }
     }
 
@@ -604,6 +661,7 @@ impl AiAgent {
         self.title_prompt = None;
         self.questions = QuestionWizard::default();
         self.editing = None;
+        self.parsed_sub.clear();
     }
 
     /// Set the live conversation aside and start an empty one, in the conversation view.
@@ -616,18 +674,19 @@ impl AiAgent {
 
     /// Swap a stored conversation back into the pane.
     fn open_chat(&mut self, index: usize) {
-        let Some(chat) = self.chats.get(index).cloned() else {
+        if index >= self.chats.len() {
             return;
-        };
-        let current = self.stored_chat();
-        if !self.agent.turns.is_empty() {
-            self.chats[index] = current;
-        } else {
-            self.chats.remove(index);
         }
+        let chat = if self.agent.turns.is_empty() {
+            self.chats.remove(index)
+        } else {
+            let current = self.stored_chat();
+            std::mem::replace(&mut self.chats[index], current)
+        };
         self.agent.clear();
         self.agent.turns = chat.turns;
         self.agent.history = chat.history;
+        self.agent.adopt_subagents(chat.subagents);
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
         self.agent.scopes = chat.scopes;
@@ -657,17 +716,26 @@ impl AiAgent {
     /// The system prompt: what the agent is connected to, the tools this session really
     /// offers, and how to choose between them.
     fn system_prompt(
-        &self,
+        agent: &Agent,
         settings: &serde_json::Map<String, Value>,
         host: &str,
         environment: &str,
     ) -> String {
-        let mut lines = vec![
+        let mut lines = Vec::new();
+        if agent.subagent {
+            lines.push(
+                "You are a sub-agent that another agent delegated one task to. Work that task \
+through to an answer, then reply with a concise summary of what you found or did and stop. \
+You cannot ask the main conversation to do work for you and you cannot start sub-agents."
+                    .to_owned(),
+            );
+        }
+        lines.extend([
             format!(
                 "You are an AI development agent connected to the active WaSSH session \"{host}\"."
             ),
             format!("Environment: {environment}."),
-            format!("Current working directory: {}", self.agent.cwd),
+            format!("Current working directory: {}", agent.cwd),
             String::new(),
             // Tools arrive by scope: sending every schema on every turn would spend the
             // prompt on tools nobody asked for.
@@ -678,16 +746,16 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 .to_owned(),
             String::new(),
             "Loaded scopes:".to_owned(),
-        ];
+        ]);
         // Only what the request actually sends: naming a tool this host may not call just
         // invites the model to try it and fall back to the shell.
-        for scope in self.agent.scopes.scopes() {
-            let names = self.scope_tools(scope);
+        for scope in agent.scopes.scopes() {
+            let names = Self::scope_tools(agent, scope);
             if !names.is_empty() {
                 lines.push(format!("- {}: {}", scope.id, names.join(", ")));
             }
         }
-        let loadable = scopes::visible(&self.agent.scopes, &self.agent.permissions);
+        let loadable = scopes::visible(&agent.scopes, &agent.permissions);
         if !loadable.is_empty() {
             lines.push(String::new());
             lines.push("Scopes to load, by id:".to_owned());
@@ -697,19 +765,19 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         // The map's digest: the tree this conversation already knows, so its turns go on
         // the work rather than on finding the files again.
-        if self.agent.scopes.contains(ENV_SCOPE) && !self.agent.map.is_empty() {
+        if agent.scopes.contains(ENV_SCOPE) && !agent.map.is_empty() {
             lines.push(String::new());
             lines.push(MAP_HEADING.to_owned());
-            lines.push(self.agent.map.overview());
+            lines.push(agent.map.overview());
         }
-        if self.agent.scopes.contains(ENV_SCOPE) && !self.agent.system.is_empty() {
+        if agent.scopes.contains(ENV_SCOPE) && !agent.system.is_empty() {
             lines.push(String::new());
             lines.push(SYSTEM_HEADING.to_owned());
-            lines.push(self.agent.system.summary());
+            lines.push(agent.system.summary());
         }
         lines.push(String::new());
         lines.push("Guidelines:".to_owned());
-        lines.extend(self.tool_guidance());
+        lines.extend(Self::tool_guidance(agent));
         lines.extend([
             "- After each command or tool call you see its actual result. Never invent output."
                 .to_owned(),
@@ -729,7 +797,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 lines.push(format!("[Host prompt]\n{host_text}"));
             }
         }
-        if let Some(summary) = &self.agent.compacted {
+        if let Some(summary) = &agent.compacted {
             lines.push(String::new());
             lines.push(COMPACTED_HEADING.to_owned());
             lines.push(summary.clone());
@@ -738,12 +806,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     }
 
     /// The tools of `scope` this conversation can call, as the model names them.
-    fn scope_tools(&self, scope: &scopes::Scope) -> Vec<&'static str> {
+    fn scope_tools(agent: &Agent, scope: &scopes::Scope) -> Vec<&'static str> {
         let mut names = scope.tools.to_vec();
         if let Some(pane) = scope.pane {
             names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
         }
-        names.retain(|name| self.agent.offers_tool(name));
+        names.retain(|name| agent.offers_tool(name));
         names
     }
 
@@ -752,8 +820,8 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     ///
     /// Naming them while they are not loaded is what stops the agent from reading, searching
     /// and editing files with `cat`, `grep` and `sed` instead of loading the scope.
-    fn host_file_scope(&self) -> Option<(&'static str, String)> {
-        let scope = scopes::visible(&self.agent.scopes, &self.agent.permissions)
+    fn host_file_scope(agent: &Agent) -> Option<(&'static str, String)> {
+        let scope = scopes::visible(&agent.scopes, &agent.permissions)
             .into_iter()
             .find(|scope| scope.tools.iter().any(|name| is_host_file_tool(name)))?;
         let names: Vec<&str> = scope
@@ -770,12 +838,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     /// A family the host has switched off is not mentioned, so the agent never reads about
     /// a capability it cannot use; a file tool that is missing is reported as such rather
     /// than worked around with a shell command.
-    fn tool_guidance(&self) -> Vec<String> {
+    fn tool_guidance(agent: &Agent) -> Vec<String> {
         let offered = |keep: fn(&str) -> bool| -> Vec<&'static str> {
             tools::TOOL_SPECS
                 .iter()
                 .map(|spec| spec.name)
-                .filter(|name| keep(name) && self.agent.offers_tool(name))
+                .filter(|name| keep(name) && agent.offers_tool(name))
                 .collect()
         };
         let mut lines = vec![
@@ -796,8 +864,8 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                  they cannot hang on a pager, and they show the user what changed.",
                 host_files.join(", ")
             ));
-            if !self.agent.offers_tool(super::protocol::TOOL_ENV_FIND)
-                && scopes::visible(&self.agent.scopes, &self.agent.permissions)
+            if !agent.offers_tool(super::protocol::TOOL_ENV_FIND)
+                && scopes::visible(&agent.scopes, &agent.permissions)
                     .iter()
                     .any(|scope| scope.id == ENV_SCOPE)
             {
@@ -809,7 +877,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                         .to_owned(),
                 );
             }
-        } else if let Some((scope, names)) = self.host_file_scope() {
+        } else if let Some((scope, names)) = Self::host_file_scope(agent) {
             lines.push(format!(
                 "- Files on the connected host are read, searched and changed with {names}, \
                  which the '{scope}' scope holds. Load that scope before touching a file there; \
@@ -825,7 +893,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 local_files.join(", ")
             ));
         }
-        if self.agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
+        if agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
             lines.push(
                 "- Look in the environment map before searching the tree: env_search ranks \
                  files by how well their path and declarations answer a phrase, env_find \
@@ -843,7 +911,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             super::protocol::TOOL_LOCAL_RUN,
         ]
         .into_iter()
-        .filter(|name| self.agent.offers_tool(name))
+        .filter(|name| agent.offers_tool(name))
         .collect();
         if !shells.is_empty() {
             lines.push(format!(
@@ -853,14 +921,14 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 if shells.len() == 1 { "is" } else { "are" }
             ));
         }
-        if self.agent.offers_tool(super::protocol::TOOL_TERMINAL_READ) {
+        if agent.offers_tool(super::protocol::TOOL_TERMINAL_READ) {
             lines.push(
                 "- The terminal_* tools drive the live shell the user is watching; use them for \
                  what only an interactive program can do."
                     .to_owned(),
             );
         }
-        if self.agent.offers_tool(super::protocol::TOOL_RUN_SUDO) {
+        if agent.offers_tool(super::protocol::TOOL_RUN_SUDO) {
             lines.push(
                 "- When a task needs root, call run_sudo with the same command: it asks the user \
                  for their sudo password before running. Plain run_command cannot answer sudo's \
@@ -901,6 +969,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             setting_rules(settings, SETTING_HOST_ALLOW_RULES).unwrap_or_default();
         self.agent.host_deny = setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
         self.agent.permissions = Permissions::from_settings(settings);
+        self.agent.max_subagents = settings
+            .get(SETTING_MAX_SUBAGENTS)
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_MAX_SUBAGENTS, |limit| limit as usize);
 
         let mut folders = Vec::new();
         let global_folder = setting_text(settings, SETTING_RAG_FOLDER);
@@ -981,23 +1053,191 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         host: &str,
         environment: &str,
     ) -> Option<CompletionRequest> {
-        self.agent.repair_history();
-        let system = self.system_prompt(settings, host, environment);
-        let tools = tools::specs(&self.agent.permissions, &self.agent.scopes);
-        // Kept so compaction measures the scopes this conversation really carries.
-        self.agent.prompt_chars = tools::prompt_chars(&tools, &system);
-        let provider = self.active()?;
+        self.request_for(None, settings, host, environment)
+    }
+
+    /// Build the request for the conversation as it stands, or for one of its sub-agents.
+    fn request_for(
+        &mut self,
+        subagent: Option<usize>,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) -> Option<CompletionRequest> {
+        let provider = self.active()?.clone();
         let api_key = self.keys.get(&provider.id).cloned().unwrap_or_default();
-        Some(CompletionRequest {
-            base_url: provider.base_url.clone(),
+        let model = self.model.trim().to_owned();
+        let agent = match subagent {
+            Some(index) => &mut self.agent.subagents.get_mut(index)?.agent,
+            None => &mut self.agent,
+        };
+        Some(build_request(
+            agent,
+            &provider,
             api_key,
-            protocol: provider.protocol,
-            model: self.model.trim().to_owned(),
-            system,
-            messages: self.agent.history.clone(),
-            tools,
-            max_tokens: MAX_TOKENS,
-        })
+            &model,
+            settings,
+            host,
+            environment,
+        ))
+    }
+
+    /// Turn a spawn the agent asked for into a sub-agent with its first request.
+    fn launch_spawn(
+        &mut self,
+        session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
+        let Some(spawn) = self.agent.take_spawn_request() else {
+            return;
+        };
+        let index = self.agent.begin_subagent(&spawn.title, &spawn.prompt);
+        match self.request_for(Some(index), settings, host, environment) {
+            Some(request) => self
+                .agent
+                .launch_subagent(index, request, spawn.call, spawn.turn, session),
+            None => {
+                let reason = "No model is configured, so the sub-agent cannot start.";
+                if let Some(sub) = self.agent.subagents.get_mut(index) {
+                    sub.agent.error = Some(reason.to_owned());
+                }
+                self.agent.fail_spawn(spawn, reason.to_owned(), session);
+            }
+        }
+    }
+
+    /// Start the next request of every sub-agent that owes an answer.
+    fn drive_subagents(
+        &mut self,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
+        for index in 0..self.agent.subagents.len() {
+            let owes = {
+                let sub = &mut self.agent.subagents[index];
+                sub.running() && !sub.agent.blocked() && sub.agent.take_needs_reply()
+            };
+            if !owes {
+                continue;
+            }
+            match self.request_for(Some(index), settings, host, environment) {
+                Some(request) => self.agent.subagents[index].agent.start(request),
+                None => {
+                    self.agent.subagents[index].agent.error =
+                        Some("No model is configured, so the sub-agent stopped.".to_owned());
+                }
+            }
+        }
+    }
+
+    /// Keep the filed chats' sub-agents working while another chat is open.
+    fn poll_filed_subagents(
+        &mut self,
+        session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
+        let Some(provider) = self.active().cloned() else {
+            return;
+        };
+        let api_key = self.keys.get(&provider.id).cloned().unwrap_or_default();
+        let model = self.model.trim().to_owned();
+        let now_ms = self.agent.now_ms;
+        for chat in self.chats.iter_mut() {
+            for index in 0..chat.subagents.len() {
+                if !chat.subagents[index].running() {
+                    continue;
+                }
+                chat.subagents[index].agent.now_ms = now_ms;
+                chat.subagents[index].agent.poll(session);
+                let (waiting, ended) = {
+                    let sub = &mut chat.subagents[index];
+                    let waiting = announce_wait(sub);
+                    let mut ended = None;
+                    // A filed chat's prompts wait until the chat is opened again.
+                    if sub.agent.needs_user() {
+                        // Nothing else to move: the run is parked on the user.
+                    } else if sub.agent.take_needs_reply() {
+                        let request = build_request(
+                            &mut sub.agent,
+                            &provider,
+                            api_key.clone(),
+                            &model,
+                            settings,
+                            host,
+                            environment,
+                        );
+                        sub.agent.start(request);
+                    } else if sub.agent.phase.is_none() && !sub.agent.spawning() {
+                        ended = Some(end_subagent(sub));
+                    }
+                    (waiting, ended)
+                };
+                if let Some(turn) = waiting {
+                    chat.turns.push(turn);
+                }
+                if let Some((turn, report)) = ended {
+                    chat.turns.push(turn);
+                    chat.history
+                        .push(super::protocol::ApiMessage::User { content: report });
+                }
+            }
+        }
+    }
+
+    /// What the pane has to show: the main conversation's request, else a sub-agent's.
+    fn pending_prompts(&self) -> (Prompts, PromptTarget) {
+        let own = Prompts::of(&self.agent);
+        if !own.is_empty() {
+            return (own, PromptTarget::Main);
+        }
+        match self.agent.waiting_subagent() {
+            Some(index) => (
+                Prompts::of(&self.agent.subagents[index].agent),
+                PromptTarget::Subagent(index),
+            ),
+            None => (own, PromptTarget::Main),
+        }
+    }
+
+    /// The agent whose prompt is on screen.
+    fn prompt_agent(&mut self, target: PromptTarget) -> &mut Agent {
+        match target {
+            PromptTarget::Main => &mut self.agent,
+            PromptTarget::Subagent(index) => &mut self.agent.subagents[index].agent,
+        }
+    }
+
+    /// Stop the run whose prompt is on screen.
+    fn stop_prompted(&mut self, target: PromptTarget) {
+        match target {
+            PromptTarget::Main => self.agent.stop(),
+            PromptTarget::Subagent(index) => {
+                let Some(sub) = self.agent.subagents.get_mut(index) else {
+                    return;
+                };
+                sub.agent.stop();
+                sub.end = Some(SubagentEnd::Stopped);
+            }
+        }
+    }
+
+    /// What the action button does: stop the main run, then the sub-agents it left behind.
+    fn action_state(&self, can_send: bool) -> ActionState {
+        if can_send {
+            return ActionState::Send;
+        }
+        if self.agent.blocked() {
+            ActionState::StopMain
+        } else if self.agent.subagents_running() > 0 {
+            ActionState::StopSubagents
+        } else {
+            ActionState::Send
+        }
     }
 
     /// Whether a message can go out: a provider and a model are configured.
@@ -1308,6 +1548,8 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
         self.agent.scopes = Loaded::from_json(stored.get("scopes"));
+        self.agent
+            .adopt_subagents(subagents_from_json(stored.get("subagents")));
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
             self.chats = chats
                 .iter()
@@ -1332,6 +1574,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                         .filter(|summary| !summary.is_empty())
                         .map(str::to_owned),
                     scopes: Loaded::from_json(chat.get("scopes")),
+                    subagents: subagents_from_json(chat.get("subagents")),
                 })
                 .collect();
         }
@@ -1606,15 +1849,22 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     ///
     /// Only text that changed is parsed again: a settled message is drawn from what an
     /// earlier frame parsed, and a streaming reply re-parses the one turn that is growing.
-    fn parse_transcript(&mut self) {
-        for index in 0..self.agent.turns.len() {
-            let text = match &self.agent.turns[index] {
+    fn parse_transcript(&mut self, source: TranscriptSource) {
+        let turns: &[Turn] = match source {
+            TranscriptSource::Main => &self.agent.turns,
+            TranscriptSource::Subagent(index) => &self.agent.subagents[index].agent.turns,
+        };
+        let cache = match source {
+            TranscriptSource::Main => &mut self.parsed,
+            TranscriptSource::Subagent(_) => &mut self.parsed_sub,
+        };
+        for (index, turn) in turns.iter().enumerate() {
+            let text = match turn {
                 Turn::User { text, .. } | Turn::Assistant { text, .. } => text.as_str(),
                 _ => "",
             };
             let fingerprint = super::markdown::fingerprint(text);
-            if self
-                .parsed
+            if cache
                 .get(index)
                 .is_some_and(|parsed| parsed.fingerprint == fingerprint)
             {
@@ -1624,12 +1874,20 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 fingerprint,
                 blocks: super::markdown::blocks(text),
             };
-            match self.parsed.get_mut(index) {
+            match cache.get_mut(index) {
                 Some(cached) => *cached = parsed,
-                None => self.parsed.push(parsed),
+                None => cache.push(parsed),
             }
         }
-        self.parsed.truncate(self.agent.turns.len());
+        cache.truncate(turns.len());
+    }
+
+    /// The parsed Markdown of one turn of the conversation on screen.
+    fn blocks(&self, source: TranscriptSource, index: usize) -> &[Block] {
+        match source {
+            TranscriptSource::Main => &self.parsed[index].blocks,
+            TranscriptSource::Subagent(_) => &self.parsed_sub[index].blocks,
+        }
     }
 
     /// Paint the transcript, answering where each user bubble landed on screen.
@@ -1639,30 +1897,40 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         palette: &wassh_core::Palette,
         muted: egui::Color32,
         session: &mut Option<&mut dyn crate::plugin::SessionAccess>,
+        source: TranscriptSource,
     ) -> TranscriptReply {
-        self.parse_transcript();
-        if self.agent.turns.is_empty() {
+        self.parse_transcript(source);
+        // A sub-agent's transcript is read-only: nothing here is edited, stopped or replayed.
+        let interactive = source == TranscriptSource::Main;
+        let agent = match source {
+            TranscriptSource::Main => &self.agent,
+            TranscriptSource::Subagent(index) => &self.agent.subagents[index].agent,
+        };
+        if agent.turns.is_empty() {
             let empty = if self.providers.is_empty() {
                 "No model providers configured yet. Configure one in Options."
-            } else {
+            } else if interactive {
                 "Ask the agent to help with this session. It can use terminal tools when you approve them."
+            } else {
+                "This sub-agent has not written anything yet."
             };
             ui.add(egui::Label::new(egui::RichText::new(empty).size(12.0).color(muted)).wrap());
         }
         let mut open = None;
         let mut edit_action = EditAction::None;
-        let editing = self.editing.as_ref().map(|edit| edit.index);
+        let editing = interactive
+            .then(|| self.editing.as_ref().map(|edit| edit.index))
+            .flatten();
         let mut bubbles = Vec::new();
         let mut stop_command = false;
         let mut copy_output = None;
-        let running = self.agent.running_command();
-        let last_user = self
-            .agent
+        let running = agent.running_command();
+        let last_user = agent
             .turns
             .iter()
             .rposition(|turn| matches!(turn, Turn::User { .. }));
-        let turn_finished = self.agent.phase.is_none();
-        for (index, turn) in self.agent.turns.iter().enumerate() {
+        let turn_finished = agent.phase.is_none();
+        for (index, turn) in agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { meta, .. } => {
                     if editing == Some(index)
@@ -1670,7 +1938,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     {
                         edit_action = prompt_editor(ui, palette, edit);
                     } else {
-                        let reply = user_bubble(ui, palette, &self.parsed[index].blocks, *meta);
+                        let reply = user_bubble(ui, palette, self.blocks(source, index), *meta);
                         if reply.clicked {
                             open = Some(index);
                         }
@@ -1681,7 +1949,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     // A reply waiting for its first token, or one that only asked for
                     // tools, has no words to show: no bubble for it.
                     if !text.trim().is_empty() {
-                        assistant_bubble(ui, palette, &self.parsed[index].blocks);
+                        assistant_bubble(ui, palette, self.blocks(source, index));
                     }
                     if *stopped {
                         ui.label(
@@ -1778,7 +2046,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             ui.add_space(TURN_GAP);
         }
         // The reference shows this until the first token of the reply arrives.
-        if self.waiting_for_the_first_token() {
+        if interactive && self.waiting_for_the_first_token() {
             let step = (self.agent.now_ms / THINKING_DOT_MS) as usize;
             let dots: String = ".".repeat(1 + step % THINKING_DOT_COUNT);
             ui.label(
@@ -1789,8 +2057,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             );
         }
         // Clicking a message opens it for editing; the edit itself is sent by the pane.
-        if let Some(index) = open {
-            self.edit_prompt(index);
+        if interactive {
+            if let Some(index) = open {
+                self.edit_prompt(index);
+            }
+        } else {
+            edit_action = EditAction::None;
         }
         let submitted = match edit_action {
             EditAction::Cancel => {
@@ -1800,7 +2072,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             EditAction::Submit => self.editing.take().map(|edit| (edit.index, edit.text)),
             EditAction::None => None,
         };
-        if stop_command {
+        if stop_command && interactive {
             self.agent.stop_command(session);
         }
         if let Some((index, target, text)) = copy_output {
@@ -2051,6 +2323,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         let mut open = None;
+        let mut open_subagent = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-chats")
             .max_height(ui.available_height())
@@ -2068,9 +2341,20 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     ) {
                         open = Some(index);
                     }
+                    for (position, sub) in chat.subagents.iter().enumerate() {
+                        if subagent_row(ui, palette, sub) {
+                            open_subagent = Some((index, position));
+                        }
+                    }
                 }
             });
-        if let Some(index) = open {
+        if let Some((index, subagent)) = open_subagent {
+            // Opening the parent puts its sub-agents back in the pane, in the same order.
+            self.open_chat(index);
+            if subagent < self.agent.subagents.len() {
+                self.view = ChatView::Subagent(subagent);
+            }
+        } else if let Some(index) = open {
             self.open_chat(index);
         }
     }
@@ -2086,7 +2370,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         viewport: egui::Rect,
         bubbles: &[(usize, egui::Rect)],
     ) -> Option<PinnedBubble> {
-        self.parse_transcript();
+        self.parse_transcript(TranscriptSource::Main);
         let (index, _) = bubbles
             .iter()
             .rev()
@@ -2198,6 +2482,49 @@ fn scope_tag(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
         }),
     );
     response
+}
+
+/// One sub-agent card under its chat: name, state and how much it has written.
+fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
+    let state = sub.state();
+    let (badge, colour) = match state {
+        SubagentState::Running => ("running", palette.accent),
+        SubagentState::NeedsAnswer => ("needs answer", palette.danger),
+        SubagentState::Done => ("done", palette.text_muted),
+        SubagentState::Failed => ("failed", palette.danger),
+        SubagentState::Stopped => ("stopped", palette.text_muted),
+    };
+    let response = egui::Frame::NONE
+        .fill(to_color32(palette.bg_panel))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(RADIUS)
+        .inner_margin(egui::Margin::symmetric(CHAT_ROW_PADDING as i8, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("\u{21b3} {}", sub.title))
+                        .size(CHAT_TITLE_TEXT_SIZE)
+                        .color(to_color32(palette.text)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(badge)
+                            .size(10.0)
+                            .color(to_color32(colour)),
+                    );
+                });
+            });
+        })
+        .response;
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.allocate_exact_size(
+        egui::Vec2::new(ui.available_width(), 4.0),
+        egui::Sense::hover(),
+    );
+    response.interact(egui::Sense::click()).clicked()
 }
 
 /// One chat card: title above compact transcript, model and working-directory stats.
@@ -2840,6 +3167,77 @@ fn scope_label(text: &str) -> String {
     format!("{head}…")
 }
 
+/// What the composer's action button does right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionState {
+    /// Send what is typed.
+    Send,
+    /// Stop the run in front of the user.
+    StopMain,
+    /// Stop the sub-agents a stopped run left working.
+    StopSubagents,
+}
+
+/// Which agent a prompt on screen belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptTarget {
+    /// The main conversation.
+    Main,
+    /// One of its sub-agents.
+    Subagent(usize),
+}
+
+/// What one agent is waiting for, taken out of it so the cards can be drawn while the pane
+/// borrows itself mutably.
+#[derive(Default)]
+struct Prompts {
+    /// Approval card: the command and the scopes on offer.
+    approval: Option<(String, Vec<ApprovalScope>)>,
+    /// Capability card: the label, and the tool it belongs to when it has a setting.
+    allowing: Option<(String, Option<String>)>,
+    /// Question card: the call id and the questions.
+    asking: Option<(String, Vec<AgentQuestion>)>,
+    /// Sudo card: the command and why it needs root.
+    sudo: Option<(String, Option<String>)>,
+}
+
+impl Prompts {
+    /// What `agent` is waiting for.
+    fn of(agent: &Agent) -> Self {
+        Self {
+            approval: match &agent.phase {
+                Some(Phase::Approving {
+                    command, scopes, ..
+                }) => Some((command.clone(), scopes.clone())),
+                _ => None,
+            },
+            allowing: match &agent.phase {
+                Some(Phase::Allowing { call, label, .. }) => {
+                    Some((label.clone(), Some(call.name.clone())))
+                }
+                _ => None,
+            },
+            asking: match &agent.phase {
+                Some(Phase::Asking { call, questions }) => {
+                    Some((call.id.clone(), questions.clone()))
+                }
+                _ => None,
+            },
+            sudo: agent
+                .sudo_prompt()
+                .map(|(command, reason)| (command.to_owned(), reason.map(str::to_owned))),
+        }
+    }
+
+    /// Whether there is nothing to ask.
+    fn is_empty(&self) -> bool {
+        self.approval.is_none()
+            && self.allowing.is_none()
+            && self.asking.is_none()
+            && self.sudo.is_none()
+    }
+}
+
 /// What the user did with the prompt cards this frame.
 #[derive(Default)]
 struct PromptAnswers {
@@ -2921,17 +3319,26 @@ impl AiAgent {
         ui: &mut Ui,
         palette: &Palette,
         muted: egui::Color32,
+        prompts: &Prompts,
+        source: Option<&str>,
     ) -> PromptAnswers {
         let mut answers = PromptAnswers::default();
 
+        // A card from a sub-agent says whose it is, so the main chat stays the one place
+        // where every answer is given.
+        if let Some(source) = source
+            && !prompts.is_empty()
+        {
+            ui.label(
+                egui::RichText::new(format!("From sub-agent \"{source}\""))
+                    .size(10.0)
+                    .strong()
+                    .color(to_color32(palette.accent)),
+            );
+        }
+
         // The approval card: the command the model wants to run, and how far to allow it.
-        let approval = match &self.agent.phase {
-            Some(Phase::Approving { command, scopes, .. }) => {
-                Some((command.clone(), scopes.clone()))
-            }
-            _ => None,
-        };
-        if let Some((command, scopes)) = approval {
+        if let Some((command, scopes)) = &prompts.approval {
             let mut chosen: Option<(bool, Option<usize>)> = None;
             let mut everything = false;
             prompt_card(
@@ -2945,7 +3352,7 @@ impl AiAgent {
                             .strong()
                             .color(to_color32(palette.text)),
                     );
-                    prompt_command(ui, palette, &command);
+                    prompt_command(ui, palette, command);
                 },
                 |ui| {
                     prompt_action_row(ui, "approval", |ui| {
@@ -3003,11 +3410,7 @@ impl AiAgent {
         }
 
         // The capability card: a tool whose permission is "ask".
-        let asking = match &self.agent.phase {
-            Some(Phase::Allowing { label, .. }) => Some(label.clone()),
-            _ => None,
-        };
-        if let Some(label) = asking {
+        if let Some((label, _)) = &prompts.allowing {
             prompt_card(
                 ui,
                 palette,
@@ -3019,7 +3422,7 @@ impl AiAgent {
                             .strong()
                             .color(to_color32(palette.text)),
                     );
-                    prompt_command(ui, palette, &label);
+                    prompt_command(ui, palette, label);
                 },
                 |ui| {
                     prompt_action_row(ui, "permission-now", |ui| {
@@ -3073,12 +3476,8 @@ impl AiAgent {
 
         // The question card: one question at a time, every answer kept so Previous can
         // change it and only the last question submits.
-        let asking = match &self.agent.phase {
-            Some(Phase::Asking { call, questions }) => Some((call.id.clone(), questions.clone())),
-            _ => None,
-        };
-        if let Some((call, questions)) = asking {
-            self.questions.open(&call, questions.len());
+        if let Some((call, questions)) = &prompts.asking {
+            self.questions.open(call, questions.len());
             let page = self.questions.page;
             let question = &questions[page];
             let is_last = page + QUESTION_INDEX_OFFSET >= questions.len();
@@ -3158,7 +3557,7 @@ impl AiAgent {
                     if previous {
                         self.questions.page = page.saturating_sub(1);
                     } else if confirmed && is_last {
-                        answers.answers = self.questions.answers(&questions);
+                        answers.answers = self.questions.answers(questions);
                     } else if confirmed || (picked && !is_last) {
                         self.questions.page = page + 1;
                     }
@@ -3167,11 +3566,7 @@ impl AiAgent {
         }
 
         // The sudo card: the command that needs root, and the password for it.
-        let sudo = self
-            .agent
-            .sudo_prompt()
-            .map(|(command, reason)| (command.to_owned(), reason.map(str::to_owned)));
-        if let Some((command, reason)) = sudo {
+        if let Some((command, reason)) = &prompts.sudo {
             prompt_card(
                 ui,
                 palette,
@@ -3183,7 +3578,7 @@ impl AiAgent {
                             .strong()
                             .color(to_color32(palette.text)),
                     );
-                    prompt_command(ui, palette, &command);
+                    prompt_command(ui, palette, command);
                     if let Some(reason) = reason {
                         ui.add(
                             egui::Label::new(egui::RichText::new(reason).size(11.0).color(muted))
@@ -3257,6 +3652,12 @@ impl Plugin for AiAgent {
         let mut session = context.session.take();
         self.sync_providers(context.settings, context.secrets);
         self.load(context.settings);
+        // A sub-agent that went away with its chat takes its view with it.
+        if let ChatView::Subagent(index) = self.view
+            && index >= self.agent.subagents.len()
+        {
+            self.view = ChatView::Chat;
+        }
         self.apply_settings(context.settings, context.secret(SETTING_WEB_SEARCH_KEY));
         self.poll_models();
         self.refresh_models(context);
@@ -3266,8 +3667,23 @@ impl Plugin for AiAgent {
         self.poll_picker();
         self.compact_if_needed(context.settings, &context.host_label);
 
-        // Drain workers, then answer any tool result it produced.
+        // Drain workers, then answer any tool result it produced. Sub-agents are drained
+        // with it, so they keep working while the user reads another chat.
         self.agent.poll(&mut session);
+        self.launch_spawn(
+            &mut session,
+            context.settings,
+            &context.host_label,
+            &context.environment,
+        );
+        self.drive_subagents(context.settings, &context.host_label, &context.environment);
+        // A chat set aside keeps its sub-agents working, so they finish while it is filed.
+        self.poll_filed_subagents(
+            &mut session,
+            context.settings,
+            &context.host_label,
+            &context.environment,
+        );
         // The environment map belongs to the host, so the pane scans it outside a turn.
         self.agent.poll_map_scan(&mut session);
         if std::mem::take(&mut self.map_rebuild) {
@@ -3308,10 +3724,26 @@ impl Plugin for AiAgent {
         // The caption only changes when the run state or the session does, so its text is
         // built then rather than every frame. The chat's own title sits in the body beside
         // the back button, so an idle pane says nothing here.
-        let caption_for = (self.agent.busy(), self.summary.is_some(), context.status);
+        let running = self.agent.subagents_running();
+        let waiting = self.view != ChatView::List && self.agent.waiting_subagent().is_some();
+        let caption_for = (
+            self.agent.busy(),
+            self.summary.is_some(),
+            context.status,
+            running,
+            waiting,
+        );
         if self.caption_for != Some(caption_for) {
             self.caption_for = Some(caption_for);
-            self.caption = if caption_for.0 || caption_for.1 {
+            self.caption = if waiting {
+                ("A sub-agent needs an answer".to_owned(), HeaderHealth::Warn)
+            } else if running > 0 {
+                let plural = if running == 1 { "" } else { "s" };
+                (
+                    format!("{running} sub-agent{plural} running"),
+                    HeaderHealth::Warn,
+                )
+            } else if caption_for.0 || caption_for.1 {
                 ("Thinking…".to_owned(), HeaderHealth::Warn)
             } else if context.status == SessionStatus::Connected {
                 (String::new(), HeaderHealth::Ok)
@@ -3335,6 +3767,24 @@ impl Plugin for AiAgent {
                     .truncate(),
                 );
             }
+            ChatView::Subagent(index) => {
+                back = back_button(ui, palette);
+                let (title, state) = match self.agent.subagents.get(index) {
+                    Some(sub) => (sub.title.clone(), sub.state()),
+                    None => (String::new(), SubagentState::Done),
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("\u{21b3} {title}")).size(CHAT_TITLE_TEXT_SIZE),
+                    )
+                    .truncate(),
+                );
+                ui.label(
+                    egui::RichText::new(state.label())
+                        .size(FOOTER_TEXT_SIZE)
+                        .color(muted),
+                );
+            }
             ChatView::List => {
                 ui.label(
                     egui::RichText::new(CHAT_LIST_HEADING)
@@ -3344,13 +3794,19 @@ impl Plugin for AiAgent {
             }
         });
         if back {
-            // Leaving a settled chat files it, so the list holds everything the pane has.
-            // A run still going stays open: clearing the conversation would end it.
-            if !busy {
-                self.file_chat();
-                self.reset_chat();
+            match self.view {
+                // Back returns to the chat that owns the sub-agent.
+                ChatView::Subagent(_) => self.view = ChatView::Chat,
+                _ => {
+                    // Leaving a settled chat files it, so the list holds everything the pane
+                    // has. A run still going stays open: clearing it would end the run.
+                    if !busy {
+                        self.file_chat();
+                        self.reset_chat();
+                    }
+                    self.view = ChatView::List;
+                }
             }
-            self.view = ChatView::List;
         }
 
         // The provider, model and keys are configured in Options → AI agent; the pane
@@ -3364,6 +3820,13 @@ impl Plugin for AiAgent {
         let mut queue = false;
         let mut command: Option<SlashCommand> = None;
         let mut prompts = PromptAnswers::default();
+        // The main conversation's request comes first; a sub-agent's is shown when the
+        // main one has nothing to answer.
+        let (pending, prompt_target) = self.pending_prompts();
+        let prompt_source = match prompt_target {
+            PromptTarget::Main => None,
+            PromptTarget::Subagent(index) => Some(self.agent.subagents[index].title.clone()),
+        };
         let slash = parse_slash_input(&self.draft);
         egui::Panel::bottom("ai-composer")
             .frame(egui::Frame::NONE)
@@ -3371,7 +3834,19 @@ impl Plugin for AiAgent {
             .show(ui, |ui| {
                 // A request the agent is blocked on comes first: it is the one thing the
                 // user has to answer before the run can go on.
-                prompts = self.prompt_cards(ui, palette, muted);
+                prompts = self.prompt_cards(ui, palette, muted, &pending, prompt_source.as_deref());
+
+                // A sub-agent's transcript is for watching: answers go through the main
+                // chat, and Back returns to it.
+                if let ChatView::Subagent(_) = self.view {
+                    ui.label(
+                        egui::RichText::new(SUBAGENT_VIEW_NOTICE)
+                            .size(11.0)
+                            .italics()
+                            .color(muted),
+                    );
+                    return;
+                }
 
                 // A run cut off before the model answered can be picked up again.
                 if self.agent.can_resume() {
@@ -3545,6 +4020,17 @@ impl Plugin for AiAgent {
                 });
 
                 // Provider and model, with the action at the right end of the same row.
+                let can_send = !self.providers.is_empty() && !self.draft.trim().is_empty();
+                let action_state = self.action_state(can_send);
+                // The stop hint says whether a second press is coming.
+                let stop_hint = match action_state {
+                    ActionState::StopMain if self.agent.subagents_running() > 0 => {
+                        "Stop this run. Press again to stop the sub-agents."
+                    }
+                    ActionState::StopMain => "Stop this run.",
+                    ActionState::StopSubagents => "Stop the sub-agents still running.",
+                    ActionState::Send => "",
+                };
                 let (chosen_provider, chosen_model, action_clicked) = {
                     let provider_options: Vec<(usize, &str)> = self
                         .providers
@@ -3569,12 +4055,15 @@ impl Plugin for AiAgent {
                             egui::TextStyle::Button,
                             egui::FontId::proportional(FOOTER_TEXT_SIZE),
                         );
-                        let can_send =
-                            !self.providers.is_empty() && !self.draft.trim().is_empty();
-                        let action = if self.agent.blocked() && !can_send {
-                            Button::new("Stop").compact().kind(ButtonKind::Danger)
-                        } else {
-                            Button::new("Send").compact().enabled(can_send)
+                        let action = match action_state {
+                            ActionState::Send => Button::new("Send").compact().enabled(can_send),
+                            ActionState::StopMain => {
+                                Button::new("Stop").compact().kind(ButtonKind::Danger)
+                            }
+                            ActionState::StopSubagents => Button::new("Stop agents")
+                                .compact()
+                                .kind(ButtonKind::Danger)
+                                .active(true),
                         };
                         if self.providers.is_empty() {
                             // The action comes first; the hint is cropped to what is left.
@@ -3592,7 +4081,13 @@ impl Plugin for AiAgent {
                                 )
                                 .truncate(),
                             );
-                            return (None, None, action.show(ui, palette).clicked());
+                            let response = action.show(ui, palette);
+                            let clicked = if stop_hint.is_empty() {
+                                response.clicked()
+                            } else {
+                                response.on_hover_text(stop_hint).clicked()
+                            };
+                            return (None, None, clicked);
                         }
                         // The dropdowns give way to the action, never the other way round.
                         let spare =
@@ -3612,15 +4107,23 @@ impl Plugin for AiAgent {
                             &model_options,
                             select_room,
                         );
-                        (provider, model, action.show(ui, palette).clicked())
+                        let response = action.show(ui, palette);
+                        let clicked = if stop_hint.is_empty() {
+                            response.clicked()
+                        } else {
+                            response.on_hover_text(stop_hint).clicked()
+                        };
+                        (provider, model, clicked)
                     })
                     .inner
                 };
                 if action_clicked {
-                    if self.agent.blocked() && self.draft.trim().is_empty() {
-                        self.agent.stop();
-                    } else {
-                        submit = true;
+                    match action_state {
+                        ActionState::StopMain => self.agent.stop(),
+                        ActionState::StopSubagents => {
+                            self.agent.stop_subagents();
+                        }
+                        ActionState::Send => submit = true,
                     }
                 }
                 if let Some(index) = chosen_provider {
@@ -3638,26 +4141,31 @@ impl Plugin for AiAgent {
                 }
             });
 
-        // The chat list, or the transcript of the open chat.
+        // The chat list, the open chat, or a sub-agent's transcript.
         let mut reply = TranscriptReply::default();
-        if self.view == ChatView::List {
+        let source = match self.view {
+            ChatView::List => None,
+            ChatView::Chat => Some(TranscriptSource::Main),
+            ChatView::Subagent(index) => Some(TranscriptSource::Subagent(index)),
+        };
+        if source.is_none() {
             self.chat_list(ui, palette, muted);
-        } else {
+        } else if let Some(source) = source {
             let scroll = egui::ScrollArea::vertical()
                 .id_salt("ai-transcript")
                 .max_height(ui.available_height())
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    let reply = self.transcript(ui, palette, muted, &mut session);
-                    reply
+                    self.transcript(ui, palette, muted, &mut session, source)
                 });
             reply = scroll.inner;
 
             // The message the transcript scrolled past the top stays pinned there, as in the
             // reference chat: a long reply cannot push it out of sight. It opens the same
             // editor as the message it copies.
-            if self.editing.is_none()
+            if source == TranscriptSource::Main
+                && self.editing.is_none()
                 && let Some(pinned) =
                     self.pinned_bubble(ui, palette, scroll.inner_rect, &reply.bubbles)
                 && pinned.clicked
@@ -3680,37 +4188,48 @@ impl Plugin for AiAgent {
 
         if let Some((allow, remember, everything)) = prompts.approval {
             if everything {
-                self.agent.approve_everything(&mut session);
+                self.prompt_agent(prompt_target)
+                    .approve_everything(&mut session);
             } else {
-                self.agent.approve(allow, remember, &mut session);
+                self.prompt_agent(prompt_target)
+                    .approve(allow, remember, &mut session);
             }
         }
         if prompts.stop {
             self.questions = QuestionWizard::default();
-            self.agent.stop();
+            self.stop_prompted(prompt_target);
         }
         if prompts.allow_session {
-            self.agent.allow_everything(&mut session);
+            self.prompt_agent(prompt_target)
+                .allow_everything(&mut session);
         } else if let Some((allow, always)) = prompts.permission {
             if always
-                && let Some(Phase::Allowing { call, .. }) = &self.agent.phase
-                && let Some(key) = setting_key(&call.name)
+                && let Some((_, Some(tool))) = &pending.allowing
+                && let Some(key) = setting_key(tool)
             {
                 context.set_text(&key, if allow { "allow" } else { "deny" });
             }
-            self.agent.answer_permission(allow, &mut session);
+            self.prompt_agent(prompt_target)
+                .answer_permission(allow, &mut session);
         }
         if let Some(answers) = prompts.answers {
             self.questions = QuestionWizard::default();
-            self.agent.answer(&answers, &mut session);
+            self.prompt_agent(prompt_target)
+                .answer(&answers, &mut session);
         }
         match prompts.sudo {
             Some(SudoAnswer::Run) => {
                 let password = std::mem::take(&mut self.sudo);
-                self.agent.submit_sudo(&password, &mut session);
+                self.prompt_agent(prompt_target)
+                    .submit_sudo(&password, &mut session);
             }
-            Some(SudoAnswer::Cancel) => self.agent.cancel_sudo(&mut session),
+            Some(SudoAnswer::Cancel) => self.prompt_agent(prompt_target).cancel_sudo(&mut session),
             None => {}
+        }
+        // A sub-agent's "always" answers join the main conversation, so every other
+        // sub-agent and the next run inherit them.
+        if let PromptTarget::Subagent(index) = prompt_target {
+            self.agent.adopt_subagent_rules(index);
         }
 
         if submit
@@ -3785,6 +4304,7 @@ impl Plugin for AiAgent {
                     "provider": chat.provider,
                     "turns": turns_to_json(&chat.turns),
                     "history": history_to_json(&chat.history),
+                    "subagents": subagents_to_json(&chat.subagents),
                     "compacted": chat.compacted,
                     "scopes": chat.scopes.to_json()
                 })
@@ -3800,6 +4320,7 @@ impl Plugin for AiAgent {
                 "cwd": self.agent.cwd,
                 "turns": turns_to_json(&self.agent.turns),
                 "history": history_to_json(&self.agent.history),
+                "subagents": subagents_to_json(&self.agent.subagents),
                 "compacted": self.agent.compacted,
                 "scopes": self.agent.scopes.to_json(),
                 "chats": chats
@@ -4388,7 +4909,7 @@ mod tests {
             text: "**bold** prompt".to_owned(),
             meta: UserMeta::default(),
         });
-        plugin.parse_transcript();
+        plugin.parse_transcript(TranscriptSource::Main);
         assert_eq!(plugin.parsed.len(), 1);
         assert!(
             !plugin.parsed[0].blocks.is_empty(),
@@ -4398,7 +4919,7 @@ mod tests {
 
         // An unchanged message keeps what was parsed, even if that is nonsense.
         plugin.parsed[0].blocks.clear();
-        plugin.parse_transcript();
+        plugin.parse_transcript(TranscriptSource::Main);
         assert!(
             plugin.parsed[0].blocks.is_empty(),
             "an unchanged message is not parsed again"
@@ -4409,13 +4930,13 @@ mod tests {
             text: "one".to_owned(),
             stopped: false,
         });
-        plugin.parse_transcript();
+        plugin.parse_transcript(TranscriptSource::Main);
         assert_eq!(plugin.parsed.len(), 2);
         plugin.agent.turns[1] = Turn::Assistant {
             text: "one two".to_owned(),
             stopped: false,
         };
-        plugin.parse_transcript();
+        plugin.parse_transcript(TranscriptSource::Main);
         assert_eq!(
             plugin.parsed[1].blocks,
             crate::ai_agent::markdown::blocks("one two")
@@ -5814,7 +6335,7 @@ mod tests {
         let muted = to_color32(palette.text_muted);
         let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
         let mut output = ctx.run_ui(input, |ui| {
-            plugin.transcript(ui, &palette, muted, &mut session);
+            plugin.transcript(ui, &palette, muted, &mut session, TranscriptSource::Main);
         });
         let mut bubbles = Vec::new();
         for clipped in std::mem::take(&mut output.shapes) {
@@ -6028,7 +6549,12 @@ mod tests {
             for id in load {
                 plugin.agent.scopes.load(super::scopes::find(id).unwrap());
             }
-            plugin.system_prompt(&serde_json::Map::new(), "dev", "a test shell")
+            AiAgent::system_prompt(
+                &plugin.agent,
+                &serde_json::Map::new(),
+                "dev",
+                "a test shell",
+            )
         };
 
         // Nothing loaded beyond the root: the prompt offers the next stops and names no
@@ -6036,7 +6562,10 @@ mod tests {
         let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &[]);
         assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(
-            both.contains("- core: run_command, run_command_background, run_sudo, ask_user, get_current_time"),
+            both.contains(
+                "- core: run_command, run_command_background, run_sudo, ask_user, \
+                 spawn_subagent, wait_subagent, get_current_time"
+            ),
             "{both}"
         );
         assert!(both.contains("- host: "), "{both}");
@@ -6283,15 +6812,21 @@ mod tests {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
         plugin.agent.map = a_scanned_map();
-        plugin.agent.scopes.load(super::super::scopes::find("host").unwrap());
-        let without = plugin.system_prompt(&settings, "dev", "a test shell");
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("host").unwrap());
+        let without = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
         assert!(
             !without.contains(MAP_HEADING),
             "the map is not the conversation's until its scope is loaded: {without}"
         );
 
-        plugin.agent.scopes.load(super::super::scopes::find("env").unwrap());
-        let with = plugin.system_prompt(&settings, "dev", "a test shell");
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("env").unwrap());
+        let with = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
         assert!(with.contains(MAP_HEADING), "{with}");
         assert!(with.contains("/srv/app (2 files"), "{with}");
         assert!(with.contains("src/  2"), "{with}");
@@ -6299,7 +6834,7 @@ mod tests {
 
         // An empty map says nothing rather than costing prompt room.
         plugin.agent.map.clear();
-        let empty = plugin.system_prompt(&settings, "dev", "a test shell");
+        let empty = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
         assert!(!empty.contains(MAP_HEADING), "{empty}");
         settings.clear();
     }
@@ -6308,9 +6843,15 @@ mod tests {
     fn the_prompt_carries_the_host_setup_once_it_has_been_scanned() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
-        plugin.agent.scopes.load(super::super::scopes::find("host").unwrap());
-        plugin.agent.scopes.load(super::super::scopes::find("env").unwrap());
-        let without = plugin.system_prompt(&settings, "dev", "a test shell");
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("host").unwrap());
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("env").unwrap());
+        let without = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
         assert!(
             !without.contains(SYSTEM_HEADING),
             "nothing scanned, nothing claimed: {without}"
@@ -6320,7 +6861,7 @@ mod tests {
             1,
             "__wassh_os__\nLinux 6.1\n__wassh_ports__\n:8080 nginx\n__wassh_units__\nnginx.service\n",
         );
-        let with = plugin.system_prompt(&settings, "dev", "a test shell");
+        let with = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
         assert!(with.contains(SYSTEM_HEADING), "{with}");
         assert!(with.contains(":8080 nginx"), "{with}");
         assert!(with.contains("nginx.service"), "{with}");
@@ -6786,5 +7327,257 @@ mod tests {
         let mut plugin = AiAgent::default();
         draw(&mut plugin, &mut settings);
         assert_eq!(plugin.agent.app_allow, ["uptime", "date"]);
+    }
+
+    #[test]
+    fn the_pane_turns_a_spawn_into_a_running_subagent() {
+        let mut plugin = AiAgent::default();
+        plugin.providers.push(ProviderConfig {
+            id: "one".to_owned(),
+            name: "First".to_owned(),
+            protocol: Protocol::Openai,
+            base_url: "https://one/v1".to_owned(),
+            models: vec!["m".to_owned()],
+            embedding_model: None,
+        });
+        plugin.model = "m".to_owned();
+        plugin.agent.turns.push(Turn::User {
+            text: "delegate the log check".to_owned(),
+            meta: UserMeta::default(),
+        });
+        let call = super::super::protocol::ApiToolCall {
+            id: "c1".to_owned(),
+            name: super::super::protocol::TOOL_SPAWN_SUBAGENT.to_owned(),
+            arguments: r#"{"title":"check the logs","prompt":"Find the failing unit."}"#.to_owned(),
+        };
+        // The model asks for a spawn in its reply.
+        plugin.agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        let (sender, events) = std::sync::mpsc::channel();
+        plugin.agent.phase = Some(Phase::Streaming { turn: 1, events });
+        sender
+            .send(crate::ai_agent::StreamEvent::Done(
+                super::super::protocol::Completion {
+                    text: String::new(),
+                    tool_calls: vec![call],
+                    ..super::super::protocol::Completion::default()
+                },
+            ))
+            .expect("send");
+        let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
+        plugin.agent.poll(&mut session);
+        assert!(plugin.agent.spawning(), "the pane has to build the request");
+
+        let settings = serde_json::Map::new();
+        plugin.launch_spawn(&mut session, &settings, "dev", "a test shell");
+
+        assert_eq!(plugin.agent.subagents.len(), 1);
+        let sub = &plugin.agent.subagents[0];
+        assert_eq!(sub.id, "sub-1");
+        assert!(sub.running());
+        assert!(
+            matches!(sub.agent.phase, Some(Phase::Streaming { .. })),
+            "the sub-agent is answering on its own"
+        );
+        assert!(!plugin.agent.spawning());
+        let answered = plugin
+            .agent
+            .turns
+            .iter()
+            .find_map(|turn| match turn {
+                Turn::Tool { output, failed, .. } => Some((output.clone(), *failed)),
+                _ => None,
+            })
+            .expect("the spawn call is answered");
+        assert!(!answered.1, "{}", answered.0);
+        assert!(answered.0.contains("sub-1"), "{}", answered.0);
+        assert!(plugin.agent.needs_reply, "the main run goes on");
+    }
+
+    /// A pane whose only chat is filed, with one finished sub-agent under it.
+    fn filed_chat_with_a_subagent() -> AiAgent {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "delegate the log check".to_owned(),
+            meta: UserMeta::default(),
+        });
+        let index = plugin
+            .agent
+            .begin_subagent("check the logs", "Find the failing unit.");
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: "api.service is failing".to_owned(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].end = Some(SubagentEnd::Done);
+        plugin.begin_new_chat();
+        plugin
+    }
+
+    #[test]
+    fn a_filed_subagent_is_listed_and_opens_read_only() {
+        let mut plugin = filed_chat_with_a_subagent();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        frame(&mut plugin, &mut settings, &ctx, click_back());
+        assert_eq!(plugin.view, ChatView::List);
+
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let row = rows
+            .iter()
+            .find(|(_, _, text)| text == "\u{21b3} check the logs")
+            .cloned()
+            .unwrap_or_else(|| panic!("the sub-agent is not listed: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(row));
+        assert_eq!(
+            plugin.view,
+            ChatView::Subagent(0),
+            "the row brings the sub-agent forward"
+        );
+
+        let drawn = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let texts: Vec<&str> = drawn.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(texts.contains(&SUBAGENT_VIEW_NOTICE), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("api.service is failing")),
+            "the sub-agent's transcript is shown: {texts:?}"
+        );
+
+        // Back returns to the chat that owns it rather than to the list.
+        frame(&mut plugin, &mut settings, &ctx, click_back());
+        assert_eq!(plugin.view, ChatView::Chat);
+    }
+
+    #[test]
+    fn stop_takes_the_main_run_first_and_the_subagents_second() {
+        let (mut plugin, _worker) = busy_pane();
+        assert_eq!(plugin.action_state(false), ActionState::StopMain);
+        let index = plugin.agent.begin_subagent("check", "do it");
+        // A stream still open keeps the sub-agent working after the main run stops.
+        let (_sender, events) = std::sync::mpsc::channel();
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: String::new(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].agent.phase = Some(Phase::Streaming { turn: 1, events });
+
+        plugin.agent.stop();
+        assert_eq!(
+            plugin.action_state(false),
+            ActionState::StopSubagents,
+            "the button stays on to stop what is left"
+        );
+        assert_eq!(plugin.agent.stop_subagents(), 1);
+        assert_eq!(plugin.action_state(false), ActionState::Send);
+        // A typed message sends again.
+        assert_eq!(plugin.action_state(true), ActionState::Send);
+    }
+
+    #[test]
+    fn subagents_survive_a_reload_with_their_transcript() {
+        let mut settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "delegate the log check".to_owned(),
+            meta: UserMeta::default(),
+        });
+        let index = plugin
+            .agent
+            .begin_subagent("check the logs", "Find the failing unit.");
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: "api.service is failing".to_owned(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].end = Some(SubagentEnd::Done);
+        draw(&mut plugin, &mut settings);
+        assert_eq!(
+            settings[CONVERSATION_KEY]["subagents"][0]["title"],
+            "check the logs"
+        );
+
+        let mut reloaded = AiAgent::default();
+        draw(&mut reloaded, &mut settings);
+        assert_eq!(reloaded.agent.subagents.len(), 1);
+        assert_eq!(reloaded.agent.subagents[0].title, "check the logs");
+        assert_eq!(reloaded.agent.subagents[0].state(), SubagentState::Done);
+        assert!(reloaded.agent.subagents[0].answer().contains("api.service"));
+    }
+
+    #[test]
+    fn a_subagent_that_was_running_comes_back_stopped() {
+        let mut settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "delegate".to_owned(),
+            meta: UserMeta::default(),
+        });
+        let index = plugin.agent.begin_subagent("check", "do it");
+        let (_sender, events) = std::sync::mpsc::channel();
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: String::new(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].agent.phase = Some(Phase::Streaming { turn: 1, events });
+        draw(&mut plugin, &mut settings);
+
+        let mut reloaded = AiAgent::default();
+        draw(&mut reloaded, &mut settings);
+        assert_eq!(reloaded.agent.subagents.len(), 1);
+        assert_eq!(reloaded.agent.subagents[0].state(), SubagentState::Stopped);
+    }
+
+    #[test]
+    fn the_header_counts_the_subagents_of_the_open_chat() {
+        let (mut plugin, _worker) = busy_pane();
+        let index = plugin.agent.begin_subagent("check", "do it");
+        let (_sender, events) = std::sync::mpsc::channel();
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: String::new(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].agent.phase = Some(Phase::Streaming { turn: 1, events });
+        plugin.caption_for = None;
+        let mut settings = serde_json::Map::new();
+        draw(&mut plugin, &mut settings);
+        assert_eq!(
+            plugin.header_status().expect("a caption").0,
+            "1 sub-agent running"
+        );
+
+        // One waiting for an answer is said in the header too.
+        plugin.agent.subagents[index].agent.phase = Some(Phase::Allowing {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: "terminal_write".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            turn: 1,
+            label: "type rm".to_owned(),
+        });
+        plugin.caption_for = None;
+        draw(&mut plugin, &mut settings);
+        assert_eq!(
+            plugin.header_status().expect("a caption").0,
+            "A sub-agent needs an answer"
+        );
     }
 }

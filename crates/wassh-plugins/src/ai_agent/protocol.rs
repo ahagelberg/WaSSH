@@ -38,6 +38,12 @@ pub const SETTING_WEB_SEARCH_KEY: &str = "webSearchApiKey";
 pub const SETTING_MODEL_CONTEXTS: &str = "modelContexts";
 /// Setting key: whether a chat that outgrows its model's window is compacted.
 pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
+/// Setting key: how many sub-agents may run at the same time.
+pub const SETTING_MAX_SUBAGENTS: &str = "maxSubagents";
+/// Sub-agents allowed at once when nothing is stored.
+pub const DEFAULT_MAX_SUBAGENTS: usize = 5;
+/// Longest sub-agent answer handed back to the model.
+pub const MAX_SUBAGENT_RESULT_CHARS: usize = 8_000;
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";
@@ -47,6 +53,10 @@ pub const TOOL_RUN_COMMAND_BACKGROUND: &str = "run_command_background";
 pub const TOOL_RUN_SUDO: &str = "run_sudo";
 /// Tool: ask the user a multiple-choice question.
 pub const TOOL_ASK_USER: &str = "ask_user";
+/// Tool: delegate a task to a sub-agent that runs in the background.
+pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
+/// Tool: wait for a sub-agent and collect its answer.
+pub const TOOL_WAIT_SUBAGENT: &str = "wait_subagent";
 /// Tool: fetch a URL.
 pub const TOOL_WEB_FETCH: &str = "web_fetch";
 /// Tool: search the web.
@@ -155,7 +165,7 @@ pub const OPENAI_MODELS_PATH: &str = "/models";
 pub const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 
 /// Version of the plugin's stored data.
-pub const DATA_VERSION: u32 = 2;
+pub const DATA_VERSION: u32 = 3;
 /// Title a fresh chat gets.
 pub const DEFAULT_CHAT_TITLE: &str = "New chat";
 /// Chats kept per host.

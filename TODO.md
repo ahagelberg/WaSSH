@@ -1,5 +1,5 @@
-## Fixes
-- Windows installed version show command window for every WSL command run.
+## Bugs
+- Hosts can't be re-order within group.
 
 ## Additions
 - Key manager for setting up password-less logins
@@ -28,6 +28,5 @@
 - AI Agent: Add option to include (yaml) files with prompts
 - Daemon monitor: triggers
 - AI Agent: better approval system - detect individual commands in long command list, classify them as already approved or not depending on arguments.
-- AI Agent: add support for sub-agents.
 - AI Agent: add support for questions
 - AI Agent: support for ANSI codes (colors mainly) in command output boxes.

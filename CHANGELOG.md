@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Let the AI agent delegate work to sub-agents. Two new tools in the core scope, `spawn_subagent`
+  and `wait_subagent`, start a second conversation that runs in the background and collect its
+  answer.
+  - A sub-agent inherits the chat's provider, model, working directory, loaded scopes and
+    permissions, and is never offered the spawn tools itself, so delegation stops after one level.
+  - The main chat's rules are re-read every frame, so an "always allow" answered later reaches
+    every running sub-agent.
+  - Approvals, capability prompts, questions and sudo prompts from a sub-agent appear in the main
+    chat labelled with the sub-agent's name, and the sub-agent waits for that answer.
+  - Starting, waiting and finishing are recorded in the parent transcript and its history; a
+    completion never starts a main turn on its own.
+  - The chat list shows a chat's sub-agents beneath it with their state, and one opens as a
+    read-only transcript that Back leaves.
+  - Stop is two-stage: the first press stops the main run, and while sub-agents are still working
+    the button stays on and a second press stops them.
+  - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
+    back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
+
 ## [2.0.15] - 2026-11-18
 
 ### Added

@@ -311,7 +311,7 @@ fn gate(tool: &str) -> Option<&'static Gate> {
 ///
 /// Empty is "nothing gated yet", which is what a pane that has not read its
 /// settings runs under; the pane replaces it from the settings every frame.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Permissions {
     /// The decision for every gated tool.
     decisions: Vec<(&'static str, Permission)>,
