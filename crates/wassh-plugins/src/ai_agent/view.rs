@@ -14,7 +14,6 @@ use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
     select_width, small_button, small_button_enabled, text_area, text_area_with_id, ToastKind,
-    truncating_galley,
 };
 
 use super::agent::{
@@ -162,12 +161,14 @@ const BACK_ARROW_WIDTH: f32 = 1.8;
 const CHAT_LIST_HEADING: &str = "Chats";
 /// What the chat list says when there is nothing to reopen.
 const CHAT_LIST_EMPTY: &str = "No previous chats yet.";
-/// Height of one row of the chat list.
-const CHAT_ROW_HEIGHT: f32 = 26.0;
 /// Type size of a chat's name in the list and of the open chat's title.
 const CHAT_TITLE_TEXT_SIZE: f32 = 12.0;
 /// Side padding inside a chat list row.
-const CHAT_ROW_PADDING: f32 = 6.0;
+const CHAT_ROW_PADDING: f32 = 10.0;
+/// System instruction for the short title generated from the first prompt.
+const CHAT_TITLE_SYSTEM_PROMPT: &str =
+    "Create a short digest title for the user's prompt. Reply with 3 to 8 words only. \
+No quotes, punctuation, prefix, or explanation.";
 
 /// How long one dot of the animated "Thinking…" stays on.
 const THINKING_DOT_MS: u64 = 400;
@@ -374,6 +375,12 @@ pub struct AiAgent {
     app_writes: Vec<(String, Value)>,
     /// A summary running on its own thread, with the history index it folds up to.
     summary: Option<SummaryJob>,
+    /// A short title being generated from the first prompt.
+    title_job: Option<Receiver<Result<String, String>>>,
+    /// First prompt waiting for the main run to finish before title generation.
+    title_prompt: Option<String>,
+    /// A generated title, preferred over the prompt-derived fallback.
+    generated_title: Option<String>,
     /// Each turn's Markdown, parsed once so a frame does not parse the whole transcript.
     parsed: Vec<ParsedTurn>,
     /// The question composer, while `ask_user` waits.
@@ -451,6 +458,9 @@ impl Default for AiAgent {
             refreshed: std::collections::BTreeSet::new(),
             app_writes: Vec::new(),
             summary: None,
+            title_job: None,
+            title_prompt: None,
+            generated_title: None,
             parsed: Vec::new(),
             questions: QuestionWizard::default(),
             editing: None,
@@ -589,6 +599,9 @@ impl AiAgent {
     fn reset_chat(&mut self) {
         self.agent.clear();
         self.error = None;
+        self.generated_title = None;
+        self.title_job = None;
+        self.title_prompt = None;
         self.questions = QuestionWizard::default();
         self.editing = None;
     }
@@ -618,6 +631,8 @@ impl AiAgent {
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
         self.agent.scopes = chat.scopes;
+        self.generated_title = Some(chat.title.clone());
+        self.title_prompt = None;
         if !chat.model.is_empty() {
             self.model = chat.model;
         }
@@ -781,12 +796,26 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                  they cannot hang on a pager, and they show the user what changed.",
                 host_files.join(", ")
             ));
+            if !self.agent.offers_tool(super::protocol::TOOL_ENV_FIND)
+                && scopes::visible(&self.agent.scopes, &self.agent.permissions)
+                    .iter()
+                    .any(|scope| scope.id == ENV_SCOPE)
+            {
+                lines.push(
+                    "- Development work has a separate Graph scope ('env'). Load it when you need \
+                     to locate files or declarations across the host; env_search, env_find and \
+                     env_outline query the graph instead of re-discovering the tree with shell \
+                     commands."
+                        .to_owned(),
+                );
+            }
         } else if let Some((scope, names)) = self.host_file_scope() {
             lines.push(format!(
                 "- Files on the connected host are read, searched and changed with {names}, \
                  which the '{scope}' scope holds. Load that scope before touching a file there; \
                  do not use cat, head, tail, ls, find, grep/rg, sed, awk or shell redirection \
-                 in its place."
+                 in its place. For development, also load 'env' (Graph) separately when you need \
+                 its file/declaration index."
             ));
         }
         let local_files = offered(is_local_file_tool);
@@ -988,6 +1017,75 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.toasts.push((ToastKind::Error, error));
     }
 
+    fn start_chat_title(&mut self, prompt: &str) {
+        if self.generated_title.is_some() || self.title_job.is_some() {
+            return;
+        }
+        let Some(provider) = self.active().cloned() else {
+            return;
+        };
+        let model = self.model.clone();
+        let key = self.keys.get(&provider.id).cloned().unwrap_or_default();
+        let prompt = prompt.trim().to_owned();
+        let (sender, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let request = CompletionRequest {
+                base_url: provider.base_url,
+                api_key: key,
+                protocol: provider.protocol,
+                model,
+                system: CHAT_TITLE_SYSTEM_PROMPT.to_owned(),
+                messages: vec![super::protocol::ApiMessage::User { content: prompt }],
+                tools: Vec::new(),
+                max_tokens: 32,
+            };
+            let result = complete_blocking(&request).map(|completion| completion.text.trim().to_owned());
+            let _ = sender.send(result);
+        });
+        self.title_job = Some(events);
+    }
+
+    fn poll_chat_title(&mut self) {
+        if self.title_job.is_none()
+            && self.title_prompt.is_some()
+            && !self.agent.blocked()
+        {
+            let prompt = self.title_prompt.take().unwrap_or_default();
+            self.start_chat_title(&prompt);
+        }
+        let ready = match &self.title_job {
+            Some(events) => match events.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("The chat title worker stopped.".to_owned()))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        let Some(result) = ready else {
+            return;
+        };
+        self.title_job = None;
+        if let Ok(title) = result {
+            let title = title
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches(['"', '\''])
+                .trim();
+            if !title.is_empty() {
+                let too_long = title.chars().count() > TITLE_MAX_CHARS;
+                let mut title: String = title.chars().take(TITLE_MAX_CHARS).collect();
+                if too_long {
+                    title.push('…');
+                }
+                self.generated_title = Some(title);
+            }
+        }
+    }
+
     /// Hand one message to the agent: it becomes a turn and its reply starts.
     fn send_message(
         &mut self,
@@ -1001,6 +1099,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         self.error = None;
+        if self.generated_title.is_none() && self.title_prompt.is_none() {
+            self.title_prompt = Some(message.to_owned());
+        }
         if let Some(request) = self.request(settings, host, environment) {
             self.agent.start(request);
         }
@@ -1174,6 +1275,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 
     /// Take the stored conversation and the chats filed under it.
     fn restore(&mut self, stored: &Value) {
+        if let Some(title) = stored["title"].as_str()
+            && title != DEFAULT_CHAT_TITLE
+            && !title.trim().is_empty()
+        {
+            self.generated_title = Some(title.to_owned());
+        }
         if let Some(model) = stored.get("model").and_then(Value::as_str)
             && !model.is_empty()
         {
@@ -1232,6 +1339,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 
     /// Title for the header and the stored conversation.
     fn title(&self) -> String {
+        if let Some(title) = &self.generated_title {
+            return title.clone();
+        }
         let first = self.agent.turns.iter().find_map(|turn| match turn {
             Turn::User { text, .. } => Some(text.clone()),
             _ => None,
@@ -1947,7 +2057,15 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for index in (0..self.chats.len()).rev() {
-                    if chat_row(ui, palette, &self.chats[index].title) {
+                    let chat = &self.chats[index];
+                    if chat_row(
+                        ui,
+                        palette,
+                        &chat.title,
+                        chat.turns.len(),
+                        &chat.model,
+                        &chat.cwd,
+                    ) {
                         open = Some(index);
                     }
                 }
@@ -2082,41 +2200,58 @@ fn scope_tag(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
     response
 }
 
-/// One chat in the list: its title across the row, which the user can click.
-fn chat_row(ui: &mut Ui, palette: &Palette, title: &str) -> bool {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::Vec2::new(ui.available_width(), CHAT_ROW_HEIGHT),
-        egui::Sense::click(),
-    );
-    let hovered = response.hovered();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, RADIUS, to_color32(palette.bg_panel_2));
+/// One chat card: title above compact transcript, model and working-directory stats.
+fn chat_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    title: &str,
+    turns: usize,
+    model: &str,
+    cwd: &str,
+) -> bool {
+    let response = egui::Frame::NONE
+        .fill(to_color32(palette.bg_panel_2))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(RADIUS)
+        .inner_margin(egui::Margin::symmetric(CHAT_ROW_PADDING as i8, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(CHAT_TITLE_TEXT_SIZE)
+                        .strong()
+                        .color(to_color32(palette.text)),
+                );
+                ui.add_space(4.0);
+                let model = if model.trim().is_empty() {
+                    "No model"
+                } else {
+                    model
+                };
+                let cwd = if cwd.trim().is_empty() { "/" } else { cwd };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} turn{} · {} · {}",
+                        turns,
+                        if turns == 1 { "" } else { "s" },
+                        model,
+                        cwd
+                    ))
+                    .size(10.0)
+                    .color(to_color32(palette.text_muted)),
+                );
+            });
+        })
+        .response;
+    if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let colour = to_color32(if hovered {
-        palette.text
-    } else {
-        palette.text_muted
-    });
-    // Painted rather than laid out as a widget: a label over the row would take the
-    // pointer and the row would never see the click.
-    let galley = truncating_galley(
-        ui,
-        title,
-        CHAT_TITLE_TEXT_SIZE,
-        colour,
-        rect.width() - CHAT_ROW_PADDING * 2.0,
+    ui.allocate_exact_size(
+        egui::Vec2::new(ui.available_width(), 8.0),
+        egui::Sense::hover(),
     );
-    ui.painter().galley(
-        egui::pos2(
-            rect.left() + CHAT_ROW_PADDING,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        colour,
-    );
-    response.clicked()
+    response.interact(egui::Sense::click()).clicked()
 }
 
 /// A dropdown that never grows past `width`: a long label is cropped rather than
@@ -2718,6 +2853,8 @@ struct PromptAnswers {
     answers: Option<Vec<String>>,
     /// The sudo card.
     sudo: Option<SudoAnswer>,
+    /// Stop the agent without answering the prompt.
+    stop: bool,
 }
 
 /// What the question card holds: the call it belongs to, the question on screen and what
@@ -3009,6 +3146,14 @@ impl AiAgent {
                         if small_button_enabled(ui, palette, label, answered) {
                             confirmed = true;
                         }
+                        if Button::new("Stop")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.stop = true;
+                        }
                     });
                     if previous {
                         self.questions.page = page.saturating_sub(1);
@@ -3117,6 +3262,7 @@ impl Plugin for AiAgent {
         self.refresh_models(context);
         self.agent.now_ms = wassh_core::time::now_ms();
         self.poll_summary();
+        self.poll_chat_title();
         self.poll_picker();
         self.compact_if_needed(context.settings, &context.host_label);
 
@@ -3425,7 +3571,7 @@ impl Plugin for AiAgent {
                         );
                         let can_send =
                             !self.providers.is_empty() && !self.draft.trim().is_empty();
-                        let action = if busy && !can_send {
+                        let action = if self.agent.blocked() && !can_send {
                             Button::new("Stop").compact().kind(ButtonKind::Danger)
                         } else {
                             Button::new("Send").compact().enabled(can_send)
@@ -3471,7 +3617,7 @@ impl Plugin for AiAgent {
                     .inner
                 };
                 if action_clicked {
-                    if busy && self.draft.trim().is_empty() {
+                    if self.agent.blocked() && self.draft.trim().is_empty() {
                         self.agent.stop();
                     } else {
                         submit = true;
@@ -3538,6 +3684,10 @@ impl Plugin for AiAgent {
             } else {
                 self.agent.approve(allow, remember, &mut session);
             }
+        }
+        if prompts.stop {
+            self.questions = QuestionWizard::default();
+            self.agent.stop();
         }
         if prompts.allow_session {
             self.agent.allow_everything(&mut session);
@@ -4746,12 +4896,12 @@ mod tests {
             .expect("the card has no background of its own");
 
         // The composer is still on screen, well under the 760-point pane.
-        let send = texts
+        let stop = texts
             .iter()
-            .find(|(_, text)| text == "Send")
+            .find(|(_, text)| text == "Stop")
             .map(|(pos, _)| *pos)
-            .expect("the send button is drawn");
-        assert!(send.y < 760.0, "the card pushed the composer away");
+            .expect("the stop button is drawn");
+        assert!(stop.y < 760.0, "the card pushed the composer away");
         // The card itself stays a card, not a whole screen of script.
         for card in &cards {
             assert!(card.height() < 760.0 / 2.0, "the card grew to {card:?}");
@@ -5101,6 +5251,7 @@ mod tests {
             "Your answer…",
             "Previous",
             "Next",
+            "Stop",
         ] {
             assert!(texts.contains(&expected), "{expected} missing: {texts:?}");
         }
@@ -5109,7 +5260,6 @@ mod tests {
             !texts.contains(&"Other (write your own)"),
             "the text field is the free answer: {texts:?}"
         );
-
         // Picking an option is the answer: the card moves on by itself.
         let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Go");
         let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
@@ -5145,6 +5295,27 @@ mod tests {
             })
             .collect();
         assert_eq!(answers, ["Rust", "lib.rs"]);
+
+        plugin.agent.phase = Some(Phase::Asking {
+            call: super::super::protocol::ApiToolCall {
+                id: "c2".to_owned(),
+                name: "ask_user".to_owned(),
+                arguments: String::new(),
+            },
+            questions: vec![super::super::agent::AgentQuestion {
+                text: "Stop this?".to_owned(),
+                options: vec!["Yes".to_owned()],
+            }],
+        });
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.stop();
+        assert!(
+            !plugin.agent.asking(),
+            "Stop ends the question prompt: asking={}, blocked={}, busy={}",
+            plugin.agent.asking(),
+            plugin.agent.blocked(),
+            plugin.agent.busy()
+        );
     }
 
     #[test]
