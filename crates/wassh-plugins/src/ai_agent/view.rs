@@ -1,4 +1,4 @@
-//! The AI agent pane.
+﻿//! The AI agent pane.
 //!
 //! A chat with an LLM that can act on the session: run commands, read and write
 //! files, drive the terminal, search the web or the knowledge base. Provider and
@@ -13,7 +13,7 @@ use wassh_core::{Palette, RADIUS, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
-    select_width, small_button, small_button_enabled, text_area, text_area_with_id,
+    select_width, small_button, small_button_enabled, text_area, text_area_with_id, ToastKind,
     truncating_galley,
 };
 
@@ -388,6 +388,8 @@ pub struct AiAgent {
     caption_for: Option<(bool, bool, SessionStatus)>,
     /// Last problem reported to the user.
     error: Option<String>,
+    /// Problems raised in one frame, forwarded to the host as toasts.
+    toasts: Vec<(ToastKind, String)>,
     /// Provider list and keys [`AiAgent::sync_providers`] last derived its state from.
     synced_providers: Option<Value>,
     synced_secrets: std::collections::BTreeMap<String, String>,
@@ -455,6 +457,7 @@ impl Default for AiAgent {
             caption: (String::new(), HeaderHealth::Ok),
             caption_for: None,
             error: None,
+            toasts: Vec::new(),
             synced_providers: None,
             synced_secrets: std::collections::BTreeMap::new(),
             applied: None,
@@ -976,6 +979,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         Ok(())
     }
 
+    fn report_error(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        self.error = Some(error.clone());
+        self.toasts.push((ToastKind::Error, error));
+    }
+
     /// Hand one message to the agent: it becomes a turn and its reply starts.
     fn send_message(
         &mut self,
@@ -1005,7 +1014,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         if let Err(error) = self.ready() {
-            self.error = Some(error.to_owned());
+            self.report_error(error);
             return;
         }
         if let Some(request) = self.request(settings, host, environment) {
@@ -1252,7 +1261,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         let Some(provider) = self.active().cloned() else {
-            self.error = Some("Add a provider first.".to_owned());
+            self.report_error("Add a provider first.");
             return;
         };
         let transcript = match mode {
@@ -1338,9 +1347,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let cut = *cut;
         self.summary = None;
         match result {
-            Err(error) => self.error = Some(error),
+            Err(error) => self.report_error(error),
             Ok(summary) if summary.is_empty() => {
-                self.error = Some("The provider returned an empty summary.".to_owned());
+                self.report_error("The provider returned an empty summary.");
             }
             Ok(summary) => {
                 if mode == SummaryMode::Compact {
@@ -1408,12 +1417,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     /// Attach one file to the next message.
     fn attach(&mut self, path: &str) {
         if self.attachments.len() >= MAX_ATTACHMENTS {
-            self.error = Some(format!("At most {MAX_ATTACHMENTS} files can be attached."));
+            self.report_error(format!("At most {MAX_ATTACHMENTS} files can be attached."));
             return;
         }
         match std::fs::metadata(path) {
             Ok(meta) if meta.len() > MAX_ATTACHMENT_BYTES => {
-                self.error = Some(format!(
+                self.report_error(format!(
                     "{} is larger than {} bytes.",
                     path, MAX_ATTACHMENT_BYTES
                 ));
@@ -1421,13 +1430,13 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             }
             Ok(_) => {}
             Err(error) => {
-                self.error = Some(format!("Cannot read {path}: {error}"));
+                self.report_error(format!("Cannot read {path}: {error}"));
                 return;
             }
         }
         match std::fs::read(path) {
             Ok(bytes) if bytes.iter().take(2048).any(|byte| *byte == 0) => {
-                self.error = Some(format!("{path} looks like a binary file."));
+                self.report_error(format!("{path} looks like a binary file."));
             }
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -1437,7 +1446,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     text,
                 });
             }
-            Err(error) => self.error = Some(format!("Cannot read {path}: {error}")),
+            Err(error) => self.report_error(format!("Cannot read {path}: {error}")),
         }
     }
 
@@ -1713,7 +1722,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         };
         if self.agent.blocked() {
-            self.error = Some(EDIT_WHILE_BUSY.to_owned());
+            self.report_error(EDIT_WHILE_BUSY);
             return;
         }
         self.editing = Some(MessageEdit {
@@ -1737,7 +1746,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         if self.agent.blocked() {
-            self.error = Some(EDIT_WHILE_BUSY.to_owned());
+            self.report_error(EDIT_WHILE_BUSY);
             return;
         }
         if self.agent.rewind_to(index).is_none() {
@@ -3077,6 +3086,10 @@ impl Plugin for AiAgent {
         PluginId::AiAgent.manifest()
     }
 
+    fn take_toasts(&mut self) -> Vec<(ToastKind, String)> {
+        std::mem::take(&mut self.toasts)
+    }
+
     fn header_status(&self) -> Option<(&str, HeaderHealth)> {
         (!self.caption.0.is_empty()).then_some((self.caption.0.as_str(), self.caption.1))
     }
@@ -3107,7 +3120,7 @@ impl Plugin for AiAgent {
         if std::mem::take(&mut self.map_rebuild) {
             let root = self.map_root();
             if let Err(error) = self.agent.start_map_scan(&root, &mut session) {
-                self.error = Some(error);
+                self.report_error(error);
             }
         }
         // A message typed during the last run joins the conversation before the next
@@ -3134,7 +3147,7 @@ impl Plugin for AiAgent {
                     );
                 }
                 Err(error) => {
-                    self.error = Some(error.to_owned());
+                    self.report_error(error);
                     self.queued = Some(queued);
                 }
             }
@@ -3483,17 +3496,6 @@ impl Plugin for AiAgent {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     let reply = self.transcript(ui, palette, muted, &mut session);
-
-                    if let Some(error) = &self.error {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("⚠ {error}"))
-                                    .size(11.0)
-                                    .color(to_color32(palette.danger)),
-                            )
-                            .wrap(),
-                        );
-                    }
                     reply
                 });
             reply = scroll.inner;
@@ -3565,7 +3567,7 @@ impl Plugin for AiAgent {
         } else if submit && !self.draft.trim().is_empty() {
             // Say why nothing would go out instead of dropping the message silently.
             if let Err(error) = self.ready() {
-                self.error = Some(error.to_owned());
+                self.report_error(error);
             } else {
                 // A prompt typed on the chat list starts a new chat instead of joining the
                 // one the list holds; a run still going in the background keeps its
