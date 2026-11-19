@@ -48,6 +48,8 @@ const MAP_KEY: &str = "envMap";
 const SYSTEM_KEY: &str = "envSystem";
 /// The scope that holds the environment map.
 const ENV_SCOPE: &str = "env";
+/// User-facing name for the environment-map scope.
+const GRAPH_SCOPE_LABEL: &str = "Graph";
 /// Settings [`AiAgent::apply_settings`] derives the agent's rules and tools from, besides
 /// the per-group and per-tool permission keys it reads through [`Permissions`].
 const DERIVED_SETTINGS: &[&str] = &[
@@ -1792,7 +1794,11 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                         ui.set_width(SCOPE_POPUP_WIDTH);
                         ui.spacing_mut().item_spacing.y = SCOPE_POPUP_GAP;
                         ui.label(
-                            egui::RichText::new(scope.id)
+                            egui::RichText::new(if scope.id == ENV_SCOPE {
+                                GRAPH_SCOPE_LABEL
+                            } else {
+                                scope.id
+                            })
                                 .size(12.0)
                                 .strong()
                                 .color(to_color32(palette.text)),
@@ -1903,7 +1909,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         let map = &self.agent.map;
         format!(
-            "{} files under {} ({}), built {} min ago",
+            "Graph: {} files under {} ({}), built {} min ago",
             map.len(),
             map.root,
             if map.truncated { "capped" } else { "complete" },
@@ -3331,7 +3337,8 @@ impl Plugin for AiAgent {
                                 .color(muted),
                         );
                         for id in loaded {
-                            let tag = scope_tag(ui, palette, id).on_hover_text(SCOPE_CHIP_HINT);
+                            let label = if id == ENV_SCOPE { GRAPH_SCOPE_LABEL } else { id };
+                            let tag = scope_tag(ui, palette, label).on_hover_text(SCOPE_CHIP_HINT);
                             if tag.clicked() {
                                 opened = Some((id, tag.rect));
                             }
@@ -6180,9 +6187,13 @@ mod tests {
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let tag = rows
             .iter()
-            .find(|(_, _, text)| text == ENV_SCOPE)
+            .find(|(_, _, text)| text == GRAPH_SCOPE_LABEL)
             .cloned()
-            .expect("the env scope has a tag");
+            .expect("the Graph scope has a tag");
+        assert!(
+            rows.iter().any(|(_, _, text)| text == "host"),
+            "the host scope stays visible alongside Graph: {rows:?}"
+        );
         frame(&mut plugin, &mut settings, &ctx, click(tag));
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         assert!(
