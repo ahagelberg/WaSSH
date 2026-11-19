@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.16] - 2026-11-19
 
 ### Added
 
@@ -21,6 +21,24 @@
     the button stays on and a second press stops them.
   - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
     back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
+- Start a command in the background: `run_command_background` sits in the core scope beside
+  `run_command`, runs the command under `nohup` with its output discarded and answers with its
+  process id, so a server or a long job no longer holds the conversation. It is approved by the
+  same command rules as any other command.
+- Name the environment map's scope "Graph" wherever the pane shows it — on its tag, in the scope
+  popup and in the line reporting what is mapped — while the agent still loads it as `env`.
+- Generate a chat's title from its first prompt: once the reply is on its way the model is asked
+  for a 3-to-8 word digest, which replaces the truncated prompt in the chat list and the header.
+  A provider that fails or answers nothing leaves the prompt-derived title in place.
+
+### Changed
+
+- Report the AI agent's errors as toasts as well as under the transcript, so a failed send, a
+  broken provider or a summary that came back empty is seen wherever the pane is docked.
+- Lead the agent's guidance with the Graph scope when the development tools are already loaded but
+  the map is not, and name the scope to load when the host's file tools are still out of reach.
+- Give the question card a Stop of its own: it ends the prompt and the run without an answer,
+  instead of leaving the question open with no way out but typing one.
 
 ### Fixed
 
