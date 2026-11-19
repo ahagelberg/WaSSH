@@ -27,7 +27,7 @@ use super::protocol::{
     TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH,
     TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH,
     TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE,
-    TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
+    TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
     TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
     TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
@@ -106,6 +106,12 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
 code. Meant for work no tool covers, such as builds, tests, services, package managers and \
 version control; files are read, searched and edited with the file tools of the \"host-files\" \
 scope, not with cat, grep, ls, find or sed.",
+    },
+    ToolSpec {
+        name: TOOL_RUN_COMMAND_BACKGROUND,
+        description: "Start a shell command on the connected SSH host in the background and return \
+immediately. Use this for long-running servers or jobs whose output does not need to be returned \
+now. The command does not keep the live terminal busy.",
     },
     ToolSpec {
         name: TOOL_RUN_SUDO,
@@ -349,6 +355,10 @@ fn parameters(name: &str) -> (Value, Value) {
     match name {
         TOOL_RUN_COMMAND => (
             json!({ "command": string("The command line to run, exactly as it would be typed.") }),
+            json!(["command"]),
+        ),
+        TOOL_RUN_COMMAND_BACKGROUND => (
+            json!({ "command": string("The command line to start in the background.") }),
             json!(["command"]),
         ),
         TOOL_RUN_SUDO => (
@@ -688,6 +698,7 @@ pub fn needs_session(name: &str) -> bool {
         TOOL_ENV_SCAN
             | TOOL_ENV_SYSTEM
             | TOOL_RUN_COMMAND
+            | TOOL_RUN_COMMAND_BACKGROUND
             | TOOL_RUN_SUDO
             | TOOL_REMOTE_READ
             | TOOL_REMOTE_WRITE
@@ -1889,6 +1900,7 @@ mod tests {
                 TOOL_LOAD_SCOPE,
                 TOOL_UNLOAD_SCOPE,
                 TOOL_RUN_COMMAND,
+                TOOL_RUN_COMMAND_BACKGROUND,
                 TOOL_RUN_SUDO,
                 TOOL_ASK_USER,
                 TOOL_CURRENT_TIME,

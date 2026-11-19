@@ -807,6 +807,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         let shells: Vec<&str> = [
             super::protocol::TOOL_RUN_COMMAND,
+            super::protocol::TOOL_RUN_COMMAND_BACKGROUND,
             super::protocol::TOOL_RUN_SUDO,
             super::protocol::TOOL_LOCAL_RUN,
         ]
@@ -5857,7 +5858,7 @@ mod tests {
         let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &[]);
         assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(
-            both.contains("- core: run_command, run_sudo, ask_user, get_current_time"),
+            both.contains("- core: run_command, run_command_background, run_sudo, ask_user, get_current_time"),
             "{both}"
         );
         assert!(both.contains("- host: "), "{both}");

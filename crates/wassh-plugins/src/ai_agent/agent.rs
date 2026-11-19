@@ -19,7 +19,7 @@ use super::protocol::{
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK,
+    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SUDO, TOOL_SYSTEM_DISK,
     TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS,
     TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE,
     TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
@@ -1269,7 +1269,7 @@ impl Agent {
         // Everything that needs the session checks once, up front.
         // `run_command` asks for approval first, so it keeps its own check.
         let needs_session_now = tools::needs_session(&name)
-            && !matches!(name.as_str(), TOOL_ASK_USER | TOOL_RUN_COMMAND);
+            && !matches!(name.as_str(), TOOL_ASK_USER | TOOL_RUN_COMMAND | TOOL_RUN_COMMAND_BACKGROUND);
         if needs_session_now && session.is_none() {
             let label = call_label(&call);
             self.settle(
@@ -1368,6 +1368,41 @@ impl Agent {
                 match decision {
                     RuleDecision::Allow => {
                         self.exec_command(call, command, sudo_stdin, turn, session)
+                    }
+                    RuleDecision::Deny => {
+                        let reason =
+                            format!("Running `{command}` is not allowed by the permission rules.");
+                        self.settle(call, turn, format!("$ {command}"), reason, true, session);
+                    }
+                    RuleDecision::Ask => {
+                        self.phase = Some(Phase::Approving {
+                            scopes: approval_scopes(&command),
+                            call,
+                            command,
+                        });
+                    }
+                }
+            }
+            TOOL_RUN_COMMAND_BACKGROUND => {
+                let Some(command) = arguments["command"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .map(str::to_owned)
+                else {
+                    self.settle(
+                        call,
+                        turn,
+                        TOOL_RUN_COMMAND_BACKGROUND.to_owned(),
+                        "The command argument was missing or empty.".to_owned(),
+                        true,
+                        session,
+                    );
+                    return;
+                };
+                match self.command_decision(&command) {
+                    RuleDecision::Allow => {
+                        self.exec_background_command(call, command, turn, session)
                     }
                     RuleDecision::Deny => {
                         let reason =
@@ -1913,6 +1948,40 @@ impl Agent {
         });
     }
 
+    fn exec_background_command(
+        &mut self,
+        call: ApiToolCall,
+        command: String,
+        turn: usize,
+        session: Session<'_, '_>,
+    ) {
+        let Some(access) = session.as_mut() else {
+            self.settle(
+                call,
+                turn,
+                format!("$ {command}"),
+                "The session is not connected.".to_owned(),
+                true,
+                session,
+            );
+            return;
+        };
+        let launched = format!(
+            "(nohup sh -c {} >/dev/null 2>&1 </dev/null & echo \"Background PID: $!\")",
+            shell_quote(&command)
+        );
+        let wrapped = wrap_command(&self.cwd, &launched);
+        access.exec(EXEC_KEY, &wrapped);
+        self.phase = Some(Phase::Running {
+            call,
+            turn,
+            waiting: Waiting::Command {
+                key: EXEC_KEY,
+                then: CommandThen::Return,
+            },
+        });
+    }
+
     /// Run a probe command on the session.
     fn run_probe(
         &mut self,
@@ -2347,6 +2416,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
     let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     match call.name.as_str() {
         TOOL_RUN_COMMAND => format!("$ {}", arguments["command"].as_str().unwrap_or_default()),
+        TOOL_RUN_COMMAND_BACKGROUND => format!(
+            "$ {} (background)",
+            arguments["command"].as_str().unwrap_or_default()
+        ),
         TOOL_RUN_SUDO => format!(
             "$ sudo {}",
             arguments["command"].as_str().unwrap_or_default()

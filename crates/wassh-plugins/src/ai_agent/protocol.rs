@@ -41,6 +41,8 @@ pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";
+/// Tool: start a shell command in the background without waiting for it.
+pub const TOOL_RUN_COMMAND_BACKGROUND: &str = "run_command_background";
 /// Tool: run a shell command as root, asking the user for the password first.
 pub const TOOL_RUN_SUDO: &str = "run_sudo";
 /// Tool: ask the user a multiple-choice question.
