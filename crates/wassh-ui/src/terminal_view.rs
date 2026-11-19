@@ -29,15 +29,9 @@ pub struct TerminalView {
     /// Monospace family from the session's style; empty means egui's own.
     pub font_family: String,
     pub padding: f32,
-    /// Cell size measured at a given font; the glyphs are laid out once, not once
-    /// per call, because every frame asks for the cell size several times.
-    metrics: std::cell::RefCell<Option<(FontKey, (f32, f32))>>,
     /// Text of one style run, reused so a frame does not allocate once per run.
     run: std::cell::RefCell<String>,
 }
-
-/// What a measured cell size belongs to: the font it was measured with.
-type FontKey = (String, f32);
 
 impl Default for TerminalView {
     fn default() -> Self {
@@ -45,7 +39,6 @@ impl Default for TerminalView {
             font_size: 14.0,
             font_family: String::new(),
             padding: 4.0,
-            metrics: std::cell::RefCell::new(None),
             run: std::cell::RefCell::new(String::new()),
         }
     }
@@ -66,22 +59,18 @@ impl TerminalView {
     }
 
     /// Character-cell size derived from the active font.
+    ///
+    /// The probe is a fixed string, so egui's galley cache answers every repeat of it; a
+    /// measurement of our own would outlive a font atlas that gains the family later, and
+    /// the grid would then keep a cell the glyphs no longer advance by.
     pub fn cell_size(&self, ui: &Ui) -> (f32, f32) {
-        let key = (self.font_family.clone(), self.font_size);
-        if let Some((measured, cell)) = self.metrics.borrow().as_ref()
-            && *measured == key
-        {
-            return *cell;
-        }
         let galley = ui
             .painter()
             .layout_no_wrap(CELL_PROBE.to_owned(), self.font(), Color32::WHITE);
-        let cell = (
+        (
             (galley.size().x / CELL_PROBE.len() as f32).max(1.0),
             galley.size().y.max(1.0),
-        );
-        self.metrics.replace(Some((key, cell)));
-        cell
+        )
     }
 
     /// Terminal size that fits into `available`, in whole cells.
@@ -267,6 +256,85 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         cell
+    }
+
+    /// One frame's cell size and the advance the same font gives a glyph run.
+    fn cell_and_advance(ctx: &egui::Context, view: &TerminalView) -> (f32, f32) {
+        let font = view.font();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut measured = (0.0, 0.0);
+        let output = ctx.run_ui(input, |ui| {
+            let (cell_w, _) = view.cell_size(ui);
+            let galley = ui.painter().layout_no_wrap(
+                CELL_PROBE.to_owned(),
+                font.clone(),
+                Color32::WHITE,
+            );
+            measured = (cell_w, galley.size().x / CELL_PROBE.len() as f32);
+        });
+        output.drop_without_applying_deltas();
+        measured
+    }
+
+    /// Installs `family` into `ctx` as a named family, the way the app registers it.
+    fn install_family(ctx: &egui::Context, family: &str) {
+        let face = fonts::face_for(family).expect("the family is installed on this host");
+        let mut definitions = egui::FontDefinitions::default();
+        let key = format!("term:{family}");
+        definitions.font_data.insert(
+            key.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(
+                std::fs::read(&face.path).expect("read the face"),
+            )),
+        );
+        let mut chain = vec![key];
+        chain.extend(
+            definitions
+                .families
+                .get(&egui::FontFamily::Monospace)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        definitions
+            .families
+            .insert(egui::FontFamily::Name(std::sync::Arc::from(family)), chain);
+        ctx.set_fonts(definitions);
+    }
+
+    #[test]
+    fn a_family_the_atlas_gains_later_moves_the_cell_with_the_glyphs() {
+        // Only a host that has a second monospace face can tell the fallback from the real
+        // one, and a session opens before its family is in the atlas: the first frame
+        // measures egui's face, the next draws the family's glyphs.
+        let faces = fonts::installed();
+        let Some(other) = faces
+            .iter()
+            .find(|family| family.to_lowercase().contains("consolas"))
+        else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let view = TerminalView {
+            font_family: other.to_owned(),
+            ..TerminalView::default()
+        };
+        let (fallback, _) = cell_and_advance(&ctx, &view);
+        install_family(&ctx, other);
+        let (cell, advance) = cell_and_advance(&ctx, &view);
+        assert!(
+            cell < fallback,
+            "the family did not reach the atlas, so this says nothing"
+        );
+        assert!(
+            (cell - advance).abs() < 0.05,
+            "the grid cell is {cell} but the glyphs advance by {advance}"
+        );
     }
 
     #[test]

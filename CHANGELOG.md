@@ -22,6 +22,14 @@
   - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
     back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
 
+### Fixed
+
+- Keep terminal text in its cells when the session's font differs from egui's own. A host whose
+  family reached the font atlas after the session's first frame kept the cell measured in the
+  fallback face, so every run of text fell short of its column and the cursor sat right of it.
+- Offer only monospaced families in the terminal's font dropdown, and draw a family from its
+  regular file: the first file the scan met could be the bold or the italic one.
+
 ## [2.0.15] - 2026-11-18
 
 ### Added

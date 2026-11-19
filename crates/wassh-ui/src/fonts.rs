@@ -7,6 +7,8 @@
 //!
 //! The terminal's monospace face is chosen in the settings, so the families the settings
 //! name are registered as named families and the terminal asks for the one it was given.
+//! Only families whose characters share one advance are offered, and each is drawn from the
+//! file of its regular style, never from whichever bold or italic file the scan met first.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -29,11 +31,36 @@ const FONT_DIRS: &[&str] = &[
 /// only its first face, and a font that fails to parse takes the window with it.
 const FACE_EXTENSIONS: &[&str] = &["ttf", "otf"];
 
+/// Bytes of one record in a font file's table directory.
+const TABLE_RECORD_BYTES: usize = 16;
+
 /// Font files one scan of the platform's directories keeps.
 const MAX_FACES: usize = 2_000;
 
 /// Most of a `name` table that is ever read.
 const MAX_NAME_TABLE_BYTES: usize = 64 * 1024;
+
+/// Where in its table each field the scan reads starts: `head.macStyle`, `post.isFixedPitch`,
+/// and `OS/2`'s weight class and panose proportion.
+const MAC_STYLE_AT: usize = 44;
+const FIXED_PITCH_AT: usize = 12;
+const OS2_WEIGHT_AT: usize = 4;
+const OS2_PANOSE_PROPORTION_AT: usize = 35;
+
+/// Bytes each of those fields takes.
+const MAC_STYLE_WIDTH: usize = 2;
+const POST_FIXED_PITCH_WIDTH: usize = 4;
+const WEIGHT_WIDTH: usize = 2;
+
+/// `head.macStyle` bit marking a file drawn in bold, and the one marking it drawn slanted.
+const MAC_STYLE_BOLD: u16 = 1;
+const MAC_STYLE_ITALIC: u16 = 2;
+
+/// `OS/2.usWeightClass` of a regular face.
+const REGULAR_WEIGHT: u16 = 400;
+
+/// Panose proportion of a face whose characters all advance by one width.
+const PANOSE_MONOSPACED: u8 = 9;
 
 /// UI faces worth installing, best first.
 const UI_FACES: &[&str] = &[
@@ -53,14 +80,130 @@ pub struct Face {
     pub family: String,
     /// Where it lives.
     pub path: PathBuf,
+    /// Draws every character at one advance, so a grid of cells can be built from it.
+    pub monospace: bool,
 }
 
-/// Every installed family, sorted, for a settings dropdown.
+/// Where a file stands among the files of its family; lower is the one a grid is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StyleRank {
+    /// `head.macStyle` marks the file bold and/or slanted.
+    marked: u8,
+    /// Distance from the regular weight, so a Light or Black file ranks below it.
+    weight_gap: u16,
+}
+
+impl StyleRank {
+    fn of(mac_style: u16, weight: u16) -> Self {
+        let bold = u8::from(mac_style & MAC_STYLE_BOLD != 0);
+        let italic = u8::from(mac_style & MAC_STYLE_ITALIC != 0);
+        Self {
+            marked: bold + italic,
+            weight_gap: weight.abs_diff(REGULAR_WEIGHT),
+        }
+    }
+}
+
+/// A font file, and where its tables sit.
+struct FontFile {
+    file: std::fs::File,
+    tables: Vec<([u8; 4], (u32, u32))>,
+}
+
+impl FontFile {
+    /// Open `path` and read its table directory.
+    fn open(path: &Path) -> Option<Self> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut header = [0u8; 12];
+        file.read_exact(&mut header).ok()?;
+        let count = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let mut directory = vec![0u8; count.checked_mul(TABLE_RECORD_BYTES)?];
+        file.read_exact(&mut directory).ok()?;
+        let tables = directory
+            .as_chunks::<TABLE_RECORD_BYTES>()
+            .0
+            .iter()
+            .map(|record| {
+                (
+                    [record[0], record[1], record[2], record[3]],
+                    (
+                        u32::from_be_bytes([record[8], record[9], record[10], record[11]]),
+                        u32::from_be_bytes([record[12], record[13], record[14], record[15]]),
+                    ),
+                )
+            })
+            .collect();
+        Some(Self { file, tables })
+    }
+
+    /// The first `max` bytes of the table `tag`.
+    fn table(&mut self, tag: &[u8; 4], max: usize) -> Option<Vec<u8>> {
+        let (offset, length) = self
+            .tables
+            .iter()
+            .find_map(|(found, range)| (found == tag).then_some(*range))?;
+        self.file.seek(SeekFrom::Start(u64::from(offset))).ok()?;
+        let mut bytes = vec![0u8; (length as usize).min(max)];
+        self.file.read_exact(&mut bytes).ok()?;
+        Some(bytes)
+    }
+
+    /// `N` bytes of the table `tag`, read from `at`.
+    fn field<const N: usize>(&mut self, tag: &[u8; 4], at: usize) -> Option<[u8; N]> {
+        let table = self.table(tag, at + N)?;
+        <[u8; N]>::try_from(table.get(at..at + N)?).ok()
+    }
+}
+
+/// What a font file says about itself that the settings list needs.
+struct FaceInfo {
+    family: String,
+    monospace: bool,
+    style: StyleRank,
+}
+
+impl FaceInfo {
+    fn read(path: &Path) -> Option<Self> {
+        let mut file = FontFile::open(path)?;
+        let family = read_family(&file.table(b"name", MAX_NAME_TABLE_BYTES)?)?;
+        Some(Self {
+            family,
+            monospace: is_monospaced(&mut file),
+            style: style_rank(&mut file),
+        })
+    }
+}
+
+/// Whether every character of the face advances by one width.
+///
+/// Windows marks such a face in the panose proportion and most faces also set `post`'s
+/// fixed-pitch flag; either one is enough, because some fonts fill in only one of them.
+fn is_monospaced(file: &mut FontFile) -> bool {
+    let flagged = file
+        .field::<POST_FIXED_PITCH_WIDTH>(b"post", FIXED_PITCH_AT)
+        .is_some_and(|bytes| u32::from_be_bytes(bytes) != 0);
+    let proportion = file.field::<1>(b"OS/2", OS2_PANOSE_PROPORTION_AT);
+    flagged || proportion == Some([PANOSE_MONOSPACED])
+}
+
+/// How the file's style ranks against the other files of its family.
+fn style_rank(file: &mut FontFile) -> StyleRank {
+    let mac_style = file
+        .field::<MAC_STYLE_WIDTH>(b"head", MAC_STYLE_AT)
+        .map_or(0, u16::from_be_bytes);
+    let weight = file
+        .field::<WEIGHT_WIDTH>(b"OS/2", OS2_WEIGHT_AT)
+        .map_or(REGULAR_WEIGHT, u16::from_be_bytes);
+    StyleRank::of(mac_style, weight)
+}
+
+/// Every installed family a terminal grid can be drawn in, sorted, for a settings dropdown.
 pub fn installed() -> Vec<String> {
-    let mut names: Vec<String> = faces().iter().map(|face| face.family.clone()).collect();
-    names.sort_by_key(|name| name.to_lowercase());
-    names.dedup();
-    names
+    faces()
+        .iter()
+        .filter(|face| face.monospace)
+        .map(|face| face.family.clone())
+        .collect()
 }
 
 /// The file a family is drawn from, or `None` when the host does not have it.
@@ -174,20 +317,30 @@ fn stem(path: &Path) -> Option<String> {
         .map(|stem| stem.to_string_lossy().to_lowercase())
 }
 
-/// Every readable face the platform offers, scanned once.
+/// Every family the platform offers, once, drawn from the file of its regular style.
 fn faces() -> &'static [Face] {
     static FACES: OnceLock<Vec<Face>> = OnceLock::new();
     FACES.get_or_init(|| {
-        let mut faces = Vec::new();
+        let mut found = Vec::new();
         for dir in FONT_DIRS {
-            collect(Path::new(dir), &mut faces);
+            collect(Path::new(dir), &mut found);
         }
-        faces
+        // A family ships one file per style. Keep the upright file closest to the regular
+        // weight, and order what is left the way the settings list shows it.
+        found.sort_by(|(left, left_style), (right, right_style)| {
+            left.family
+                .to_lowercase()
+                .cmp(&right.family.to_lowercase())
+                .then(left_style.cmp(right_style))
+                .then(left.path.cmp(&right.path))
+        });
+        found.dedup_by(|left, right| left.0.family.eq_ignore_ascii_case(&right.0.family));
+        found.into_iter().map(|(face, _)| face).collect()
     })
 }
 
 /// Read every face under `dir`, following sub-directories.
-fn collect(dir: &Path, faces: &mut Vec<Face>) {
+fn collect(dir: &Path, faces: &mut Vec<(Face, StyleRank)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -207,36 +360,18 @@ fn collect(dir: &Path, faces: &mut Vec<Face>) {
         if !is_face {
             continue;
         }
-        let Some(family) = family_name(&path) else {
+        let Some(info) = FaceInfo::read(&path) else {
             continue;
         };
-        faces.push(Face { family, path });
+        faces.push((
+            Face {
+                family: info.family,
+                path,
+                monospace: info.monospace,
+            },
+            info.style,
+        ));
     }
-}
-
-/// The family a font file calls itself, read from its `name` table.
-fn family_name(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 12];
-    file.read_exact(&mut header).ok()?;
-    let tables = u16::from_be_bytes([header[4], header[5]]) as usize;
-    let mut directory = vec![0u8; tables.checked_mul(16)?];
-    file.read_exact(&mut directory).ok()?;
-    let (offset, length) = directory
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .find(|record| &record[0..4] == b"name")
-        .map(|record| {
-            (
-                u32::from_be_bytes([record[8], record[9], record[10], record[11]]),
-                u32::from_be_bytes([record[12], record[13], record[14], record[15]]),
-            )
-        })?;
-    file.seek(SeekFrom::Start(u64::from(offset))).ok()?;
-    let mut table = vec![0u8; (length as usize).min(MAX_NAME_TABLE_BYTES)];
-    file.read_exact(&mut table).ok()?;
-    read_family(&table)
 }
 
 /// The family out of an OpenType `name` table: the typographic name when there is one.
@@ -330,7 +465,7 @@ mod tests {
         let empty = dir.join("empty.ttf");
         std::fs::write(&empty, b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
             .expect("write");
-        assert_eq!(family_name(&empty), None);
+        assert!(FaceInfo::read(&empty).is_none());
         let mut faces = Vec::new();
         collect(&dir, &mut faces);
         assert!(faces.is_empty(), "{faces:?}");
@@ -347,6 +482,48 @@ mod tests {
             face_for("no such family").is_none(),
             "a name nobody has must not resolve"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn only_monospaced_families_are_offered() {
+        let families = installed();
+        let Some(face) = face_for("Courier New") else {
+            return;
+        };
+        assert!(face.monospace, "Courier New is drawn in one advance");
+        assert!(
+            families.iter().any(|family| family == "Courier New"),
+            "{families:?}"
+        );
+        // A proportional face stays reachable for a setting that already names it, but the
+        // dropdown must not offer it.
+        assert!(face_for("Segoe UI").is_some());
+        assert!(
+            !families.iter().any(|family| family == "Segoe UI"),
+            "{families:?}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_family_is_drawn_from_its_regular_file() {
+        let regular = StyleRank::of(0, REGULAR_WEIGHT);
+        let Some(face) = face_for("Consolas") else {
+            return;
+        };
+        assert_eq!(
+            FaceInfo::read(&face.path).expect("the chosen face").style,
+            regular,
+            "{} is not the family's regular file",
+            face.path.display()
+        );
+        // The host really ships the other styles under the same family name.
+        let italic = face.path.with_file_name("consolai.ttf");
+        if italic.exists() {
+            let style = FaceInfo::read(&italic).expect("the italic face").style;
+            assert!(style > regular, "{style:?} ranks with the regular file");
+        }
     }
 
     #[test]

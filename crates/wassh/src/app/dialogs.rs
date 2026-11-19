@@ -3389,7 +3389,7 @@ fn defaultable_row(
     toggle
 }
 
-/// A dropdown of the fonts this computer has, for the terminal's monospace family.
+/// A dropdown of the monospaced fonts this computer has, for the terminal's family.
 ///
 /// The current value stays in the list even when the host does not have it, so a setting
 /// carried from another machine still shows what it asked for instead of silently changing.
