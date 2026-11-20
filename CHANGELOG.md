@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.17] - 2026-11-20
 
 ### Added
 
@@ -21,6 +21,12 @@
     the button stays on and a second press stops them.
   - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
     back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
+- Start a command in the background: `run_command_background` sits in the core scope beside
+  `run_command`, runs the command under `nohup` with its output discarded and answers with its
+  process id, so a server or a long job no longer holds the conversation. The command rules that
+  gate `run_command` gate it too.
+- Give the question card a Stop of its own: it ends the prompt and the run without an answer,
+  instead of leaving the question open with no way out but typing one.
 - Give the AI pane a New chat button in the header: on the chat list beside "Chats", and in a chat
   beside its title. It files the open conversation and starts an empty one.
 - Add two scroll switches to Options → Appearance, each with a per-host override in a host's
@@ -42,9 +48,13 @@
   JetBrains Mono and Source Code Pro — and offer them in the terminal's font list beside the ones
   the computer has, so the terminal looks the same on a machine with no programming font installed.
   The default family is one of them, and each font ships with its licence.
+- Name the environment map's scope "Graph" wherever the pane shows it — on its tag, in the scope
+  popup and in the line reporting what is mapped — while the agent still loads it as `env`.
 
 ### Changed
 
+- Report the AI agent's errors as toasts as well as under the transcript, so a failed send, a
+  broken provider or a summary that came back empty is seen wherever the pane is docked.
 - `env_search` ranks and answers with a file's summary where a mapping pass wrote one, and
   `env_outline` shows the summary and the connections beside the declarations.
 - List the AI pane's chats in the order they were started, newest on top, so reopening one does not
@@ -52,6 +62,9 @@
 - Name an AI chat by the model's digest of its first prompt instead of the first line of that
   prompt. A chat filed before its digest arrives keeps the request and takes the name when it
   lands, and a title the pane had taken from the prompt is asked for again.
+- Lead the agent's guidance with the Graph scope once the development tools are loaded but the map
+  is not, and name the scope to load when the host's file tools are still out of reach instead of
+  letting it reach for `cat`, `grep` and `sed`.
 
 ### Fixed
 
