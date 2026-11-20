@@ -555,9 +555,11 @@ const AI_AGENT_APP: &[SettingsField] = &[
     ),
     boolean(
         "autoCompact",
-        "Compact long chats",
-        true,
-        "Summarise the older part of the chat into the prompt once it would no longer fit the model's context window.",
+        "Compact long chats automatically",
+        false,
+        "Summarise the older part of the chat into the prompt once it would no longer fit the \
+model's context window. Off by default: the Compact button and /compact fold the chat whenever \
+you ask them to.",
     ),
     number(
         "maxSubagents",
@@ -1356,7 +1358,7 @@ mod tests {
             [
                 "Global prompt text",
                 "Model context windows",
-                "Compact long chats",
+                "Compact long chats automatically",
                 "Sub-agents at a time",
                 "Global knowledge",
                 "Default allow rules",

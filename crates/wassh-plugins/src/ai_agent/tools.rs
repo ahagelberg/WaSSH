@@ -667,19 +667,20 @@ fn parameters(name: &str) -> (Value, Value) {
     }
 }
 
-/// Every tool schema this host may use, ready for the provider.
 /// Every tool schema this conversation sends: the scope tools plus what the loaded scopes
 /// hold and the host may use.
 ///
 /// Tools of scopes that are not loaded are left out on purpose — that is what keeps the
-/// prompt from carrying the whole toolset whether or not it is needed.
-pub fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool) -> Vec<Value> {
+/// prompt from carrying the whole toolset whether or not it is needed. `plan` narrows it
+/// further to what only reads.
+pub fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool, plan: bool) -> Vec<Value> {
     let mut specs: Vec<Value> = SCOPE_TOOLS.iter().map(|spec| spec.schema()).collect();
     specs.extend(
         TOOL_SPECS
             .iter()
             .filter(|spec| subagents || !is_subagent_tool(spec.name))
             .filter(|spec| loaded.holds(spec.name) && permissions.offers(spec.name))
+            .filter(|spec| !plan || is_read_only(spec.name))
             .map(|spec| spec.schema()),
     );
     // Tools a pane offers are listed as they are: their calls run commands, which the
@@ -692,6 +693,7 @@ pub fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool) -> Vec
             crate::plugin::tools_of(pane)
                 .iter()
                 .filter(|tool| permissions.offers(tool.name))
+                .filter(|tool| !plan || tool.read_only)
                 .map(PluginTool::schema),
         );
     }
@@ -760,11 +762,11 @@ pub fn needs_session(name: &str) -> bool {
     )
 }
 
-/// Tools that read only, so they never need approval.
+/// Tools that only read, which is all Plan mode offers.
 ///
-/// Documented here because the reference lists the same set; the permission
-/// check itself only ever gates `run_command`.
-#[allow(dead_code)]
+/// Reads, listings, searches and diffs, the terminal's screen, the system probes and the map
+/// queries — plus the tools that ask the user or move along the graph. Anything that writes a
+/// file, types into a terminal, runs a shell command or changes a container is not here.
 pub fn is_read_only(name: &str) -> bool {
     matches!(
         name,
@@ -780,14 +782,26 @@ pub fn is_read_only(name: &str) -> bool {
             | TOOL_DEV_GREP
             | TOOL_DEV_FIND
             | TOOL_DEV_DIFF
+            | TOOL_ENV_SCAN
+            | TOOL_ENV_SYSTEM
+            | TOOL_ENV_FIND
+            | TOOL_ENV_OUTLINE
+            | TOOL_ENV_OVERVIEW
+            | TOOL_ENV_SEARCH
             | TOOL_TERMINAL_READ
+            | TOOL_TERMINAL_WAIT
             | TOOL_WEB_FETCH
             | TOOL_WEB_SEARCH
             | TOOL_SYSTEM_OVERVIEW
             | TOOL_SYSTEM_PROCESSES
             | TOOL_SYSTEM_DISK
             | TOOL_SYSTEM_MEMORY
-    )
+            | TOOL_ASK_USER
+            | TOOL_LOAD_SCOPE
+            | TOOL_UNLOAD_SCOPE
+            | TOOL_SPAWN_SUBAGENT
+            | TOOL_WAIT_SUBAGENT
+    ) || plugin_tool(name).is_some_and(|tool| tool.read_only)
 }
 
 /// The local root operations resolve against: the user's home directory.
@@ -1892,7 +1906,7 @@ mod tests {
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), true);
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true, false);
         assert_eq!(
             schemas.len(),
             TOOL_SPECS.len() + crate::plugin::tools().count() + SCOPE_TOOLS.len()
@@ -1931,7 +1945,7 @@ mod tests {
 
     #[test]
     fn a_fresh_conversation_carries_the_scope_tools_and_the_root_only() {
-        let schemas = specs(&everything_allowed(), &Loaded::new(), true);
+        let schemas = specs(&everything_allowed(), &Loaded::new(), true, false);
         assert_eq!(
             names(&schemas),
             [
@@ -1950,7 +1964,7 @@ mod tests {
 
     #[test]
     fn a_subagent_is_not_offered_the_tools_that_drive_subagents() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), false);
+        let schemas = specs(&everything_allowed(), &everything_loaded(), false, false);
         let names = names(&schemas);
         assert!(!names.contains(&TOOL_SPAWN_SUBAGENT));
         assert!(!names.contains(&TOOL_WAIT_SUBAGENT));
@@ -1962,24 +1976,65 @@ mod tests {
         let permissions = everything_allowed();
         let mut loaded = Loaded::new();
         loaded.load(super::super::scopes::find("host-files").unwrap());
-        let schemas = specs(&permissions, &loaded, true);
+        let schemas = specs(&permissions, &loaded, true, false);
         assert!(names(&schemas).contains(&TOOL_DEV_VIEW));
         assert!(!names(&schemas).contains(&TOOL_LOCAL_READ));
         loaded.load(super::super::scopes::find("docker").unwrap());
-        assert!(names(&specs(&permissions, &loaded, true)).contains(&"docker_containers"));
+        assert!(names(&specs(&permissions, &loaded, true, false)).contains(&"docker_containers"));
     }
 
     #[test]
     fn the_root_request_costs_a_fraction_of_the_loadouts() {
         let permissions = everything_allowed();
-        let base = specs(&permissions, &Loaded::new(), true);
-        let all = specs(&permissions, &everything_loaded(), true);
+        let base = specs(&permissions, &Loaded::new(), true, false);
+        let all = specs(&permissions, &everything_loaded(), true, false);
         let base = prompt_chars(&base, "");
         let all = prompt_chars(&all, "");
         assert!(
             base * 5 < all,
             "the base request is {base} chars of {all}, which is not a saving worth the hop"
         );
+    }
+
+    #[test]
+    fn plan_mode_sends_only_the_tools_that_read() {
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true, true);
+        let names = names(&schemas);
+        for kept in [
+            TOOL_DEV_VIEW,
+            TOOL_DEV_GREP,
+            TOOL_LOCAL_READ,
+            TOOL_REMOTE_LIST,
+            TOOL_TERMINAL_READ,
+            TOOL_WEB_FETCH,
+            TOOL_SYSTEM_OVERVIEW,
+            TOOL_ENV_FIND,
+            TOOL_ASK_USER,
+            TOOL_LOAD_SCOPE,
+            "docker_containers",
+        ] {
+            assert!(names.contains(&kept), "{kept} should survive Plan mode: {names:?}");
+        }
+        for dropped in [
+            TOOL_RUN_COMMAND,
+            TOOL_RUN_COMMAND_BACKGROUND,
+            TOOL_RUN_SUDO,
+            TOOL_LOCAL_RUN,
+            TOOL_DEV_EDIT,
+            TOOL_DEV_CREATE,
+            TOOL_REMOTE_WRITE,
+            TOOL_REMOTE_DELETE,
+            TOOL_LOCAL_DELETE,
+            TOOL_TERMINAL_WRITE,
+            TOOL_TERMINAL_KEYS,
+            "docker_start",
+            "docker_remove",
+        ] {
+            assert!(
+                !names.contains(&dropped),
+                "{dropped} changes something and must stay out of Plan mode"
+            );
+        }
     }
 
     #[test]
@@ -1993,7 +2048,7 @@ mod tests {
         ]));
         assert_eq!(permissions.decision(TOOL_TERMINAL_KEYS), Permission::Ask);
         assert_eq!(permissions.decision(TOOL_TERMINAL_WRITE), Permission::Deny);
-        let schemas = specs(&permissions, &everything_loaded(), true);
+        let schemas = specs(&permissions, &everything_loaded(), true, false);
         assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
         assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
     }

@@ -45,8 +45,6 @@ use crate::{PluginId, PluginManifest};
 const CONVERSATION_KEY: &str = "conversation";
 /// Key the host's environment map is stored under.
 const MAP_KEY: &str = "envMap";
-/// Key the folder the user pinned for the map is stored under; empty means the host picks.
-const MAP_FOLDER_KEY: &str = "envMapFolder";
 /// Key the host's ports and services are stored under.
 const SYSTEM_KEY: &str = "envSystem";
 /// The scope that holds the environment map.
@@ -116,8 +114,6 @@ const MAP_ATTEMPTS: u8 = 2;
 const MAP_EMPTY_NOTICE: &str = "The mapping pass described no files.";
 /// What the transcript says while it asks the model for the object again.
 const MAP_RETRY_NOTICE: &str = "The mapping answer had no file list; asking again.";
-/// Hint the popup's folder field shows while the host picks the tree itself.
-const MAP_FOLDER_HINT: &str = "auto: the project root above the session";
 
 /// Name the chat list gives the mapping sub-agent.
 const MAP_SUBAGENT_TITLE: &str = "map the project";
@@ -134,9 +130,28 @@ const SYSTEM_HEADING: &str = "Host setup (from env_system):";
 /// Transcript note left where the conversation was compacted.
 const COMPACTED_NOTICE: &str = "Earlier messages were compacted into a summary:";
 /// Gap between the provider and model dropdowns under the composer.
-const FOOTER_GAP: f32 = 6.0;
-/// Type size of the two dropdowns.
+const FOOTER_GAP: f32 = 6.0;/// Type size of the two dropdowns.
 const FOOTER_TEXT_SIZE: f32 = 11.0;
+/// Labels of the two modes the footer switches between.
+const MODE_PLAN_LABEL: &str = "Plan";
+/// The other mode's label.
+const MODE_AGENT_LABEL: &str = "Agent";
+/// What Plan mode means, on the mode button.
+const MODE_TO_AGENT_HINT: &str = "Plan mode: every tool only reads. Click for Agent mode, where \
+the agent may change files, run commands and act on the host.";
+/// What Agent mode means, on the mode button.
+const MODE_TO_PLAN_HINT: &str = "Agent mode: the agent may change files, run commands and act \
+on the host. Click for Plan mode, where it only reads.";
+/// Room two dropdowns need before the mode and Compact buttons are drawn at all.
+const MIN_SELECT_ROOM: f32 = 80.0;
+/// Tooltip of the Compact button.
+const COMPACT_HINT: &str = "Fold the older part of this chat into a summary now.";
+/// Caption of the Compact button.
+const COMPACT_LABEL: &str = "Compact";
+/// Said when Compact is pressed while a run is in flight.
+const COMPACT_BUSY: &str = "Stop the run before compacting the chat.";
+/// Said when there is nothing old enough to fold.
+const COMPACT_EMPTY: &str = "Nothing to compact yet: the chat is as short as it gets.";
 /// Narrowest the composer text area gets.
 const MIN_COMPOSER_WIDTH: f32 = 80.0;
 /// Gap between two entries of the transcript.
@@ -253,6 +268,27 @@ pub struct SlashCommand {
     pub description: &'static str,
 }
 
+/// The command the Compact button runs.
+const COMPACT_COMMAND: SlashCommand = SlashCommand {
+    name: "compact",
+    label: "/compact",
+    description: "Fold the older part of this chat into a summary",
+};
+
+/// The command that puts the chat back in Plan mode.
+const PLAN_COMMAND: SlashCommand = SlashCommand {
+    name: "plan",
+    label: "/plan",
+    description: "Plan mode: the agent can only read, and proposes instead of changing",
+};
+
+/// The command that puts the chat back in Agent mode.
+const AGENT_COMMAND: SlashCommand = SlashCommand {
+    name: "agent",
+    label: "/agent",
+    description: "Agent mode: the agent may change files, run commands and act on the host",
+};
+
 /// The commands the reference offers.
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
@@ -270,6 +306,9 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         label: "/new",
         description: "Start a new chat",
     },
+    COMPACT_COMMAND,
+    PLAN_COMMAND,
+    AGENT_COMMAND,
     SlashCommand {
         name: "transfer",
         label: "/transfer",
@@ -375,6 +414,8 @@ pub struct StoredChat {
     pub compacted: Option<String>,
     /// Scopes it carried tools from.
     pub scopes: Loaded,
+    /// Whether it was a Plan-mode chat, which only reads.
+    pub plan: bool,
 }
 
 /// A message typed while a run was in flight.
@@ -477,6 +518,11 @@ pub struct AiAgent {
     applied: Option<serde_json::Map<String, Value>>,
     /// Search key the agent's tools were last given.
     applied_web_key: Option<String>,
+    /// Which chats the list shows its sub-agents for, by the chat's start stamp.
+    ///
+    /// Collapsed by default: a chat with sub-agents says how many there are and lists them
+    /// only when the user clicks it.
+    expanded_chats: std::collections::BTreeSet<u64>,
     /// Tool card whose copy button confirmed: which card, which button, and when.
     copied: Option<(usize, CopyTarget, u64)>,
     /// The scope popup a tag click opened, if any.
@@ -491,10 +537,6 @@ pub struct AiAgent {
     map_deep_wanted: bool,
     /// The mapping pass running for this pane, until its answer lands.
     map_deep: Option<MapRun>,
-    /// Folder the popup pinned for the map, empty to let the host find the project root.
-    map_folder: String,
-    /// Folder the host's plugin data holds, so a change is written once.
-    map_folder_saved: String,
     /// Set by the popup: show what the mapping pass is doing, call by call.
     map_more: bool,
     /// Which of the pane's two views is drawn.
@@ -581,13 +623,12 @@ impl Default for AiAgent {
             applied_web_key: None,
             copied: None,
             scope_popup: None,
+            expanded_chats: std::collections::BTreeSet::new(),
             map_saved: 0,
             system_saved: 0,
             map_rebuild: false,
             map_deep_wanted: false,
             map_deep: None,
-            map_folder: String::new(),
-            map_folder_saved: String::new(),
             map_more: false,
             view: ChatView::List,
         }
@@ -676,7 +717,7 @@ fn build_request(
 ) -> CompletionRequest {
     agent.repair_history();
     let system = AiAgent::system_prompt(agent, settings, host, environment);
-    let tools = tools::specs(&agent.permissions, &agent.scopes, !agent.subagent);
+    let tools = tools::specs(&agent.permissions, &agent.scopes, !agent.subagent, agent.plan);
     // Kept so compaction measures the scopes this conversation really carries.
     agent.prompt_chars = tools::prompt_chars(&tools, &system);
     CompletionRequest {
@@ -725,6 +766,7 @@ impl AiAgent {
             provider,
             compacted: self.agent.compacted.take(),
             scopes: std::mem::take(&mut self.agent.scopes),
+            plan: self.agent.plan,
         }
     }
 
@@ -785,6 +827,7 @@ impl AiAgent {
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
         self.agent.scopes = chat.scopes;
+        self.agent.plan = chat.plan;
         self.created = chat.created;
         self.generated_title = (chat.title != DEFAULT_CHAT_TITLE).then(|| chat.title.clone());
         // A digest this chat was still waiting for goes on being written here.
@@ -834,6 +877,16 @@ You cannot ask the main conversation to do work for you and you cannot start sub
             ),
             format!("Environment: {environment}."),
             format!("Current working directory: {}", agent.cwd),
+        ]);
+        if agent.plan {
+            lines.push(
+                "This chat is in Plan mode: every tool offered here only reads. Investigate \
+as far as the question needs, then answer with what you would change, where, and why — you \
+cannot change anything yourself, and the user switches to Agent mode to carry the plan out."
+                    .to_owned(),
+            );
+        }
+        lines.extend([
             String::new(),
             // Tools arrive by scope: sending every schema on every turn would spend the
             // prompt on tools nobody asked for.
@@ -1604,12 +1657,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         // The map belongs to the host, so it survives every chat on the connection.
         self.agent.map = super::map::EnvMap::from_json(settings.get(MAP_KEY));
         self.map_saved = self.agent.map.revision;
-        self.map_folder = settings
-            .get(MAP_FOLDER_KEY)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        self.map_folder_saved = self.map_folder.clone();
         self.agent.system = super::map::SystemFacts::from_json(settings.get(SYSTEM_KEY));
         self.system_saved = self.agent.system.revision;
         // The pane opens on the conversation it was in, or on the list when there is none.
@@ -1659,6 +1706,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
         self.agent.scopes = Loaded::from_json(stored.get("scopes"));
+        self.agent.plan = stored["planMode"].as_bool().unwrap_or(false);
         self.agent
             .adopt_subagents(subagents_from_json(stored.get("subagents")));
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
@@ -1700,6 +1748,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                             .filter(|summary| !summary.is_empty())
                             .map(str::to_owned),
                         scopes: Loaded::from_json(chat.get("scopes")),
+                        plan: chat["planMode"].as_bool().unwrap_or(false),
                         subagents: subagents_from_json(chat.get("subagents")),
                     }
                 })
@@ -1764,9 +1813,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 
     /// Compact the conversation once it would no longer fit the model's context window.
     ///
-    /// The model's window comes from the per-model settings rows, so a local model with a
-    /// small window is compacted far earlier than a long-context one. Only an idle chat is
-    /// compacted: folding under a running turn would take away what it is answering.
+    /// Off unless the host switched automatic compaction on: the model's window comes from
+    /// the per-model settings rows, so a local model with a small window would otherwise be
+    /// folded long before the user expects it. Only an idle chat is compacted: folding under
+    /// a running turn would take away what it is answering.
     fn compact_if_needed(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
         if self.summary.is_some()
             || self.agent.blocked()
@@ -1775,7 +1825,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             || !settings
                 .get(SETTING_AUTO_COMPACT)
                 .and_then(Value::as_bool)
-                .unwrap_or(true)
+                .unwrap_or(false)
         {
             return;
         }
@@ -1792,6 +1842,27 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         let Some(cut) = self.agent.compact_split(COMPACT_KEEP_MESSAGES) else {
+            return;
+        };
+        self.start_summary(SummaryMode::Compact, cut, settings, host);
+    }
+
+    /// Fold the older part of the chat into a summary because the user asked for it.
+    ///
+    /// This is what the Compact button and `/compact` do; with automatic compaction off it is
+    /// the only path, and it says so when there is nothing to fold.
+    fn compact_now(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
+        if self.summary.is_some() {
+            return;
+        }
+        if self.agent.blocked() || self.agent.needs_reply {
+            self.report_error(COMPACT_BUSY);
+            return;
+        }
+        let Some(cut) = self.agent.compact_split(COMPACT_KEEP_MESSAGES) else {
+            self.agent
+                .turns
+                .push(Turn::Notice(COMPACT_EMPTY.to_owned()));
             return;
         };
         self.start_summary(SummaryMode::Compact, cut, settings, host);
@@ -1952,6 +2023,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.draft.clear();
         match command.name {
             "new" => self.begin_new_chat(),
+            "compact" => self.compact_now(settings, host),
+            "plan" => self.agent.plan = true,
+            "agent" => self.agent.plan = false,
             "summary" | "context" => self.start_summary(SummaryMode::Summary, 0, settings, host),
             "transfer" => self.start_summary(SummaryMode::Transfer, 0, settings, host),
             _ => {}
@@ -2278,7 +2352,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let mut deep = false;
         let mut clear = false;
         let mut more = false;
-        let mut folder = self.map_folder.clone();
         let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
@@ -2364,11 +2437,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                                     }
                                 }
                             }
-                            ui.add(
-                                egui::TextEdit::singleline(&mut folder)
-                                    .hint_text(MAP_FOLDER_HINT)
-                                    .desired_width(f32::INFINITY),
-                            );
                             ui.horizontal(|ui| {
                                 scan = Button::new("Scan")
                                     .compact()
@@ -2401,9 +2469,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if clear {
             self.agent.map.clear();
         }
-        if folder.trim() != self.map_folder.trim() {
-            self.map_folder = folder;
-        }
         if scan {
             self.map_rebuild = true;
         }
@@ -2411,11 +2476,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             self.map_more = !self.map_more;
         }
         if deep {
-            // A folder the map was not built from, and a map that is not there yet, both mean
-            // the cheap walk comes first; the description follows it.
-            let pinned = self.map_folder.trim();
-            let unbuilt = !pinned.is_empty() && pinned != self.agent.map.root;
-            if self.agent.map.is_empty() || unbuilt {
+            // A map that is not there yet means the cheap walk comes first; the description
+            // follows it.
+            if self.agent.map.is_empty() {
                 self.map_rebuild = true;
             }
             self.map_deep_wanted = true;
@@ -2433,12 +2496,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if turn_off || clear || escape || pressed_outside {
             self.scope_popup = None;
         }
-    }
-
-    /// The tree a scan starts in: the folder the popup pinned, or none so the host finds the
-    /// project root itself.
-    fn map_root(&self) -> String {
-        self.map_folder.trim().to_owned()
     }
 
     /// Run the mapping pass a tool answer asked for, and take in the one that finished.
@@ -2594,14 +2651,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return format!("Describing {}: {doing}", run.root);
         }
         if self.agent.map.is_empty() {
-            let pinned = self.map_root();
-            return match pinned.is_empty() {
-                true => format!(
-                    "Nothing mapped yet. A scan starts at the project root above {}.",
-                    self.agent.cwd
-                ),
-                false => format!("Nothing mapped yet. A scan starts at {pinned}."),
-            };
+            return format!(
+                "Nothing mapped yet. A scan starts at the project root above {}.",
+                self.agent.cwd
+            );
         }
         let map = &self.agent.map;
         let described = match map.summarised() {
@@ -2678,6 +2731,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         let mut open = None;
         let mut open_subagent = None;
+        let mut toggled = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-chats")
             .max_height(ui.available_height())
@@ -2685,23 +2739,24 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .show(ui, |ui| {
                 for index in chat_order(&self.chats) {
                     let chat = &self.chats[index];
-                    if chat_row(
-                        ui,
-                        palette,
-                        &chat.title,
-                        chat.turns.len(),
-                        &chat.model,
-                        &chat.cwd,
-                    ) {
+                    let expanded = self.expanded_chats.contains(&chat.created);
+                    let row = chat_row(ui, palette, chat, expanded);
+                    if row.open {
                         open = Some(index);
                     }
-                    for (position, sub) in chat.subagents.iter().enumerate() {
-                        if subagent_row(ui, palette, sub) {
-                            open_subagent = Some((index, position));
-                        }
+                    if row.toggle {
+                        toggled = Some(chat.created);
+                    }
+                    if let Some(position) = row.subagent {
+                        open_subagent = Some((index, position));
                     }
                 }
             });
+        if let Some(created) = toggled
+            && !self.expanded_chats.remove(&created)
+        {
+            self.expanded_chats.insert(created);
+        }
         if let Some((index, subagent)) = open_subagent {
             // Opening the parent puts its sub-agents back in the pane, in the same order.
             self.open_chat(index);
@@ -2839,7 +2894,10 @@ fn scope_tag(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
 }
 
 /// One sub-agent card under its chat: name, state and how much it has written.
-fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
+///
+/// The card it sits in decides what a click means, so this paints only and reports where it
+/// landed: a row inside a clickable card cannot win the pointer on its own.
+fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> egui::Rect {
     let state = sub.state();
     let (badge, colour) = match state {
         SubagentState::Running => ("running", palette.accent),
@@ -2848,7 +2906,7 @@ fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
         SubagentState::Failed => ("failed", palette.danger),
         SubagentState::Stopped => ("stopped", palette.text_muted),
     };
-    let response = egui::Frame::NONE
+    let rect = egui::Frame::NONE
         .fill(to_color32(palette.bg_panel))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
         .corner_radius(RADIUS)
@@ -2862,34 +2920,38 @@ fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
                         .color(to_color32(palette.text)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(badge)
-                            .size(10.0)
-                            .color(to_color32(colour)),
-                    );
+                    ui.label(egui::RichText::new(badge).size(10.0).color(to_color32(colour)));
                 });
             });
         })
-        .response;
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+        .response
+        .rect;
     ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), 4.0),
         egui::Sense::hover(),
     );
-    response.interact(egui::Sense::click()).clicked()
+    rect
 }
 
-/// One chat card: title above compact transcript, model and working-directory stats.
-fn chat_row(
-    ui: &mut Ui,
-    palette: &Palette,
-    title: &str,
-    turns: usize,
-    model: &str,
-    cwd: &str,
-) -> bool {
+/// What one chat card in the list reported.
+#[derive(Default)]
+struct ChatRowReply {
+    /// The card itself was clicked: open the chat.
+    open: bool,
+    /// The sub-agent note was clicked: show or hide the sub-agent cards.
+    toggle: bool,
+    /// One of the expanded sub-agent cards was clicked.
+    subagent: Option<usize>,
+}
+
+/// One chat card: title, a compact stats line, and its sub-agents behind a note.
+///
+/// A chat with sub-agents says how many there are in one clickable line instead of listing
+/// them: the list stays one card per conversation until the user asks to look inside.
+fn chat_row(ui: &mut Ui, palette: &Palette, chat: &StoredChat, expanded: bool) -> ChatRowReply {
+    let mut reply = ChatRowReply::default();
+    let mut note_rect = None;
+    let mut sub_rects: Vec<(usize, egui::Rect)> = Vec::new();
     let response = egui::Frame::NONE
         .fill(to_color32(palette.bg_panel_2))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
@@ -2899,18 +2961,23 @@ fn chat_row(
             ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new(title)
+                    egui::RichText::new(&chat.title)
                         .size(CHAT_TITLE_TEXT_SIZE)
                         .strong()
                         .color(to_color32(palette.text)),
                 );
                 ui.add_space(4.0);
-                let model = if model.trim().is_empty() {
+                let turns = chat.turns.len();
+                let model = if chat.model.trim().is_empty() {
                     "No model"
                 } else {
-                    model
+                    chat.model.as_str()
                 };
-                let cwd = if cwd.trim().is_empty() { "/" } else { cwd };
+                let cwd = if chat.cwd.trim().is_empty() {
+                    "/"
+                } else {
+                    chat.cwd.as_str()
+                };
                 ui.label(
                     egui::RichText::new(format!(
                         "{} turn{} · {} · {}",
@@ -2922,17 +2989,56 @@ fn chat_row(
                     .size(10.0)
                     .color(to_color32(palette.text_muted)),
                 );
+                if chat.subagents.is_empty() {
+                    return;
+                }
+                ui.add_space(4.0);
+                let note = format!(
+                    "{} sub-agent{}",
+                    chat.subagents.len(),
+                    if chat.subagents.len() == 1 { "" } else { "s" }
+                );
+                note_rect = Some(
+                    ui.label(
+                        egui::RichText::new(note)
+                            .size(10.0)
+                            .color(to_color32(palette.accent)),
+                    )
+                    .rect,
+                );
+                if !expanded {
+                    return;
+                }
+                ui.add_space(4.0);
+                for (position, sub) in chat.subagents.iter().enumerate() {
+                    sub_rects.push((position, subagent_row(ui, palette, sub)));
+                }
             });
         })
         .response;
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
     ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), 8.0),
         egui::Sense::hover(),
     );
-    response.interact(egui::Sense::click()).clicked()
+    // The card is clickable as a whole, which puts it above the note and the sub-agent cards
+    // in the pointer order, so where the press landed decides what it meant.
+    let clicked = response.interact(egui::Sense::click()).clicked();
+    let pointer = ui.ctx().input(|input| input.pointer.interact_pos());
+    if let Some(pos) = pointer {
+        let over_note = note_rect.is_some_and(|rect| rect.contains(pos));
+        let over_sub = sub_rects.iter().find(|(_, rect)| rect.contains(pos));
+        if over_note || over_sub.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if clicked {
+            match (over_note, over_sub) {
+                (true, _) => reply.toggle = true,
+                (false, Some((position, _))) => reply.subagent = Some(*position),
+                _ => reply.open = true,
+            }
+        }
+    }
+    reply
 }
 
 /// The answer a title worker has given, once it has one.
@@ -4141,8 +4247,8 @@ impl Plugin for AiAgent {
                 .push(Turn::Notice(format!("Scan of {root} found no files.")));
         }
         if std::mem::take(&mut self.map_rebuild) {
-            let root = self.map_root();
-            if let Err(error) = self.agent.start_map_scan(&root, &mut session) {
+            // The host picks the project root above the session.
+            if let Err(error) = self.agent.start_map_scan("", &mut session) {
                 self.report_error(error);
             }
         }
@@ -4515,6 +4621,8 @@ impl Plugin for AiAgent {
                     ActionState::Send => "",
                 };
                 let (chosen_provider, chosen_model, action_clicked) = {
+                    let mut plan_mode = self.agent.plan;
+                    let mut compact_clicked = false;
                     let provider_options: Vec<(usize, &str)> = self
                         .providers
                         .iter()
@@ -4531,7 +4639,8 @@ impl Plugin for AiAgent {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    ui.horizontal(|ui| {
+                    let chosen = ui
+                        .horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = FOOTER_GAP;
                         // The reference footer is set in the same small type as the rest.
                         ui.style_mut().text_styles.insert(
@@ -4548,6 +4657,38 @@ impl Plugin for AiAgent {
                                 .kind(ButtonKind::Danger)
                                 .active(true),
                         };
+                        // The mode says most about what this chat may do, so it leads; the
+                        // Compact button sits where the model dropdown starts. A pane too
+                        // narrow for both keeps the action and drops them.
+                        let mode_button = Button::new(if plan_mode {
+                            MODE_PLAN_LABEL
+                        } else {
+                            MODE_AGENT_LABEL
+                        })
+                        .compact()
+                        .active(plan_mode);
+                        let compact_button = Button::new(COMPACT_LABEL)
+                            .compact()
+                            .enabled(self.summary.is_none() && !self.agent.turns.is_empty());
+                        let controls = mode_button.size(ui).x
+                            + compact_button.size(ui).x
+                            + FOOTER_GAP;
+                        let room = (ui.available_width() - action.size(ui).x - FOOTER_GAP * 2.0)
+                            .max(0.0);
+                        if room >= controls + MIN_SELECT_ROOM * 2.0 {
+                            let hint = if plan_mode {
+                                MODE_TO_AGENT_HINT
+                            } else {
+                                MODE_TO_PLAN_HINT
+                            };
+                            if mode_button.show(ui, palette).on_hover_text(hint).clicked() {
+                                plan_mode = !plan_mode;
+                            }
+                            compact_clicked = compact_button
+                                .show(ui, palette)
+                                .on_hover_text(COMPACT_HINT)
+                                .clicked();
+                        }
                         if self.providers.is_empty() {
                             // The action comes first; the hint is cropped to what is left.
                             let room =
@@ -4598,7 +4739,14 @@ impl Plugin for AiAgent {
                         };
                         (provider, model, clicked)
                     })
-                    .inner
+                    .inner;
+                    if plan_mode != self.agent.plan {
+                        self.agent.plan = plan_mode;
+                    }
+                    if compact_clicked {
+                        command = Some(COMPACT_COMMAND);
+                    }
+                    chosen
                 };
                 if action_clicked {
                     match action_state {
@@ -4790,7 +4938,8 @@ impl Plugin for AiAgent {
                     "history": history_to_json(&chat.history),
                     "subagents": subagents_to_json(&chat.subagents),
                     "compacted": chat.compacted,
-                    "scopes": chat.scopes.to_json()
+                    "scopes": chat.scopes.to_json(),
+                    "planMode": chat.plan
                 })
             })
             .collect();
@@ -4808,6 +4957,7 @@ impl Plugin for AiAgent {
                 "subagents": subagents_to_json(&self.agent.subagents),
                 "compacted": self.agent.compacted,
                 "scopes": self.agent.scopes.to_json(),
+                "planMode": self.agent.plan,
                 "chats": chats
             }),
         );
@@ -4816,10 +4966,6 @@ impl Plugin for AiAgent {
         if self.agent.map.revision != self.map_saved {
             self.map_saved = self.agent.map.revision;
             context.set_value(MAP_KEY, self.agent.map.to_json());
-        }
-        if self.map_folder != self.map_folder_saved {
-            self.map_folder_saved = self.map_folder.clone();
-            context.set_value(MAP_FOLDER_KEY, json!(self.map_folder));
         }
         if self.agent.system.revision != self.system_saved {
             self.system_saved = self.agent.system.revision;
@@ -6332,9 +6478,121 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_switches_the_chat_between_agent_and_plan() {
+        let mut settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        // The composer panel settles its height on the first frame.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let mode = rows
+            .iter()
+            .find(|(_, _, text)| text == MODE_AGENT_LABEL)
+            .cloned()
+            .unwrap_or_else(|| panic!("the footer offers the mode: {rows:?}"));
+        assert!(!plugin.agent.plan, "a chat starts in Agent mode");
+        frame(&mut plugin, &mut settings, &ctx, click(mode));
+        assert!(plugin.agent.plan, "the mode button did not switch to Plan");
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter().any(|(_, _, text)| text == MODE_PLAN_LABEL),
+            "the button names the mode the chat is in: {rows:?}"
+        );
+        // And the pane keeps it with the conversation.
+        assert_eq!(settings[CONVERSATION_KEY]["planMode"], json!(true));
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_the_mode_and_compact_buttons_first() {
+        let mut settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        frame_at(&mut plugin, &mut settings, &ctx, Vec::new(), NARROW_PANE);
+        let rows = frame_at(&mut plugin, &mut settings, &ctx, Vec::new(), NARROW_PANE);
+        assert!(
+            !rows.iter().any(|(_, _, text)| text == COMPACT_LABEL),
+            "a 120-point pane has no room for the buttons: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_compact_command_is_the_only_way_to_fold_when_automatic_compaction_is_off() {
+        let (base_url, _requests) = provider("", "{\"data\":[]}");
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent {
+            model: "test-model".to_owned(),
+            ..AiAgent::default()
+        };
+        plugin.agent.cwd = "/srv".to_owned();
+        // One frame loads the provider and keys the settings hold, as the pane does.
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.model = "test-model".to_owned();
+        for step in 0..8 {
+            assert!(plugin.agent.push_user(&format!("question {step}"), UserMeta::default()));
+        }
+
+        // Automatic compaction is off by default, however long the chat is.
+        assert!(
+            !settings
+                .get(SETTING_AUTO_COMPACT)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+        plugin.compact_if_needed(&settings, "dev");
+        assert!(plugin.summary.is_none(), "compaction ran on its own");
+
+        // Asking for it folds the older part, and says so when there is nothing to fold.
+        plugin.run_command(COMPACT_COMMAND, &settings, "dev");
+        assert!(plugin.summary.is_some(), "/compact did not start a summary");
+        plugin.summary = None;
+        let mut fresh = AiAgent {
+            providers: plugin.providers.clone(),
+            model: plugin.model.clone(),
+            ..AiAgent::default()
+        };
+        assert!(fresh.agent.push_user("only question", UserMeta::default()));
+        fresh.run_command(COMPACT_COMMAND, &settings, "dev");
+        assert!(fresh.summary.is_none(), "a short chat was folded anyway");
+        assert!(
+            fresh
+                .agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::Notice(text) if text == COMPACT_EMPTY)),
+            "the pane does not say why nothing happened: {:?}",
+            fresh.agent.turns
+        );
+    }
+
+    #[test]
+    fn the_mode_commands_switch_the_chat() {
+        let settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        assert!(!plugin.agent.plan, "a chat starts in Agent mode");
+        plugin.run_command(PLAN_COMMAND, &settings, "dev");
+        assert!(plugin.agent.plan, "/plan did not switch the chat");
+        assert!(plugin.draft.is_empty(), "the command stayed in the composer");
+        plugin.run_command(AGENT_COMMAND, &settings, "dev");
+        assert!(!plugin.agent.plan, "/agent did not switch it back");
+    }
+
+    #[test]
     fn slash_commands_parse_like_the_reference() {
         let exact = parse_slash_input("/new").unwrap();
         assert_eq!(exact.exact.map(|command| command.name), Some("new"));
+        let compact = parse_slash_input("/compact").unwrap();
+        assert_eq!(compact.exact.map(|command| command.name), Some("compact"));
+        let plan = parse_slash_input("/plan").unwrap();
+        assert_eq!(plan.exact.map(|command| command.name), Some("plan"));
+        let agent = parse_slash_input("/agent").unwrap();
+        assert_eq!(agent.exact.map(|command| command.name), Some("agent"));
         let partial = parse_slash_input("/sum").unwrap();
         assert_eq!(partial.prefix, "sum");
         assert_eq!(partial.matches.len(), 1);
@@ -7527,7 +7785,7 @@ mod tests {
     }
 
     #[test]
-    fn the_graph_popup_scans_the_folder_it_is_given() {
+    fn the_graph_popup_scans_the_root_the_host_finds() {
         let mut settings = serde_json::Map::new();
         settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
         let mut plugin = AiAgent::default();
@@ -7549,28 +7807,23 @@ mod tests {
             .expect("the Graph scope has a tag");
         frame(&mut plugin, &mut settings, &ctx, click(tag));
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert!(
-            rows.iter().any(|(_, _, text)| text == MAP_FOLDER_HINT),
-            "the popup offers a folder to scan: {rows:?}"
-        );
-        assert_eq!(
-            plugin.map_root(),
-            "",
-            "the root of a stored map is not a folder the host must keep using"
-        );
-        plugin.map_folder = "/srv/app".to_owned();
-        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let scan = rows
             .iter()
             .find(|(_, _, text)| text == "Scan")
             .cloned()
-            .expect("the map popup offers Scan");
+            .unwrap_or_else(|| panic!("the map popup offers Scan: {rows:?}"));
+        // Scanning needs no folder: the host finds the project root itself, and a pane
+        // without a session says so instead of asking for one.
         frame(&mut plugin, &mut settings, &ctx, click(scan));
-        assert_eq!(plugin.map_root(), "/srv/app", "the scan walks the folder given");
+        // The click arms the rebuild; the frame after it runs the scan.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
         assert_eq!(
-            settings.get(MAP_FOLDER_KEY).and_then(Value::as_str),
-            Some("/srv/app"),
-            "the folder is kept with the host"
+            plugin.error.as_deref(),
+            Some("The session is not connected.")
+        );
+        assert!(
+            !settings.contains_key("envMapFolder"),
+            "the pane keeps no folder of its own"
         );
     }
 
@@ -8370,7 +8623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_filed_subagent_is_listed_and_opens_read_only() {
+    fn a_filed_chats_subagents_open_from_its_note() {
         let mut plugin = filed_chat_with_a_subagent();
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -8378,12 +8631,32 @@ mod tests {
         frame(&mut plugin, &mut settings, &ctx, click_back());
         assert_eq!(plugin.view, ChatView::List);
 
+        // The card says how many sub-agents there are and lists none of them yet.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, _, text)| text == "\u{21b3} check the logs"),
+            "a sub-agent card is listed before it is asked for: {rows:?}"
+        );
+        let note = rows
+            .iter()
+            .find(|(_, _, text)| text == "1 sub-agent")
+            .cloned()
+            .unwrap_or_else(|| panic!("the chat does not name its sub-agents: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(note));
+        assert_eq!(
+            plugin.view,
+            ChatView::List,
+            "the note expands the card instead of opening the chat"
+        );
+
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let row = rows
             .iter()
             .find(|(_, _, text)| text == "\u{21b3} check the logs")
             .cloned()
-            .unwrap_or_else(|| panic!("the sub-agent is not listed: {rows:?}"));
+            .unwrap_or_else(|| panic!("the sub-agent is not listed after the note: {rows:?}"));
         frame(&mut plugin, &mut settings, &ctx, click(row));
         assert_eq!(
             plugin.view,
@@ -8404,6 +8677,35 @@ mod tests {
         // Back returns to the chat that owns it rather than to the list.
         frame(&mut plugin, &mut settings, &ctx, click_back());
         assert_eq!(plugin.view, ChatView::Chat);
+        frame(&mut plugin, &mut settings, &ctx, click_back());
+        assert_eq!(plugin.view, ChatView::List);
+
+        // The note folds them away again, and the card still opens the chat.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let note = rows
+            .iter()
+            .find(|(_, _, text)| text == "1 sub-agent")
+            .cloned()
+            .expect("the note is still there");
+        frame(&mut plugin, &mut settings, &ctx, click(note));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, _, text)| text == "\u{21b3} check the logs"),
+            "the note did not hide the sub-agent cards: {rows:?}"
+        );
+        let stats = rows
+            .iter()
+            .find(|(_, _, text)| text.starts_with("1 turn"))
+            .cloned()
+            .expect("the card keeps its stats line");
+        frame(&mut plugin, &mut settings, &ctx, click(stats));
+        assert_eq!(
+            plugin.view,
+            ChatView::Chat,
+            "the card opens the chat it belongs to"
+        );
     }
 
     #[test]

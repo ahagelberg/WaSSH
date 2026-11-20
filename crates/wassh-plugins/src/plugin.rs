@@ -167,6 +167,8 @@ pub struct PluginTool {
     pub description: &'static str,
     /// JSON schema of the arguments object.
     pub parameters: serde_json::Value,
+    /// Whether the call only reads, which is what Plan mode offers.
+    pub read_only: bool,
     /// The command that answers a call; `Err` is reported to the model as the tool's result.
     pub command: fn(&serde_json::Value) -> Result<String, String>,
 }

@@ -82,6 +82,9 @@ pub const EMPTY_ANSWER: &str = "The model returned an empty answer.";
 pub const NOT_PERMITTED: &str = "This action is not permitted.";
 /// Said when the user turns an action down.
 pub const DENIED_BY_USER: &str = "Action denied by user.";
+/// Said when a Plan-mode chat is asked to change something.
+pub const PLAN_READ_ONLY: &str = "This chat is in Plan mode, which only reads. Switch it to Agent \
+mode to change anything.";
 /// Answer given to a tool call the user stopped before it ran.
 pub const STOPPED_BY_USER: &str = "Stopped by the user before this ran.";
 /// System prompt used when summarising a chat for a new one.
@@ -587,6 +590,9 @@ pub struct Agent {
     pub tools: ToolSettings,
     /// What this host may do, read from the plugin settings.
     pub permissions: Permissions,
+    /// Whether this chat only reads: Plan mode offers the read-only tools and refuses the
+    /// rest even if the model asks for one.
+    pub plan: bool,
     /// The scopes whose tools this conversation carries.
     pub scopes: Loaded,
     /// Characters the last request spent on the system prompt and the tool schemas.
@@ -708,6 +714,7 @@ impl Agent {
         self.needs_reply = false;
         self.compacted = None;
         self.scopes = Loaded::new();
+        self.plan = false;
         self.spawn_request = None;
         self.pending_reports.clear();
         for sub in &mut self.subagents {
@@ -1528,6 +1535,13 @@ impl Agent {
 
     /// Run one call, or park the agent on whatever it needs.
     fn dispatch(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
+        // Nothing to approve in Plan mode: a call that changes something is refused before
+        // the user is asked about a tool the chat will not run.
+        if self.plan_blocks(&call.name) {
+            let label = call_label(&call);
+            self.settle(call, turn, label, PLAN_READ_ONLY.to_owned(), true, session);
+            return;
+        }
         match self.permission(&call.name) {
             Permission::Allow => {}
             Permission::Deny => {
@@ -1583,12 +1597,20 @@ impl Agent {
         }
     }
 
+    /// Whether Plan mode forbids a call.
+    fn plan_blocks(&self, tool: &str) -> bool {
+        self.plan && !tools::is_read_only(tool)
+    }
+
     /// Whether a tool should be offered to the model for this session.
     ///
-    /// A tool exists, belongs to a scope this conversation loaded, and the host may use it.
-    /// That one answer decides both what the request carries and what the prompt names.
+    /// A tool exists, belongs to a scope this conversation loaded, the host may use it, and
+    /// — in Plan mode — it only reads. That one answer decides both what the request carries
+    /// and what the prompt names.
     pub fn offers_tool(&self, tool: &str) -> bool {
-        (tools::is_scope_tool(tool) || self.scopes.holds(tool)) && self.permission(tool) != Permission::Deny
+        (tools::is_scope_tool(tool) || self.scopes.holds(tool))
+            && self.permission(tool) != Permission::Deny
+            && (!self.plan || tools::is_read_only(tool))
     }
 
     /// Bring a scope's tools into the conversation.
@@ -1714,6 +1736,14 @@ impl Agent {
                 true,
                 session,
             );
+            return;
+        }
+        // Plan mode offers read-only tools, so a call that changes something can only come
+        // from an earlier turn or a mode switch made under a prompt: refuse it rather than
+        // trust the request to have been enough.
+        if self.plan_blocks(&name) {
+            let label = call_label(&call);
+            self.settle(call, turn, label, PLAN_READ_ONLY.to_owned(), true, session);
             return;
         }
 
@@ -2474,6 +2504,7 @@ impl Agent {
         agent.session_allow = self.session_allow.clone();
         agent.session_deny = self.session_deny.clone();
         agent.allow_all = self.allow_all;
+        agent.plan = self.plan;
         agent.tools = self.tools.clone();
         agent.max_subagents = self.max_subagents;
         agent.push_user(prompt, UserMeta::default());
@@ -4554,6 +4585,64 @@ mod tests {
             matches!(agent.phase, Some(Phase::Running { .. })),
             "no approval"
         );
+    }
+
+    #[test]
+    fn plan_mode_offers_reads_and_refuses_what_changes_something() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_REMOTE_FS),
+            Value::Bool(true),
+        )]));
+        agent.scopes.load(scopes::find("host-files").unwrap());
+        agent.plan = true;
+        assert!(agent.offers_tool(TOOL_DEV_VIEW));
+        assert!(!agent.offers_tool(TOOL_DEV_EDIT));
+        assert!(!agent.offers_tool(TOOL_RUN_COMMAND));
+        assert!(agent.offers_tool(TOOL_LOAD_SCOPE));
+
+        let mut fake = FakeSession::default();
+        fake.contents
+            .insert("/srv/app/main.rs".to_owned(), "fn main() {}\n".to_owned());
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.cwd = "/srv/app".to_owned();
+        // A call that changes something is answered, not run, even though this host would
+        // allow it in Agent mode.
+        agent.begin_tool(
+            ApiToolCall {
+                id: "edit".to_owned(),
+                name: TOOL_DEV_EDIT.to_owned(),
+                arguments: r#"{"path":"main.rs","oldText":"main","newText":"start"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(
+            matches!(
+                agent.turns.last(),
+                Some(Turn::Tool { failed: true, output, .. }) if output == PLAN_READ_ONLY
+            ),
+            "{:?}",
+            agent.turns.last()
+        );
+        // Reading still answers.
+        agent.begin_tool(
+            ApiToolCall {
+                id: "view".to_owned(),
+                name: TOOL_DEV_VIEW.to_owned(),
+                arguments: r#"{"path":"main.rs"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(
+            matches!(agent.turns.last(), Some(Turn::Tool { failed: false, .. })),
+            "{:?}",
+            agent.turns.last()
+        );
+
+        // And a sub-agent works under the same restriction.
+        let index = agent.begin_subagent("look", "read main.rs");
+        assert!(agent.subagents[index].agent.plan);
+        assert!(!agent.subagents[index].agent.offers_tool(TOOL_DEV_EDIT));
     }
 
     #[test]
