@@ -61,6 +61,8 @@
 
 ### Fixed
 
+- Send the sudo password on Enter: the card takes the keyboard when it appears, so the shell behind
+  it no longer gets the key, and the field's own Enter handling is read before the field takes it.
 - Read the age a scan prints. `find -printf %T@` writes the timestamp with a fraction too, so
   every file line was thrown away and the map came out empty: the Graph popup said nothing was
   mapped, `env_search` and `env_outline` answered nothing, and a mapping pass had nothing to

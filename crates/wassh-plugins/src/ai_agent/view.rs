@@ -463,6 +463,9 @@ pub struct AiAgent {
     editing: Option<MessageEdit>,
     /// The password being typed into the sudo card.
     sudo: String,
+    /// The sudo command whose card took the keyboard, so a field that lost focus is not
+    /// pulled back to it.
+    sudo_focused: Option<String>,
     /// Whether the stored conversation has been read back.
     loaded: bool,
     /// Caption and health for the pane header.
@@ -575,6 +578,7 @@ impl Default for AiAgent {
             questions: QuestionWizard::default(),
             editing: None,
             sudo: String::new(),
+            sudo_focused: None,
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
             caption_for: None,
@@ -3873,6 +3877,11 @@ impl AiAgent {
     ) -> PromptAnswers {
         let mut answers = PromptAnswers::default();
 
+        // No sudo card means the next one takes the keyboard again.
+        if prompts.sudo.is_none() {
+            self.sudo_focused = None;
+        }
+
         // A card from a sub-agent says whose it is, so the main chat stays the one place
         // where every answer is given.
         if let Some(source) = source
@@ -4142,11 +4151,20 @@ impl AiAgent {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(room);
+                            // Read the key before the field: a focused single-line field
+                            // takes Enter as its own submission, so reading it afterwards
+                            // finds nothing.
+                            let submitted =
+                                ui.input(|input| input.key_pressed(egui::Key::Enter));
                             let response =
                                 password_input(ui, palette, &mut self.sudo, "sudo password");
-                            if response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            {
+                            // The card just appeared: the field takes the keyboard, so Enter
+                            // sends the password instead of reaching the shell behind it.
+                            if self.sudo_focused.as_deref() != Some(command.as_str()) {
+                                self.sudo_focused = Some(command.clone());
+                                response.request_focus();
+                            }
+                            if submitted && (response.has_focus() || response.lost_focus()) {
                                 answers.sudo = Some(SudoAnswer::Run);
                             }
                         },
@@ -8232,6 +8250,48 @@ mod tests {
         );
         assert!(texts.contains(&"Continue"), "no way to go on: {texts:?}");
         assert!(texts.contains(&"Cancel"), "no way out: {texts:?}");
+    }
+
+    #[test]
+    fn the_sudo_password_field_takes_the_keyboard_and_enter_sends_it() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Sudo {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_SUDO.to_owned(),
+                arguments: r#"{"command":"apt-get update"}"#.to_owned(),
+            },
+            command: "apt-get update".to_owned(),
+            reason: None,
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            ctx.text_edit_focused(),
+            "the password field did not take the keyboard, so Enter reaches the shell"
+        );
+        plugin.sudo = "hunter2".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(
+            plugin.sudo.is_empty(),
+            "Enter did not send the password: sudo={} focused={:?} error={:?}",
+            plugin.agent.sudo_prompt().is_some(),
+            plugin.sudo_focused,
+            plugin.error
+        );
     }
 
     #[test]
