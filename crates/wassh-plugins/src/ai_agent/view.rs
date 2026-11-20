@@ -45,6 +45,8 @@ use crate::{PluginId, PluginManifest};
 const CONVERSATION_KEY: &str = "conversation";
 /// Key the host's environment map is stored under.
 const MAP_KEY: &str = "envMap";
+/// Key the folder the user pinned for the map is stored under; empty means the host picks.
+const MAP_FOLDER_KEY: &str = "envMapFolder";
 /// Key the host's ports and services are stored under.
 const SYSTEM_KEY: &str = "envSystem";
 /// The scope that holds the environment map.
@@ -86,17 +88,36 @@ refresh or extend it with env_scan):";
 const MAP_TASK: &str = "\
 Map the project rooted at {root} for the other chats on this host.
 
-The environment map already lists every file with its declarations: env_overview, env_find, \
-env_search and env_outline answer from it without touching the host. Use them to choose what \
-matters, then read the files themselves (load_scope for the file tools if they are not loaded \
-yet) and describe at most {files} of them. Prefer entry points, build and configuration files \
-and the modules the rest of the tree depends on; skip vendored, generated and lock files. Spend \
-the budget where it explains the widest slice of the project, and stop when it is spent.
+Work in this order:
+1. Call env_overview with no arguments to see the tree the environment map already holds.
+2. Choose the files that explain the most: entry points, build and configuration files, and the
+   modules the rest of the tree depends on. Skip vendored, generated and lock files, and stay
+   inside {root}.
+3. Read the files you chose — load_scope first if the file tools are not loaded — and note what
+   each one is for and what it imports, calls or feeds. Describe at most {files} of them.
+4. Answer with one JSON object and nothing else. Never answer with prose and never ask a
+   question: when the budget is spent, or you have nothing worth adding, answer with
+   {\"files\": []} and nothing else.
 
-Answer with one JSON object and nothing else:
+The object has this shape:
 {\"files\": [{\"path\": \"<absolute or root-relative path>\", \"summary\": \"<what the file is \
 for, at most 40 words>\", \"connects\": [\"<path, module or service it imports, calls or \
 feeds>\"]}]}";
+
+/// What a mapping sub-agent is told when its answer carried no file list.
+const MAP_REPAIR_TASK: &str = "\
+Your answer did not carry the JSON object, so it was thrown away. Read the files you chose if you \
+have not read them yet, then answer with one JSON object and nothing else — no prose, no \
+questions. An empty list is a fine answer: {\"files\": []}";
+
+/// Answers one mapping pass accepts before it gives up on the shape of them.
+const MAP_ATTEMPTS: u8 = 2;
+/// What the transcript says when a mapping pass answered without describing anything.
+const MAP_EMPTY_NOTICE: &str = "The mapping pass described no files.";
+/// What the transcript says while it asks the model for the object again.
+const MAP_RETRY_NOTICE: &str = "The mapping answer had no file list; asking again.";
+/// Hint the popup's folder field shows while the host picks the tree itself.
+const MAP_FOLDER_HINT: &str = "auto: the project root above the session";
 
 /// Name the chat list gives the mapping sub-agent.
 const MAP_SUBAGENT_TITLE: &str = "map the project";
@@ -470,6 +491,10 @@ pub struct AiAgent {
     map_deep_wanted: bool,
     /// The mapping pass running for this pane, until its answer lands.
     map_deep: Option<MapRun>,
+    /// Folder the popup pinned for the map, empty to let the host find the project root.
+    map_folder: String,
+    /// Folder the host's plugin data holds, so a change is written once.
+    map_folder_saved: String,
     /// Set by the popup: show what the mapping pass is doing, call by call.
     map_more: bool,
     /// Which of the pane's two views is drawn.
@@ -484,6 +509,8 @@ struct MapRun {
     root: String,
     /// When it started, for the popup's elapsed time.
     started: u64,
+    /// Answers this pass has taken, so a shapeless one is asked again once.
+    attempts: u8,
 }
 
 /// The popup a click on a loaded scope's tag opens.
@@ -559,6 +586,8 @@ impl Default for AiAgent {
             map_rebuild: false,
             map_deep_wanted: false,
             map_deep: None,
+            map_folder: String::new(),
+            map_folder_saved: String::new(),
             map_more: false,
             view: ChatView::List,
         }
@@ -1575,6 +1604,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         // The map belongs to the host, so it survives every chat on the connection.
         self.agent.map = super::map::EnvMap::from_json(settings.get(MAP_KEY));
         self.map_saved = self.agent.map.revision;
+        self.map_folder = settings
+            .get(MAP_FOLDER_KEY)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.map_folder_saved = self.map_folder.clone();
         self.agent.system = super::map::SystemFacts::from_json(settings.get(SYSTEM_KEY));
         self.system_saved = self.agent.system.revision;
         // The pane opens on the conversation it was in, or on the list when there is none.
@@ -2239,10 +2274,11 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let loaded = self.agent.scopes.contains(scope.id);
         let tools = self.scope_tool_names(scope);
         let mut turn_off = false;
-        let mut rebuild = false;
+        let mut scan = false;
         let mut deep = false;
         let mut clear = false;
         let mut more = false;
+        let mut folder = self.map_folder.clone();
         let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
@@ -2328,15 +2364,22 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                                     }
                                 }
                             }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut folder)
+                                    .hint_text(MAP_FOLDER_HINT)
+                                    .desired_width(f32::INFINITY),
+                            );
                             ui.horizontal(|ui| {
-                                rebuild = Button::new("Rebuild")
+                                scan = Button::new("Scan")
                                     .compact()
                                     .enabled(self.agent.map_scan.is_none())
                                     .show(ui, palette)
                                     .clicked();
                                 deep = Button::new("Map project")
                                     .compact()
-                                    .enabled(self.map_deep.is_none() && self.agent.map_scan.is_none())
+                                    .enabled(
+                                        self.map_deep.is_none() && self.agent.map_scan.is_none(),
+                                    )
                                     .show(ui, palette)
                                     .clicked();
                                 clear = Button::new("Clear")
@@ -2358,19 +2401,24 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if clear {
             self.agent.map.clear();
         }
-        if rebuild {
+        if folder.trim() != self.map_folder.trim() {
+            self.map_folder = folder;
+        }
+        if scan {
             self.map_rebuild = true;
         }
         if more {
             self.map_more = !self.map_more;
         }
         if deep {
-            // Nothing listed yet means the cheap walk comes first; the description follows.
-            if self.agent.map.is_empty() {
+            // A folder the map was not built from, and a map that is not there yet, both mean
+            // the cheap walk comes first; the description follows it.
+            let pinned = self.map_folder.trim();
+            let unbuilt = !pinned.is_empty() && pinned != self.agent.map.root;
+            if self.agent.map.is_empty() || unbuilt {
                 self.map_rebuild = true;
-            } else {
-                self.map_deep_wanted = true;
             }
+            self.map_deep_wanted = true;
         }
         let rect = area.response.rect;
         let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
@@ -2382,15 +2430,15 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 .flatten()
                 .is_some_and(|pos| !rect.contains(pos) && !anchor.contains(pos))
         });
-        if turn_off || rebuild || clear || escape || pressed_outside {
+        if turn_off || clear || escape || pressed_outside {
             self.scope_popup = None;
         }
     }
 
-    /// The tree a scan starts in: the map's own root, or none so the host finds the project
-    /// root itself by its markers.
+    /// The tree a scan starts in: the folder the popup pinned, or none so the host finds the
+    /// project root itself.
     fn map_root(&self) -> String {
-        self.agent.map.root.clone()
+        self.map_folder.trim().to_owned()
     }
 
     /// Run the mapping pass a tool answer asked for, and take in the one that finished.
@@ -2419,6 +2467,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     .map(|sub| sub.answer_full())
                     .unwrap_or_default();
                 let files = super::map::parse_mapped(&answer);
+                if files.is_empty() {
+                    self.report_map_empty(&run, &answer, settings, host, environment);
+                    return;
+                }
                 let described = self
                     .agent
                     .map
@@ -2435,14 +2487,19 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 }
             }
         }
-        let wanted = std::mem::take(&mut self.map_deep_wanted)
-            || self.agent.take_deep_map_wanted();
-        if !wanted || self.map_deep.is_some() || self.agent.map.is_empty() {
+        // A pass cannot start over a map that is not there yet or one that is being walked,
+        // so what asked for it waits rather than being spent on nothing.
+        if self.map_deep.is_some() || self.agent.map_scan.is_some() || self.agent.map.is_empty() {
             return;
         }
-        let Some(root) = (!self.agent.map.root.is_empty()).then(|| self.agent.map.root.clone())
-        else {
+        let wanted =
+            std::mem::take(&mut self.map_deep_wanted) || self.agent.take_deep_map_wanted();
+        if !wanted {
             return;
+        }
+        let root = match self.agent.map.root.is_empty() {
+            true => self.agent.cwd.clone(),
+            false => self.agent.map.root.clone(),
         };
         let prompt = MAP_TASK
             .replace("{root}", &root)
@@ -2457,6 +2514,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     subagent: index,
                     root,
                     started: self.agent.now_ms,
+                    attempts: 1,
                 });
             }
             None => {
@@ -2464,6 +2522,47 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 self.agent.subagents.pop();
             }
         }
+    }
+
+    /// Say in the transcript why a mapping pass described nothing, asking the model again
+    /// while it still has an attempt left.
+    fn report_map_empty(
+        &mut self,
+        run: &MapRun,
+        answer: &str,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
+        let answered = self
+            .agent
+            .subagents
+            .get(run.subagent)
+            .is_some_and(|sub| sub.state() == SubagentState::Done);
+        if answered && run.attempts < MAP_ATTEMPTS {
+            if let Some(sub) = self.agent.subagents.get_mut(run.subagent) {
+                sub.end = None;
+                sub.agent.push_user(MAP_REPAIR_TASK, UserMeta::default());
+            }
+            let request = self.request_for(Some(run.subagent), settings, host, environment);
+            if let Some(request) = request {
+                self.agent.subagents[run.subagent].agent.start(request);
+                self.map_deep = Some(MapRun {
+                    subagent: run.subagent,
+                    root: run.root.clone(),
+                    started: run.started,
+                    attempts: run.attempts + 1,
+                });
+                self.show_map_ready(MAP_RETRY_NOTICE);
+                return;
+            }
+        }
+        let said = answer.lines().next().unwrap_or_default().trim();
+        let notice = match said.is_empty() {
+            true => MAP_EMPTY_NOTICE.to_owned(),
+            false => format!("{MAP_EMPTY_NOTICE} It said: {said}"),
+        };
+        self.show_map_ready(&notice);
     }
 
     /// Report a mapping pass in the transcript, in place of the sub-agent's raw JSON answer.
@@ -2481,8 +2580,11 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 
     /// One line about the map for its scope popup.
     fn map_summary(&self) -> String {
-        if self.agent.map_scan.is_some() {
-            return "Scanning…".to_owned();
+        if let Some(root) = &self.agent.map_scan {
+            return match root.trim().is_empty() {
+                true => "Scanning the project root the host finds…".to_owned(),
+                false => format!("Scanning {root}…"),
+            };
         }
         if let Some(run) = &self.map_deep {
             let doing = match self.agent.subagents.get(run.subagent) {
@@ -2492,10 +2594,14 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return format!("Describing {}: {doing}", run.root);
         }
         if self.agent.map.is_empty() {
-            return format!(
-                "Nothing mapped yet. A scan starts at the project root above {}.",
-                self.agent.cwd
-            );
+            let pinned = self.map_root();
+            return match pinned.is_empty() {
+                true => format!(
+                    "Nothing mapped yet. A scan starts at the project root above {}.",
+                    self.agent.cwd
+                ),
+                false => format!("Nothing mapped yet. A scan starts at {pinned}."),
+            };
         }
         let map = &self.agent.map;
         let described = match map.summarised() {
@@ -4705,6 +4811,10 @@ impl Plugin for AiAgent {
         if self.agent.map.revision != self.map_saved {
             self.map_saved = self.agent.map.revision;
             context.set_value(MAP_KEY, self.agent.map.to_json());
+        }
+        if self.map_folder != self.map_folder_saved {
+            self.map_folder_saved = self.map_folder.clone();
+            context.set_value(MAP_FOLDER_KEY, json!(self.map_folder));
         }
         if self.agent.system.revision != self.system_saved {
             self.system_saved = self.agent.system.revision;
@@ -7310,6 +7420,7 @@ mod tests {
             subagent: index,
             root: "/srv/app".to_owned(),
             started: 0,
+            attempts: MAP_ATTEMPTS,
         });
 
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
@@ -7366,6 +7477,7 @@ mod tests {
             subagent: index,
             root: "/srv/app".to_owned(),
             started: plugin.agent.now_ms,
+            attempts: MAP_ATTEMPTS,
         });
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let tag = rows
@@ -7407,6 +7519,151 @@ mod tests {
         assert_eq!(elapsed_text(0), "0 s");
         assert_eq!(elapsed_text(9_500), "9 s");
         assert_eq!(elapsed_text(90_000), "1 min");
+    }
+
+    #[test]
+    fn the_graph_popup_scans_the_folder_it_is_given() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
+        let mut plugin = AiAgent::default();
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("host").unwrap());
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("env").unwrap());
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let tag = rows
+            .iter()
+            .find(|(_, _, text)| text == GRAPH_SCOPE_LABEL)
+            .cloned()
+            .expect("the Graph scope has a tag");
+        frame(&mut plugin, &mut settings, &ctx, click(tag));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter().any(|(_, _, text)| text == MAP_FOLDER_HINT),
+            "the popup offers a folder to scan: {rows:?}"
+        );
+        assert_eq!(
+            plugin.map_root(),
+            "",
+            "the root of a stored map is not a folder the host must keep using"
+        );
+        plugin.map_folder = "/srv/app".to_owned();
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let scan = rows
+            .iter()
+            .find(|(_, _, text)| text == "Scan")
+            .cloned()
+            .expect("the map popup offers Scan");
+        frame(&mut plugin, &mut settings, &ctx, click(scan));
+        assert_eq!(plugin.map_root(), "/srv/app", "the scan walks the folder given");
+        assert_eq!(
+            settings.get(MAP_FOLDER_KEY).and_then(Value::as_str),
+            Some("/srv/app"),
+            "the folder is kept with the host"
+        );
+    }
+
+    #[test]
+    fn a_mapping_answer_without_files_says_what_it_said() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.map = super::super::map::EnvMap::parse(
+            "/srv/app",
+            1,
+            "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
+        );
+        let index = plugin.agent.begin_subagent("map the project", "map it");
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: "I had a look around.".to_owned(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].end = Some(super::super::agent::SubagentEnd::Done);
+        plugin.map_deep = Some(MapRun {
+            subagent: index,
+            root: "/srv/app".to_owned(),
+            started: 0,
+            attempts: MAP_ATTEMPTS,
+        });
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            plugin.agent.turns.iter().any(|turn| matches!(
+                turn,
+                Turn::Notice(text)
+                    if text.contains("described no files") && text.contains("I had a look around")
+            )),
+            "the pane says the pass described nothing, and what it said: {:?}",
+            plugin.agent.turns
+        );
+        assert!(plugin.map_deep.is_none(), "the pass is over");
+    }
+
+    #[test]
+    fn a_mapping_answer_without_files_is_asked_for_again() {
+        const CHAT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, _requests) = provider(CHAT, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.map = super::super::map::EnvMap::parse(
+            "/srv/app",
+            1,
+            "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
+        );
+        let index = plugin.agent.begin_subagent("map the project", "map it");
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: "I had a look around.".to_owned(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].end = Some(super::super::agent::SubagentEnd::Done);
+        plugin.map_deep = Some(MapRun {
+            subagent: index,
+            root: "/srv/app".to_owned(),
+            started: 0,
+            attempts: 1,
+        });
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let run = plugin
+            .map_deep
+            .as_ref()
+            .unwrap_or_else(|| panic!("the pass gave up: {:?}", plugin.agent.turns));
+        assert_eq!(run.attempts, 2, "the answer is asked for once more");
+        assert!(
+            plugin.agent.subagents[index].agent.phase.is_some(),
+            "the model is asked again"
+        );
+        assert!(
+            plugin
+                .agent
+                .subagents[index]
+                .agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User { text, .. } if text.contains("JSON object"))),
+            "the sub-agent is told what was missing"
+        );
     }
 
     #[test]

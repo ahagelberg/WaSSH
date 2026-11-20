@@ -248,9 +248,13 @@ lines, using ripgrep when the host has it.",
         name: TOOL_ENV_SCAN,
         description: "Build or refresh the environment map: one walk of a directory tree that \
 records every file with its size, age and declarations. With no path it starts at the project \
-root the host finds above the working directory. Cheap enough to re-run; it reads no individual \
-files. Do this before searching a tree you have not mapped yet: the files are then described by \
-a mapping pass, so env_search and env_outline answer with what is in them.",
+root the host finds for itself — the nearest directory at or above the working directory with \
+.git, Cargo.toml, package.json and the like, or the one project folder directly inside it — and \
+says which directory that was. Pass a path only when the user named one, or when the map's root \
+is clearly the wrong tree; a subdirectory of the project only throws away the rest of it. Cheap \
+enough to re-run; it reads no individual files. Do this before searching a tree you have not \
+mapped yet: the files are then described by a mapping pass, so env_search and env_outline answer \
+with what is in them.",
     },
     ToolSpec {
         name: TOOL_ENV_FIND,

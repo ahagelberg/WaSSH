@@ -55,6 +55,11 @@
 
 ### Fixed
 
+- Keep the mapping pass on the right tree and honest about its answer: the Graph popup takes the
+  folder to scan (empty lets the host pick, and the root a stored map remembers is no longer reused
+  blindly), a session opened in a home directory maps the one project folder inside it instead of
+  the whole home, and a pass whose answer carries no file list is asked once more and then says so
+  in the transcript instead of stopping silently.
 - Keep terminal text in its cells when the session's font differs from egui's own. A host whose
   family reached the font atlas after the session's first frame kept the cell measured in the
   fallback face, so every run of text fell short of its column and the cursor sat right of it.

@@ -69,27 +69,54 @@ const PROJECT_MARKERS: &[&str] = &[
     "package.json",
     "pyproject.toml",
     "setup.py",
+    "setup.cfg",
     "Makefile",
     "CMakeLists.txt",
     "pom.xml",
     "build.gradle",
+    "build.gradle.kts",
     "Gemfile",
     "composer.json",
+    "mix.exs",
+    "deno.json",
+    "Package.swift",
 ];
 
-/// Shell that prints the project root: the nearest directory at or above the working
-/// directory carrying one of [`PROJECT_MARKERS`], stopping at the home directory.
+/// Shell that prints the project root.
+///
+/// The nearest directory at or above the working directory carrying one of
+/// [`PROJECT_MARKERS`] wins, which is the repository a session was started in. When there is
+/// none — a session opened in a home directory, say — the one project folder directly inside
+/// the working directory is used instead. Anything else stays where the session is, because
+/// guessing further would map the wrong tree.
 fn root_probe() -> String {
     let mut markers = String::new();
     for marker in PROJECT_MARKERS {
         markers.push_str(&format!("{marker} "));
     }
     format!(
-        "root=$PWD; while [ \"$root\" != / ] && [ \"$root\" != \"$HOME\" ]; do \
-           found=; for m in {markers}; do [ -e \"$root/$m\" ] && {{ found=1; break; }}; done; \
+        "root=$PWD; found=; \
+         while [ \"$root\" != / ] && [ \"$root\" != \"$HOME\" ]; do \
+           for m in {markers}; do [ -e \"$root/$m\" ] && {{ found=1; break; }}; done; \
            [ -n \"$found\" ] && break; root=$(dirname \"$root\"); \
-         done; printf '{ROOT_MARKER}%s\\n' \"$root\""
+         done; \
+         if [ -z \"$found\" ]; then \
+           picks=0; pick=; \
+           for d in */; do \
+             [ -d \"$d\" ] || continue; \
+             for m in {markers}; do \
+               [ -e \"$d/$m\" ] && {{ picks=$((picks+1)); pick=$d; break; }}; \
+             done; \
+           done; \
+           [ \"$picks\" = 1 ] && root=\"$PWD/${{pick%/}}\"; \
+         fi; \
+         printf '{ROOT_MARKER}%s\\n' \"$root\""
     )
+}
+
+/// The seconds of a `find -printf %T@` stamp, which carries a fractional part.
+fn whole_seconds(stamp: &str) -> Option<u64> {
+    stamp.split('.').next()?.parse().ok()
 }
 
 /// One file in the map.
@@ -957,6 +984,42 @@ __wassh_symbols__
         assert!(command.contains("Cargo.toml"), "no project marker: {command}");
         assert!(command.contains(ROOT_MARKER), "{command}");
         assert!(!command.contains("root=''"), "{command}");
+    }
+
+    /// A POSIX shell, where the machine has one.
+    fn shell() -> Option<&'static str> {
+        ["/bin/sh", "C:/Program Files/Git/bin/sh.exe"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+    }
+
+    #[test]
+    fn the_probe_prefers_the_project_inside_or_below_the_session() {
+        // Shell paths and Windows paths mean different things to `sh`, so the tree is built on
+        // disk and every comparison happens inside the shell.
+        let Some(shell) = shell() else {
+            return;
+        };
+        let base = std::env::temp_dir().join(format!("wassh-probe-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("home").join("ayla").join(".git")).expect("a project");
+        std::fs::create_dir_all(base.join("home").join("downloads")).expect("another directory");
+        let script = "fail=; home=$(cd home && pwd -P) || exit 1
+            check() { out=$(__PROBE__); root=${out#__wassh_root__}; [ \"$root\" = \"$1\" ] || fail=\"$fail $2\"; }
+            cd \"$home\" && HOME=$home && check \"$home/ayla\" a-session-in-the-home-directory
+            cd \"$home/ayla/.git\" && HOME=$home && check \"$home/ayla\" a-session-inside-the-project
+            mkdir -p \"$home/other/.git\"
+            cd \"$home\" && HOME=$home && check \"$home\" two-projects-side-by-side
+            echo \"${fail:-pass}\"";
+        let script = script.replace("__PROBE__", &root_probe());
+        let output = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .current_dir(&base)
+            .output()
+            .expect("the shell runs");
+        let said = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(said, "pass", "the probe picked the wrong root:{said}");
     }
 
     #[test]
