@@ -1607,6 +1607,25 @@ fn options_appearance(ui: &mut Ui, palette: &Palette, draft: &mut AppSettings) {
             }
         },
     );
+    let defaults = &mut draft.session_style_defaults;
+    row(
+        ui,
+        palette,
+        "Reset scroll on server activity",
+        Some("Return to the newest line whenever the host sends output."),
+        |ui| {
+            checkbox(ui, palette, &mut defaults.reset_scroll_on_server, "Enabled");
+        },
+    );
+    row(
+        ui,
+        palette,
+        "Reset scroll on user activity",
+        Some("Return to the newest line whenever you type or paste."),
+        |ui| {
+            checkbox(ui, palette, &mut defaults.reset_scroll_on_user, "Enabled");
+        },
+    );
 }
 
 fn options_general(ui: &mut Ui, palette: &Palette, draft: &mut AppSettings) {
@@ -3352,6 +3371,28 @@ fn host_appearance(ui: &mut Ui, palette: &Palette, fields: &mut AppearanceFields
         defaults.cursor_blink,
         |ui, blink| {
             checkbox(ui, palette, blink, "Blink");
+        },
+    );
+    override_row(
+        ui,
+        palette,
+        "Reset scroll on server activity",
+        "Return to the newest line whenever the host sends output",
+        &mut style.reset_scroll_on_server,
+        defaults.reset_scroll_on_server,
+        |ui, reset| {
+            checkbox(ui, palette, reset, "Enabled");
+        },
+    );
+    override_row(
+        ui,
+        palette,
+        "Reset scroll on user activity",
+        "Return to the newest line whenever you type or paste",
+        &mut style.reset_scroll_on_user,
+        defaults.reset_scroll_on_user,
+        |ui, reset| {
+            checkbox(ui, palette, reset, "Enabled");
         },
     );
 }
@@ -5265,6 +5306,26 @@ mod tests {
         let state = OptionsState::new(&settings).focusing_plugin(PluginId::Sftp);
         assert_eq!(state.nav.active, OPTION_SECTIONS.len() - 1);
         assert_eq!(OPTION_SECTIONS[OPTION_SECTIONS.len() - 1], "Plugins");
+    }
+
+    #[test]
+    fn options_appearance_holds_the_scroll_reset_switches() {
+        let ctx = Context::default();
+        let palette = Palette::dark();
+        let mut state = OptionsState::new(&AppSettings::default());
+        assert_eq!(OPTION_SECTIONS[state.nav.active], "Appearance");
+        let rows = painted_rows(&ctx, Vec2::new(1280.0, 900.0), |ctx| {
+            let _ = options_dialog(ctx, &palette, &mut state);
+        });
+        for label in [
+            "Reset scroll on server activity",
+            "Reset scroll on user activity",
+        ] {
+            assert!(
+                rows.iter().any(|(_, _, text)| text == label),
+                "{label:?} is not in Appearance: {rows:?}"
+            );
+        }
     }
 
     #[test]

@@ -377,6 +377,21 @@ impl Terminal {
         self.touch();
     }
 
+    /// Whether the viewport is showing history above the newest line.
+    pub fn is_scrolled_back(&self) -> bool {
+        self.term.grid().display_offset() > 0
+    }
+
+    /// Return the viewport to the newest line, doing nothing when it is already there.
+    pub fn scroll_to_bottom(&mut self) {
+        use alacritty_terminal::grid::Scroll;
+        if !self.is_scrolled_back() {
+            return;
+        }
+        self.term.scroll_display(Scroll::Bottom);
+        self.touch();
+    }
+
     /// Start a fresh selection at a viewport cell.
     pub fn begin_selection(&mut self, row: usize, col: usize) {
         let Some(point) = self.grid_point(row, col) else {
@@ -661,6 +676,23 @@ mod tests {
         assert!(multi.contains(3, 2));
         assert!(!multi.contains(3, 3));
         assert!(!multi.contains(4, 0));
+    }
+
+    #[test]
+    fn scrolling_back_holds_the_view_until_it_is_returned_to_the_newest_line() {
+        let (mut term, _rx) = terminal(10, 3);
+        term.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        assert!(!term.is_scrolled_back());
+        term.scroll(2);
+        assert!(term.is_scrolled_back());
+        // New output alone leaves the view where the user put it.
+        term.feed(b"six\r\n");
+        assert!(term.is_scrolled_back(), "output moved the view");
+        term.scroll_to_bottom();
+        assert!(!term.is_scrolled_back());
+        let revision = term.revision();
+        term.scroll_to_bottom();
+        assert_eq!(term.revision(), revision, "nothing changed, nothing to redraw");
     }
 
     fn row_text(snapshot: &ScreenSnapshot, row: usize) -> String {

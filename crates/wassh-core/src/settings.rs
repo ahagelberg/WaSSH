@@ -63,6 +63,10 @@ pub struct SessionStyleDefaults {
     pub cursor: CursorStyle,
     pub cursor_blink: bool,
     pub scrollback: u32,
+    /// Return to the newest line when the host sends output.
+    pub reset_scroll_on_server: bool,
+    /// Return to the newest line when the user types or pastes.
+    pub reset_scroll_on_user: bool,
 }
 
 impl Default for SessionStyleDefaults {
@@ -77,6 +81,8 @@ impl Default for SessionStyleDefaults {
             cursor: CursorStyle::Block,
             cursor_blink: true,
             scrollback: DEFAULT_SCROLLBACK_LINES,
+            reset_scroll_on_server: false,
+            reset_scroll_on_user: true,
         }
     }
 }
@@ -153,6 +159,7 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::SessionStyle;
 
     #[test]
     fn cleared_colours_in_the_defaults_parse_as_unset() {
@@ -182,6 +189,29 @@ mod tests {
         assert_eq!(settings.session_style_defaults.scrollback, 10_000);
         assert_eq!(settings.session_style_defaults.font_family, "JetBrains Mono");
         assert!(settings.session_style_defaults.cursor_blink);
+        assert!(!settings.session_style_defaults.reset_scroll_on_server);
+        assert!(settings.session_style_defaults.reset_scroll_on_user);
+    }
+
+    #[test]
+    fn a_session_overrides_the_scroll_resets_or_inherits_them() {
+        let defaults = SessionStyleDefaults {
+            reset_scroll_on_server: true,
+            reset_scroll_on_user: false,
+            ..SessionStyleDefaults::default()
+        };
+        let inherited = SessionStyle::default().scroll_resets(&defaults);
+        assert!(inherited.on_server);
+        assert!(!inherited.on_user);
+
+        let own = SessionStyle {
+            reset_scroll_on_server: Some(false),
+            reset_scroll_on_user: Some(true),
+            ..SessionStyle::default()
+        }
+        .scroll_resets(&defaults);
+        assert!(!own.on_server, "the session's own value wins");
+        assert!(own.on_user, "the session's own value wins");
     }
 
     #[test]

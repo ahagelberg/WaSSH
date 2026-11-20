@@ -364,6 +364,16 @@ impl CursorStyle {
     }
 }
 
+/// Whether the viewport returns to the newest line when the host writes, and when the user
+/// types, resolved from a style and the application defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollResets {
+    /// Follow the newest line when the host sends output.
+    pub on_server: bool,
+    /// Return to the newest line when the user types or pastes.
+    pub on_user: bool,
+}
+
 /// Per-host or per-tab style overrides. `None` means "use the application default".
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -380,9 +390,21 @@ pub struct SessionStyle {
     pub cursor: Option<CursorStyle>,
     pub cursor_blink: Option<bool>,
     pub scrollback: Option<u32>,
+    pub reset_scroll_on_server: Option<bool>,
+    pub reset_scroll_on_user: Option<bool>,
 }
 
 impl SessionStyle {
+    /// The scroll resets this style asks for, else the application defaults.
+    pub fn scroll_resets(&self, defaults: &crate::settings::SessionStyleDefaults) -> ScrollResets {
+        ScrollResets {
+            on_server: self
+                .reset_scroll_on_server
+                .unwrap_or(defaults.reset_scroll_on_server),
+            on_user: self.reset_scroll_on_user.unwrap_or(defaults.reset_scroll_on_user),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }

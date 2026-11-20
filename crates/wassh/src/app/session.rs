@@ -283,6 +283,8 @@ pub struct SessionEntry {
     pub events: Receiver<TerminalEvent>,
     /// Renderer settings for this session.
     pub view: TerminalView,
+    /// Whether the viewport follows new output and new input.
+    scroll_resets: wassh_core::ScrollResets,
     /// Transport.
     pub backend: Backend,
     /// Parameters the session was opened with.
@@ -480,6 +482,7 @@ impl SessionEntry {
             view: TerminalView::with_font_size(f32::from(
                 params.style.font_size.unwrap_or(defaults.font_size),
             )),
+            scroll_resets: params.style.scroll_resets(defaults),
             backend: Backend::Closed,
             palette: *palette,
             connection: params,
@@ -802,7 +805,7 @@ impl SessionEntry {
                 for chunk in pty.read_pending() {
                     if !chunk.is_empty() {
                         pumped.wake = true;
-                        self.terminal.feed(&chunk);
+                        Self::absorb(&mut self.terminal, self.scroll_resets, &chunk);
                     }
                 }
                 local_exited = pty.has_exited();
@@ -813,7 +816,7 @@ impl SessionEntry {
                         SshEvent::Data(bytes) => {
                             if !bytes.is_empty() {
                                 pumped.wake = true;
-                                self.terminal.feed(&bytes);
+                                Self::absorb(&mut self.terminal, self.scroll_resets, &bytes);
                             }
                         }
                         SshEvent::Status { status, .. } => {
@@ -900,7 +903,7 @@ impl SessionEntry {
                         wassh_telnet::TelnetEvent::Data(bytes) => {
                             if !bytes.is_empty() {
                                 pumped.wake = true;
-                                self.terminal.feed(&bytes);
+                                Self::absorb(&mut self.terminal, self.scroll_resets, &bytes);
                             }
                         }
                         wassh_telnet::TelnetEvent::Status(status) => {
@@ -937,7 +940,7 @@ impl SessionEntry {
                 for chunk in session.read_pending() {
                     if !chunk.is_empty() {
                         pumped.wake = true;
-                        self.terminal.feed(&chunk);
+                        Self::absorb(&mut self.terminal, self.scroll_resets, &chunk);
                     }
                 }
             }
@@ -1025,10 +1028,24 @@ impl SessionEntry {
         self.plugins_dirty = true;
     }
 
+    /// Feed transport output into the emulator, following the newest line when the
+    /// session asks for it.
+    ///
+    /// Takes the two fields it touches: the transport is borrowed mutably while it runs.
+    fn absorb(terminal: &mut Terminal, resets: wassh_core::ScrollResets, bytes: &[u8]) {
+        if resets.on_server {
+            terminal.scroll_to_bottom();
+        }
+        terminal.feed(bytes);
+    }
+
     /// Send encoded input to the transport.
     pub fn send(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
+        }
+        if self.scroll_resets.on_user {
+            self.terminal.scroll_to_bottom();
         }
         match &mut self.backend {
             Backend::Local(pty) => {
@@ -1225,6 +1242,7 @@ impl SessionEntry {
             .font_family
             .clone()
             .unwrap_or_else(|| defaults.font_family.clone());
+        self.scroll_resets = style.scroll_resets(defaults);
 
         let mut palette = self.palette;
         if let Some(colour) = style.term_background.or(defaults.term_background) {
@@ -3441,7 +3459,7 @@ fn grid_lines(snapshot: &ScreenSnapshot) -> impl Iterator<Item = String> + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wassh_core::SessionStyleDefaults;
+    use wassh_core::{SessionStyle, SessionStyleDefaults};
 
     const ZIP_PROGRESS_TEST_BYTES: u64 = 7;
     const ZIP_PROGRESS_TEST_ARCHIVE_BYTES: u64 = 120;
@@ -4020,6 +4038,75 @@ mod tests {
             TerminalSize::new(80, 24),
             local_params(),
         )
+    }
+
+    /// A tab with no transport, so output and input can be driven by hand.
+    fn idle_entry(style: SessionStyle) -> SessionEntry {
+        let mut params = local_params();
+        params.style = style;
+        SessionEntry::prepare(
+            "idle",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            TerminalSize::new(20, 4),
+            params,
+            None,
+        )
+    }
+
+    /// Scroll `entry` back two lines over more output than its grid holds.
+    fn scrolled_back(entry: &mut SessionEntry) {
+        SessionEntry::absorb(
+            &mut entry.terminal,
+            entry.scroll_resets,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n",
+        );
+        entry.terminal.scroll(2);
+        assert!(entry.terminal.is_scrolled_back());
+    }
+
+    #[test]
+    fn output_holds_the_view_unless_the_session_asks_to_follow_it() {
+        let mut entry = idle_entry(SessionStyle::default());
+        scrolled_back(&mut entry);
+        SessionEntry::absorb(&mut entry.terminal, entry.scroll_resets, b"six\r\n");
+        assert!(
+            entry.terminal.is_scrolled_back(),
+            "server activity must not move the view by default"
+        );
+
+        let mut following = idle_entry(SessionStyle {
+            reset_scroll_on_server: Some(true),
+            ..SessionStyle::default()
+        });
+        scrolled_back(&mut following);
+        SessionEntry::absorb(&mut following.terminal, following.scroll_resets, b"six\r\n");
+        assert!(
+            !following.terminal.is_scrolled_back(),
+            "the session asked to follow the newest line"
+        );
+    }
+
+    #[test]
+    fn typing_returns_to_the_newest_line_unless_the_session_says_otherwise() {
+        let mut entry = idle_entry(SessionStyle::default());
+        scrolled_back(&mut entry);
+        entry.send(b"x");
+        assert!(
+            !entry.terminal.is_scrolled_back(),
+            "user activity returns to the newest line by default"
+        );
+
+        let mut staying = idle_entry(SessionStyle {
+            reset_scroll_on_user: Some(false),
+            ..SessionStyle::default()
+        });
+        scrolled_back(&mut staying);
+        staying.send(b"x");
+        assert!(
+            staying.terminal.is_scrolled_back(),
+            "the session asked to stay where the user put the view"
+        );
     }
 
     /// Fresh directory under the system temp dir.
