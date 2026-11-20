@@ -162,6 +162,8 @@ const BACK_ARROW_HEAD: f32 = 4.5;
 const BACK_ARROW_WIDTH: f32 = 1.8;
 /// Heading of the chat list.
 const CHAT_LIST_HEADING: &str = "Chats";
+/// Label of the header button that leaves the open chat and starts an empty one.
+const NEW_CHAT_LABEL: &str = "New chat";
 /// What the chat list says when there is nothing to reopen.
 const CHAT_LIST_EMPTY: &str = "No previous chats yet.";
 /// What the pane says while a sub-agent's transcript is on screen.
@@ -3755,44 +3757,68 @@ impl Plugin for AiAgent {
         let busy = self.agent.busy();
 
         // A chat leads with a way back to the list and the chat's own title; the list leads
-        // with its heading. Provider and model live under the composer.
+        // with its heading. Both keep a way into a fresh conversation at the right edge.
+        // Provider and model live under the composer.
         let mut back = false;
-        ui.horizontal(|ui| match self.view {
-            ChatView::Chat => {
-                back = back_button(ui, palette);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(self.title()).size(CHAT_TITLE_TEXT_SIZE),
-                    )
-                    .truncate(),
-                );
-            }
-            ChatView::Subagent(index) => {
-                back = back_button(ui, palette);
-                let (title, state) = match self.agent.subagents.get(index) {
-                    Some(sub) => (sub.title.clone(), sub.state()),
-                    None => (String::new(), SubagentState::Done),
-                };
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("\u{21b3} {title}")).size(CHAT_TITLE_TEXT_SIZE),
-                    )
-                    .truncate(),
-                );
-                ui.label(
-                    egui::RichText::new(state.label())
-                        .size(FOOTER_TEXT_SIZE)
-                        .color(muted),
-                );
-            }
-            ChatView::List => {
-                ui.label(
-                    egui::RichText::new(CHAT_LIST_HEADING)
-                        .size(FOOTER_TEXT_SIZE)
-                        .color(muted),
-                );
-            }
-        });
+        let mut new_chat = false;
+        egui::containers::Sides::new()
+            .height(BACK_BUTTON_SIZE)
+            .shrink_left()
+            .truncate()
+            .show(
+                ui,
+                |ui| match self.view {
+                    ChatView::Chat => {
+                        back = back_button(ui, palette);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(self.title()).size(CHAT_TITLE_TEXT_SIZE),
+                            )
+                            .truncate(),
+                        );
+                    }
+                    ChatView::Subagent(index) => {
+                        back = back_button(ui, palette);
+                        let (title, state) = match self.agent.subagents.get(index) {
+                            Some(sub) => (sub.title.clone(), sub.state()),
+                            None => (String::new(), SubagentState::Done),
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("\u{21b3} {title}"))
+                                    .size(CHAT_TITLE_TEXT_SIZE),
+                            )
+                            .truncate(),
+                        );
+                        ui.label(
+                            egui::RichText::new(state.label())
+                                .size(FOOTER_TEXT_SIZE)
+                                .color(muted),
+                        );
+                    }
+                    ChatView::List => {
+                        ui.label(
+                            egui::RichText::new(CHAT_LIST_HEADING)
+                                .size(FOOTER_TEXT_SIZE)
+                                .color(muted),
+                        );
+                    }
+                },
+                |ui| {
+                    // A sub-agent belongs to the chat that started it, so only the chat and
+                    // the list offer a fresh one. A run in flight keeps its conversation.
+                    new_chat = matches!(self.view, ChatView::Chat | ChatView::List)
+                        && Button::new(NEW_CHAT_LABEL)
+                            .compact()
+                            .ghost()
+                            .enabled(!busy)
+                            .show(ui, palette)
+                            .clicked();
+                },
+            );
+        if new_chat {
+            self.begin_new_chat();
+        }
         if back {
             match self.view {
                 // Back returns to the chat that owns the sub-agent.
@@ -6779,6 +6805,49 @@ mod tests {
             "the prompt starts the new chat: {:?}",
             plugin.agent.turns
         );
+    }
+
+    #[test]
+    fn the_header_starts_a_new_chat_from_the_chat_and_from_the_list() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::User {
+            text: "first question".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.generated_title = Some("First digest".to_owned());
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+
+        // The open chat files itself and starts empty.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let button = rows
+            .iter()
+            .find(|(_, _, text)| text == NEW_CHAT_LABEL)
+            .cloned()
+            .unwrap_or_else(|| panic!("the chat header has no new chat button: {rows:?}"));
+        assert!(
+            button.1 > (WIDE_PANE / 2.0) as i32,
+            "the button belongs at the right edge of the header, not at {}",
+            button.1
+        );
+        frame(&mut plugin, &mut settings, &ctx, click(button));
+        assert_eq!(plugin.view, ChatView::Chat, "the new chat is entered");
+        assert_eq!(plugin.chats.len(), 1, "the chat left behind is filed");
+        assert_eq!(plugin.chats[0].title, "First digest");
+        assert!(plugin.agent.turns.is_empty(), "the new chat starts empty");
+
+        // The list offers the same button, and it enters a fresh chat.
+        frame(&mut plugin, &mut settings, &ctx, click_back());
+        assert_eq!(plugin.view, ChatView::List);
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let button = rows
+            .iter()
+            .find(|(_, _, text)| text == NEW_CHAT_LABEL)
+            .cloned()
+            .unwrap_or_else(|| panic!("the chat list has no new chat button: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(button));
+        assert_eq!(plugin.view, ChatView::Chat, "the list's button enters a chat");
+        assert_eq!(plugin.chats.len(), 1, "an empty conversation is not filed");
     }
 
     #[test]

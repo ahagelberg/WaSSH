@@ -21,6 +21,8 @@
     the button stays on and a second press stops them.
   - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
     back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
+- Give the AI pane a New chat button in the header: on the chat list beside "Chats", and in a chat
+  beside its title. It files the open conversation and starts an empty one.
 - Add two scroll switches to Options → Appearance, each with a per-host override in a host's
   Appearance section: return to the newest line when the host sends output (off by default), and
   when the user types or pastes (on by default).
