@@ -36,7 +36,8 @@
   one is for and what it connects to; a tool answered from a map that has no summaries starts that
   pass and says so, the Graph scope popup gains **Map project**, and the transcript and the model
   are told when it lands. The summaries and links live in the per-host map with the file list, so
-  every chat on the connection answers `env_search` and `env_outline` from them.
+  every chat on the connection answers `env_search` and `env_outline` from them. While the pass
+  runs, that popup says what the agent is doing and, behind **More**, lists the calls it has made.
 
 ### Changed
 

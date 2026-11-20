@@ -102,6 +102,12 @@ feeds>\"]}]}";
 const MAP_SUBAGENT_TITLE: &str = "map the project";
 /// What the transcript says when a mapping pass lands.
 const MAP_READY_NOTICE: &str = "Map ready: {described} files described under {root}.";
+/// Call labels the popup lists while a mapping pass runs.
+const MAP_DETAIL_LINES: usize = 5;
+/// Milliseconds in a second, for a mapping pass's elapsed time.
+const MILLIS_PER_SECOND: u64 = 1_000;
+/// Seconds in a minute, for the same.
+const SECONDS_PER_MINUTE: u64 = 60;
 /// Heading of the host's ports and services in the system prompt.
 const SYSTEM_HEADING: &str = "Host setup (from env_system):";
 /// Transcript note left where the conversation was compacted.
@@ -464,6 +470,8 @@ pub struct AiAgent {
     map_deep_wanted: bool,
     /// The mapping pass running for this pane, until its answer lands.
     map_deep: Option<MapRun>,
+    /// Set by the popup: show what the mapping pass is doing, call by call.
+    map_more: bool,
     /// Which of the pane's two views is drawn.
     view: ChatView,
 }
@@ -474,6 +482,8 @@ struct MapRun {
     subagent: usize,
     /// The tree it is mapping.
     root: String,
+    /// When it started, for the popup's elapsed time.
+    started: u64,
 }
 
 /// The popup a click on a loaded scope's tag opens.
@@ -549,6 +559,7 @@ impl Default for AiAgent {
             map_rebuild: false,
             map_deep_wanted: false,
             map_deep: None,
+            map_more: false,
             view: ChatView::List,
         }
     }
@@ -2231,6 +2242,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let mut rebuild = false;
         let mut deep = false;
         let mut clear = false;
+        let mut more = false;
         let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
@@ -2297,6 +2309,25 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                                 )
                                 .wrap(),
                             );
+                            if self.map_deep.is_some() {
+                                more = Button::new(if self.map_more { "Less" } else { "More" })
+                                    .compact()
+                                    .ghost()
+                                    .show(ui, palette)
+                                    .clicked();
+                                if self.map_more {
+                                    for line in self.map_detail_lines() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(line)
+                                                    .size(10.0)
+                                                    .color(to_color32(palette.text_muted)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                }
+                            }
                             ui.horizontal(|ui| {
                                 rebuild = Button::new("Rebuild")
                                     .compact()
@@ -2329,6 +2360,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         if rebuild {
             self.map_rebuild = true;
+        }
+        if more {
+            self.map_more = !self.map_more;
         }
         if deep {
             // Nothing listed yet means the cheap walk comes first; the description follows.
@@ -2422,6 +2456,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 self.map_deep = Some(MapRun {
                     subagent: index,
                     root,
+                    started: self.agent.now_ms,
                 });
             }
             None => {
@@ -2449,8 +2484,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if self.agent.map_scan.is_some() {
             return "Scanning…".to_owned();
         }
-        if self.map_deep.is_some() {
-            return "Describing the files…".to_owned();
+        if let Some(run) = &self.map_deep {
+            let doing = match self.agent.subagents.get(run.subagent) {
+                Some(sub) => map_activity(sub),
+                None => "finishing".to_owned(),
+            };
+            return format!("Describing {}: {doing}", run.root);
         }
         if self.agent.map.is_empty() {
             return format!(
@@ -2470,6 +2509,42 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             if map.truncated { "capped" } else { "complete" },
             map.age_minutes(self.agent.now_ms)
         )
+    }
+
+    /// What the mapping pass has done so far, newest last, for the popup's detail view.
+    fn map_detail_lines(&self) -> Vec<String> {
+        let Some(run) = &self.map_deep else {
+            return Vec::new();
+        };
+        let Some(sub) = self.agent.subagents.get(run.subagent) else {
+            return Vec::new();
+        };
+        let mut calls = 0;
+        let mut lines = Vec::new();
+        for turn in &sub.agent.turns {
+            if let Turn::Tool {
+                name, label, failed, ..
+            } = turn
+            {
+                calls += 1;
+                let text = if label.is_empty() { name } else { label };
+                lines.push(if *failed {
+                    format!("{text} (failed)")
+                } else {
+                    text.clone()
+                });
+                if lines.len() > MAP_DETAIL_LINES {
+                    lines.remove(0);
+                }
+            }
+        }
+        let count = match calls {
+            1 => "1 call".to_owned(),
+            total => format!("{total} calls"),
+        };
+        let elapsed = elapsed_text(self.agent.now_ms.saturating_sub(run.started));
+        lines.insert(0, format!("{count} in {elapsed}"));
+        lines
     }
 
     /// The tools `scope` holds that this host may call, loaded or not.
@@ -2820,6 +2895,33 @@ fn chat_order(chats: &[StoredChat]) -> Vec<usize> {
     order.sort_by_key(|&index| (chats[index].created, index));
     order.reverse();
     order
+}
+
+/// What a mapping sub-agent is doing now, in one line.
+fn map_activity(sub: &Subagent) -> String {
+    match sub.state() {
+        SubagentState::NeedsAnswer => return "waiting for your answer".to_owned(),
+        SubagentState::Running => {}
+        state => return state.label().to_owned(),
+    }
+    match &sub.agent.phase {
+        Some(Phase::Running { turn, .. }) => match sub.agent.turns.get(*turn) {
+            Some(Turn::Tool { label, .. }) if !label.is_empty() => label.clone(),
+            Some(Turn::Tool { name, .. }) => name.clone(),
+            _ => "running a tool".to_owned(),
+        },
+        Some(Phase::Streaming { .. }) => "writing its answer".to_owned(),
+        _ => "working".to_owned(),
+    }
+}
+
+/// How long something took, as the popup says it.
+fn elapsed_text(ms: u64) -> String {
+    let seconds = ms / MILLIS_PER_SECOND;
+    match seconds / SECONDS_PER_MINUTE {
+        0 => format!("{seconds} s"),
+        minutes => format!("{minutes} min"),
+    }
 }
 
 /// A dropdown that never grows past `width`: a long label is cropped rather than
@@ -4613,6 +4715,8 @@ impl Plugin for AiAgent {
             || self.summary.is_some()
             || self.picking.is_some()
             || self.fetch.is_some()
+            || self.map_deep.is_some()
+            || self.agent.map_scan.is_some()
         {
             context.request_repaint_after(std::time::Duration::ZERO);
         }
@@ -7205,6 +7309,7 @@ mod tests {
         plugin.map_deep = Some(MapRun {
             subagent: index,
             root: "/srv/app".to_owned(),
+            started: 0,
         });
 
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
@@ -7219,6 +7324,89 @@ mod tests {
             plugin.agent.turns
         );
         assert!(plugin.map_deep.is_none(), "the pass is done");
+    }
+
+    #[test]
+    fn the_graph_popup_says_what_the_mapping_agent_is_doing() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
+        let mut plugin = AiAgent::default();
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("host").unwrap());
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("env").unwrap());
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let index = plugin.agent.begin_subagent("map the project", "map it");
+        {
+            let sub = &mut plugin.agent.subagents[index];
+            sub.agent.turns.push(Turn::Tool {
+                name: "run_command".to_owned(),
+                label: "read /srv/app/main.rs".to_owned(),
+                output: String::new(),
+                failed: false,
+            });
+            sub.agent.phase = Some(Phase::Running {
+                call: crate::ai_agent::ApiToolCall {
+                    id: "call-1".to_owned(),
+                    name: "run_command".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                turn: sub.agent.turns.len() - 1,
+                waiting: crate::ai_agent::Waiting::List {
+                    path: "/srv/app".to_owned(),
+                },
+            });
+        }
+        plugin.map_deep = Some(MapRun {
+            subagent: index,
+            root: "/srv/app".to_owned(),
+            started: plugin.agent.now_ms,
+        });
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let tag = rows
+            .iter()
+            .find(|(_, _, text)| text == GRAPH_SCOPE_LABEL)
+            .cloned()
+            .expect("the Graph scope has a tag");
+        frame(&mut plugin, &mut settings, &ctx, click(tag));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter()
+                .any(|(_, _, text)| text.contains("main.rs") && text.contains("Describing")),
+            "the popup says what the mapping agent is doing: {rows:?}"
+        );
+        let more = rows
+            .iter()
+            .find(|(_, _, text)| text == "More")
+            .cloned()
+            .expect("a running pass offers more about itself");
+        frame(&mut plugin, &mut settings, &ctx, click(more));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter()
+                .any(|(_, _, text)| text.starts_with("1 call in")),
+            "the popup counts the calls the pass made: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, _, text)| text == "read /srv/app/main.rs"),
+            "the popup lists the calls themselves: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, _, text)| text == "Less"),
+            "the detail view can be closed again: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_mapping_pass_says_how_long_it_has_been_running() {
+        assert_eq!(elapsed_text(0), "0 s");
+        assert_eq!(elapsed_text(9_500), "9 s");
+        assert_eq!(elapsed_text(90_000), "1 min");
     }
 
     #[test]
