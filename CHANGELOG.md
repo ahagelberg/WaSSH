@@ -56,6 +56,8 @@
   lists them as their own rows, each with its own Edit and ✕, and they go out one at a time in the
   order they were written. The queue belongs to the conversation it was written in and is dropped
   when another chat opens.
+- Cut a prompt bubble at 200 points of text: a pasted log no longer fills the transcript, and a
+  **Show all** line under the bubble opens the rest (and **Show less** folds it back).
 
 ### Fixed
 

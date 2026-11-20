@@ -143,6 +143,8 @@ const MIN_COMPOSER_WIDTH: f32 = 80.0;
 const TURN_GAP: f32 = 8.0;
 /// Share of the pane a chat message may take.
 const MESSAGE_BUBBLE_SHARE: f32 = 0.92;
+/// Height a prompt bubble reaches before its text is cut, with the way to open the rest.
+const PROMPT_BUBBLE_MAX_HEIGHT: f32 = 200.0;
 /// Transparency of the context tags on the accent-filled user bubble.
 const USER_BUBBLE_TAG_ALPHA: u8 = 200;
 /// Lines the prompt editor opens with at least.
@@ -427,6 +429,8 @@ pub struct AiAgent {
     composer_id: egui::Id,
     /// Messages typed while a run was in flight, sent one at a time as it ends.
     queued: Vec<Queued>,
+    /// Turns whose prompt bubble shows its whole text rather than the cut preview.
+    expanded_prompts: std::collections::BTreeSet<usize>,
     /// Files attached to the next message.
     attachments: Vec<Attachment>,
     /// Whether the next message carries the recent terminal output.
@@ -554,6 +558,7 @@ impl Default for AiAgent {
             draft: String::new(),
             composer_id: egui::Id::unique("ai-agent-composer"),
             queued: Vec::new(),
+            expanded_prompts: std::collections::BTreeSet::new(),
             attachments: Vec::new(),
             attach_terminal: false,
             picking: None,
@@ -758,6 +763,7 @@ impl AiAgent {
         self.questions = QuestionWizard::default();
         self.editing = None;
         self.queued.clear();
+        self.expanded_prompts.clear();
         self.parsed_sub.clear();
     }
 
@@ -805,6 +811,7 @@ impl AiAgent {
         self.error = None;
         self.editing = None;
         self.queued.clear();
+        self.expanded_prompts.clear();
         self.view = ChatView::Chat;
     }
 
@@ -2033,6 +2040,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         let mut open = None;
         let mut edit_action = EditAction::None;
+        let mut prompt_toggle = None;
         let editing = interactive
             .then(|| self.editing.as_ref().map(|edit| edit.index))
             .flatten();
@@ -2053,9 +2061,19 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                     {
                         edit_action = prompt_editor(ui, palette, edit);
                     } else {
-                        let reply = user_bubble(ui, palette, self.blocks(source, index), *meta);
+                        let reply = user_bubble(
+                            ui,
+                            palette,
+                            self.blocks(source, index),
+                            *meta,
+                            self.expanded_prompts.contains(&index),
+                            ("prompt", index),
+                        );
                         if reply.clicked {
                             open = Some(index);
+                        }
+                        if reply.toggle {
+                            prompt_toggle = Some(index);
                         }
                         bubbles.push((index, reply.rect));
                     }
@@ -2198,9 +2216,19 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 COPY_FEEDBACK_MS,
             ));
         }
+        if let Some(index) = prompt_toggle {
+            self.toggle_prompt(index);
+        }
         TranscriptReply {
             bubbles,
             submitted,
+        }
+    }
+
+    /// Show a prompt bubble whole, or cut it back to its preview.
+    fn toggle_prompt(&mut self, index: usize) {
+        if !self.expanded_prompts.remove(&index) {
+            self.expanded_prompts.insert(index);
         }
     }
 
@@ -2257,6 +2285,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.attachments.clear();
         self.attach_terminal = false;
         self.queued.clear();
+        self.expanded_prompts.clear();
         // The files and terminal tail the first version carried are not in the transcript,
         // so the edited prompt goes out as written.
         self.send_message(text, UserMeta::default(), settings, host, environment);
@@ -2740,18 +2769,26 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         pinned.set_clip_rect(viewport);
-        let clicked = egui::Frame::new()
+        let reply = egui::Frame::new()
             .fill(to_color32(palette.bg_panel))
             .show(&mut pinned, |ui| {
                 // The backdrop spans the whole transcript, so nothing shows beside the
                 // pinned bubble where it scrolls underneath.
                 ui.set_min_width(ui.available_width());
-                user_bubble(ui, palette, &self.parsed[*index].blocks, *meta).clicked
+                user_bubble(
+                    ui,
+                    palette,
+                    &self.parsed[*index].blocks,
+                    *meta,
+                    self.expanded_prompts.contains(index),
+                    ("prompt-pinned", *index),
+                )
             })
             .inner;
         Some(PinnedBubble {
             index: *index,
-            clicked,
+            clicked: reply.clicked,
+            toggle: reply.toggle,
         })
     }
 }
@@ -3065,6 +3102,8 @@ fn cropped_select<T: Clone + PartialEq>(
 struct BubbleReply {
     /// The bubble was clicked, asking to edit the prompt.
     clicked: bool,
+    /// The bubble asked for its whole text, or for the cut one back.
+    toggle: bool,
     /// Where the bubble landed on screen.
     rect: egui::Rect,
 }
@@ -3075,6 +3114,8 @@ struct PinnedBubble {
     index: usize,
     /// The pinned copy was clicked, asking to edit the prompt.
     clicked: bool,
+    /// The pinned copy asked for its whole text, or for the cut one back.
+    toggle: bool,
 }
 
 /// What the transcript reports after a frame: where each prompt landed, and the edited
@@ -3160,11 +3201,23 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
 
 /// A user message: a bubble against the right edge, filled with the accent like a primary
 /// button and carrying white ink. Clicking it opens the prompt for editing.
-fn user_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block], meta: UserMeta) -> BubbleReply {
+///
+/// A prompt taller than [`PROMPT_BUBBLE_MAX_HEIGHT`] is cut there, with a line under it that
+/// opens the rest, so one long paste does not fill the transcript.
+fn user_bubble(
+    ui: &mut Ui,
+    palette: &Palette,
+    blocks: &[Block],
+    meta: UserMeta,
+    open: bool,
+    key: (&'static str, usize),
+) -> BubbleReply {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
+    let mut toggle = false;
+    let mut cut = false;
     let response = ui
-        .with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            egui::Frame::new()
+        .with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            let response = egui::Frame::new()
                 .fill(to_color32(palette.accent))
                 .corner_radius(wassh_core::RADIUS)
                 .inner_margin(egui::Margin::symmetric(8, 6))
@@ -3191,18 +3244,54 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block], meta: UserMeta)
                                     .color(egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA)),
                             );
                         }
-                        super::markdown::draw(ui, Ink::on_accent(), blocks);
+                        let mut prompt = egui::ScrollArea::vertical()
+                            // Every bubble has its own area: two user messages in one
+                            // transcript, and the pinned copy of the last one, share a
+                            // parent, so a shared id would be reported as a clash.
+                            .id_salt(key)
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .scroll_source(
+                                egui::containers::scroll_area::ScrollSource::SCROLL_BAR,
+                            );
+                        if !open {
+                            prompt = prompt.max_height(PROMPT_BUBBLE_MAX_HEIGHT);
+                        }
+                        let shown = prompt.show(ui, |ui| {
+                            super::markdown::draw(ui, Ink::on_accent(), blocks);
+                        });
+                        cut = !open && shown.content_size.y > shown.inner_rect.height() + 1.0;
                     });
                 })
-                .response
+                .response;
+            // Under the bubble rather than inside it: a click there must not count as the
+            // click that opens the prompt for editing.
+            if cut || open {
+                let label = if open { "Show less" } else { "Show all" };
+                toggle = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .size(9.5)
+                                .color(to_color32(palette.text_muted)),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked();
+            }
+            response
         })
         .inner;
     BubbleReply {
-        clicked: response
-            .interact(egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Click to edit this message")
-            .clicked(),
+        clicked: !toggle
+            && response
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Click to edit this message")
+                .clicked(),
+        toggle,
         rect: response.rect,
     }
 }
@@ -4677,9 +4766,12 @@ impl Plugin for AiAgent {
                 && self.editing.is_none()
                 && let Some(pinned) =
                     self.pinned_bubble(ui, palette, scroll.inner_rect, &reply.bubbles)
-                && pinned.clicked
             {
-                self.edit_prompt(pinned.index);
+                if pinned.clicked {
+                    self.edit_prompt(pinned.index);
+                } else if pinned.toggle {
+                    self.toggle_prompt(pinned.index);
+                }
             }
         }
         if let Some((index, text)) = reply.submitted {
@@ -6435,6 +6527,8 @@ mod tests {
                         attachments: 0,
                         terminal: true,
                     },
+                    false,
+                    ("prompt", 0),
                 );
             });
             let shapes = std::mem::take(&mut output.shapes);
@@ -6490,6 +6584,8 @@ mod tests {
                             &palette,
                             &crate::ai_agent::markdown::blocks(&prompt),
                             UserMeta::default(),
+                            false,
+                            ("prompt", 1),
                         );
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
                             failed: false, running: false, turn_index: 0, collapsed: false, copied: None,
@@ -6643,6 +6739,8 @@ mod tests {
                 &palette,
                 &crate::ai_agent::markdown::blocks("hello"),
                 UserMeta::default(),
+                false,
+                ("prompt", 0),
             );
         });
         let mut fill = None;
@@ -7547,6 +7645,30 @@ mod tests {
     }
 
     #[test]
+    fn two_prompts_do_not_share_one_scroll_area() {
+        // egui paints "Second use of ScrollArea ID …" over the pane in red when two areas end
+        // up with one id, which is what a pinned copy of a prompt used to run into.
+        let mut plugin = AiAgent::default();
+        for text in ["first question", "second question"] {
+            plugin.agent.turns.push(Turn::User {
+                text: text.to_owned(),
+                meta: UserMeta::default(),
+            });
+            plugin.agent.turns.push(Turn::Assistant {
+                text: "an answer".to_owned(),
+                stopped: false,
+            });
+        }
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            !rows.iter().any(|(_, _, text)| text.contains("use of")),
+            "the pane paints an id clash: {rows:?}"
+        );
+    }
+
+    #[test]
     fn a_mapping_pass_says_how_long_it_has_been_running() {
         assert_eq!(elapsed_text(0), "0 s");
         assert_eq!(elapsed_text(9_500), "9 s");
@@ -8317,6 +8439,80 @@ mod tests {
                 modifiers: alt,
             },
         ]
+    }
+
+    #[test]
+    fn a_long_prompt_is_cut_until_it_is_opened() {
+        let mut plugin = AiAgent::default();
+        let long = (0..60)
+            .map(|line| format!("line {line} of a pasted log"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        plugin.agent.turns.push(Turn::User {
+            text: long,
+            meta: UserMeta::default(),
+        });
+        let cut = prompt_bubble_height(&mut plugin);
+        assert!(
+            cut <= PROMPT_BUBBLE_MAX_HEIGHT + PROMPT_BUBBLE_SLACK,
+            "the prompt bubble took {cut} points"
+        );
+
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let show = rows
+            .iter()
+            .find(|(_, _, text)| text == "Show all")
+            .cloned()
+            .expect("a cut prompt offers the rest");
+        frame(&mut plugin, &mut settings, &ctx, click(show));
+        assert!(
+            plugin.editing.is_none(),
+            "opening the rest must not open the editor"
+        );
+        assert!(plugin.expanded_prompts.contains(&0), "the prompt opens");
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter().any(|(_, _, text)| text == "Show less"),
+            "the open prompt offers the cut back: {rows:?}"
+        );
+        let open = prompt_bubble_height(&mut plugin);
+        assert!(
+            open > cut + PROMPT_BUBBLE_SLACK,
+            "the open bubble is not taller: {cut} -> {open}"
+        );
+    }
+
+    /// Points a prompt bubble may add around its cut text: margins and the toggle line.
+    const PROMPT_BUBBLE_SLACK: f32 = 40.0;
+
+    /// Height of the accent-filled prompt bubble the transcript draws.
+    fn prompt_bubble_height(plugin: &mut AiAgent) -> f32 {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 600.0),
+            )),
+            ..Default::default()
+        };
+        let muted = to_color32(palette.text_muted);
+        let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            plugin.transcript(ui, &palette, muted, &mut session, TranscriptSource::Main);
+        });
+        let mut height: f32 = 0.0;
+        for clipped in std::mem::take(&mut output.shapes) {
+            if let egui::Shape::Rect(rect) = clipped.shape
+                && rect.fill == to_color32(palette.accent)
+            {
+                height = height.max(rect.rect.height());
+            }
+        }
+        output.drop_without_applying_deltas();
+        height
     }
 
     /// The settings of a pane with one OpenAI-compatible provider that never answers.
