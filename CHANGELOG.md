@@ -21,6 +21,9 @@
     the button stays on and a second press stops them.
   - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
     back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
+- Keep every glyph on its column: a run whose glyphs do not add up to the cells it covers is now
+  placed one cell at a time, so a double-width character from a face without one no longer pulls
+  the rest of the line short, and a tab cell no longer expands in the middle of a run.
 
 ### Fixed
 

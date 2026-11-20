@@ -12,6 +12,10 @@ use crate::fonts;
 /// Glyphs measured to derive one cell's width.
 const CELL_PROBE: &str = "MMMMMMMMMM";
 
+/// How far a run's glyphs may drift from the cells it covers, as a share of one cell,
+/// before every cell of the run is placed on its own.
+const CELL_DRIFT_SHARE: f32 = 0.05;
+
 /// Converts the palette colour type to egui's.
 pub fn to_color32(color: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
@@ -179,7 +183,10 @@ impl TerminalView {
                     if let Some(cell) = snapshot.cell(row, run_column)
                         && !cell.style.wide_spacer
                     {
-                        text.push(cell.ch);
+                        // A control character has no glyph of its own: a tab's columns are
+                        // the blanks the grid already holds, and its own glyph would move
+                        // the rest of the run.
+                        text.push(if cell.ch.is_control() { ' ' } else { cell.ch });
                     }
                 }
                 if !text.trim().is_empty() {
@@ -188,13 +195,31 @@ impl TerminalView {
                     } else {
                         to_color32(style.fg)
                     };
-                    painter.text(
-                        egui::pos2(x, y),
-                        Align2::LEFT_TOP,
-                        &*text,
-                        font.clone(),
-                        color,
-                    );
+                    let start = egui::pos2(x, y);
+                    let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+                    if (galley.size().x - width).abs() > cell_w * CELL_DRIFT_SHARE {
+                        // A glyph the face draws wider or narrower than its cells — a
+                        // double-width character from a face without one, a fallback face's
+                        // advance — would carry every later glyph of the run off its column.
+                        // Place such a run one cell at a time.
+                        for run_column in col..end {
+                            let Some(cell) = snapshot.cell(row, run_column) else {
+                                break;
+                            };
+                            if cell.style.wide_spacer || cell.ch == ' ' || cell.ch.is_control() {
+                                continue;
+                            }
+                            painter.text(
+                                egui::pos2(origin_x + run_column as f32 * cell_w, y),
+                                Align2::LEFT_TOP,
+                                cell.ch,
+                                font.clone(),
+                                color,
+                            );
+                        }
+                    } else {
+                        painter.galley(start, galley, color);
+                    }
                 }
 
                 if style.underline {
@@ -335,6 +360,86 @@ mod tests {
             (cell - advance).abs() < 0.05,
             "the grid cell is {cell} but the glyphs advance by {advance}"
         );
+    }
+
+    /// Every text one frame of `snapshot` painted, with where it starts, and one cell's width.
+    fn painted(snapshot: &ScreenSnapshot) -> (Vec<(f32, String)>, f32) {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(f32, String)>) {
+            match shape {
+                egui::Shape::Text(text) => texts.push((text.pos.x, text.galley.text().to_owned())),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let view = TerminalView::default();
+        let palette = Palette::for_mode(wassh_core::ThemeMode::Dark);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut texts = Vec::new();
+        let mut cell = 0.0;
+        let output = ctx.run_ui(input, |ui| {
+            view.show(ui, snapshot, &palette);
+            cell = view.cell_size(ui).0;
+        });
+        for painted in &output.shapes {
+            collect(&painted.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+        (texts, cell)
+    }
+
+    /// A one-row screen of `cols` columns holding `bytes`.
+    fn snapshot_of(cols: u16, bytes: &[u8]) -> ScreenSnapshot {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let palette = Palette::for_mode(wassh_core::ThemeMode::Dark);
+        let mut term = wassh_term::Terminal::new(TerminalSize::new(cols, 2), 10, tx, &palette);
+        term.feed(bytes);
+        term.snapshot()
+    }
+
+    #[test]
+    fn a_tab_keeps_the_glyph_after_it_on_its_column() {
+        let (texts, _) = painted(&snapshot_of(20, b"a\tb\r\n"));
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        let (x, text) = &texts[0];
+        assert_eq!(*x, TerminalView::default().padding);
+        assert_eq!(
+            text.chars().nth(8),
+            Some('b'),
+            "the tab's columns are blanks, so the next glyph sits on column 8: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_double_width_character_does_not_move_the_rest_of_the_run() {
+        let (texts, cell) = painted(&snapshot_of(20, "a\u{6f22}b\r\n".as_bytes()));
+        let after = texts
+            .iter()
+            .find(|(_, text)| text.starts_with('b'))
+            .unwrap_or_else(|| panic!("the glyph after the wide character is missing: {texts:?}"));
+        assert_eq!(
+            after.0,
+            TerminalView::default().padding + 3.0 * cell,
+            "a wide character holds two columns, so its neighbour keeps column 3: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_run_is_drawn_in_one_piece() {
+        let (texts, _) = painted(&snapshot_of(20, b"hello\r\n"));
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].1.starts_with("hello"), "{texts:?}");
     }
 
     #[test]
