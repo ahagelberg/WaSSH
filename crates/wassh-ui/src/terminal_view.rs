@@ -309,13 +309,13 @@ mod tests {
 
     /// Installs `family` into `ctx` as a named family, the way the app registers it.
     fn install_family(ctx: &egui::Context, family: &str) {
-        let face = fonts::face_for(family).expect("the family is installed on this host");
+        let face = fonts::face_for(family).expect("the family is offered");
         let mut definitions = egui::FontDefinitions::default();
         let key = format!("term:{family}");
         definitions.font_data.insert(
             key.clone(),
             std::sync::Arc::new(egui::FontData::from_owned(
-                std::fs::read(&face.path).expect("read the face"),
+                face.bytes().expect("read the face"),
             )),
         );
         let mut chain = vec![key];
@@ -337,7 +337,7 @@ mod tests {
         // Only a host that has a second monospace face can tell the fallback from the real
         // one, and a session opens before its family is in the atlas: the first frame
         // measures egui's face, the next draws the family's glyphs.
-        let faces = fonts::installed();
+        let faces = fonts::offered();
         let Some(other) = faces
             .iter()
             .find(|family| family.to_lowercase().contains("consolas"))
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn the_cell_follows_the_family_the_session_names() {
         // Only a host that has a second monospace face can tell the two apart.
-        let faces = fonts::installed();
+        let faces = fonts::offered();
         let Some(other) = faces
             .iter()
             .find(|family| family.to_lowercase().contains("consolas"))
@@ -458,6 +458,18 @@ mod tests {
             cell_of(&ctx, other),
             cell_of(&ctx, ""),
             "{other} measures like egui's own face, so the setting is not in use"
+        );
+    }
+
+    #[test]
+    fn a_family_the_app_ships_reaches_the_atlas_without_being_installed() {
+        let ctx = egui::Context::default();
+        let family = "JetBrains Mono";
+        fonts::ensure(&ctx, &[family.to_owned()]);
+        assert_ne!(
+            cell_of(&ctx, family),
+            cell_of(&ctx, ""),
+            "{family} measures like egui's own face, so the shipped file is not in use"
         );
     }
 

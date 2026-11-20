@@ -7,8 +7,10 @@
 //!
 //! The terminal's monospace face is chosen in the settings, so the families the settings
 //! name are registered as named families and the terminal asks for the one it was given.
-//! Only families whose characters share one advance are offered, and each is drawn from the
-//! file of its regular style, never from whichever bold or italic file the scan met first.
+//! Families shipped with the app come first, so the list does not depend on what the host
+//! happens to have installed — the default family is one of them. Only families whose
+//! characters share one advance are offered, and each is drawn from the file of its regular
+//! style, never from whichever bold or italic file the scan met first.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -73,15 +75,78 @@ const UI_FACES: &[&str] = &[
     "ubuntu",
 ];
 
+/// The regular face of a family the app draws terminal text with, whatever the host has.
+struct Bundled {
+    /// Family name the settings store.
+    family: &'static str,
+    /// The family's regular file, compiled in.
+    bytes: &'static [u8],
+}
+
+/// Monospace families shipped with the app, each with its licence beside it in `assets`.
+const BUNDLED: &[Bundled] = &[
+    Bundled {
+        family: "Cascadia Mono",
+        bytes: include_bytes!("../assets/fonts/cascadia-mono/CascadiaMono.ttf"),
+    },
+    Bundled {
+        family: "Fira Code",
+        bytes: include_bytes!("../assets/fonts/fira-code/FiraCode-Regular.ttf"),
+    },
+    Bundled {
+        family: "Hack",
+        bytes: include_bytes!("../assets/fonts/hack/Hack-Regular.ttf"),
+    },
+    Bundled {
+        family: "IBM Plex Mono",
+        bytes: include_bytes!("../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"),
+    },
+    Bundled {
+        family: "JetBrains Mono",
+        bytes: include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
+    },
+    Bundled {
+        family: "Source Code Pro",
+        bytes: include_bytes!("../assets/fonts/source-code-pro/SourceCodePro-Regular.ttf"),
+    },
+];
+
+/// Where a family's regular file comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A file the host has installed.
+    File(PathBuf),
+    /// A face compiled into the app.
+    Bundled(&'static [u8]),
+}
+
 /// One font file a family can be drawn from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Face {
     /// Family the file calls itself.
     pub family: String,
-    /// Where it lives.
-    pub path: PathBuf,
+    /// Where its bytes are.
+    pub source: Source,
     /// Draws every character at one advance, so a grid of cells can be built from it.
     pub monospace: bool,
+}
+
+impl Face {
+    /// The file, when the host is where it lives.
+    fn path(&self) -> Option<&Path> {
+        match &self.source {
+            Source::File(path) => Some(path),
+            Source::Bundled(_) => None,
+        }
+    }
+
+    /// The bytes the family is drawn from.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        match &self.source {
+            Source::File(path) => std::fs::read(path).ok(),
+            Source::Bundled(bytes) => Some(bytes.to_vec()),
+        }
+    }
 }
 
 /// Where a file stands among the files of its family; lower is the one a grid is drawn in.
@@ -197,8 +262,9 @@ fn style_rank(file: &mut FontFile) -> StyleRank {
     StyleRank::of(mac_style, weight)
 }
 
-/// Every installed family a terminal grid can be drawn in, sorted, for a settings dropdown.
-pub fn installed() -> Vec<String> {
+/// Every family a terminal grid can be drawn in — the ones shipped with the app and the ones
+/// the host has — sorted, for a settings dropdown.
+pub fn offered() -> Vec<String> {
     faces()
         .iter()
         .filter(|face| face.monospace)
@@ -215,7 +281,7 @@ pub fn face_for(family: &str) -> Option<&'static Face> {
 
 /// The family to draw terminal text with.
 ///
-/// A name the host does not have falls back to egui's own monospace rather than leaving the
+/// A name no family answers to falls back to egui's own monospace rather than leaving the
 /// terminal blank.
 pub fn terminal_family(family: &str) -> FontFamily {
     if family.trim().is_empty() || face_for(family).is_none() {
@@ -265,13 +331,15 @@ pub fn ensure(ctx: &egui::Context, mono: &[String]) {
         let Some(face) = face_for(family) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&face.path) else {
-            continue;
+        let data = match &face.source {
+            Source::Bundled(bytes) => FontData::from_static(bytes),
+            Source::File(path) => match std::fs::read(path) {
+                Ok(bytes) => FontData::from_owned(bytes),
+                Err(_) => continue,
+            },
         };
         let key = format!("term:{family}");
-        fonts
-            .font_data
-            .insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+        fonts.font_data.insert(key.clone(), Arc::new(data));
         let mut chain = vec![key];
         chain.extend(fallback.iter().cloned());
         fonts
@@ -287,12 +355,13 @@ fn system_ui_face() -> Option<(String, Vec<u8>)> {
     static CACHE: OnceLock<Option<(String, Vec<u8>)>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let face = faces()
+            let path = faces()
                 .iter()
-                .filter(|face| is_ui_candidate(&face.path))
-                .min_by_key(|face| ui_rank(&face.path))?;
-            let key = stem(&face.path).unwrap_or_else(|| "system-ui".to_owned());
-            Some((key, std::fs::read(&face.path).ok()?))
+                .filter_map(|face| face.path())
+                .filter(|path| is_ui_candidate(path))
+                .min_by_key(|path| ui_rank(path))?;
+            let key = stem(path).unwrap_or_else(|| "system-ui".to_owned());
+            Some((key, std::fs::read(path).ok()?))
         })
         .clone()
 }
@@ -317,10 +386,19 @@ fn stem(path: &Path) -> Option<String> {
         .map(|stem| stem.to_string_lossy().to_lowercase())
 }
 
-/// Every family the platform offers, once, drawn from the file of its regular style.
+/// Every family the terminal can be drawn in: the ones shipped with the app first, then the
+/// platform's, each drawn from the file of its regular style.
 fn faces() -> &'static [Face] {
     static FACES: OnceLock<Vec<Face>> = OnceLock::new();
     FACES.get_or_init(|| {
+        let mut shipped: Vec<Face> = BUNDLED
+            .iter()
+            .map(|bundled| Face {
+                family: bundled.family.to_owned(),
+                source: Source::Bundled(bundled.bytes),
+                monospace: true,
+            })
+            .collect();
         let mut found = Vec::new();
         for dir in FONT_DIRS {
             collect(Path::new(dir), &mut found);
@@ -332,10 +410,23 @@ fn faces() -> &'static [Face] {
                 .to_lowercase()
                 .cmp(&right.family.to_lowercase())
                 .then(left_style.cmp(right_style))
-                .then(left.path.cmp(&right.path))
+                .then(left.path().cmp(&right.path()))
         });
         found.dedup_by(|left, right| left.0.family.eq_ignore_ascii_case(&right.0.family));
-        found.into_iter().map(|(face, _)| face).collect()
+        // A shipped family answers for its name even where the host has its own copy, so the
+        // terminal is drawn the same on every machine.
+        let system: Vec<Face> = found
+            .into_iter()
+            .map(|(face, _)| face)
+            .filter(|face| {
+                !shipped
+                    .iter()
+                    .any(|known| known.family.eq_ignore_ascii_case(&face.family))
+            })
+            .collect();
+        shipped.extend(system);
+        shipped.sort_by_key(|face| face.family.to_lowercase());
+        shipped
     })
 }
 
@@ -366,7 +457,7 @@ fn collect(dir: &Path, faces: &mut Vec<(Face, StyleRank)>) {
         faces.push((
             Face {
                 family: info.family,
-                path,
+                source: Source::File(path),
                 monospace: info.monospace,
             },
             info.style,
@@ -475,7 +566,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn the_platform_offers_families_to_choose_from() {
-        let families = installed();
+        let families = offered();
         assert!(families.len() > 5, "only {} families found", families.len());
         assert!(face_for("Segoe UI").is_some(), "{families:?}");
         assert!(
@@ -487,7 +578,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn only_monospaced_families_are_offered() {
-        let families = installed();
+        let families = offered();
         let Some(face) = face_for("Courier New") else {
             return;
         };
@@ -509,17 +600,17 @@ mod tests {
     #[test]
     fn a_family_is_drawn_from_its_regular_file() {
         let regular = StyleRank::of(0, REGULAR_WEIGHT);
-        let Some(face) = face_for("Consolas") else {
+        let Some(path) = face_for("Consolas").and_then(Face::path) else {
             return;
         };
         assert_eq!(
-            FaceInfo::read(&face.path).expect("the chosen face").style,
+            FaceInfo::read(path).expect("the chosen face").style,
             regular,
             "{} is not the family's regular file",
-            face.path.display()
+            path.display()
         );
         // The host really ships the other styles under the same family name.
-        let italic = face.path.with_file_name("consolai.ttf");
+        let italic = path.with_file_name("consolai.ttf");
         if italic.exists() {
             let style = FaceInfo::read(&italic).expect("the italic face").style;
             assert!(style > regular, "{style:?} ranks with the regular file");
@@ -527,7 +618,58 @@ mod tests {
     }
 
     #[test]
-    fn a_family_the_host_lacks_falls_back_to_egui_monospace() {
+    fn the_families_shipped_with_the_app_are_offered() {
+        let families = offered();
+        for bundled in BUNDLED {
+            assert!(
+                families.iter().any(|family| family == bundled.family),
+                "{} is not offered: {families:?}",
+                bundled.family
+            );
+            assert_eq!(
+                terminal_family(bundled.family),
+                FontFamily::Name(Arc::from(bundled.family)),
+                "{} does not resolve to a family of its own",
+                bundled.family
+            );
+        }
+        let mut sorted = families.clone();
+        sorted.sort_by_key(|family| family.to_lowercase());
+        sorted.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        assert_eq!(
+            sorted.len(),
+            families.len(),
+            "a family is offered twice: {families:?}"
+        );
+    }
+
+    #[test]
+    fn a_shipped_face_is_the_regular_monospaced_file() {
+        let dir = std::env::temp_dir().join(format!("wassh-bundled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        for bundled in BUNDLED {
+            let path = dir.join(format!("{}.ttf", bundled.family.replace(' ', "-")));
+            std::fs::write(&path, bundled.bytes).expect("write");
+            let info = FaceInfo::read(&path)
+                .unwrap_or_else(|| panic!("{} does not parse", bundled.family));
+            assert_eq!(info.family, bundled.family, "the manifest names another family");
+            assert!(
+                info.monospace,
+                "{} is not drawn in one advance",
+                bundled.family
+            );
+            assert_eq!(
+                info.style,
+                StyleRank::of(0, REGULAR_WEIGHT),
+                "{} is not its regular file",
+                bundled.family
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_family_no_one_has_falls_back_to_egui_monospace() {
         assert_eq!(
             terminal_family("no-such-font-anywhere"),
             FontFamily::Monospace

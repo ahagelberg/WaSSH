@@ -3430,14 +3430,15 @@ fn defaultable_row(
     toggle
 }
 
-/// A dropdown of the monospaced fonts this computer has, for the terminal's family.
+/// A dropdown of the monospaced fonts the app ships and this computer has, for the
+/// terminal's family.
 ///
-/// The current value stays in the list even when the host does not have it, so a setting
-/// carried from another machine still shows what it asked for instead of silently changing.
+/// The current value stays in the list even when it is not offered, so a setting carried
+/// from another machine still shows what it asked for instead of silently changing.
 fn font_family_select(ui: &mut Ui, id: &str, family: &mut String) {
-    let installed = wassh_ui::fonts::installed();
+    let offered = wassh_ui::fonts::offered();
     let current = family.clone();
-    let mut options: Vec<&str> = installed.iter().map(String::as_str).collect();
+    let mut options: Vec<&str> = offered.iter().map(String::as_str).collect();
     if !options.iter().any(|name| name.eq_ignore_ascii_case(&current)) {
         options.insert(0, current.as_str());
     }

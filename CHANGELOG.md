@@ -38,6 +38,10 @@
   are told when it lands. The summaries and links live in the per-host map with the file list, so
   every chat on the connection answers `env_search` and `env_outline` from them. While the pass
   runs, that popup says what the agent is doing and, behind **More**, lists the calls it has made.
+- Ship six monospace families with the app — Cascadia Mono, Fira Code, Hack, IBM Plex Mono,
+  JetBrains Mono and Source Code Pro — and offer them in the terminal's font list beside the ones
+  the computer has, so the terminal looks the same on a machine with no programming font installed.
+  The default family is one of them, and each font ships with its licence.
 
 ### Changed
 
