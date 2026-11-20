@@ -52,6 +52,10 @@
 - Name an AI chat by the model's digest of its first prompt instead of the first line of that
   prompt. A chat filed before its digest arrives keeps the request and takes the name when it
   lands, and a title the pane had taken from the prompt is asked for again.
+- Queue several messages instead of one: Alt+Enter holds each behind the run in flight, the composer
+  lists them as their own rows, each with its own Edit and ✕, and they go out one at a time in the
+  order they were written. The queue belongs to the conversation it was written in and is dropped
+  when another chat opens.
 
 ### Fixed
 

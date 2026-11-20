@@ -425,8 +425,8 @@ pub struct AiAgent {
     draft: String,
     /// Stable identity so conditional prompt cards cannot unset composer focus.
     composer_id: egui::Id,
-    /// A message typed while a run was in flight, sent when it ends.
-    queued: Option<Queued>,
+    /// Messages typed while a run was in flight, sent one at a time as it ends.
+    queued: Vec<Queued>,
     /// Files attached to the next message.
     attachments: Vec<Attachment>,
     /// Whether the next message carries the recent terminal output.
@@ -553,7 +553,7 @@ impl Default for AiAgent {
             keys: std::collections::BTreeMap::new(),
             draft: String::new(),
             composer_id: egui::Id::unique("ai-agent-composer"),
-            queued: None,
+            queued: Vec::new(),
             attachments: Vec::new(),
             attach_terminal: false,
             picking: None,
@@ -757,6 +757,7 @@ impl AiAgent {
         self.created = self.agent.now_ms;
         self.questions = QuestionWizard::default();
         self.editing = None;
+        self.queued.clear();
         self.parsed_sub.clear();
     }
 
@@ -803,6 +804,7 @@ impl AiAgent {
         self.attachments.clear();
         self.error = None;
         self.editing = None;
+        self.queued.clear();
         self.view = ChatView::Chat;
     }
 
@@ -1771,7 +1773,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if self.summary.is_some()
             || self.agent.blocked()
             || self.agent.needs_reply
-            || self.queued.is_some()
+            || !self.queued.is_empty()
             || !settings
                 .get(SETTING_AUTO_COMPACT)
                 .and_then(Value::as_bool)
@@ -2254,7 +2256,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.draft.clear();
         self.attachments.clear();
         self.attach_terminal = false;
-        self.queued = None;
+        self.queued.clear();
         // The files and terminal tail the first version carried are not in the transcript,
         // so the edited prompt goes out as written.
         self.send_message(text, UserMeta::default(), settings, host, environment);
@@ -3019,6 +3021,15 @@ fn map_activity(sub: &Subagent) -> String {
         Some(Phase::Streaming { .. }) => "writing its answer".to_owned(),
         _ => "working".to_owned(),
     }
+}
+
+/// The head of a queued message, as its row in the composer shows it.
+fn queue_preview(text: &str) -> String {
+    if text.chars().count() <= QUEUE_PREVIEW_MAX_CHARS {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(QUEUE_PREVIEW_MAX_CHARS).collect();
+    format!("{head}…")
 }
 
 /// How long something took, as the popup says it.
@@ -4160,10 +4171,12 @@ impl Plugin for AiAgent {
                 self.agent.start(request);
             }
         }
-        // A queued follow-up goes out as soon as the run in front of it ends.
+        // A queued follow-up goes out as soon as the run in front of it ends; the rest of
+        // the queue waits its turn behind it.
         if !self.agent.blocked()
-            && let Some(queued) = self.queued.take()
+            && !self.queued.is_empty()
         {
+            let queued = self.queued.remove(0);
             match self.ready() {
                 Ok(()) => {
                     self.send_message(
@@ -4176,7 +4189,7 @@ impl Plugin for AiAgent {
                 }
                 Err(error) => {
                     self.report_error(error);
-                    self.queued = Some(queued);
+                    self.queued.insert(0, queued);
                 }
             }
         }
@@ -4379,46 +4392,59 @@ impl Plugin for AiAgent {
                     }
                 }
 
-                // A message typed while the agent was busy, like the reference's queue strip.
-                if let Some(queued) = self.queued.clone() {
-                    let mut edit = false;
-                    let mut drop = false;
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Queued")
-                                .size(10.0)
-                                .strong()
-                                .color(to_color32(palette.accent)),
-                        );
-                        let preview = if queued.text.chars().count() > QUEUE_PREVIEW_MAX_CHARS {
-                            let head: String =
-                                queued.text.chars().take(QUEUE_PREVIEW_MAX_CHARS).collect();
-                            format!("{head}…")
-                        } else {
-                            queued.text.clone()
-                        };
-                        let room = (ui.available_width() - 90.0).max(60.0);
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(room, 0.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.set_width(room);
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(preview).size(11.0).color(muted),
-                                    )
-                                    .truncate(),
-                                );
-                            },
-                        );
-                        edit = small_button(ui, palette, "Edit");
-                        drop = small_button(ui, palette, "\u{2715}");
-                    });
-                    if edit {
-                        self.draft = queued.text;
-                        self.queued = None;
-                    } else if drop {
-                        self.queued = None;
+                // Messages typed while the agent was busy, one row each in the order they
+                // were written, like the reference's queue strip.
+                if !self.queued.is_empty() {
+                    let previews: Vec<String> = self
+                        .queued
+                        .iter()
+                        .map(|queued| queue_preview(&queued.text))
+                        .collect();
+                    let mut edit = None;
+                    let mut drop = None;
+                    let mut caption_width = 0.0;
+                    for (index, preview) in previews.into_iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            // The caption goes on the first row; the rows below line up
+                            // under the message it names.
+                            match index {
+                                0 => {
+                                    let caption = ui.label(
+                                        egui::RichText::new("Queued")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(to_color32(palette.accent)),
+                                    );
+                                    caption_width = caption.rect.width();
+                                }
+                                _ => ui.add_space(caption_width),
+                            }
+                            let room = (ui.available_width() - 90.0).max(60.0);
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(room, 0.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_width(room);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(preview).size(11.0).color(muted),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            if small_button(ui, palette, "Edit") {
+                                edit = Some(index);
+                            }
+                            if small_button(ui, palette, "\u{2715}") {
+                                drop = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = edit {
+                        self.draft = self.queued.remove(index).text;
+                    } else if let Some(index) = drop {
+                        self.queued.remove(index);
                     }
                 }
 
@@ -4754,8 +4780,9 @@ impl Plugin for AiAgent {
                 self.attachments.clear();
                 self.attach_terminal = false;
                 if self.agent.blocked() && queue {
-                    // Alt+Enter holds the message back until the run is over.
-                    self.queued = Some(Queued {
+                    // Alt+Enter holds the message back until the run is over, behind any
+                    // that are already waiting.
+                    self.queued.push(Queued {
                         text,
                         message,
                         meta,
@@ -8142,7 +8169,7 @@ mod tests {
             "the message was dropped: {:?}",
             plugin.agent.turns
         );
-        assert!(plugin.queued.is_none(), "Enter and Send inject, they queue");
+        assert!(plugin.queued.is_empty(), "Enter and Send inject, they queue");
         assert_eq!(
             plugin.agent.history.len(),
             1,
@@ -8168,30 +8195,11 @@ mod tests {
         frame(&mut plugin, &mut settings, &ctx, click(hint));
         plugin.draft = "second opinion".to_owned();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
-
-        let alt = egui::Modifiers {
-            alt: true,
-            ..Default::default()
-        };
-        frame(
-            &mut plugin,
-            &mut settings,
-            &ctx,
-            vec![
-                egui::Event::ModifiersChanged(alt),
-                egui::Event::Key {
-                    key: egui::Key::Enter,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: alt,
-                },
-            ],
-        );
+        frame(&mut plugin, &mut settings, &ctx, alt_enter());
 
         let queued = plugin
             .queued
-            .as_ref()
+            .first()
             .unwrap_or_else(|| panic!("Alt+Enter queues the message: {:?}", plugin.agent.turns));
         assert_eq!(queued.text, "second opinion");
         assert!(
@@ -8207,6 +8215,108 @@ mod tests {
                 .any(|(_, _, text)| text == "Queued"),
             "nothing shows what waits its turn"
         );
+    }
+
+    #[test]
+    fn a_second_queued_message_waits_behind_the_first() {
+        let mut settings = local_provider();
+        let (mut plugin, _worker) = busy_pane();
+        let ctx = egui::Context::default();
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let hint = rows
+            .iter()
+            .find(|(_, _, text)| text == "Ask the agent…")
+            .cloned()
+            .expect("the prompt has a hint");
+        frame(&mut plugin, &mut settings, &ctx, click(hint));
+        for text in ["second opinion", "third opinion"] {
+            // Typed rather than assigned, so the caret sits where a writer's would.
+            frame(
+                &mut plugin,
+                &mut settings,
+                &ctx,
+                vec![egui::Event::Text(text.to_owned())],
+            );
+            frame(&mut plugin, &mut settings, &ctx, alt_enter());
+        }
+        let waiting = |plugin: &AiAgent| {
+            plugin
+                .queued
+                .iter()
+                .map(|queued| queued.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            waiting(&plugin),
+            ["second opinion", "third opinion"],
+            "both messages wait, in the order they were written"
+        );
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        for text in ["second opinion", "third opinion"] {
+            assert!(
+                rows.iter().any(|(_, _, line)| line == text),
+                "the strip does not show {text}: {rows:?}"
+            );
+        }
+
+        // Editing the second row takes that message back to the composer, not the first.
+        let edits: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, text)| text == "Edit")
+            .cloned()
+            .collect();
+        assert_eq!(edits.len(), 2, "every queued message has its own Edit: {rows:?}");
+        frame(&mut plugin, &mut settings, &ctx, click(edits[1].clone()));
+        assert_eq!(plugin.draft, "third opinion");
+        assert_eq!(waiting(&plugin), ["second opinion"]);
+
+        // The run ends: the message in front goes out, the rest keeps waiting.
+        plugin.draft.clear();
+        plugin.queued.push(Queued {
+            text: "third opinion".to_owned(),
+            message: "third opinion".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.agent.phase = None;
+        plugin.agent.needs_reply = false;
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            plugin
+                .agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User { text, .. } if text == "second opinion")),
+            "the first message went out: {:?}",
+            plugin.agent.turns
+        );
+        assert_eq!(
+            waiting(&plugin),
+            ["third opinion"],
+            "the second message still waits its turn"
+        );
+    }
+
+    /// Alt, held for a queue.
+    fn alt() -> egui::Modifiers {
+        egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    /// Alt+Enter, which holds a message back until the run in flight is over.
+    fn alt_enter() -> Vec<egui::Event> {
+        let alt = alt();
+        vec![
+            egui::Event::ModifiersChanged(alt),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: alt,
+            },
+        ]
     }
 
     /// The settings of a pane with one OpenAI-compatible provider that never answers.
