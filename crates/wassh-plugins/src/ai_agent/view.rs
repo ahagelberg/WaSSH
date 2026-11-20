@@ -4134,7 +4134,12 @@ impl Plugin for AiAgent {
             &context.environment,
         );
         // The environment map belongs to the host, so the pane scans it outside a turn.
-        self.agent.poll_map_scan(&mut session);
+        if self.agent.poll_map_scan(&mut session) && self.agent.map.is_empty() {
+            let root = self.agent.map.root.clone();
+            self.agent
+                .turns
+                .push(Turn::Notice(format!("Scan of {root} found no files.")));
+        }
         if std::mem::take(&mut self.map_rebuild) {
             let root = self.map_root();
             if let Err(error) = self.agent.start_map_scan(&root, &mut session) {

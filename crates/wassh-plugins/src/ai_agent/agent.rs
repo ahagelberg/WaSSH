@@ -1055,15 +1055,21 @@ impl Agent {
                         let deeper = self.note_shallow_map();
                         Ready::Settle(
                             format!("env_scan {mapped_root}"),
-                            format!(
-                                "Mapped {mapped_root}: {found} files{}. Query it with env_find, \
-                                 env_outline or env_overview.{deeper}",
-                                if truncated {
-                                    " (capped, the tree is bigger)"
-                                } else {
-                                    ""
-                                }
-                            ),
+                            match found {
+                                0 => format!(
+                                    "Mapped {mapped_root}: no files. The walk read nothing there — \
+                                     check the directory, and that the session's shell can list it."
+                                ),
+                                found => format!(
+                                    "Mapped {mapped_root}: {found} files{}. Query it with env_find, \
+                                     env_outline or env_overview.{deeper}",
+                                    if truncated {
+                                        " (capped, the tree is bigger)"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                            },
                             found == 0,
                         )
                     }

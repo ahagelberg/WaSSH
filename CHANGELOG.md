@@ -55,6 +55,10 @@
 
 ### Fixed
 
+- Read the age a scan prints. `find -printf %T@` writes the timestamp with a fraction too, so
+  every file line was thrown away and the map came out empty: the Graph popup said nothing was
+  mapped, `env_search` and `env_outline` answered nothing, and a mapping pass had nothing to
+  describe. A scan that really reads no file now says so instead of looking like a fresh map.
 - Keep the mapping pass on the right tree and honest about its answer: the Graph popup takes the
   folder to scan (empty lets the host pick, and the root a stored map remembers is no longer reused
   blindly), a session opened in a home directory maps the one project folder inside it instead of

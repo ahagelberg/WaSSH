@@ -265,12 +265,12 @@ impl EnvMap {
             }
             if section {
                 let mut parts = line.splitn(3, ' ');
-                let (Some(size), Some(mtime), Some(path)) =
+                let (Some(size), Some(stamp), Some(path)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     continue;
                 };
-                let (Ok(size), Ok(mtime)) = (size.parse::<u64>(), mtime.parse::<u64>()) else {
+                let (Ok(size), Some(mtime)) = (size.parse::<u64>(), whole_seconds(stamp)) else {
                     continue;
                 };
                 if map.nodes.len() >= MAX_NODES {
@@ -1028,6 +1028,64 @@ __wassh_symbols__
         let map = EnvMap::parse("", 7, &output);
         assert_eq!(map.root, "/srv/app", "the marker names the root");
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn the_whole_seconds_of_a_find_stamp_are_read() {
+        // `find -printf '%T@'` prints the fraction too, and a map that drops those lines is
+        // empty whatever the tree holds.
+        assert_eq!(whole_seconds("1795170949.2881875000"), Some(1_795_170_949));
+        assert_eq!(whole_seconds("1795170949"), Some(1_795_170_949));
+        assert_eq!(whole_seconds("not a stamp"), None);
+        let scan = format!(
+            "{ROOT_MARKER}/srv/app\n12 1795170949.2881875000 /srv/app/a.rs\n{SECTION_MARKER}\n"
+        );
+        assert_eq!(
+            EnvMap::parse("", 7, &scan)
+                .nodes
+                .get("/srv/app/a.rs")
+                .map(|node| node.size),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn a_real_scan_lists_the_files_and_their_declarations() {
+        let Some(shell) = shell() else {
+            return;
+        };
+        let base = std::env::temp_dir().join(format!("wassh-scan-{}", std::process::id()));
+        let tree = base.join("tree");
+        std::fs::create_dir_all(tree.join(".git")).expect("a project");
+        std::fs::create_dir_all(tree.join("src")).expect("a source directory");
+        std::fs::write(tree.join("src").join("main.rs"), "fn main() {\n    run();\n}\n")
+            .expect("a source file");
+        std::fs::write(tree.join("README.md"), "# Notes\n").expect("a readme");
+        let command = EnvMap::scan_command("");
+        let output = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(format!("cd \"$1\" && {command}", command = command))
+            .arg("sh")
+            .arg(&tree)
+            .output()
+            .expect("the shell runs");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let map = EnvMap::parse("", 7, &text);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(map.root.ends_with("tree"), "walked the project root: {}", map.root);
+        let main = map
+            .nodes
+            .iter()
+            .find(|(path, _)| path.ends_with("src/main.rs"))
+            .map(|(_, node)| node)
+            .unwrap_or_else(|| panic!("the tree is not in the map: {:?}", map.nodes.keys()));
+        assert!(main.size > 0, "the file's size was read");
+        assert!(main.mtime > 0, "the file's age was read");
+        assert!(
+            main.symbols.iter().any(|line| line.contains("fn main")),
+            "the declarations were found: {:?}",
+            main.symbols
+        );
     }
 
     #[test]
