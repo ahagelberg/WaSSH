@@ -30,6 +30,14 @@
   placed one cell at a time, so a double-width character from a face without one no longer pulls
   the rest of the line short, and a tab cell no longer expands in the middle of a run.
 
+### Changed
+
+- List the AI pane's chats in the order they were started, newest on top, so reopening one does not
+  move it up.
+- Name an AI chat by the model's digest of its first prompt instead of the first line of that
+  prompt. A chat filed before its digest arrives keeps the request and takes the name when it
+  lands, and a title the pane had taken from the prompt is asked for again.
+
 ### Fixed
 
 - Keep terminal text in its cells when the session's font differs from egui's own. A host whose

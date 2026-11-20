@@ -297,10 +297,20 @@ type ModelFetch = (usize, Receiver<Result<Vec<String>, String>>);
 /// and the worker.
 type SummaryJob = (SummaryMode, usize, Receiver<Result<String, String>>);
 
+/// A digest of a chat's first prompt being written by the model.
+type TitleJob = Receiver<Result<String, String>>;
+
 /// A previous conversation, kept so the user can go back to it.
 pub struct StoredChat {
-    /// First question, for the picker.
+    /// Digest of its first prompt, written by the model.
     pub title: String,
+    /// When it was started, so the list keeps creation order however often a chat is
+    /// reopened.
+    pub created: u64,
+    /// First prompt still waiting for a run to finish before its digest is asked for.
+    title_prompt: Option<String>,
+    /// Digest being written for this chat.
+    title_job: Option<TitleJob>,
     /// The transcript.
     pub turns: Vec<Turn>,
     /// The provider history.
@@ -383,12 +393,14 @@ pub struct AiAgent {
     app_writes: Vec<(String, Value)>,
     /// A summary running on its own thread, with the history index it folds up to.
     summary: Option<SummaryJob>,
-    /// A short title being generated from the first prompt.
-    title_job: Option<Receiver<Result<String, String>>>,
-    /// First prompt waiting for the main run to finish before title generation.
+    /// A digest of the first prompt being written by the model.
+    title_job: Option<TitleJob>,
+    /// First prompt waiting for the main run to finish before its digest is asked for.
     title_prompt: Option<String>,
-    /// A generated title, preferred over the prompt-derived fallback.
+    /// The model's digest of the chat, once it arrived.
     generated_title: Option<String>,
+    /// When the live chat was started, carried into the list when it is filed.
+    created: u64,
     /// Each turn's Markdown, parsed once so a frame does not parse the whole transcript.
     parsed: Vec<ParsedTurn>,
     /// The same for the sub-agent transcript on screen, which is read-only.
@@ -482,6 +494,7 @@ impl Default for AiAgent {
             title_job: None,
             title_prompt: None,
             generated_title: None,
+            created: 0,
             parsed: Vec::new(),
             parsed_sub: Vec::new(),
             questions: QuestionWizard::default(),
@@ -624,6 +637,11 @@ impl AiAgent {
             .unwrap_or_default();
         StoredChat {
             title,
+            created: self.created,
+            // A digest still to be written belongs to this conversation, not to the one
+            // that follows it.
+            title_prompt: self.title_prompt.take(),
+            title_job: self.title_job.take(),
             turns: std::mem::take(&mut self.agent.turns),
             history: std::mem::take(&mut self.agent.history),
             subagents: std::mem::take(&mut self.agent.subagents),
@@ -661,6 +679,7 @@ impl AiAgent {
         self.generated_title = None;
         self.title_job = None;
         self.title_prompt = None;
+        self.created = self.agent.now_ms;
         self.questions = QuestionWizard::default();
         self.editing = None;
         self.parsed_sub.clear();
@@ -673,7 +692,6 @@ impl AiAgent {
         self.attachments.clear();
         self.view = ChatView::Chat;
     }
-
     /// Swap a stored conversation back into the pane.
     fn open_chat(&mut self, index: usize) {
         if index >= self.chats.len() {
@@ -692,8 +710,11 @@ impl AiAgent {
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
         self.agent.scopes = chat.scopes;
-        self.generated_title = Some(chat.title.clone());
-        self.title_prompt = None;
+        self.created = chat.created;
+        self.generated_title = (chat.title != DEFAULT_CHAT_TITLE).then(|| chat.title.clone());
+        // A digest this chat was still waiting for goes on being written here.
+        self.title_prompt = chat.title_prompt;
+        self.title_job = chat.title_job;
         if !chat.model.is_empty() {
             self.model = chat.model;
         }
@@ -1259,13 +1280,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.toasts.push((ToastKind::Error, error));
     }
 
-    fn start_chat_title(&mut self, prompt: &str) {
-        if self.generated_title.is_some() || self.title_job.is_some() {
-            return;
-        }
-        let Some(provider) = self.active().cloned() else {
-            return;
-        };
+    /// Ask the model for a digest of `prompt`, if a provider is configured.
+    fn title_request(&self, prompt: &str) -> Option<TitleJob> {
+        let provider = self.active().cloned()?;
         let model = self.model.clone();
         let key = self.keys.get(&provider.id).cloned().unwrap_or_default();
         let prompt = prompt.trim().to_owned();
@@ -1284,47 +1301,47 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             let result = complete_blocking(&request).map(|completion| completion.text.trim().to_owned());
             let _ = sender.send(result);
         });
-        self.title_job = Some(events);
+        Some(events)
     }
 
+    /// Collect the digests the model wrote and ask for the next one that is due.
     fn poll_chat_title(&mut self) {
+        // The live chat asks once its run is done, so the digest reads the prompt alone.
         if self.title_job.is_none()
-            && self.title_prompt.is_some()
             && !self.agent.blocked()
+            && let Some(prompt) = self.title_prompt.clone()
+            && let Some(job) = self.title_request(&prompt)
         {
-            let prompt = self.title_prompt.take().unwrap_or_default();
-            self.start_chat_title(&prompt);
+            self.title_prompt = None;
+            self.title_job = Some(job);
         }
-        let ready = match &self.title_job {
-            Some(events) => match events.try_recv() {
-                Ok(result) => Some(result),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("The chat title worker stopped.".to_owned()))
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            },
-            None => None,
-        };
-        let Some(result) = ready else {
-            return;
-        };
-        self.title_job = None;
-        if let Ok(title) = result {
-            let title = title
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches(['"', '\''])
-                .trim();
-            if !title.is_empty() {
-                let too_long = title.chars().count() > TITLE_MAX_CHARS;
-                let mut title: String = title.chars().take(TITLE_MAX_CHARS).collect();
-                if too_long {
-                    title.push('…');
-                }
+        if let Some(answer) = self.title_job.as_ref().and_then(title_answer) {
+            self.title_job = None;
+            if let Some(title) = digest_title(answer) {
                 self.generated_title = Some(title);
             }
+        }
+        // Filed chats keep their own work: a chat filed before its digest came back still
+        // gets one, and the list shows it as soon as it lands.
+        for chat in &mut self.chats {
+            if let Some(answer) = chat.title_job.as_ref().and_then(title_answer) {
+                chat.title_job = None;
+                if let Some(title) = digest_title(answer) {
+                    chat.title = title;
+                }
+            }
+        }
+        // One request at a time, so a list of untitled chats does not burst the provider.
+        if self.title_job.is_none()
+            && let Some(index) = self
+                .chats
+                .iter()
+                .position(|chat| chat.title_prompt.is_some() && chat.title_job.is_none())
+            && let Some(prompt) = self.chats[index].title_prompt.clone()
+            && let Some(job) = self.title_request(&prompt)
+        {
+            self.chats[index].title_prompt = None;
+            self.chats[index].title_job = Some(job);
         }
     }
 
@@ -1339,6 +1356,11 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
     ) {
         if !self.agent.push_user(message, meta) {
             return;
+        }
+        // The first message of a conversation stamps when it was started, for the list's
+        // order.
+        if self.created == 0 {
+            self.created = self.agent.now_ms;
         }
         self.error = None;
         if self.generated_title.is_none() && self.title_prompt.is_none() {
@@ -1517,12 +1539,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 
     /// Take the stored conversation and the chats filed under it.
     fn restore(&mut self, stored: &Value) {
-        if let Some(title) = stored["title"].as_str()
-            && title != DEFAULT_CHAT_TITLE
-            && !title.trim().is_empty()
-        {
-            self.generated_title = Some(title.to_owned());
-        }
         if let Some(model) = stored.get("model").and_then(Value::as_str)
             && !model.is_empty()
         {
@@ -1541,6 +1557,18 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if let Some(turns) = stored.get("turns").and_then(Value::as_array) {
             self.agent.turns = turns_from_json(turns);
         }
+        // The title is the model's digest; one the pane took from the prompt is asked for
+        // again rather than shown.
+        let stored_title = stored["title"].as_str().unwrap_or_default();
+        if is_digest(stored_title, &self.agent.turns) {
+            self.generated_title = Some(stored_title.to_owned());
+        } else {
+            self.title_prompt = first_prompt(&self.agent.turns).map(str::to_owned);
+        }
+        self.created = stored["created"]
+            .as_u64()
+            // An older file did not record it, and the live chat is the newest one.
+            .unwrap_or(self.agent.now_ms);
         if let Some(history) = stored.get("history").and_then(Value::as_array) {
             self.agent.history = history_from_json(history);
         }
@@ -1555,53 +1583,55 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
             self.chats = chats
                 .iter()
-                .map(|chat| StoredChat {
-                    title: chat["title"]
-                        .as_str()
-                        .unwrap_or(DEFAULT_CHAT_TITLE)
-                        .to_owned(),
-                    cwd: chat["cwd"].as_str().unwrap_or("/").to_owned(),
-                    model: chat["model"].as_str().unwrap_or_default().to_owned(),
-                    provider: chat["provider"].as_str().unwrap_or_default().to_owned(),
-                    turns: chat["turns"]
+                .enumerate()
+                .map(|(index, chat)| {
+                    let turns = chat["turns"]
                         .as_array()
                         .map(|turns| turns_from_json(turns))
-                        .unwrap_or_default(),
-                    history: chat["history"]
-                        .as_array()
-                        .map(|history| history_from_json(history))
-                        .unwrap_or_default(),
-                    compacted: chat["compacted"]
-                        .as_str()
-                        .filter(|summary| !summary.is_empty())
-                        .map(str::to_owned),
-                    scopes: Loaded::from_json(chat.get("scopes")),
-                    subagents: subagents_from_json(chat.get("subagents")),
+                        .unwrap_or_default();
+                    let stored_title = chat["title"].as_str().unwrap_or_default();
+                    let digest = is_digest(stored_title, &turns);
+                    StoredChat {
+                        title: if digest {
+                            stored_title.to_owned()
+                        } else {
+                            DEFAULT_CHAT_TITLE.to_owned()
+                        },
+                        // A file written before chats carried their start keeps the order
+                        // it stored them in; 0 stays free for "not stamped yet".
+                        created: chat["created"].as_u64().unwrap_or(index as u64 + 1),
+                        title_prompt: if digest {
+                            None
+                        } else {
+                            first_prompt(&turns).map(str::to_owned)
+                        },
+                        title_job: None,
+                        cwd: chat["cwd"].as_str().unwrap_or("/").to_owned(),
+                        model: chat["model"].as_str().unwrap_or_default().to_owned(),
+                        provider: chat["provider"].as_str().unwrap_or_default().to_owned(),
+                        turns,
+                        history: chat["history"]
+                            .as_array()
+                            .map(|history| history_from_json(history))
+                            .unwrap_or_default(),
+                        compacted: chat["compacted"]
+                            .as_str()
+                            .filter(|summary| !summary.is_empty())
+                            .map(str::to_owned),
+                        scopes: Loaded::from_json(chat.get("scopes")),
+                        subagents: subagents_from_json(chat.get("subagents")),
+                    }
                 })
                 .collect();
         }
     }
 
-    /// Title for the header and the stored conversation.
+    /// Title for the header and the stored conversation: the model's digest of the chat,
+    /// or a placeholder until it arrives.
     fn title(&self) -> String {
-        if let Some(title) = &self.generated_title {
-            return title.clone();
-        }
-        let first = self.agent.turns.iter().find_map(|turn| match turn {
-            Turn::User { text, .. } => Some(text.clone()),
-            _ => None,
-        });
-        match first {
-            Some(text) if !text.trim().is_empty() => {
-                let trimmed = text.trim();
-                let mut title: String = trimmed.chars().take(TITLE_MAX_CHARS).collect();
-                if trimmed.chars().count() > TITLE_MAX_CHARS {
-                    title.push('…');
-                }
-                title
-            }
-            _ => DEFAULT_CHAT_TITLE.to_owned(),
-        }
+        self.generated_title
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CHAT_TITLE.to_owned())
     }
 
     /// Start a summary of the conversation on a worker thread.
@@ -2331,7 +2361,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .max_height(ui.available_height())
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for index in (0..self.chats.len()).rev() {
+                for index in chat_order(&self.chats) {
                     let chat = &self.chats[index];
                     if chat_row(
                         ui,
@@ -2581,6 +2611,74 @@ fn chat_row(
         egui::Sense::hover(),
     );
     response.interact(egui::Sense::click()).clicked()
+}
+
+/// The answer a title worker has given, once it has one.
+fn title_answer(job: &TitleJob) -> Option<Result<String, String>> {
+    match job.try_recv() {
+        Ok(answer) => Some(answer),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Some(Err("The chat title worker stopped.".to_owned()))
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+    }
+}
+
+/// The title a model's answer asks for, tidied and cut to length.
+fn digest_title(answer: Result<String, String>) -> Option<String> {
+    let answer = answer.ok()?;
+    let title = answer
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    let too_long = title.chars().count() > TITLE_MAX_CHARS;
+    let mut title: String = title.chars().take(TITLE_MAX_CHARS).collect();
+    if too_long {
+        title.push('…');
+    }
+    Some(title)
+}
+
+/// The first prompt of a conversation.
+fn first_prompt(turns: &[Turn]) -> Option<&str> {
+    turns.iter().find_map(|turn| match turn {
+        Turn::User { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+        _ => None,
+    })
+}
+
+/// A title as the pane used to take it from the prompt, so a stored one is told apart
+/// from a digest and asked for again.
+fn prompt_title(turns: &[Turn]) -> Option<String> {
+    let prompt = first_prompt(turns)?;
+    let too_long = prompt.chars().count() > TITLE_MAX_CHARS;
+    let mut title: String = prompt.chars().take(TITLE_MAX_CHARS).collect();
+    if too_long {
+        title.push('…');
+    }
+    Some(title)
+}
+
+/// Whether a stored title came from the model rather than from the first prompt.
+fn is_digest(stored: &str, turns: &[Turn]) -> bool {
+    !stored.trim().is_empty()
+        && stored != DEFAULT_CHAT_TITLE
+        && Some(stored) != prompt_title(turns).as_deref()
+}
+
+/// The chat list's order: creation order, newest first, so reopening a chat does not move
+/// it up.
+fn chat_order(chats: &[StoredChat]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..chats.len()).collect();
+    order.sort_by_key(|&index| (chats[index].created, index));
+    order.reverse();
+    order
 }
 
 /// A dropdown that never grows past `width`: a long label is cropped rather than
@@ -4325,6 +4423,7 @@ impl Plugin for AiAgent {
             .map(|chat| {
                 json!({
                     "title": chat.title,
+                    "created": chat.created,
                     "cwd": chat.cwd,
                     "model": chat.model,
                     "provider": chat.provider,
@@ -4341,6 +4440,7 @@ impl Plugin for AiAgent {
             json!({
                 "version": DATA_VERSION,
                 "title": self.title(),
+                "created": self.created,
                 "model": self.model,
                 "provider": self.active().map(|provider| provider.id.clone()),
                 "cwd": self.agent.cwd,
@@ -4815,6 +4915,7 @@ mod tests {
             CONVERSATION_KEY.to_owned(),
             json!({
                 "version": DATA_VERSION,
+                "title": "Compaction test",
                 "model": "test-model",
                 "provider": "local",
                 "cwd": "/srv/app",
@@ -6087,7 +6188,7 @@ mod tests {
                 assert!(text.pos.x + text.galley.size().x <= limit, "text exceeds pane: {} > {limit}", text.pos.x + text.galley.size().x);
             }
         }
-        assert_eq!(found, 3, "the prompt, the tool output and the chat title stay inside");
+        assert_eq!(found, 2, "the prompt and the tool output stay inside");
     }
 
     #[test]
@@ -6331,14 +6432,14 @@ mod tests {
             pinned < PINNED_TOP_MAX,
             "the newest message is pinned at the top of the transcript: {rows:?}"
         );
-        // The first question names the chat, which the title row shows; its own bubble has
-        // scrolled away.
+        // The chat is named by its digest, so the first question shows nowhere: its own
+        // bubble has scrolled away and the title row no longer repeats it.
         assert_eq!(
             rows.iter()
                 .filter(|(_, text)| text == "first question")
                 .count(),
-            1,
-            "only the chat title names the first question: {rows:?}"
+            0,
+            "the prompt is not repeated as the chat's title: {rows:?}"
         );
     }
 
@@ -6636,15 +6737,19 @@ mod tests {
     }
 
     #[test]
-    fn a_long_question_is_cut_short_in_the_header() {
+    fn the_header_names_the_chat_by_its_digest_not_by_its_prompt() {
         let mut plugin = AiAgent::default();
         plugin.agent.turns.push(Turn::User {
             text: "x".repeat(200),
             meta: UserMeta::default(),
         });
-        let caption = plugin.title();
-        assert_eq!(caption.chars().count(), TITLE_MAX_CHARS + 1);
-        assert!(caption.ends_with('…'));
+        assert_eq!(
+            plugin.title(),
+            DEFAULT_CHAT_TITLE,
+            "a prompt is not a title"
+        );
+        plugin.generated_title = Some("Short digest".to_owned());
+        assert_eq!(plugin.title(), "Short digest");
     }
 
     #[test]
@@ -6668,11 +6773,14 @@ mod tests {
                 ]
             }),
         );
-        let mut plugin = AiAgent::default();
+        let mut plugin = AiAgent {
+            generated_title: Some("Check the host".to_owned()),
+            ..AiAgent::default()
+        };
         draw(&mut plugin, &mut settings);
         let stored = &settings[CONVERSATION_KEY];
         assert_eq!(stored["version"], DATA_VERSION);
-        assert_eq!(stored["title"], "hello");
+        assert_eq!(stored["title"], "Check the host");
         assert_eq!(stored["turns"].as_array().map(Vec::len), Some(2));
         assert_eq!(stored["history"].as_array().map(Vec::len), Some(3));
         assert_eq!(stored["turns"][1]["label"], "$ uptime");
@@ -6721,10 +6829,11 @@ mod tests {
             .push(super::super::protocol::ApiMessage::User {
                 content: "first question".to_owned(),
             });
+        plugin.generated_title = Some("First digest".to_owned());
         plugin.begin_new_chat();
         assert!(plugin.agent.turns.is_empty(), "the live chat was cleared");
         assert_eq!(plugin.chats.len(), 1);
-        assert_eq!(plugin.chats[0].title, "first question");
+        assert_eq!(plugin.chats[0].title, "First digest");
 
         // Opening it back restores the transcript and history.
         plugin.open_chat(0);
@@ -6740,6 +6849,7 @@ mod tests {
             text: "first question".to_owned(),
             meta: UserMeta::default(),
         });
+        plugin.generated_title = Some("First digest".to_owned());
         plugin.begin_new_chat();
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -6754,7 +6864,7 @@ mod tests {
         );
         let row = rows
             .iter()
-            .find(|(_, _, text)| text == "first question")
+            .find(|(_, _, text)| text == "First digest")
             .cloned()
             .unwrap_or_else(|| panic!("the filed chat is not listed: {rows:?}"));
         frame(&mut plugin, &mut settings, &ctx, click(row));
@@ -6780,6 +6890,7 @@ mod tests {
             text: "earlier question".to_owned(),
             meta: UserMeta::default(),
         });
+        plugin.generated_title = Some("Earlier digest".to_owned());
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         frame(&mut plugin, &mut settings, &ctx, click_back());
@@ -6795,7 +6906,7 @@ mod tests {
         frame(&mut plugin, &mut settings, &ctx, click(send));
         assert_eq!(plugin.view, ChatView::Chat, "the new chat is entered");
         assert_eq!(plugin.chats.len(), 1, "the chat left behind is filed");
-        assert_eq!(plugin.chats[0].title, "earlier question");
+        assert_eq!(plugin.chats[0].title, "Earlier digest");
         assert!(
             plugin
                 .agent
@@ -6851,6 +6962,44 @@ mod tests {
     }
 
     #[test]
+    fn a_filed_chat_is_titled_by_the_model() {
+        const TITLE: &str = "{\"choices\":[{\"message\":{\"content\":\"Check the pump\"}}]}";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, _requests) = answering("application/json", TITLE, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent::default();
+        plugin.agent.now_ms = 7;
+        plugin.agent.turns.push(Turn::User {
+            text: "what is the pump doing".to_owned(),
+            meta: UserMeta::default(),
+        });
+        plugin.title_prompt = Some("what is the pump doing".to_owned());
+        // Filed while the digest is still to be written: the work goes with the chat.
+        plugin.begin_new_chat();
+        assert_eq!(plugin.chats[0].title, DEFAULT_CHAT_TITLE);
+
+        let ctx = egui::Context::default();
+        for _ in 0..50 {
+            frame(&mut plugin, &mut settings, &ctx, Vec::new());
+            if plugin.chats[0].title != DEFAULT_CHAT_TITLE {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            plugin.chats[0].title, "Check the pump",
+            "the model names the filed chat: error {:?}",
+            plugin.error
+        );
+    }
+
+    #[test]
     fn the_oldest_chats_are_dropped_at_the_cap() {
         let mut plugin = AiAgent::default();
         for index in 0..(CONVERSATIONS_PER_HOST_MAX + 3) {
@@ -6858,10 +7007,71 @@ mod tests {
                 text: format!("question {index}"),
                 meta: UserMeta::default(),
             });
+            // The chat that follows starts a moment later, so creation order is total.
+            plugin.agent.now_ms = index as u64 + 1;
             plugin.begin_new_chat();
         }
         assert_eq!(plugin.chats.len(), CONVERSATIONS_PER_HOST_MAX);
-        assert_eq!(plugin.chats[0].title, "question 3");
+        // The three oldest were dropped; the rest keep the order they were started in.
+        assert_eq!(plugin.chats[0].created, 3);
+        assert_eq!(
+            plugin.chats.last().map(|chat| chat.created),
+            Some((CONVERSATIONS_PER_HOST_MAX + 2) as u64)
+        );
+    }
+
+    #[test]
+    fn the_list_keeps_creation_order_when_a_chat_is_opened_again() {
+        let mut plugin = AiAgent::default();
+        for index in 0..3u64 {
+            plugin.agent.turns.push(Turn::User {
+                text: format!("question {index}"),
+                meta: UserMeta::default(),
+            });
+            plugin.generated_title = Some(format!("digest {index}"));
+            plugin.agent.now_ms = index + 1;
+            plugin.begin_new_chat();
+        }
+        assert_eq!(plugin.chats.len(), 3);
+        assert_eq!(plugin.chats[2].title, "digest 2");
+
+        // Reopening the oldest and filing it again leaves it where it was created.
+        plugin.open_chat(0);
+        plugin.begin_new_chat();
+        let titles: Vec<&str> = chat_order(&plugin.chats)
+            .iter()
+            .map(|&index| plugin.chats[index].title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["digest 2", "digest 1", "digest 0"],
+            "newest on top, and reopening a chat does not move it"
+        );
+    }
+
+    #[test]
+    fn a_title_taken_from_the_prompt_is_asked_for_again() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            CONVERSATION_KEY.to_owned(),
+            json!({
+                "version": DATA_VERSION,
+                "title": "New chat",
+                "chats": [{
+                    "title": "what is on the line",
+                    "turns": [{ "role": "user", "text": "what is on the line" }],
+                    "history": [{ "role": "user", "content": "what is on the line" }]
+                }]
+            }),
+        );
+        let mut plugin = AiAgent::default();
+        draw(&mut plugin, &mut settings);
+        assert_eq!(plugin.chats[0].title, DEFAULT_CHAT_TITLE);
+        assert_eq!(
+            plugin.chats[0].title_prompt.as_deref(),
+            Some("what is on the line"),
+            "the prompt is queued for a digest"
+        );
     }
 
     /// A map with two files, as a scan would leave it.
@@ -7018,7 +7228,7 @@ mod tests {
         let mut plugin = AiAgent::default();
         draw(&mut plugin, &mut settings);
         assert_eq!(plugin.chats.len(), 1);
-        assert_eq!(plugin.chats[0].title, "old chat");
+        assert_eq!(plugin.chats[0].title, "New chat", "a prompt is not a title");
         assert_eq!(plugin.chats[0].cwd, "/srv");
         // The picker is painted.
         let painted = draw(&mut plugin, &mut settings);
