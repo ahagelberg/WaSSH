@@ -247,8 +247,10 @@ lines, using ripgrep when the host has it.",
     ToolSpec {
         name: TOOL_ENV_SCAN,
         description: "Build or refresh the environment map: one walk of a directory tree that \
-records every file with its size, age and declarations. Cheap enough to re-run; it needs no \
-reading of individual files. Do this before searching a tree you have not mapped yet.",
+records every file with its size, age and declarations. With no path it starts at the project \
+root the host finds above the working directory. Cheap enough to re-run; it reads no individual \
+files. Do this before searching a tree you have not mapped yet: the files are then described by \
+a mapping pass, so env_search and env_outline answer with what is in them.",
     },
     ToolSpec {
         name: TOOL_ENV_FIND,
@@ -258,8 +260,9 @@ or dev_find_files for \"where is X\" questions.",
     },
     ToolSpec {
         name: TOOL_ENV_OUTLINE,
-        description: "What the environment map knows about one file: its size, when it changed and \
-its declarations with line numbers, without reading the file.",
+        description: "What the environment map knows about one file: its size, when it changed, \
+its summary, what it connects to and its declarations with line numbers, without reading the \
+file.",
     },
     ToolSpec {
         name: TOOL_ENV_OVERVIEW,

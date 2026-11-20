@@ -1,19 +1,23 @@
 //! The environment map: a per-host graph of the files behind the session.
 //!
-//! Built by `env_scan`, which asks the host for one `find` listing and one symbol grep
-//! rather than letting the model discover the tree with `ls`, `grep` and `find` of its
-//! own. `env_find`, `env_outline` and `env_overview` answer from the map, so a question
-//! about where something lives costs no host call at all.
+//! Built in two steps. `env_scan` asks the host for one `find` listing and one symbol grep
+//! rather than letting the model discover the tree with `ls`, `grep` and `find` of its own;
+//! with no directory given, the host finds the project root itself. A mapping pass then has
+//! a sub-agent read the files that matter and write a summary and the connections of each
+//! into the map, bounded by [`MAX_MAPPED_FILES`] so it costs a known number of tokens.
+//!
+//! `env_find`, `env_search`, `env_outline` and `env_overview` answer from the map, so a
+//! question about where something lives, or what talks to what, costs no host call at all.
 //!
 //! The map is host state, not conversation state: it outlives the chat that built it and
-//! is written back to the host's plugin data.
+//! is written back to the host's plugin data, so every chat on the connection shares it.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-/// Version of the stored shape.
-pub const MAP_VERSION: u32 = 1;
+/// Version of the stored shape. 2 adds the summaries and the links between files.
+pub const MAP_VERSION: u32 = 2;
 /// Most files one map keeps. A scan that finds more is marked truncated.
 pub const MAX_NODES: usize = 5_000;
 /// Deepest directory walk a scan performs.
@@ -30,6 +34,8 @@ pub const MAX_FIND_HITS: usize = 100;
 const PATH_WEIGHT: usize = 3;
 /// Score a query token adds when one of a file's declarations holds it.
 const SYMBOL_WEIGHT: usize = 2;
+/// Score a query token adds when a file's summary holds it.
+const SUMMARY_WEIGHT: usize = 2;
 /// Entries one system scan keeps per section.
 pub const MAX_SYSTEM_ENTRIES: usize = 60;
 /// Directories between two lines of an overview.
@@ -38,9 +44,53 @@ pub const OVERVIEW_DEPTH: usize = 2;
 pub const TOP_LEVEL: &str = "(top level)";
 /// Files the overview names as recently changed.
 pub const OVERVIEW_RECENT: usize = 12;
+/// Files one mapping pass may describe. Past this the pass costs more than it saves.
+pub const MAX_MAPPED_FILES: usize = 100;
+/// Characters of one file's summary kept.
+pub const MAX_MAP_SUMMARY_CHARS: usize = 600;
+/// Connections kept per file.
+pub const MAX_MAP_LINKS: usize = 16;
+/// Characters of a mapping answer read back at most.
+pub const MAX_MAP_ANSWER_CHARS: usize = 200_000;
 
-/// The line the scan command prints between its two sections.
+/// Line the scan command prints between its two sections.
 pub const SECTION_MARKER: &str = "__wassh_symbols__";
+
+/// Prefix of the line the scan command prints the root it walked on.
+pub const ROOT_MARKER: &str = "__wassh_root__";
+
+/// Files that mark a directory as the root of a project.
+const PROJECT_MARKERS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "Cargo.toml",
+    "go.mod",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "Makefile",
+    "CMakeLists.txt",
+    "pom.xml",
+    "build.gradle",
+    "Gemfile",
+    "composer.json",
+];
+
+/// Shell that prints the project root: the nearest directory at or above the working
+/// directory carrying one of [`PROJECT_MARKERS`], stopping at the home directory.
+fn root_probe() -> String {
+    let mut markers = String::new();
+    for marker in PROJECT_MARKERS {
+        markers.push_str(&format!("{marker} "));
+    }
+    format!(
+        "root=$PWD; while [ \"$root\" != / ] && [ \"$root\" != \"$HOME\" ]; do \
+           found=; for m in {markers}; do [ -e \"$root/$m\" ] && {{ found=1; break; }}; done; \
+           [ -n \"$found\" ] && break; root=$(dirname \"$root\"); \
+         done; printf '{ROOT_MARKER}%s\\n' \"$root\""
+    )
+}
 
 /// One file in the map.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -51,6 +101,10 @@ pub struct Node {
     pub mtime: u64,
     /// Declaration lines: `line␉text`.
     pub symbols: Vec<String>,
+    /// What the file is for, in the mapping pass's words.
+    pub summary: String,
+    /// What it connects to: the files, modules or services it imports, calls or feeds.
+    pub links: Vec<String>,
 }
 
 /// A host's map of its own files.
@@ -60,6 +114,8 @@ pub struct EnvMap {
     pub root: String,
     /// When it was built, in milliseconds since the epoch.
     pub built_ms: u64,
+    /// When a mapping pass last described files, in milliseconds since the epoch.
+    pub mapped_ms: u64,
     /// Every file, keyed by path.
     pub nodes: BTreeMap<String, Node>,
     /// Whether the scan stopped at its caps.
@@ -77,6 +133,20 @@ impl EnvMap {
     /// How many files it holds.
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Whether the tree is listed but nothing in it has been described yet, which is when a
+    /// mapping pass is worth its tokens.
+    pub fn needs_summaries(&self) -> bool {
+        !self.nodes.is_empty() && self.nodes.values().all(|node| node.summary.is_empty())
+    }
+
+    /// How many files the mapping pass described.
+    pub fn summarised(&self) -> usize {
+        self.nodes
+            .values()
+            .filter(|node| !node.summary.is_empty())
+            .count()
     }
 
     /// Age of the map in whole minutes, for the popup and the prompt.
@@ -117,19 +187,34 @@ impl EnvMap {
     /// The command that builds the map: one `find` for the files, one `grep` for the
     /// declarations, both cut short by their caps.
     ///
-    /// `root` is the directory to walk; it is quoted by the caller's rules.
+    /// `root` is the directory to walk; it is quoted by the caller's rules. An empty `root`
+    /// asks the host to find the project root itself, so a session started deep inside a
+    /// repository maps the repository. The root actually walked is printed on a marker line.
     pub fn scan_command(root: &str) -> String {
+        let root = root.trim();
+        let locate = if root.is_empty() {
+            root_probe()
+        } else {
+            format!(
+                "root={}; printf '{ROOT_MARKER}%s\\n' \"$root\"",
+                shell_quote(root)
+            )
+        };
         format!(
-            "find {root} -maxdepth {MAX_DEPTH} {skipped} -type f -printf '%s %T@ %p\\n' \
+            "{locate}; \
+             find \"$root\" -maxdepth {MAX_DEPTH} {skipped} -type f -printf '%s %T@ %p\\n' \
              2>/dev/null | head -n {MAX_NODES}; \
              echo {SECTION_MARKER}; \
-             grep -rnIE {pattern} {root} 2>/dev/null | head -n {MAX_SCAN_SYMBOLS}",
+             grep -rnIE {pattern} \"$root\" 2>/dev/null | head -n {MAX_SCAN_SYMBOLS}",
             skipped = SKIPPED_DIRS,
             pattern = shell_quote(SYMBOL_PATTERN),
         )
     }
 
     /// Read a scan's output back. Returns the map and whether a cap was hit.
+    ///
+    /// The root the command walked wins over `root`, because a command given no directory
+    /// finds the project root itself.
     pub fn parse(root: &str, built_ms: u64, output: &str) -> Self {
         let mut map = Self {
             root: root.to_owned(),
@@ -140,6 +225,13 @@ impl EnvMap {
         let mut truncated = false;
         let mut section = true;
         for line in output.lines() {
+            if let Some(found) = line.strip_prefix(ROOT_MARKER) {
+                let found = found.trim();
+                if !found.is_empty() {
+                    map.root = found.to_owned();
+                }
+                continue;
+            }
             if line.trim() == SECTION_MARKER {
                 section = false;
                 continue;
@@ -164,6 +256,7 @@ impl EnvMap {
                         size,
                         mtime,
                         symbols: Vec::new(),
+                        ..Node::default()
                     },
                 );
             } else {
@@ -215,13 +308,13 @@ impl EnvMap {
             *counts.entry(group).or_default() += 1;
         }
         let mut lines = vec![format!(
-            "{} ({} files{})",
+            "{} ({} files{}{})",
             self.root,
             self.len(),
-            if self.truncated {
-                ", capped"
-            } else {
-                ""
+            if self.truncated { ", capped" } else { "" },
+            match self.summarised() {
+                0 => ", no summaries yet".to_owned(),
+                described => format!(", {described} described"),
             }
         )];
         for (group, count) in &counts {
@@ -291,7 +384,7 @@ impl EnvMap {
         let mut scored: Vec<(usize, String)> = Vec::new();
         for (path, node) in &self.nodes {
             let name = path.to_lowercase();
-            let symbols: String = node.symbols.join(" ").to_lowercase();
+            let symbols = format!("{} {}", node.symbols.join(" "), node.summary).to_lowercase();
             let mut score = 0usize;
             for token in &tokens {
                 if name.contains(token.as_str()) {
@@ -299,6 +392,9 @@ impl EnvMap {
                 }
                 if symbols.contains(token.as_str()) {
                     score += SYMBOL_WEIGHT;
+                }
+                if node.summary.to_lowercase().contains(token.as_str()) {
+                    score += SUMMARY_WEIGHT;
                 }
             }
             if score > 0 {
@@ -310,23 +406,80 @@ impl EnvMap {
         scored
             .into_iter()
             .take(limit)
-            .map(|(_, path)| path)
+            .map(|(_, path)| match self.nodes.get(&path) {
+                // A described file says what it is for, so the model often needs no other call.
+                Some(node) if !node.summary.is_empty() => format!("{path} — {}", node.summary),
+                _ => path,
+            })
             .collect()
     }
 
-    /// What the map knows about one file: its size, age and declarations.
+    /// What the map knows about one file: its size, age, summary, connections and
+    /// declarations.
     pub fn outline(&self, path: &str) -> Option<String> {
         let node = self.nodes.get(path)?;
-        let mut text = format!(
-            "{path}\n{} bytes, changed {}",
-            node.size,
-            node.mtime
-        );
+        let mut text = format!("{path}\n{} bytes, changed {}", node.size, node.mtime);
+        if !node.summary.is_empty() {
+            text.push('\n');
+            text.push_str(&node.summary);
+        }
+        if !node.links.is_empty() {
+            text.push_str("\nConnects to: ");
+            text.push_str(&node.links.join(", "));
+        }
         if let Some(outline) = outline_of(&node.symbols) {
             text.push('\n');
             text.push_str(&outline);
         }
         Some(text)
+    }
+
+    /// Take a mapping pass's descriptions into the map.
+    ///
+    /// Only files under `root` are kept, so an answer that wandered outside the tree cannot
+    /// grow the map. Returns how many files were described.
+    pub fn merge_summaries(&mut self, root: &str, mapped_ms: u64, files: &[MappedFile]) -> usize {
+        let root = root.trim().trim_end_matches('/');
+        let mut described = 0usize;
+        for file in files.iter().take(MAX_MAPPED_FILES) {
+            let path = if file.path.starts_with('/') {
+                file.path.clone()
+            } else {
+                format!("{root}/{}", file.path.trim_start_matches("./"))
+            };
+            if !path.starts_with(root) || path.len() <= root.len() {
+                continue;
+            }
+            let summary: String = file
+                .summary
+                .trim()
+                .chars()
+                .take(MAX_MAP_SUMMARY_CHARS)
+                .collect();
+            if summary.is_empty() {
+                continue;
+            }
+            let links: Vec<String> = file
+                .links
+                .iter()
+                .map(|link| link.trim())
+                .filter(|link| !link.is_empty())
+                .take(MAX_MAP_LINKS)
+                .map(str::to_owned)
+                .collect();
+            let node = self.nodes.entry(path).or_default();
+            node.summary = summary;
+            node.links = links;
+            described += 1;
+        }
+        if described > 0 {
+            if self.root.is_empty() {
+                self.root = root.to_owned();
+            }
+            self.mapped_ms = mapped_ms;
+            self.revision += 1;
+        }
+        described
     }
 
     /// The stored shape.
@@ -335,20 +488,29 @@ impl EnvMap {
             .nodes
             .iter()
             .map(|(path, node)| {
-                json!([path, node.size, node.mtime, node.symbols])
+                json!([
+                    path,
+                    node.size,
+                    node.mtime,
+                    node.symbols,
+                    node.summary,
+                    node.links
+                ])
             })
             .collect();
         json!({
             "version": MAP_VERSION,
             "root": self.root,
             "builtMs": self.built_ms,
+            "mappedMs": self.mapped_ms,
             "revision": self.revision,
             "truncated": self.truncated,
             "nodes": nodes,
         })
     }
 
-    /// Read a stored map back.
+    /// Read a stored map back. A version 1 map has no summaries: those nodes keep empty
+    /// ones and ask for a mapping pass.
     pub fn from_json(value: Option<&Value>) -> Self {
         let Some(value) = value else {
             return Self::default();
@@ -356,6 +518,7 @@ impl EnvMap {
         let mut map = Self {
             root: value["root"].as_str().unwrap_or_default().to_owned(),
             built_ms: value["builtMs"].as_u64().unwrap_or_default(),
+            mapped_ms: value["mappedMs"].as_u64().unwrap_or_default(),
             revision: value["revision"].as_u64().unwrap_or_default(),
             truncated: value["truncated"].as_bool().unwrap_or(false),
             ..Self::default()
@@ -370,17 +533,94 @@ impl EnvMap {
                 .flatten()
                 .filter_map(|symbol| symbol.as_str().map(str::to_owned))
                 .collect();
+            let links: Vec<String> = entry[5]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|link| link.as_str().map(str::to_owned))
+                .collect();
             map.nodes.insert(
                 path.to_owned(),
                 Node {
                     size: entry[1].as_u64().unwrap_or_default(),
                     mtime: entry[2].as_u64().unwrap_or_default(),
                     symbols,
+                    summary: entry[4].as_str().unwrap_or_default().to_owned(),
+                    links,
                 },
             );
         }
         map
     }
+}
+
+/// One file as a mapping pass describes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MappedFile {
+    /// The file, absolute or relative to the map's root.
+    pub path: String,
+    /// What it is for.
+    pub summary: String,
+    /// What it connects to.
+    pub links: Vec<String>,
+}
+
+/// Read the `{"files": [...]}` object a mapping pass answers with.
+///
+/// The model may fence it or wrap it in a sentence, so every fenced block is tried and then
+/// the widest brace-delimited run of the text.
+pub fn parse_mapped(answer: &str) -> Vec<MappedFile> {
+    let answer: String = answer.chars().take(MAX_MAP_ANSWER_CHARS).collect();
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut rest = answer.as_str();
+    while let Some(open) = rest.find("```") {
+        rest = &rest[open + 3..];
+        let Some(close) = rest.find("```") else {
+            break;
+        };
+        let block = &rest[..close];
+        // Drop the fence's language tag.
+        candidates.push(match block.split_once('\n') {
+            Some((first, body)) if !first.contains('{') => body,
+            _ => block,
+        });
+        rest = &rest[close + 3..];
+    }
+    if let (Some(start), Some(end)) = (answer.find('{'), answer.rfind('}')) {
+        candidates.push(&answer[start..=end]);
+    }
+    candidates
+        .iter()
+        .find_map(|candidate| read_files(candidate))
+        .unwrap_or_default()
+}
+
+/// The files of one `{"files": …}` object, or `None` when it does not hold one.
+fn read_files(text: &str) -> Option<Vec<MappedFile>> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let files = value.get("files")?.as_array()?;
+    let mapped: Vec<MappedFile> = files
+        .iter()
+        .filter_map(|file| {
+            let path = file["path"].as_str()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            let links: Vec<String> = file["connects"]
+                .as_array()
+                .or_else(|| file["connections"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|link| link.as_str().map(str::to_owned))
+                .collect();
+            Some(MappedFile {
+                path: path.to_owned(),
+                summary: file["summary"].as_str().unwrap_or_default().to_owned(),
+                links,
+            })
+        })
+        .collect();
+    (!mapped.is_empty()).then_some(mapped)
 }
 
 /// Declarations of a file, one per line, or nothing when it has none.
@@ -640,13 +880,91 @@ __wassh_symbols__
     }
 
     #[test]
+    fn a_mapping_pass_describes_files_and_their_links() {
+        let mut map = EnvMap::parse("/srv/app", 42, SCAN);
+        assert!(map.needs_summaries(), "a fresh scan has nothing described");
+        let files = vec![
+            MappedFile {
+                path: "/srv/app/src/main.rs".to_owned(),
+                summary: "Starts the daemon and reads its settings.".to_owned(),
+                links: vec!["src/lib.rs".to_owned(), "settings".to_owned()],
+            },
+            MappedFile {
+                path: "src/lib.rs".to_owned(),
+                summary: "Runs a job from the queue.".to_owned(),
+                links: vec![],
+            },
+            // Outside the map's tree: an answer may wander, the map does not follow.
+            MappedFile {
+                path: "/etc/passwd".to_owned(),
+                summary: "not ours".to_owned(),
+                links: vec![],
+            },
+        ];
+        let described = map.merge_summaries("/srv/app", 99, &files);
+        assert_eq!(described, 2, "only the files under the root are taken");
+        assert!(!map.needs_summaries());
+        assert_eq!(map.summarised(), 2);
+        assert_eq!(map.mapped_ms, 99);
+        assert_eq!(
+            map.nodes["/srv/app/src/lib.rs"].summary,
+            "Runs a job from the queue."
+        );
+        assert_eq!(
+            map.nodes["/srv/app/src/main.rs"].links,
+            ["src/lib.rs", "settings"]
+        );
+        // The descriptions answer questions the declarations cannot.
+        let hits = map.search("queue", 5);
+        assert!(hits.iter().any(|hit| hit == "/srv/app/src/lib.rs — Runs a job from the queue."), "{hits:?}");
+        let outline = map.outline("/srv/app/src/main.rs").expect("an outline");
+        assert!(outline.contains("Starts the daemon"), "{outline}");
+        assert!(outline.contains("Connects to: src/lib.rs, settings"), "{outline}");
+        // And they survive the store.
+        let restored = EnvMap::from_json(Some(&map.to_json()));
+        assert_eq!(restored, map);
+    }
+
+    #[test]
+    fn a_mapping_answer_is_read_out_of_its_fence() {
+        let answer = "Here is the map:\n\n```json\n{\"files\": [\
+            {\"path\": \"src/main.rs\", \"summary\": \"Entry point.\", \"connects\": [\"lib\"]},\
+            {\"path\": \"src/lib.rs\", \"summary\": \"Library.\"}]}\n```\n";
+        let files = parse_mapped(answer);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[0].summary, "Entry point.");
+        assert_eq!(files[0].links, ["lib"]);
+        assert!(files[1].links.is_empty());
+        assert_eq!(parse_mapped("no map here"), Vec::new());
+    }
+
+    #[test]
     fn the_scan_command_walks_one_root_and_marks_its_sections() {
-        let command = EnvMap::scan_command("'/srv/app'");
-        assert!(command.contains("find '/srv/app' -maxdepth"));
+        let command = EnvMap::scan_command("/srv/app");
+        assert!(command.contains("root='/srv/app'"), "{command}");
+        assert!(command.contains(&format!("printf '{ROOT_MARKER}%s")), "{command}");
+        assert!(command.contains("find \"$root\" -maxdepth"), "{command}");
         assert!(command.contains("-type f"));
         assert!(command.contains(SECTION_MARKER));
         assert!(command.contains("grep -rnIE"));
         assert!(command.contains("head -n 5000"));
+    }
+
+    #[test]
+    fn a_scan_without_a_root_finds_the_project_root_itself() {
+        let command = EnvMap::scan_command("");
+        assert!(command.contains("Cargo.toml"), "no project marker: {command}");
+        assert!(command.contains(ROOT_MARKER), "{command}");
+        assert!(!command.contains("root=''"), "{command}");
+    }
+
+    #[test]
+    fn a_scan_reports_the_root_it_walked() {
+        let output = format!("{ROOT_MARKER}/srv/app\n12 100 /srv/app/a.rs\n{SECTION_MARKER}\n");
+        let map = EnvMap::parse("", 7, &output);
+        assert_eq!(map.root, "/srv/app", "the marker names the root");
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

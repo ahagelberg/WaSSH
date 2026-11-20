@@ -75,10 +75,11 @@ system statistics, the live terminal.",
     },
     Scope {
         id: "env",
-        summary: "The environment map: every file under a root with its size, age and \
-declarations, built by env_scan and queried with env_search, env_find, env_outline and \
-env_overview without touching the host, plus env_system for the host's ports and services. \
-Cheaper than dev_grep_search or dev_find_files for \"where is X\".",
+        summary: "The environment map: every file under the project root with its size, age and \
+declarations, plus the summary and connections a mapping pass writes for the files that matter, \
+built by env_scan and queried with env_search, env_find, env_outline and env_overview without \
+touching the host, and env_system for the host's ports and services. Cheaper than \
+dev_grep_search or dev_find_files for \"where is X\".",
         tools: &[
             TOOL_ENV_SCAN,
             TOOL_ENV_SEARCH,

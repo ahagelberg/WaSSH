@@ -29,9 +29,19 @@
 - Keep every glyph on its column: a run whose glyphs do not add up to the cells it covers is now
   placed one cell at a time, so a double-width character from a face without one no longer pulls
   the rest of the line short, and a tab cell no longer expands in the middle of a run.
+- Graph a project in two steps. `env_scan` with no directory now asks the host for the project
+  root above the working directory (`.git`, `Cargo.toml`, `package.json` and the like) instead of
+  mapping whatever subdirectory the session happens to sit in, and the root it walked is reported
+  back. A mapping pass then has a sub-agent read up to 100 of the mapped files and write what each
+  one is for and what it connects to; a tool answered from a map that has no summaries starts that
+  pass and says so, the Graph scope popup gains **Map project**, and the transcript and the model
+  are told when it lands. The summaries and links live in the per-host map with the file list, so
+  every chat on the connection answers `env_search` and `env_outline` from them.
 
 ### Changed
 
+- `env_search` ranks and answers with a file's summary where a mapping pass wrote one, and
+  `env_outline` shows the summary and the connections beside the declarations.
 - List the AI pane's chats in the order they were started, newest on top, so reopening one does not
   move it up.
 - Name an AI chat by the model's digest of its first prompt instead of the first line of that

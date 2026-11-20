@@ -79,8 +79,29 @@ const COMPACT_KEEP_MESSAGES: usize = 6;
 /// Where the compacted part of the conversation sits in the system prompt.
 const COMPACTED_HEADING: &str = "Earlier conversation, compacted:";
 /// Heading of the environment map's digest in the system prompt.
-const MAP_HEADING: &str =
-    "Environment map (query it with env_find and env_outline; refresh with env_scan):";
+const MAP_HEADING: &str = "Environment map (query it with env_find, env_search and env_outline; \
+refresh or extend it with env_scan):";
+
+/// What the mapping sub-agent is asked, with the root and the file budget filled in.
+const MAP_TASK: &str = "\
+Map the project rooted at {root} for the other chats on this host.
+
+The environment map already lists every file with its declarations: env_overview, env_find, \
+env_search and env_outline answer from it without touching the host. Use them to choose what \
+matters, then read the files themselves (load_scope for the file tools if they are not loaded \
+yet) and describe at most {files} of them. Prefer entry points, build and configuration files \
+and the modules the rest of the tree depends on; skip vendored, generated and lock files. Spend \
+the budget where it explains the widest slice of the project, and stop when it is spent.
+
+Answer with one JSON object and nothing else:
+{\"files\": [{\"path\": \"<absolute or root-relative path>\", \"summary\": \"<what the file is \
+for, at most 40 words>\", \"connects\": [\"<path, module or service it imports, calls or \
+feeds>\"]}]}";
+
+/// Name the chat list gives the mapping sub-agent.
+const MAP_SUBAGENT_TITLE: &str = "map the project";
+/// What the transcript says when a mapping pass lands.
+const MAP_READY_NOTICE: &str = "Map ready: {described} files described under {root}.";
 /// Heading of the host's ports and services in the system prompt.
 const SYSTEM_HEADING: &str = "Host setup (from env_system):";
 /// Transcript note left where the conversation was compacted.
@@ -439,8 +460,20 @@ pub struct AiAgent {
     system_saved: u64,
     /// Set by the popup: rebuild the map on the next frame.
     map_rebuild: bool,
+    /// Set by the popup: have the files of the map described by the model.
+    map_deep_wanted: bool,
+    /// The mapping pass running for this pane, until its answer lands.
+    map_deep: Option<MapRun>,
     /// Which of the pane's two views is drawn.
     view: ChatView,
+}
+
+/// A mapping pass running on a sub-agent.
+struct MapRun {
+    /// Its index in [`Agent::subagents`].
+    subagent: usize,
+    /// The tree it is mapping.
+    root: String,
 }
 
 /// The popup a click on a loaded scope's tag opens.
@@ -514,6 +547,8 @@ impl Default for AiAgent {
             map_saved: 0,
             system_saved: 0,
             map_rebuild: false,
+            map_deep_wanted: false,
+            map_deep: None,
             view: ChatView::List,
         }
     }
@@ -2194,6 +2229,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let tools = self.scope_tool_names(scope);
         let mut turn_off = false;
         let mut rebuild = false;
+        let mut deep = false;
         let mut clear = false;
         let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
             .order(egui::Order::Foreground)
@@ -2267,6 +2303,11 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                                     .enabled(self.agent.map_scan.is_none())
                                     .show(ui, palette)
                                     .clicked();
+                                deep = Button::new("Map project")
+                                    .compact()
+                                    .enabled(self.map_deep.is_none() && self.agent.map_scan.is_none())
+                                    .show(ui, palette)
+                                    .clicked();
                                 clear = Button::new("Clear")
                                     .compact()
                                     .enabled(!self.agent.map.is_empty())
@@ -2289,6 +2330,14 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if rebuild {
             self.map_rebuild = true;
         }
+        if deep {
+            // Nothing listed yet means the cheap walk comes first; the description follows.
+            if self.agent.map.is_empty() {
+                self.map_rebuild = true;
+            } else {
+                self.map_deep_wanted = true;
+            }
+        }
         let rect = area.response.rect;
         let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
         let pressed_outside = ui.input(|input| {
@@ -2304,12 +2353,94 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
     }
 
-    /// Where a scan starts: the map's own root, else the directory the agent works in.
+    /// The tree a scan starts in: the map's own root, or none so the host finds the project
+    /// root itself by its markers.
     fn map_root(&self) -> String {
-        if self.agent.map.root.is_empty() {
-            self.agent.cwd.clone()
-        } else {
-            self.agent.map.root.clone()
+        self.agent.map.root.clone()
+    }
+
+    /// Run the mapping pass a tool answer asked for, and take in the one that finished.
+    ///
+    /// The files are already listed cheaply; this spends a sub-agent on describing what is
+    /// in them and what they connect to, so later questions cost neither host calls nor
+    /// tokens. One pass at a time, and only while a model is configured.
+    fn poll_map_deep(
+        &mut self,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) {
+        if let Some(run) = &self.map_deep {
+            let finished = self
+                .agent
+                .subagents
+                .get(run.subagent)
+                .is_some_and(|sub| sub.end.is_some());
+            if finished {
+                let run = self.map_deep.take().unwrap_or_else(|| unreachable!("just matched"));
+                let answer = self
+                    .agent
+                    .subagents
+                    .get(run.subagent)
+                    .map(|sub| sub.answer_full())
+                    .unwrap_or_default();
+                let files = super::map::parse_mapped(&answer);
+                let described = self
+                    .agent
+                    .map
+                    .merge_summaries(&run.root, self.agent.now_ms, &files);
+                if described > 0 {
+                    let notice = MAP_READY_NOTICE
+                        .replace("{described}", &described.to_string())
+                        .replace("{root}", &run.root);
+                    self.show_map_ready(&notice);
+                    // A run in flight carries the news into its next request.
+                    if self.agent.blocked() {
+                        self.agent.inject_user(&notice, UserMeta::default());
+                    }
+                }
+            }
+        }
+        let wanted = std::mem::take(&mut self.map_deep_wanted)
+            || self.agent.take_deep_map_wanted();
+        if !wanted || self.map_deep.is_some() || self.agent.map.is_empty() {
+            return;
+        }
+        let Some(root) = (!self.agent.map.root.is_empty()).then(|| self.agent.map.root.clone())
+        else {
+            return;
+        };
+        let prompt = MAP_TASK
+            .replace("{root}", &root)
+            .replace("{files}", &super::map::MAX_MAPPED_FILES.to_string());
+        let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt);
+        match self.request_for(Some(index), settings, host, environment) {
+            Some(request) => {
+                if let Some(sub) = self.agent.subagents.get_mut(index) {
+                    sub.agent.start(request);
+                }
+                self.map_deep = Some(MapRun {
+                    subagent: index,
+                    root,
+                });
+            }
+            None => {
+                // No model to do it; the next tool call asks again once one is configured.
+                self.agent.subagents.pop();
+            }
+        }
+    }
+
+    /// Report a mapping pass in the transcript, in place of the sub-agent's raw JSON answer.
+    fn show_map_ready(&mut self, notice: &str) {
+        let finished = format!("Sub-agent \"{MAP_SUBAGENT_TITLE}\" finished:");
+        let raw = self.agent.turns.iter_mut().rev().find_map(|turn| match turn {
+            Turn::Notice(text) if text.starts_with(&finished) => Some(text),
+            _ => None,
+        });
+        match raw {
+            Some(text) => *text = notice.to_owned(),
+            None => self.agent.turns.push(Turn::Notice(notice.to_owned())),
         }
     }
 
@@ -2318,12 +2449,22 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if self.agent.map_scan.is_some() {
             return "Scanning…".to_owned();
         }
+        if self.map_deep.is_some() {
+            return "Describing the files…".to_owned();
+        }
         if self.agent.map.is_empty() {
-            return format!("Nothing mapped yet. A scan starts at {}.", self.map_root());
+            return format!(
+                "Nothing mapped yet. A scan starts at the project root above {}.",
+                self.agent.cwd
+            );
         }
         let map = &self.agent.map;
+        let described = match map.summarised() {
+            0 => "no summaries".to_owned(),
+            count => format!("{count} described"),
+        };
         format!(
-            "Graph: {} files under {} ({}), built {} min ago",
+            "Graph: {} files under {} ({}, {described}), built {} min ago",
             map.len(),
             map.root,
             if map.truncated { "capped" } else { "complete" },
@@ -3792,6 +3933,11 @@ impl Plugin for AiAgent {
                 self.report_error(error);
             }
         }
+        self.poll_map_deep(
+            context.settings,
+            &context.host_label,
+            &context.environment,
+        );
         // A message typed during the last run joins the conversation before the next
         // request is built, so the model sees it.
         self.agent.flush_injected();
@@ -6997,6 +7143,82 @@ mod tests {
             "the model names the filed chat: error {:?}",
             plugin.error
         );
+    }
+
+    #[test]
+    fn a_shallow_map_starts_a_mapping_pass_with_its_budget() {
+        const CHAT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, _requests) = provider(CHAT, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        // The first frame reads what was stored, so the map is set after it.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.map = super::super::map::EnvMap::parse(
+            "/srv/app",
+            1,
+            "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
+        );
+        plugin.map_deep_wanted = true;
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        let run = plugin
+            .map_deep
+            .as_ref()
+            .unwrap_or_else(|| panic!("the mapping pass did not start: {:?}", plugin.error));
+        let prompt = &plugin.agent.subagents[run.subagent].prompt;
+        assert!(prompt.contains("at most 100 of them"), "{prompt}");
+        assert!(prompt.contains("/srv/app"), "{prompt}");
+    }
+
+    #[test]
+    fn a_mapping_answer_describes_the_files_in_the_map() {
+        const ANSWER: &str = "```json\n{\"files\": [\
+            {\"path\": \"main.rs\", \"summary\": \"Entry point.\", \"connects\": [\"lib.rs\"]}]}\n```";
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        // The first frame reads what was stored, so the map is set after it.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.map = super::super::map::EnvMap::parse(
+            "/srv/app",
+            1,
+            "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
+        );
+        let index = plugin.agent.begin_subagent("map the project", "map it");
+        plugin.agent.subagents[index]
+            .agent
+            .turns
+            .push(Turn::Assistant {
+                text: ANSWER.to_owned(),
+                stopped: false,
+            });
+        plugin.agent.subagents[index].end = Some(super::super::agent::SubagentEnd::Done);
+        plugin.map_deep = Some(MapRun {
+            subagent: index,
+            root: "/srv/app".to_owned(),
+        });
+
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let node = &plugin.agent.map.nodes["/srv/app/main.rs"];
+        assert_eq!(node.summary, "Entry point.");
+        assert_eq!(node.links, ["lib.rs"]);
+        assert!(
+            plugin.agent.turns.iter().any(
+                |turn| matches!(turn, Turn::Notice(text) if text.contains("Map ready"))
+            ),
+            "the pane says the map is ready: {:?}",
+            plugin.agent.turns
+        );
+        assert!(plugin.map_deep.is_none(), "the pass is done");
     }
 
     #[test]

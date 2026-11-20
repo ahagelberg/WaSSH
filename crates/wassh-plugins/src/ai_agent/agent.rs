@@ -454,8 +454,18 @@ impl Subagent {
 
     /// The last prose it wrote, capped for the transcript and the model.
     pub fn answer(&self) -> String {
-        let text = self
-            .agent
+        head_chars(self.last_text(), MAX_SUBAGENT_RESULT_CHARS)
+    }
+
+    /// The last prose it wrote in full, for a caller that reads it as data rather than as
+    /// a report — a mapping pass answers with a JSON object.
+    pub fn answer_full(&self) -> String {
+        head_chars(self.last_text(), super::map::MAX_MAP_ANSWER_CHARS)
+    }
+
+    /// The last prose it wrote.
+    fn last_text(&self) -> &str {
+        self.agent
             .turns
             .iter()
             .rev()
@@ -463,8 +473,7 @@ impl Subagent {
                 Turn::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim()),
                 _ => None,
             })
-            .unwrap_or_default();
-        head_chars(text, MAX_SUBAGENT_RESULT_CHARS)
+            .unwrap_or_default()
     }
 }
 
@@ -610,6 +619,9 @@ pub struct Agent {
     pub system: SystemFacts,
     /// A map scan the pane asked for: the root, until its output arrives.
     pub map_scan: Option<String>,
+    /// Set when a tool answered about a tree whose files are listed but not described, so
+    /// the pane can start the mapping pass.
+    deep_map_wanted: bool,
     /// Sub-agents this conversation started, in the order they were started.
     pub subagents: Vec<Subagent>,
     /// Counter behind the sub-agent ids.
@@ -1038,12 +1050,14 @@ impl Agent {
                         let scanned = EnvMap::parse(&root, self.now_ms, &text);
                         let found = scanned.len();
                         let truncated = scanned.truncated;
+                        let mapped_root = scanned.root.clone();
                         self.map = scanned;
+                        let deeper = self.note_shallow_map();
                         Ready::Settle(
-                            format!("env_scan {root}"),
+                            format!("env_scan {mapped_root}"),
                             format!(
-                                "Mapped {root}: {found} files{}. Query it with env_find, \
-                                 env_outline or env_overview.",
+                                "Mapped {mapped_root}: {found} files{}. Query it with env_find, \
+                                 env_outline or env_overview.{deeper}",
                                 if truncated {
                                     " (capped, the tree is bigger)"
                                 } else {
@@ -1298,6 +1312,29 @@ impl Agent {
         true
     }
 
+    /// Whether a tree was mapped without descriptions since the last look, so the pane can
+    /// start the mapping pass.
+    pub fn take_deep_map_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.deep_map_wanted)
+    }
+
+    /// Note that an answer came from a map whose files are listed but not described.
+    ///
+    /// Returns the line the tool answer adds, so the model knows a mapping pass is coming
+    /// and what to do meanwhile.
+    fn note_shallow_map(&mut self) -> String {
+        if !self.map.needs_summaries() {
+            return String::new();
+        }
+        self.deep_map_wanted = true;
+        format!(
+            "\n{} is listed but nothing in it has been read yet: a mapping pass is being \
+             started to describe the files and what they connect to. You will be told when it \
+             is ready.",
+            self.map.root
+        )
+    }
+
     /// Start a scan the pane asked for, apart from any tool call.
     ///
     /// The map is host state, so the pane can rebuild it without a conversation turn; the
@@ -1310,10 +1347,10 @@ impl Agent {
             return Err("The session is not connected.".to_owned());
         };
         let root = root.trim().to_owned();
-        if root.is_empty() || root == "/" {
+        if root == "/" {
             return Err("Pick a directory other than the root to map.".to_owned());
         }
-        access.exec(MAP_KEY, &EnvMap::scan_command(&shell_quote(&root)));
+        access.exec(MAP_KEY, &EnvMap::scan_command(&root));
         self.map_scan = Some(root);
         Ok(())
     }
@@ -1339,6 +1376,10 @@ impl Agent {
             None => failure.unwrap_or_default(),
         };
         self.map = EnvMap::parse(&root, self.now_ms, &text);
+        // A fresh listing describes nothing, so the pane follows it with a mapping pass.
+        if self.map.needs_summaries() {
+            self.deep_map_wanted = true;
+        }
         true
     }
 
@@ -2214,15 +2255,17 @@ impl Agent {
                 });
             }
             TOOL_ENV_SCAN => {
+                // No path means "map this project": the host finds the root itself, so a
+                // session opened deep inside a tree maps the tree and not that directory.
                 let root = arguments["path"]
                     .as_str()
                     .map(str::trim)
                     .filter(|path| !path.is_empty())
                     .map(|path| relative_remote(&self.cwd, path))
                     .or_else(|| (!self.map.root.is_empty()).then(|| self.map.root.clone()))
-                    .unwrap_or_else(|| self.cwd.clone());
+                    .unwrap_or_default();
                 // The scan is the one map tool that touches the host: one walk, no reads.
-                let command = EnvMap::scan_command(&shell_quote(&root));
+                let command = EnvMap::scan_command(&root);
                 self.run_probe(call, turn, CommandThen::ScanMap { root }, command, session);
             }
             TOOL_ENV_FIND => {
@@ -2242,6 +2285,7 @@ impl Agent {
                 } else {
                     (hits.join("\n"), false)
                 };
+                let output = format!("{output}{}", self.note_shallow_map());
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
             }
@@ -2258,11 +2302,12 @@ impl Agent {
                         true,
                     ),
                 };
+                let output = format!("{output}{}", self.note_shallow_map());
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
             }
             TOOL_ENV_OVERVIEW => {
-                let output = self.map.overview();
+                let output = format!("{}{}", self.map.overview(), self.note_shallow_map());
                 let failed = self.map.is_empty();
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
@@ -2284,6 +2329,7 @@ impl Agent {
                 } else {
                     (hits.join("\n"), false)
                 };
+                let output = format!("{output}{}", self.note_shallow_map());
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
             }
