@@ -498,6 +498,8 @@ pub struct AiAgent {
     map_deep_wanted: bool,
     /// The mapping pass running for this pane, until its answer lands.
     map_deep: Option<MapRun>,
+    /// Set while a pass waits for the walk in front of it to finish.
+    map_pass_after_scan: bool,
     /// Folder the popup pinned for the map, empty to let the host find the project root.
     map_folder: String,
     /// Folder the host's plugin data holds, so a change is written once.
@@ -595,6 +597,7 @@ impl Default for AiAgent {
             map_rebuild: false,
             map_deep_wanted: false,
             map_deep: None,
+            map_pass_after_scan: false,
             map_folder: String::new(),
             map_folder_saved: String::new(),
             map_more: false,
@@ -769,6 +772,9 @@ impl AiAgent {
         self.queued.clear();
         self.expanded_prompts.clear();
         self.parsed_sub.clear();
+        // A pass belongs to the conversation that started it.
+        self.map_deep = None;
+        self.map_pass_after_scan = false;
     }
 
     /// Set the live conversation aside and start an empty one, in the conversation view.
@@ -816,6 +822,8 @@ impl AiAgent {
         self.editing = None;
         self.queued.clear();
         self.expanded_prompts.clear();
+        self.map_deep = None;
+        self.map_pass_after_scan = false;
         self.view = ChatView::Chat;
     }
 
@@ -2446,11 +2454,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             self.map_more = !self.map_more;
         }
         if deep {
-            // A folder the map was not built from, and a map that is not there yet, both mean
-            // the cheap walk comes first; the description follows it.
+            // A folder the map was not built from needs the walk before the description; one
+            // that is not there yet is walked by the pass itself.
             let pinned = self.map_folder.trim();
-            let unbuilt = !pinned.is_empty() && pinned != self.agent.map.root;
-            if self.agent.map.is_empty() || unbuilt {
+            if !pinned.is_empty() && pinned != self.agent.map.root {
                 self.map_rebuild = true;
             }
             self.map_deep_wanted = true;
@@ -2488,50 +2495,60 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         environment: &str,
     ) {
         if let Some(run) = &self.map_deep {
-            let finished = self
-                .agent
-                .subagents
-                .get(run.subagent)
-                .is_some_and(|sub| sub.end.is_some());
-            if finished {
+            let known = self.agent.subagents.get(run.subagent);
+            let finished = known.is_some_and(|sub| sub.end.is_some());
+            // A run whose sub-agent went away with its chat is dropped rather than left to
+            // block every later pass.
+            if known.is_none() || finished {
                 let run = self.map_deep.take().unwrap_or_else(|| unreachable!("just matched"));
-                let answer = self
-                    .agent
-                    .subagents
-                    .get(run.subagent)
-                    .map(|sub| sub.answer_full())
-                    .unwrap_or_default();
-                let files = super::map::parse_mapped(&answer);
-                if files.is_empty() {
-                    self.report_map_empty(&run, &answer, settings, host, environment);
-                    return;
-                }
-                let described = self
-                    .agent
-                    .map
-                    .merge_summaries(&run.root, self.agent.now_ms, &files);
-                if described > 0 {
-                    let notice = MAP_READY_NOTICE
-                        .replace("{described}", &described.to_string())
-                        .replace("{root}", &run.root);
-                    self.show_map_ready(&notice);
-                    // A run in flight carries the news into its next request.
-                    if self.agent.blocked() {
-                        self.agent.inject_user(&notice, UserMeta::default());
+                if finished {
+                    let answer = self.agent.subagents[run.subagent].answer_full();
+                    let files = super::map::parse_mapped(&answer);
+                    if files.is_empty() {
+                        self.report_map_empty(&run, &answer, settings, host, environment);
+                        return;
+                    }
+                    let described =
+                        self.agent
+                            .map
+                            .merge_summaries(&run.root, self.agent.now_ms, &files);
+                    if described > 0 {
+                        let notice = MAP_READY_NOTICE
+                            .replace("{described}", &described.to_string())
+                            .replace("{root}", &run.root);
+                        self.show_map_ready(&notice);
+                        // A run in flight carries the news into its next request.
+                        if self.agent.blocked() {
+                            self.agent.inject_user(&notice, UserMeta::default());
+                        }
                     }
                 }
             }
         }
-        // A pass cannot start over a map that is not there yet or one that is being walked,
-        // so what asked for it waits rather than being spent on nothing.
-        if self.map_deep.is_some() || self.agent.map_scan.is_some() || self.agent.map.is_empty() {
-            return;
-        }
+        // A pass needs a map to describe. What asks for one — a tool answered from the map,
+        // or the popup — starts the walk itself when the tree has not been walked yet, and
+        // the pass follows it.
         let wanted =
-            std::mem::take(&mut self.map_deep_wanted) || self.agent.take_deep_map_wanted();
-        if !wanted {
+            self.map_deep_wanted || self.agent.deep_map_wanted() || self.map_pass_after_scan;
+        if self.map_deep.is_some() || !wanted {
             return;
         }
+        if self.agent.map_scan.is_some() {
+            self.map_pass_after_scan = true;
+            return;
+        }
+        if self.agent.map.is_empty() {
+            // Walk the folder once per request; a tree that really holds nothing is not
+            // walked again and again.
+            if !self.map_pass_after_scan {
+                self.map_pass_after_scan = true;
+                self.map_rebuild = true;
+            }
+            return;
+        }
+        self.map_deep_wanted = false;
+        self.agent.clear_deep_map_wanted();
+        self.map_pass_after_scan = false;
         let root = match self.agent.map.root.is_empty() {
             true => self.agent.cwd.clone(),
             false => self.agent.map.root.clone(),
@@ -4257,6 +4274,9 @@ impl Plugin for AiAgent {
             self.agent
                 .turns
                 .push(Turn::Notice(format!("Scan of {root} found no files.")));
+            // Nothing to describe, so the pass waiting behind the walk is dropped instead of
+            // asking for the same empty tree again.
+            self.map_pass_after_scan = false;
         }
         if std::mem::take(&mut self.map_rebuild) {
             let root = self.map_root();
@@ -7659,6 +7679,58 @@ mod tests {
         assert!(
             rows.iter().any(|(_, _, text)| text == "Less"),
             "the detail view can be closed again: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_for_a_pass_walks_an_unmapped_tree_first() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(plugin.agent.map.is_empty());
+        // A tool answered from the map, so the pane owes a walk and a pass.
+        plugin.agent.clear_deep_map_wanted();
+        plugin.map_deep_wanted = true;
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            plugin.map_pass_after_scan,
+            "the pass does not wait for the walk: {:?}",
+            plugin.error
+        );
+        // The walk itself is asked for on the next frame, and the pane has no session here.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            plugin.error.as_deref() == Some("The session is not connected."),
+            "the walk was not asked for: {:?}",
+            plugin.error
+        );
+        assert!(plugin.map_deep.is_none(), "a pass cannot run without a map");
+    }
+
+    #[test]
+    fn a_pass_whose_sub_agent_went_away_does_not_block_the_next_one() {
+        let mut plugin = AiAgent::default();
+        let mut settings = local_provider();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.map = a_scanned_map();
+        // A run left over from a conversation that is gone.
+        plugin.map_deep = Some(MapRun {
+            subagent: 7,
+            root: "/srv/app".to_owned(),
+            started: 0,
+            attempts: MAP_ATTEMPTS,
+        });
+        plugin.map_deep_wanted = true;
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let run = plugin
+            .map_deep
+            .as_ref()
+            .unwrap_or_else(|| panic!("no pass was started: {:?}", plugin.error));
+        assert!(
+            run.subagent < plugin.agent.subagents.len(),
+            "the pass points at a sub-agent that is not there"
         );
     }
 

@@ -1320,8 +1320,29 @@ impl Agent {
 
     /// Whether a tree was mapped without descriptions since the last look, so the pane can
     /// start the mapping pass.
-    pub fn take_deep_map_wanted(&mut self) -> bool {
-        std::mem::take(&mut self.deep_map_wanted)
+    /// Whether a tool answer asked for the map to be walked or described.
+    pub fn deep_map_wanted(&self) -> bool {
+        self.deep_map_wanted
+    }
+
+    /// Clear the request for a mapping pass once the pane has acted on it.
+    pub fn clear_deep_map_wanted(&mut self) {
+        self.deep_map_wanted = false;
+    }
+
+    /// Note that an answer came from a map that is not there or not described, and say what
+    /// the pane starts for it.
+    ///
+    /// Returns the line the tool answer adds, so the model knows a scan and a mapping pass are
+    /// coming and what to do meanwhile.
+    fn note_map_needed(&mut self) -> String {
+        if self.map.is_empty() {
+            self.deep_map_wanted = true;
+            return "\nNothing is mapped yet: a scan of the project and a mapping pass are being \
+                    started. You will be told when the map is ready."
+                .to_owned();
+        }
+        self.note_shallow_map()
     }
 
     /// Note that an answer came from a map whose files are listed but not described.
@@ -2291,7 +2312,7 @@ impl Agent {
                 } else {
                     (hits.join("\n"), false)
                 };
-                let output = format!("{output}{}", self.note_shallow_map());
+                let output = format!("{output}{}", self.note_map_needed());
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
             }
@@ -2308,12 +2329,12 @@ impl Agent {
                         true,
                     ),
                 };
-                let output = format!("{output}{}", self.note_shallow_map());
+                let output = format!("{output}{}", self.note_map_needed());
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
             }
             TOOL_ENV_OVERVIEW => {
-                let output = format!("{}{}", self.map.overview(), self.note_shallow_map());
+                let output = format!("{}{}", self.map.overview(), self.note_map_needed());
                 let failed = self.map.is_empty();
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
@@ -2335,7 +2356,7 @@ impl Agent {
                 } else {
                     (hits.join("\n"), false)
                 };
-                let output = format!("{output}{}", self.note_shallow_map());
+                let output = format!("{output}{}", self.note_map_needed());
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
             }
@@ -4832,6 +4853,22 @@ mod tests {
             Some(Turn::Tool { output, .. }) => output.clone(),
             other => panic!("expected a tool turn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_graph_tool_on_an_empty_map_asks_for_a_scan_and_a_pass() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        assert!(agent.map.is_empty());
+        let output = run_tool(&mut agent, &mut fake, TOOL_ENV_OVERVIEW, "{}");
+        assert!(
+            agent.deep_map_wanted(),
+            "the pane is not told to map the tree: {output}"
+        );
+        assert!(
+            output.contains("scan of the project") && output.contains("mapping pass"),
+            "the model is not told what is starting: {output}"
+        );
     }
 
     #[test]

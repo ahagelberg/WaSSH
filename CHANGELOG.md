@@ -61,6 +61,10 @@
 
 ### Fixed
 
+- Start the map on its own when a graph tool is asked for: an answer from a tree that is not
+  walked starts the scan and follows it with the mapping pass, a pass left over from a chat that is
+  gone no longer blocks the next one, and a scan that finds nothing says so instead of leaving the
+  pass waiting behind it.
 - Send the sudo password on Enter: the card takes the keyboard when it appears, so the shell behind
   it no longer gets the key, and the field's own Enter handling is read before the field takes it.
 - Read the age a scan prints. `find -printf %T@` writes the timestamp with a fraction too, so
