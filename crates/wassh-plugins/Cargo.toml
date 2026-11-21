@@ -11,6 +11,9 @@ description = "WaSSH built-in plugins and their internal registration API"
 egui = { workspace = true }
 regex = { workspace = true }
 rfd = { workspace = true }
+# The `run_script` sandbox: a QuickJS engine built from source, so a script cannot reach
+# anything the tool API does not hand it.
+rquickjs = "0.14"
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }

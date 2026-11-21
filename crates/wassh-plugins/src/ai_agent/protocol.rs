@@ -40,6 +40,10 @@ pub const SETTING_MODEL_CONTEXTS: &str = "modelContexts";
 pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
 /// Setting key: how many sub-agents may run at the same time.
 pub const SETTING_MAX_SUBAGENTS: &str = "maxSubagents";
+/// Setting key: send the tools as a script API instead of one schema per tool.
+pub const SETTING_SCRIPT_MODE: &str = "scriptMode";
+/// Setting key: this host's script mode, which wins over the app-wide one.
+pub const SETTING_HOST_SCRIPT_MODE: &str = "hostScriptMode";
 /// Sub-agents allowed at once when nothing is stored.
 pub const DEFAULT_MAX_SUBAGENTS: usize = 5;
 /// Longest sub-agent answer handed back to the model.
@@ -47,6 +51,8 @@ pub const MAX_SUBAGENT_RESULT_CHARS: usize = 8_000;
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";
+/// Tool: run a short JavaScript program that calls the other tools and returns one result.
+pub const TOOL_RUN_SCRIPT: &str = "run_script";
 /// Tool: start a shell command in the background without waiting for it.
 pub const TOOL_RUN_COMMAND_BACKGROUND: &str = "run_command_background";
 /// Tool: run a shell command as root, asking the user for the password first.

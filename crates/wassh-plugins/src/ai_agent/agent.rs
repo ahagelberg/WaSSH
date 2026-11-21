@@ -20,9 +20,10 @@ use super::protocol::{
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
     TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND,
-    TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
-    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
+    TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
+    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH,
+    TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
@@ -30,6 +31,7 @@ use super::rules::{
     ApprovalScope, RuleDecision, approval_scopes, decide_command,
 };
 use super::scopes::{self, Loaded, Scope};
+use super::script::{self, ScriptEvent, ScriptReply};
 use super::tools::{self, ToolResult};
 use super::web;
 use crate::plugin::SessionAccess;
@@ -42,6 +44,8 @@ type Session<'a, 'b> = &'a mut Option<&'b mut dyn SessionAccess>;
 
 /// Longest command output handed to the model.
 pub const MAX_OUTPUT_CHARS: usize = 64_000;
+/// Prefix of the call ids a script's tool calls carry; they never reach the provider.
+const SCRIPT_CALL_PREFIX: &str = "script-";
 /// Hits `env_find` returns when the call does not say.
 const ENV_FIND_HITS_DEFAULT: usize = 30;
 /// Files `env_search` ranks when the call does not say.
@@ -85,6 +89,11 @@ pub const DENIED_BY_USER: &str = "Action denied by user.";
 /// Said when a Plan-mode chat is asked to change something.
 pub const PLAN_READ_ONLY: &str = "This chat is in Plan mode, which only reads. Switch it to Agent \
 mode to change anything.";
+/// Said when a script-mode chat calls a tool directly instead of from a script.
+pub const SCRIPT_MODE_ONLY: &str = "This chat is in script mode, so the tools are called from \
+inside `run_script`: call run_script with a program that awaits `tools.<name>({ ... })`.";
+/// Question shown when `ask_user` carried none.
+const QUESTION_FALLBACK: &str = "The agent needs your input.";
 /// Answer given to a tool call the user stopped before it ran.
 pub const STOPPED_BY_USER: &str = "Stopped by the user before this ran.";
 /// System prompt used when summarising a chat for a new one.
@@ -139,10 +148,50 @@ pub enum Turn {
         /// The user's answer, when it came.
         answer: Option<String>,
     },
+    /// A script the agent ran, with the calls it made.
+    Script {
+        /// The program it wrote.
+        code: String,
+        /// The calls it made, in order.
+        calls: Vec<ScriptRow>,
+        /// The result handed back to the model, once it came.
+        result: Option<String>,
+        /// Whether the script failed.
+        failed: bool,
+        /// What the script logged, shown to the reader only.
+        console: String,
+    },
     /// Something that went wrong.
     Error(String),
     /// A note from a slash command.
     Notice(String),
+}
+
+/// One tool call a script made, for its transcript card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptRow {
+    /// Tool name.
+    pub name: String,
+    /// One-line summary of the call.
+    pub label: String,
+    /// What the tool returned.
+    pub output: String,
+    /// Whether it failed.
+    pub failed: bool,
+}
+
+/// A script the agent is running.
+struct ScriptRun {
+    /// The call the model made.
+    outer: ApiToolCall,
+    /// Its transcript line.
+    turn: usize,
+    /// The call the script is waiting on, with the id it waits under.
+    inner: Option<(ApiToolCall, u64)>,
+    /// Every call the script has made so far.
+    calls: Vec<ScriptRow>,
+    /// Where its events and answers travel.
+    job: script::ScriptJob,
 }
 
 /// A question the agent asks, with optional selectable answers.
@@ -257,6 +306,8 @@ pub enum Waiting {
         /// When the wait gives up, in milliseconds since the epoch.
         until_ms: u64,
     },
+    /// A script in its sandbox, until it returns or asks for another tool.
+    Script,
 }
 
 /// What follows a probe command.
@@ -643,6 +694,10 @@ pub struct Agent {
     /// Answers from sub-agents, held until the conversation is between turns so a tool
     /// call of its own is never separated from its result.
     pending_reports: Vec<String>,
+    /// The script this conversation is running, if any.
+    script: Option<ScriptRun>,
+    /// Whether the tools are offered as a script API instead of one schema per tool.
+    pub script_mode: bool,
 }
 
 impl Agent {
@@ -715,6 +770,7 @@ impl Agent {
         self.compacted = None;
         self.scopes = Loaded::new();
         self.plan = false;
+        self.script = None;
         self.spawn_request = None;
         self.pending_reports.clear();
         for sub in &mut self.subagents {
@@ -955,10 +1011,93 @@ impl Agent {
                     progressed = true;
                 }
             }
+            Some(Phase::Running {
+                waiting: Waiting::Script,
+                ..
+            }) => progressed = self.poll_script(session),
             Some(Phase::Running { .. }) => progressed = self.poll_tool(session),
             _ => {}
         }
         progressed
+    }
+
+    /// Drive the running script: dispatch the calls it makes, or take its result.
+    fn poll_script(&mut self, session: Session<'_, '_>) -> bool {
+        let Some(run) = &self.script else {
+            return false;
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = run.job.events.try_recv() {
+            events.push(event);
+        }
+        let mut progressed = false;
+        for event in events {
+            progressed = true;
+            match event {
+                ScriptEvent::Call(call) => self.start_script_call(call, &mut *session),
+                ScriptEvent::Finished { result, console } => {
+                    self.finish_script(result, console, session);
+                    break;
+                }
+            }
+        }
+        progressed
+    }
+
+    /// Run one call the script asked for, through the same gates a direct call takes.
+    fn start_script_call(&mut self, call: script::ScriptCall, session: Session<'_, '_>) {
+        let Some(run) = self.script.as_mut() else {
+            return;
+        };
+        let inner = ApiToolCall {
+            id: format!("{SCRIPT_CALL_PREFIX}{}", call.id),
+            name: call.name,
+            arguments: call.arguments,
+        };
+        run.calls.push(ScriptRow {
+            name: inner.name.clone(),
+            label: call_label(&inner),
+            output: String::new(),
+            failed: false,
+        });
+        run.inner = Some((inner.clone(), call.id));
+        let turn = run.turn;
+        self.dispatch(inner, turn, session);
+    }
+
+    /// Take the script's result: it becomes the `run_script` tool result, and nothing the
+    /// script did in between enters the provider history.
+    fn finish_script(
+        &mut self,
+        result: Result<String, String>,
+        console: String,
+        session: Session<'_, '_>,
+    ) {        let Some(run) = self.script.take() else {
+            return;
+        };
+        self.phase = None;
+        let (text, failed) = match result {
+            Ok(payload) => (script::clamp_result(payload), false),
+            Err(problem) => (format!("The script failed: {problem}"), true),
+        };
+        if let Some(Turn::Script {
+            calls,
+            result: slot,
+            failed: flag,
+            console: logged,
+            ..
+        }) = self.turns.get_mut(run.turn)
+        {
+            *calls = run.calls;
+            *slot = Some(text.clone());
+            *flag = failed;
+            *logged = console;
+        }
+        self.history.push(ApiMessage::Tool {
+            tool_call_id: run.outer.id.clone(),
+            content: text,
+        });
+        self.advance(session);
     }
 
     /// Poll the running tool and move the turn on when it answers.
@@ -978,6 +1117,7 @@ impl Agent {
         };
         let (call, turn) = (call.clone(), *turn);
         let ready = match waiting {
+            Waiting::Script => return false,
             Waiting::Command { key, then } => {
                 let (key, then) = (key.clone(), then.clone());
                 let (output, failure) = match session.as_ref() {
@@ -1032,7 +1172,7 @@ impl Agent {
                             visible.push_str(SUDO_HINT);
                         }
                         Ready::Settle(
-                            self.label(turn),
+                            self.turn_label(turn, &call),
                             command_result_text(&visible, exit_code, truncated),
                             exit_code.is_some_and(|code| code != 0) || refused_sudo,
                         )
@@ -1214,8 +1354,8 @@ impl Agent {
                 }
             }
             Waiting::Worker { events } => match events.try_recv() {
-                Ok(Ok(output)) => Ready::Settle(self.label(turn), output, false),
-                Ok(Err(error)) => Ready::Settle(self.label(turn), error, true),
+                Ok(Ok(output)) => Ready::Settle(self.turn_label(turn, &call), output, false),
+                Ok(Err(error)) => Ready::Settle(self.turn_label(turn, &call), error, true),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Ready::Settle(
                     self.label(turn),
                     "The tool stopped without an answer.".to_owned(),
@@ -1417,6 +1557,20 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// The label of a call: its tool turn's when it has one, else the call's own.
+    ///
+    /// A script's calls have no tool turn of their own — they live on the script's card —
+    /// so the call itself names them.
+    fn turn_label(&self, turn: usize, call: &ApiToolCall) -> String {
+        self.turns
+            .get(turn)
+            .and_then(|turn| match turn {
+                Turn::Tool { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| call_label(call))
+    }
+
     /// Record a tool result and move on to the next call or the next reply.
     fn settle(
         &mut self,
@@ -1427,6 +1581,12 @@ impl Agent {
         failed: bool,
         session: Session<'_, '_>,
     ) {
+        // A call a script made is not part of the provider history: its result goes back to
+        // the sandbox, which decides what the model ever sees.
+        if self.waiting_on(&call) {
+            self.answer_script(&call, label, output, failed);
+            return;
+        }
         if let Some(Turn::Tool {
             label: turn_label,
             output: turn_output,
@@ -1450,6 +1610,51 @@ impl Agent {
             content: output,
         });
         self.advance(session);
+    }
+
+    /// Whether the script is waiting on this call.
+    fn waiting_on(&self, call: &ApiToolCall) -> bool {
+        self.script.as_ref().is_some_and(|run| {
+            run.inner
+                .as_ref()
+                .is_some_and(|(inner, _)| inner.id == call.id)
+        })
+    }
+
+    /// Hand a finished tool back to the script that asked for it and resume the script.
+    fn answer_script(&mut self, call: &ApiToolCall, label: String, output: String, failed: bool) {
+        let Some(run) = self.script.as_mut() else {
+            return;
+        };
+        let Some((_, id)) = run.inner.take() else {
+            return;
+        };
+        if let Some(row) = run.calls.last_mut()
+            && row.name == call.name
+        {
+            row.label = label;
+            row.failed = failed;
+            row.output = output.clone();
+        }
+        // A successful call resolves to the tool's JSON result; a failed one rejects with
+        // the message, so `try { ... } catch` reads the way JavaScript expects.
+        let text = if failed {
+            output
+        } else {
+            serde_json::json!({ "ok": true, "text": output }).to_string()
+        };
+        run.job.reply(ScriptReply {
+            id,
+            ok: !failed,
+            text,
+        });
+        let outer = run.outer.clone();
+        let turn = run.turn;
+        self.phase = Some(Phase::Running {
+            call: outer,
+            turn,
+            waiting: Waiting::Script,
+        });
     }
 
     /// Run the next queued call, or ask the model again.
@@ -1545,10 +1750,11 @@ impl Agent {
         match self.permission(&call.name) {
             Permission::Allow => {}
             Permission::Deny => {
+                let label = call_label(&call);
                 self.settle(
                     call,
                     turn,
-                    self.label(turn),
+                    label,
                     NOT_PERMITTED.to_owned(),
                     false,
                     session,
@@ -1557,7 +1763,7 @@ impl Agent {
             }
             Permission::Ask => {
                 self.phase = Some(Phase::Allowing {
-                    label: self.label(turn),
+                    label: call_label(&call),
                     call,
                     turn,
                 });
@@ -1599,7 +1805,7 @@ impl Agent {
 
     /// Whether Plan mode forbids a call.
     fn plan_blocks(&self, tool: &str) -> bool {
-        self.plan && !tools::is_read_only(tool)
+        self.plan && !tools::plan_safe(tool)
     }
 
     /// Whether a tool should be offered to the model for this session.
@@ -1610,7 +1816,7 @@ impl Agent {
     pub fn offers_tool(&self, tool: &str) -> bool {
         (tools::is_scope_tool(tool) || self.scopes.holds(tool))
             && self.permission(tool) != Permission::Deny
-            && (!self.plan || tools::is_read_only(tool))
+            && (!self.plan || tools::plan_safe(tool))
     }
 
     /// Bring a scope's tools into the conversation.
@@ -1738,6 +1944,20 @@ impl Agent {
             );
             return;
         }
+        // Script mode offers one tool: everything else is called from inside the program.
+        // The calls a script makes are let through — they are what the sandbox asked for.
+        if self.script_mode && name != TOOL_RUN_SCRIPT && !self.waiting_on(&call) {
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                SCRIPT_MODE_ONLY.to_owned(),
+                true,
+                session,
+            );
+            return;
+        }
         // Plan mode offers read-only tools, so a call that changes something can only come
         // from an earlier turn or a mode switch made under a prompt: refuse it rather than
         // trust the request to have been enough.
@@ -1772,6 +1992,7 @@ impl Agent {
         }
 
         match name.as_str() {
+            TOOL_RUN_SCRIPT => self.start_task_script(call, turn, &arguments, session),
             TOOL_LOAD_SCOPE => {
                 let asked = arguments["scope"].as_str().unwrap_or_default().to_owned();
                 let (output, failed) = match self.load_scope(&asked) {
@@ -1791,44 +2012,7 @@ impl Agent {
                 self.settle(call, turn, label, output, failed, session);
             }
             TOOL_ASK_USER => {
-                let questions = arguments["questions"]
-                    .as_array()
-                    .map(|questions| {
-                        questions
-                            .iter()
-                            .filter_map(|question| {
-                                let text = question["question"]
-                                    .as_str()
-                                    .map(str::trim)
-                                    .filter(|text| !text.is_empty())?;
-                                let options = question["options"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(Value::as_str)
-                                    .map(str::trim)
-                                    .filter(|option| !option.is_empty())
-                                    .map(str::to_owned)
-                                    .collect();
-                                Some(AgentQuestion {
-                                    text: text.to_owned(),
-                                    options,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|questions| !questions.is_empty())
-                    .unwrap_or_else(|| {
-                        let text = arguments["text"]
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|text| !text.is_empty())
-                            .unwrap_or("The agent needs your input.");
-                        vec![AgentQuestion {
-                            text: text.to_owned(),
-                            options: Vec::new(),
-                        }]
-                    });
+                let questions = asked_questions(&arguments);
                 self.phase = Some(Phase::Asking { call, questions });
             }
             TOOL_RUN_COMMAND => {
@@ -1956,6 +2140,67 @@ impl Agent {
                 self.dispatch_remote(call, turn, &name, &arguments, session);
             }
         }
+    }
+
+    /// Start a script in its sandbox. It reports back through [`Waiting::Script`], and the
+    /// calls it makes are dispatched like any other tool's.
+    fn start_task_script(
+        &mut self,
+        call: ApiToolCall,
+        turn: usize,
+        arguments: &Value,
+        session: Session<'_, '_>,
+    ) {
+        if self.script.is_some() {
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                "A script cannot start another script; call the tool itself.".to_owned(),
+                true,
+                session,
+            );
+            return;
+        }
+        let Some(code) = arguments["code"]
+            .as_str()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned)
+        else {
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                "The code argument was missing or empty.".to_owned(),
+                true,
+                session,
+            );
+            return;
+        };
+        if let Some(slot) = self.turns.get_mut(turn) {
+            *slot = Turn::Script {
+                code: code.clone(),
+                calls: Vec::new(),
+                result: None,
+                failed: false,
+                console: String::new(),
+            };
+        }
+        self.script = Some(ScriptRun {
+            outer: call.clone(),
+            turn,
+            inner: None,
+            calls: Vec::new(),
+            job: script::spawn(&code),
+        });
+        self.phase = Some(Phase::Running {
+            call,
+            turn,
+            waiting: Waiting::Script,
+        });
     }
 
     /// Run a tool a pane offered.
@@ -2505,6 +2750,7 @@ impl Agent {
         agent.session_deny = self.session_deny.clone();
         agent.allow_all = self.allow_all;
         agent.plan = self.plan;
+        agent.script_mode = self.script_mode;
         agent.tools = self.tools.clone();
         agent.max_subagents = self.max_subagents;
         agent.push_user(prompt, UserMeta::default());
@@ -2896,6 +3142,17 @@ impl Agent {
     /// one the provider accepts: an assistant turn that asked for a tool must be followed by
     /// that tool's result, or the next request fails with a 400.
     pub fn stop(&mut self) {
+        // A script's own calls never enter the history, so the run is answered as one call.
+        if let Some(run) = self.script.take() {
+            run.job.stop();
+            self.queue.clear();
+            self.phase = None;
+            if let Some(Turn::Script { failed, .. }) = self.turns.get_mut(run.turn) {
+                *failed = true;
+            }
+            self.abandon_tool(run.outer, run.turn);
+            return;
+        }
         if let Some(spawn) = self.spawn_request.take() {
             self.abandon_tool(spawn.call, spawn.turn);
         }
@@ -3016,6 +3273,18 @@ impl Agent {
                     let body: String = output.chars().take(2_000).collect();
                     out.push_str(&format!("Tool {label}: {body}\n"));
                 }
+                Turn::Script {
+                    code,
+                    calls,
+                    result,
+                    ..
+                } => {
+                    out.push_str(&format!("Script ({} calls):\n{code}\n", calls.len()));
+                    if let Some(result) = result {
+                        let body: String = result.chars().take(2_000).collect();
+                        out.push_str(&format!("Result: {body}\n"));
+                    }
+                }
                 Turn::Denied(reason) => out.push_str(&format!("Denied: {reason}\n")),
                 Turn::Question { text, answer } => out.push_str(&format!(
                     "Question: {text}\nAnswer: {}\n",
@@ -3127,6 +3396,65 @@ fn message_chars(message: &ApiMessage) -> usize {
         }
         ApiMessage::Tool { content, .. } => content.len(),
     }
+}
+
+/// The questions an `ask_user` call asks.
+///
+/// The documented shape is `{ "questions": [{ "question", "options" }] }`, but a script
+/// makes the bare forms the natural ones: `tools.ask_user([{ question, options }])`,
+/// `tools.ask_user({ question })` or `tools.ask_user("…")`. Every shape a model writes is
+/// read here, so a real question never degrades to a card with no text and no options.
+fn asked_questions(arguments: &Value) -> Vec<AgentQuestion> {
+    let listed = &arguments["questions"];
+    let items: Vec<&Value> = match arguments {
+        Value::Array(items) => items.iter().collect(),
+        Value::String(_) => vec![arguments],
+        Value::Object(map) if map.contains_key("question") => vec![arguments],
+        Value::Object(_) => match listed {
+            Value::Array(items) => items.iter().collect(),
+            Value::String(_) => vec![listed],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let questions: Vec<AgentQuestion> = items
+        .into_iter()
+        .filter_map(|item| {
+            if let Some(text) = item.as_str().and_then(question_text) {
+                return Some(AgentQuestion {
+                    text,
+                    options: Vec::new(),
+                });
+            }
+            let text = item["question"].as_str().and_then(question_text)?;
+            let options = item["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(question_text)
+                .collect();
+            Some(AgentQuestion { text, options })
+        })
+        .collect();
+    if !questions.is_empty() {
+        return questions;
+    }
+    let text = arguments["text"]
+        .as_str()
+        .and_then(question_text)
+        .or_else(|| arguments.as_str().and_then(question_text))
+        .unwrap_or_else(|| QUESTION_FALLBACK.to_owned());
+    vec![AgentQuestion {
+        text,
+        options: Vec::new(),
+    }]
+}
+
+/// A trimmed, non-empty string.
+fn question_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// The label shown for a tool call.
@@ -3418,6 +3746,28 @@ pub fn turns_to_json(turns: &[Turn]) -> Vec<Value> {
                 "failed": failed
             }),
             Turn::Denied(reason) => serde_json::json!({ "role": "denied", "text": reason }),
+            Turn::Script {
+                code,
+                calls,
+                result,
+                failed,
+                console,
+            } => serde_json::json!({
+                "role": "script",
+                "code": code,
+                "calls": calls
+                    .iter()
+                    .map(|row| serde_json::json!({
+                        "name": row.name,
+                        "label": row.label,
+                        "output": row.output,
+                        "failed": row.failed
+                    }))
+                    .collect::<Vec<_>>(),
+                "result": result,
+                "failed": failed,
+                "console": console
+            }),
             Turn::Question { text, answer } => {
                 serde_json::json!({ "role": "question", "text": text, "answer": answer })
             }
@@ -3459,6 +3809,23 @@ pub fn turns_from_json(items: &[Value]) -> Vec<Turn> {
                     failed: item["failed"].as_bool().unwrap_or(false),
                 }),
                 "denied" => Some(Turn::Denied(text())),
+                "script" => Some(Turn::Script {
+                    code: item["code"].as_str().unwrap_or_default().to_owned(),
+                    calls: item["calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|row| ScriptRow {
+                            name: row["name"].as_str().unwrap_or_default().to_owned(),
+                            label: row["label"].as_str().unwrap_or_default().to_owned(),
+                            output: row["output"].as_str().unwrap_or_default().to_owned(),
+                            failed: row["failed"].as_bool().unwrap_or(false),
+                        })
+                        .collect(),
+                    result: item["result"].as_str().map(str::to_owned),
+                    failed: item["failed"].as_bool().unwrap_or(false),
+                    console: item["console"].as_str().unwrap_or_default().to_owned(),
+                }),
                 "question" => Some(Turn::Question {
                     text: text(),
                     answer: item["answer"].as_str().map(str::to_owned),
@@ -3612,6 +3979,9 @@ pub fn history_from_json(items: &[Value]) -> Vec<ApiMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Polls a running script may take before the test calls it stuck.
+    const SCRIPT_POLL_STEPS: usize = 10_000;
 
     #[test]
     fn a_wrapped_command_reports_status_and_directory() {
@@ -4004,6 +4374,220 @@ mod tests {
             other => panic!("expected a tool turn, got {other:?}"),
         }
         assert!(agent.needs_reply);
+    }
+
+    /// Answer every tool a running script asks for until the run is over.
+    fn drive_script(agent: &mut Agent, fake: &mut FakeSession) {
+        let mut session: Option<&mut dyn SessionAccess> = Some(fake);
+        for _ in 0..SCRIPT_POLL_STEPS {
+            if !agent.blocked() {
+                return;
+            }
+            agent.poll(&mut session);
+            std::thread::yield_now();
+        }
+        panic!("the script never finished");
+    }
+
+    /// Start a script the way the model does.
+    fn start_script(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut *fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: serde_json::json!({ "code": code }).to_string(),
+                },
+                &mut session,
+            );
+        }
+        drive_script(agent, fake);
+    }
+
+    #[test]
+    fn a_script_runs_its_calls_and_answers_with_one_result() {
+        let mut agent = Agent::new();
+        agent.now_ms = 1_700_000_000_000;
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "const a = await tools.get_current_time({});\n\
+             const b = await tools.get_current_time({});\n\
+             return { stamps: [a.text, b.text] };",
+        );
+        let Some(Turn::Script { calls, result, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|row| !row.failed && !row.output.is_empty()));
+        let result = result.clone().expect("the script returned");
+        assert!(result.contains("1700000000000"), "{result}");
+        // The script's own calls stay out of the provider history: the model reads one result.
+        let answers = agent
+            .history
+            .iter()
+            .filter(|message| matches!(message, ApiMessage::Tool { .. }))
+            .count();
+        assert_eq!(answers, 1, "{:?}", agent.history);
+        assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn a_script_that_throws_answers_with_its_error() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_script(&mut agent, &mut fake, "throw new Error('nope');");
+        let Some(Turn::Script { failed, result, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed);
+        let result = result.clone().expect("the failure is recorded");
+        assert!(result.contains("nope"), "{result}");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content.contains("nope")
+        ));
+    }
+
+    #[test]
+    fn a_script_cannot_start_another_script() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "await tools.run_script({ code: 'return 1;' });",
+        );
+        let Some(Turn::Script { calls, failed, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed, "the rejection ends the run");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].failed);
+        assert!(
+            calls[0].output.contains("cannot start another script"),
+            "{}",
+            calls[0].output
+        );
+    }
+
+    #[test]
+    fn plan_mode_offers_run_script_and_refuses_what_it_would_change() {
+        let mut agent = Agent::new();
+        agent.plan = true;
+        assert!(agent.offers_tool(TOOL_RUN_SCRIPT));
+        when_offered(&mut agent, TOOL_REMOTE_WRITE);
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "await tools.remote_fs_write_file({ path: '/tmp/x', content: 'hi' });",
+        );
+        let Some(Turn::Script { calls, failed, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].output.contains(PLAN_READ_ONLY), "{}", calls[0].output);
+    }
+
+    #[test]
+    fn script_mode_refuses_a_tool_call_that_does_not_come_from_a_script() {
+        let mut agent = Agent::new();
+        agent.script_mode = true;
+        agent.now_ms = 1_700_000_000_000;
+        let mut fake = FakeSession::default();
+        let output = run_tool(&mut agent, &mut fake, TOOL_CURRENT_TIME, "{}");
+        assert!(output.contains("script mode"), "{output}");
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Tool { failed: true, .. })
+        ));
+
+        // The same tool runs when the script asks for it.
+        let mut scripted = Agent::new();
+        scripted.script_mode = true;
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut scripted,
+            &mut fake,
+            "const now = await tools.get_current_time({});\nreturn now.text.length;",
+        );
+        assert!(matches!(
+            scripted.turns.last(),
+            Some(Turn::Script { failed: false, .. })
+        ));
+    }
+
+    #[test]
+    fn stopping_a_script_answers_the_one_call_and_leaves_the_history_valid() {
+        let mut agent = Agent::new();
+        let call = ApiToolCall {
+            id: "c1".to_owned(),
+            name: TOOL_RUN_SCRIPT.to_owned(),
+            arguments: serde_json::json!({ "code": "await tools.get_current_time({});" })
+                .to_string(),
+        };
+        agent.history.push(ApiMessage::Assistant {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![call.clone()],
+        });
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(call, &mut session);
+        }
+        agent.stop();
+        assert!(!agent.blocked());
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Script { failed: true, .. })
+        ));
+        // The history stays one the provider accepts: the call is answered once.
+        assert_eq!(agent.history.len(), 2, "{:?}", agent.history);
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == STOPPED_BY_USER
+        ));
+    }
+
+    #[test]
+    fn ask_user_is_read_from_every_shape_a_model_writes() {
+        let ask = |arguments: &str| {
+            let mut agent = Agent::new();
+            let mut session: Option<&mut dyn SessionAccess> = None;
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_ASK_USER.to_owned(),
+                    arguments: arguments.to_owned(),
+                },
+                &mut session,
+            );
+            match &agent.phase {
+                Some(Phase::Asking { questions, .. }) => questions.clone(),
+                _ => panic!("expected a question card"),
+            }
+        };
+
+        // A bare array, which is what a script writes as `tools.ask_user([...])`.
+        let questions = ask(
+            r#"[{"question":"Which host?","options":["dev","prod"]},{"question":"Then what?"}]"#,
+        );
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].text, "Which host?");
+        assert_eq!(questions[0].options, ["dev", "prod"]);
+        assert_eq!(questions[1].text, "Then what?");
+        assert_eq!(ask(r#"{"question":"Which file?"}"#)[0].text, "Which file?");
+        assert_eq!(ask(r#""Which host?""#)[0].text, "Which host?");
+        // The documented shape and the old single text keep working.
+        assert_eq!(ask(r#"{"questions":[{"question":"Why?"}]}"#)[0].text, "Why?");
+        assert_eq!(ask(r#"{"text":"Really?"}"#)[0].text, "Really?");
+        // Nothing usable still asks something the user can answer.
+        assert_eq!(ask("{}")[0].text, QUESTION_FALLBACK);
     }
 
     #[test]

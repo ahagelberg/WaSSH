@@ -18,7 +18,7 @@ use wassh_ui::widgets::{
 
 use super::agent::{
     Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, Subagent, SubagentEnd, SubagentState,
-    ToolSettings, Turn, UserMeta, announce_wait, end_subagent, history_from_json, history_to_json,
+    ToolSettings, Turn, UserMeta, Waiting, announce_wait, end_subagent, history_from_json, history_to_json,
     subagents_from_json, subagents_to_json, turns_from_json, turns_to_json,
 };
 use super::markdown::{Block, Ink};
@@ -28,9 +28,9 @@ use super::protocol::{
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
     SAFE_RULES, SETTING_AUTO_COMPACT, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES,
     SETTING_GLOBAL_PROMPT, SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
-    SETTING_HOST_RAG_FOLDER, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
-    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER,
-    TITLE_MAX_CHARS,
+    SETTING_HOST_RAG_FOLDER, SETTING_HOST_SCRIPT_MODE, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS,
+    SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_SCRIPT_MODE,
+    SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
 use super::rules::ApprovalScope;
@@ -64,6 +64,8 @@ const DERIVED_SETTINGS: &[&str] = &[
     SETTING_HOST_RAG_FOLDER,
     SETTING_WEB_SEARCH_PROVIDER,
     SETTING_MAX_SUBAGENTS,
+    SETTING_SCRIPT_MODE,
+    SETTING_HOST_SCRIPT_MODE,
 ];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
@@ -172,6 +174,22 @@ const EDIT_WHILE_BUSY: &str = "Stop the current run before editing an earlier me
 const BADGE_TINT: f32 = 0.25;
 /// Characters kept from one tool's output.
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
+/// Badge on a `run_script` card.
+const SCRIPT_BADGE: &str = "Script";
+/// Header of the program in a script card.
+const SCRIPT_CODE_LABEL: &str = "JavaScript";
+/// Header of what the script returned.
+const SCRIPT_RESULT_LABEL: &str = "Result";
+/// Header of what the script logged.
+const SCRIPT_CONSOLE_LABEL: &str = "Console";
+/// Marks a call the script made that worked.
+const SCRIPT_OK_MARK: &str = "✓";
+/// Marks a call the script made that failed.
+const SCRIPT_FAILED_MARK: &str = "✕";
+/// Marks a call the script made that has not answered yet.
+const SCRIPT_PENDING_MARK: &str = "…";
+/// Size of the program, the calls and the result in a script card.
+const SCRIPT_TEXT_SIZE: f32 = 10.5;
 /// Widest the output text gets before it has to shrink for its copy button.
 const MIN_OUTPUT_WIDTH: f32 = 60.0;
 /// What a card with nothing to show says instead of an empty box.
@@ -717,7 +735,13 @@ fn build_request(
 ) -> CompletionRequest {
     agent.repair_history();
     let system = AiAgent::system_prompt(agent, settings, host, environment);
-    let tools = tools::specs(&agent.permissions, &agent.scopes, !agent.subagent, agent.plan);
+    let tools = tools::specs(
+        &agent.permissions,
+        &agent.scopes,
+        !agent.subagent,
+        agent.plan,
+        agent.script_mode,
+    );
     // Kept so compaction measures the scopes this conversation really carries.
     agent.prompt_chars = tools::prompt_chars(&tools, &system);
     CompletionRequest {
@@ -912,6 +936,28 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             lines.push("Scopes to load, by id:".to_owned());
             for scope in loadable {
                 lines.push(format!("- {}: {}", scope.id, scope.summary));
+            }
+        }
+        // Script mode sends `run_script` instead of one schema per tool, so the tools it can
+        // call are spelled out here: a line each instead of a schema each.
+        if agent.script_mode {
+            let catalog =
+                tools::catalog(&agent.permissions, &agent.scopes, !agent.subagent, agent.plan);
+            if !catalog.is_empty() {
+                lines.push(String::new());
+                lines.push(
+                    "Call tools from a script. `run_script` runs a JavaScript program in a \
+sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
+(`{ ok: true, text }`), and a failed call throws. Run multiple tool calls in one go when it \
+makes sense: put every call a step needs in a single script, batch independent calls \
+together and chain the ones that depend on each other, instead of spending a round per \
+call, because each round re-sends the whole prompt. Do the processing and the decisions in \
+the script rather than back through the conversation: filter, join, compare and branch on \
+results there, and return only the conclusion the answer needs — that result is all the \
+model sees. Callable now:"
+                        .to_owned(),
+                );
+                lines.push(catalog);
             }
         }
         // The map's digest: the tree this conversation already knows, so its turns go on
@@ -1120,6 +1166,14 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             setting_rules(settings, SETTING_HOST_ALLOW_RULES).unwrap_or_default();
         self.agent.host_deny = setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
         self.agent.permissions = Permissions::from_settings(settings);
+        self.agent.script_mode = settings
+            .get(SETTING_HOST_SCRIPT_MODE)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || settings
+                .get(SETTING_SCRIPT_MODE)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         self.agent.max_subagents = settings
             .get(SETTING_MAX_SUBAGENTS)
             .and_then(Value::as_u64)
@@ -2112,11 +2166,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let mut stop_command = false;
         let mut copy_output = None;
         let running = agent.running_command();
-        let last_user = agent
-            .turns
-            .iter()
-            .rposition(|turn| matches!(turn, Turn::User { .. }));
-        let turn_finished = agent.phase.is_none();
         for (index, turn) in agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { meta, .. } => {
@@ -2163,19 +2212,43 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                             failed: *failed,
                             running: running == Some(index),
                             turn_index: index,
-                            collapsed: tool_output_is_collapsed(
-                                name,
-                                output,
-                                index,
-                                last_user,
-                                turn_finished,
-                            ),
                             copied: self.copied_recently(index),
                         },
                     );
                     stop_command |= reply.stop;
                     if let Some((target, text)) = reply.copy {
                         copy_output = Some((index, target, text));
+                    }
+                }
+                Turn::Script {
+                    code,
+                    calls,
+                    result,
+                    failed,
+                    console,
+                } => {
+                    let script_running = matches!(
+                        agent.phase,
+                        Some(Phase::Running {
+                            turn,
+                            waiting: Waiting::Script,
+                            ..
+                        }) if turn == index
+                    );
+                    if script_card(
+                        ui,
+                        palette,
+                        ScriptCardState {
+                            code,
+                            calls,
+                            result: result.as_deref(),
+                            failed: *failed,
+                            console,
+                            running: script_running,
+                            turn_index: index,
+                        },
+                    ) {
+                        stop_command = true;
                     }
                 }
                 Turn::Denied(reason) => {
@@ -2260,7 +2333,18 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             EditAction::None => None,
         };
         if stop_command && interactive {
+            // A command the script is waiting on is cancelled first, so it does not keep
+            // going on the host after the run is over.
             self.agent.stop_command(session);
+            if matches!(
+                self.agent.phase,
+                Some(Phase::Running {
+                    waiting: Waiting::Script,
+                    ..
+                })
+            ) {
+                self.agent.stop();
+            }
         }
         if let Some((index, target, text)) = copy_output {
             ui.ctx().copy_text(text);
@@ -3331,11 +3415,13 @@ enum CopyTarget {
 
 /// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
 /// and the output.
+///
+/// The card shows its header only until the user opens it: a transcript of several calls is
+/// read, not scrolled through.
 struct ToolCardState {
     failed: bool,
     running: bool,
     turn_index: usize,
-    collapsed: bool,
     /// Copy button still showing its confirmation, if any.
     copied: Option<CopyTarget>,
 }
@@ -3345,6 +3431,184 @@ struct ToolCardReply {
     stop: bool,
     /// The copy button that was clicked, with what it should put on the clipboard.
     copy: Option<(CopyTarget, String)>,
+}
+
+/// The parts of a `run_script` turn its card draws.
+struct ScriptCardState<'a> {
+    code: &'a str,
+    calls: &'a [super::agent::ScriptRow],
+    result: Option<&'a str>,
+    failed: bool,
+    console: &'a str,
+    running: bool,
+    turn_index: usize,
+}
+
+/// A `run_script` call: the program, the calls it made, and what came back.
+///
+/// One card rather than a card per inner call: a script may make dozens, and the transcript
+/// is meant to be read, not scrolled through. It shows its header only until the user opens
+/// it, like every other tool card.
+fn script_card(ui: &mut Ui, palette: &Palette, state: ScriptCardState<'_>) -> bool {
+    let ScriptCardState {
+        code,
+        calls,
+        result,
+        failed,
+        console,
+        running,
+        turn_index,
+    } = state;
+    let muted = to_color32(palette.text_muted);
+    let (outcome, outcome_colour) = if running {
+        ("running", muted)
+    } else if failed {
+        ("failed", to_color32(palette.danger))
+    } else {
+        ("ok", to_color32(palette.ok))
+    };
+    let mut stop = false;
+    egui::Frame::new()
+        .fill(to_color32(palette.bg_input))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                ui.make_persistent_id(("ai-script", turn_index)),
+                false,
+            )
+            .show_header(ui, |ui| {
+                badge_pill(ui, palette, SCRIPT_BADGE, palette.accent);
+                ui.label(
+                    egui::RichText::new(format!("{} calls", calls.len()))
+                        .size(10.0)
+                        .color(muted),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(outcome)
+                            .size(10.0)
+                            .strong()
+                            .color(outcome_colour),
+                    );
+                    if running
+                        && Button::new("Stop")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                    {
+                        stop = true;
+                    }
+                });
+            })
+            .body(|ui| {
+                script_card_body(ui, palette, turn_index, code, calls, result, console);
+            });
+        });
+    stop
+}
+
+/// What an opened script card shows: the program, the calls it made, their result.
+fn script_card_body(
+    ui: &mut Ui,
+    palette: &Palette,
+    turn_index: usize,
+    code: &str,
+    calls: &[super::agent::ScriptRow],
+    result: Option<&str>,
+    console: &str,
+) {
+    let muted = to_color32(palette.text_muted);
+    egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        ui.make_persistent_id(("ai-script-code", turn_index)),
+        false,
+    )
+    .show_header(ui, |ui| {
+        ui.label(
+            egui::RichText::new(SCRIPT_CODE_LABEL)
+                .size(10.0)
+                .color(muted),
+        );
+    })
+    .body(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(code)
+                    .size(SCRIPT_TEXT_SIZE)
+                    .monospace()
+                    .color(to_color32(palette.text_muted)),
+            )
+            .wrap(),
+        );
+    });
+    for (call_index, row) in calls.iter().enumerate() {
+        let (mark, mark_colour) = if row.failed {
+            (SCRIPT_FAILED_MARK, to_color32(palette.danger))
+        } else if row.output.is_empty() {
+            (SCRIPT_PENDING_MARK, muted)
+        } else {
+            (SCRIPT_OK_MARK, to_color32(palette.ok))
+        };
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("ai-script-call", turn_index, call_index)),
+            false,
+        )
+        .show_header(ui, |ui| {
+            ui.label(egui::RichText::new(mark).size(10.0).color(mark_colour));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(row.label.as_str())
+                        .size(SCRIPT_TEXT_SIZE)
+                        .monospace()
+                        .color(to_color32(palette.text)),
+                )
+                .truncate(),
+            );
+        })
+        .body(|ui| {
+            tool_output(ui, palette, &card_preview(&row.output), false, false);
+        });
+    }
+    if !console.trim().is_empty() {
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("ai-script-console", turn_index)),
+            false,
+        )
+        .show_header(ui, |ui| {
+            ui.label(
+                egui::RichText::new(SCRIPT_CONSOLE_LABEL)
+                    .size(10.0)
+                    .color(muted),
+            );
+        })
+        .body(|ui| {
+            tool_output(ui, palette, &card_preview(console), false, false);
+        });
+    }
+    if let Some(result) = result {
+        ui.label(
+            egui::RichText::new(SCRIPT_RESULT_LABEL)
+                .size(10.0)
+                .color(muted),
+        );
+        tool_output(ui, palette, &card_preview(result), false, false);
+    }
+}
+
+/// The head of a long body, so a card cannot dominate the transcript.
+fn card_preview(text: &str) -> String {
+    if text.chars().count() <= TOOL_OUTPUT_MAX_CHARS {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+    format!("{head}\n…")
 }
 
 fn tool_card(
@@ -3359,7 +3623,6 @@ fn tool_card(
         failed,
         running,
         turn_index,
-        collapsed,
         copied,
     } = state;
     let shell = is_shell_tool(name);
@@ -3376,12 +3639,7 @@ fn tool_card(
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let shown = if output.chars().count() > TOOL_OUTPUT_MAX_CHARS {
-                let head: String = output.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
-                format!("{head}\n…")
-            } else {
-                output.to_owned()
-            };
+            let shown = card_preview(output);
             let (outcome, outcome_colour) = if running {
                 ("running", muted)
             } else if failed {
@@ -3389,70 +3647,17 @@ fn tool_card(
             } else {
                 ("ok", to_color32(palette.ok))
             };
-            if collapsed {
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    output_id,
-                    false,
-                )
-                    .show_header(ui, |ui| {
-                        badge_pill(ui, palette, badge, colour);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if shell
-                                && copy_button(ui, palette, copied == Some(CopyTarget::Command))
-                            {
-                                copy = Some((CopyTarget::Command, command.to_owned()));
-                            }
-                            ui.label(
-                                egui::RichText::new(outcome)
-                                    .size(10.0)
-                                    .strong()
-                                    .color(outcome_colour),
-                            );
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(label)
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(to_color32(palette.text)),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                        });
-                    })
-                    .body(|ui| {
-                        if tool_output(
-                            ui,
-                            palette,
-                            &shown,
-                            shell && !output.trim().is_empty(),
-                            copied == Some(CopyTarget::Output),
-                        ) {
-                            copy = Some((CopyTarget::Output, output.to_owned()));
-                        }
-                    });
-            } else {
-                ui.horizontal(|ui| {
-                    badge_pill(ui, palette, badge, colour);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(label)
-                                .size(11.0)
-                                .monospace()
-                                .color(to_color32(palette.text)),
-                        )
-                        .truncate(),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(outcome)
-                            .size(10.0)
-                            .strong()
-                            .color(outcome_colour),
-                    );
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                output_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                badge_pill(ui, palette, badge, colour);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if shell && copy_button(ui, palette, copied == Some(CopyTarget::Command)) {
+                        copy = Some((CopyTarget::Command, command.to_owned()));
+                    }
                     // The command is still going: offer to end it here rather than on the host.
                     if running
                         && Button::new("Stop")
@@ -3463,11 +3668,26 @@ fn tool_card(
                     {
                         stop = true;
                     }
-                    // The command line itself; its output has the button on its own row.
-                    if shell && row_copy_button(ui, palette, copied == Some(CopyTarget::Command)) {
-                        copy = Some((CopyTarget::Command, command.to_owned()));
-                    }
+                    ui.label(
+                        egui::RichText::new(outcome)
+                            .size(10.0)
+                            .strong()
+                            .color(outcome_colour),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(label)
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(to_color32(palette.text)),
+                            )
+                            .truncate(),
+                        );
+                    });
                 });
+            })
+            .body(|ui| {
                 if tool_output(
                     ui,
                     palette,
@@ -3477,7 +3697,7 @@ fn tool_card(
                 ) {
                     copy = Some((CopyTarget::Output, output.to_owned()));
                 }
-            }
+            });
         });
     ToolCardReply { stop, copy }
 }
@@ -3518,15 +3738,6 @@ fn tool_output(ui: &mut Ui, palette: &Palette, shown: &str, copyable: bool, copi
     copy
 }
 
-/// A copy button pushed to the right edge of the row being drawn.
-fn row_copy_button(ui: &mut Ui, palette: &Palette, copied: bool) -> bool {
-    let room = ui.available_width() - COPY_BUTTON_SIZE;
-    if room > 0.0 {
-        ui.add_space(room);
-    }
-    copy_button(ui, palette, copied)
-}
-
 /// The command a shell card shows, without its prompt marker, ready to paste.
 fn command_text(label: &str) -> &str {
     let label = label
@@ -3543,35 +3754,6 @@ fn is_shell_tool(name: &str) -> bool {
             | super::protocol::TOOL_RUN_SUDO
             | super::protocol::TOOL_LOCAL_RUN
     )
-}
-
-fn tool_output_is_collapsed(
-    name: &str,
-    output: &str,
-    index: usize,
-    last_user: Option<usize>,
-    turn_finished: bool,
-) -> bool {
-    let collapse_by_tool = is_shell_tool(name) || name.starts_with("remote_fs_");
-    let has_lots_of_output = output.chars().count() > TOOL_OUTPUT_MAX_CHARS;
-    (collapse_by_tool || has_lots_of_output)
-        && (turn_finished || last_user.is_some_and(|last_user| index < last_user))
-}
-
-#[test]
-fn tool_output_collapse_state_tracks_tool_and_output_size() {
-    use super::protocol::{TOOL_LOCAL_RUN, TOOL_RUN_COMMAND, TOOL_RUN_SUDO};
-
-    let small_output = "short output";
-    let large_output = format!("{}x", "x".repeat(TOOL_OUTPUT_MAX_CHARS));
-    assert!(tool_output_is_collapsed(TOOL_RUN_COMMAND, small_output, 3, None, true));
-    assert!(tool_output_is_collapsed(TOOL_RUN_SUDO, small_output, 3, Some(5), false));
-    assert!(tool_output_is_collapsed(TOOL_LOCAL_RUN, small_output, 3, Some(5), false));
-    assert!(!tool_output_is_collapsed(TOOL_RUN_COMMAND, small_output, 6, Some(5), false));
-    assert!(tool_output_is_collapsed("remote_fs_read_file", small_output, 3, None, true));
-    assert!(tool_output_is_collapsed("web_fetch", &large_output, 3, None, true));
-    assert!(!tool_output_is_collapsed("web_fetch", small_output, 3, None, true));
-    assert!(!tool_output_is_collapsed("web_fetch", &large_output, 3, None, false));
 }
 
 /// One tool's pill, e.g. `SSH` or `REMOTE FILESYSTEM`.
@@ -5738,17 +5920,23 @@ mod tests {
         type CardFrame = (Vec<(i32, i32, String)>, Option<(CopyTarget, String)>);
         let ctx = egui::Context::default();
         let palette = Palette::dark();
+        let card_id = std::cell::Cell::new(None);
+        let time = std::cell::Cell::new(0.0_f64);
         let draw = |events: Vec<egui::Event>| -> CardFrame {
+            let now = time.get() + 0.1;
+            time.set(now);
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::Vec2::new(WIDE_PANE, 240.0),
                 )),
+                time: Some(now),
                 events,
                 ..Default::default()
             };
             let mut reply = None;
             let mut output = ctx.run_ui(input, |ui| {
+                card_id.set(Some(ui.make_persistent_id(("ai-command-output", 7))));
                 reply = Some(tool_card(
                     ui,
                     &palette,
@@ -5759,7 +5947,6 @@ mod tests {
                         failed: false,
                         running: false,
                         turn_index: 7,
-                        collapsed: false,
                         copied: None,
                     },
                 ));
@@ -5779,6 +5966,16 @@ mod tests {
             rows.sort();
             (rows, reply.and_then(|reply| reply.copy))
         };
+        draw(Vec::new());
+        // The card starts folded to its header: open it before looking for the output row.
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            card_id.get().expect("the card's collapsing id"),
+            false,
+        );
+        state.set_open(true);
+        state.store(&ctx);
+        // The body slides open: let the animation finish before clicking into it.
         draw(Vec::new());
         let (rows, _) = draw(Vec::new());
         let buttons: Vec<_> = rows
@@ -6723,10 +6920,12 @@ mod tests {
                             UserMeta::default(),
                         );
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
-                            failed: false, running: false, turn_index: 0, collapsed: false, copied: None,
+                            failed: false, running: false, turn_index: 0, copied: None,
                         });
+                        // A folded card hides its body, so the long output is painted on its own.
+                        tool_output(ui, &palette, &terminal, true, false);
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
-                            failed: false, running: false, turn_index: 1, collapsed: true, copied: None,
+                            failed: false, running: false, turn_index: 1, copied: None,
                         });
                     });
                 });
@@ -6804,14 +7003,16 @@ mod tests {
                 assert!(rect.rect.right() <= body.right().min(clipped.clip_rect.right()), "tool card exceeds pane: {:?} > {:?}", rect.rect, clipped.clip_rect);
             }
             if let egui::Shape::Text(text) = clipped.shape
-                && (text.galley.text().contains("long-path") || text.galley.text().contains("long-line"))
+                && (text.galley.text().contains("long-path")
+                    || text.galley.text().contains("long-line")
+                    || text.galley.text().contains("long-command"))
             {
                 found += 1;
                 let limit = body.right().min(clipped.clip_rect.right());
                 assert!(text.pos.x + text.galley.size().x <= limit, "text exceeds pane: {} > {limit}", text.pos.x + text.galley.size().x);
             }
         }
-        assert_eq!(found, 2, "the prompt and the tool output stay inside");
+        assert!(found >= 2, "the prompt and the cards stay inside: {found}");
     }
 
     #[test]
@@ -7122,7 +7323,6 @@ mod tests {
                         failed: false,
                         running,
                         turn_index: 0,
-                        collapsed: false,
                         copied: None,
                     },
                 );
@@ -7171,7 +7371,6 @@ mod tests {
                         failed: false,
                         running: false,
                         turn_index: 4,
-                        collapsed: true,
                         copied: None,
                     },
                 );
@@ -7287,6 +7486,34 @@ mod tests {
     }
 
     #[test]
+    fn script_mode_puts_the_tool_catalog_in_the_prompt() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.script_mode = true;
+        let prompt =
+            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+        assert!(prompt.contains("Call tools from a script."), "{prompt}");
+        // The whole point of the mode: many tool calls per script, not one round per call.
+        assert!(
+            prompt.contains("Run multiple tool calls in one go when it makes sense"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Do the processing and the decisions in the script"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("each round re-sends the whole prompt"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- run_command(command: string"),
+            "{prompt}"
+        );
+        // The root's tools are the only ones loaded, so nothing of a scope shows up.
+        assert!(!prompt.contains("- dev_grep_search("), "{prompt}");
+    }
+
+    #[test]
     fn the_prompt_names_the_loaded_scopes_and_what_can_be_loaded_next() {
         use super::super::permissions::{GROUP_LOCAL_FS, GROUP_REMOTE_FS, Permissions, group_key};
         let prompt_for = |groups: Vec<&str>, load: &[&str]| {
@@ -7313,7 +7540,7 @@ mod tests {
         assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(
             both.contains(
-                "- core: run_command, run_command_background, run_sudo, ask_user, \
+                "- core: run_command, run_command_background, run_script, run_sudo, ask_user, \
                  spawn_subagent, wait_subagent, get_current_time"
             ),
             "{both}"

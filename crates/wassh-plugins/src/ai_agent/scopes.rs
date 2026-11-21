@@ -18,10 +18,10 @@ use super::protocol::{
     TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT,
     TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE,
     TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ,
-    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SUDO,
-    TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
-    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT,
+    TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
+    TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
+    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use crate::{PluginId, plugin};
 
@@ -48,11 +48,13 @@ pub struct Scope {
 pub const SCOPES: &[Scope] = &[
     Scope {
         id: ROOT,
-        summary: "Run shell commands on the connected host (also as root), ask the user a \
-question, read the clock, and delegate work to a background sub-agent.",
+        summary: "Run shell commands on the connected host (also as root), run a JavaScript \
+program that calls the other tools itself, ask the user a question, read the clock, and \
+delegate work to a background sub-agent.",
         tools: &[
             TOOL_RUN_COMMAND,
             TOOL_RUN_COMMAND_BACKGROUND,
+            TOOL_RUN_SCRIPT,
             TOOL_RUN_SUDO,
             TOOL_ASK_USER,
             TOOL_SPAWN_SUBAGENT,

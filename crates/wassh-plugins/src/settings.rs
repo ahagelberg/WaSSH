@@ -568,6 +568,14 @@ you ask them to.",
         "How many sub-agents may run in the background at once. A spawn beyond this is refused \
 and the model is told to wait for one to finish.",
     ),
+    boolean(
+        "scriptMode",
+        "Script mode",
+        false,
+        "Send the tools as a script API instead of one schema per tool. The model then writes a \
+short JavaScript program that calls several tools and returns one compact result, which saves \
+most of the prompt tokens the tool schemas take and cuts the rounds a task needs.",
+    ),
     group(
         "globalKnowledgeGroup",
         "Global knowledge",
@@ -607,6 +615,12 @@ const AI_AGENT_HOST: &[SettingsField] = &[
         "Host knowledge folder",
         "",
         "Additional local folder of documents indexed just for this host, combined with the global knowledge folder.",
+    ),
+    boolean(
+        "hostScriptMode",
+        "Script mode for this host",
+        false,
+        "Turn script mode on for this host as well, even when it is off app-wide.",
     ),
     string_list(
         "allowRules",
@@ -1360,6 +1374,7 @@ mod tests {
                 "Model context windows",
                 "Compact long chats automatically",
                 "Sub-agents at a time",
+                "Script mode",
                 "Global knowledge",
                 "Default allow rules",
                 "Default deny rules",
