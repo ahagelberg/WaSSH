@@ -13,7 +13,7 @@ use wassh_core::{Palette, RADIUS, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
-    select_width, small_button, small_button_enabled, text_area, text_area_with_id, ToastKind,
+    select_width, small_button, small_button_enabled, text_area_with_id, ToastKind,
 };
 
 use super::agent::{
@@ -4386,10 +4386,22 @@ impl AiAgent {
                                     picked = true;
                                 }
                             }
-                            // "Write your own" is the text field itself, there from the
-                            // start: no option to pick before it can be used.
-                            let response =
-                                text_area(ui, palette, &mut draft.text, 2, "Your answer…");
+                            // "Write your own" has its own radio, and it is the answer the
+                            // moment the field holds text: picking it moves the cursor there.
+                            let custom = !draft.text.trim().is_empty();
+                            let answer_id = ui.make_persistent_id(("ai-answer", page));
+                            if ui.radio(custom, "Other").clicked() {
+                                draft.chosen = None;
+                                ui.memory_mut(|memory| memory.request_focus(answer_id));
+                            }
+                            let response = text_area_with_id(
+                                ui,
+                                palette,
+                                &mut draft.text,
+                                2,
+                                "Your answer…",
+                                answer_id,
+                            );
                             if !draft.text.trim().is_empty() {
                                 draft.chosen = None;
                             }
@@ -6831,6 +6843,7 @@ mod tests {
             "Which language?",
             "Rust",
             "Go",
+            "Other",
             "Your answer…",
             "Previous",
             "Next",
@@ -6839,10 +6852,6 @@ mod tests {
             assert!(texts.contains(&expected), "{expected} missing: {texts:?}");
         }
         assert!(!texts.contains(&"Answer"), "not on the final question");
-        assert!(
-            !texts.contains(&"Other (write your own)"),
-            "the text field is the free answer: {texts:?}"
-        );
         // Picking an option is the answer: the card moves on by itself.
         let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Go");
         let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
@@ -6898,6 +6907,49 @@ mod tests {
             plugin.agent.asking(),
             plugin.agent.blocked(),
             plugin.agent.busy()
+        );
+    }
+
+    #[test]
+    fn the_other_radio_follows_the_custom_answer() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Asking {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: "ask_user".to_owned(),
+                arguments: String::new(),
+            },
+            questions: vec![super::super::agent::AgentQuestion {
+                text: "Which file?".to_owned(),
+                options: vec!["main.rs".to_owned(), "lib.rs".to_owned()],
+            }],
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        // While the field is empty an option is the selection.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "main.rs");
+        assert_eq!(plugin.questions.drafts[0].chosen, Some(0));
+        // Picking Other takes the selection back from the option.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Other");
+        assert_eq!(plugin.questions.drafts[0].chosen, None);
+        // Typing in the field is the custom answer, and Other is what shows as selected.
+        let _rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Your answer…");
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![egui::Event::Text("build.rs".to_owned())],
+        );
+        let draft = &plugin.questions.drafts[0];
+        assert_eq!(draft.text, "build.rs");
+        assert_eq!(draft.chosen, None, "the custom answer replaces the option");
+        assert_eq!(
+            plugin
+                .questions
+                .answer(0, &["main.rs".to_owned(), "lib.rs".to_owned()]),
+            Some("build.rs".to_owned())
         );
     }
 
