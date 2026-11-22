@@ -950,20 +950,24 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 tools::catalog(&agent.permissions, &agent.scopes, !agent.subagent, agent.plan);
             if !catalog.is_empty() {
                 lines.push(String::new());
-                lines.push(
+                lines.push(format!(
                     "Call tools from a script. `run_script` runs a JavaScript program in a \
 sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
-(`{ ok: true, text }`), and a failed call throws. Run multiple tool calls in one go when it \
-makes sense: put every call a step needs in a single script, batch independent calls \
+(`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
+— time spent waiting on a tool does not count — and up to {} tool calls; one call that has \
+not answered within {} seconds fails with a timeout. Run multiple tool calls in one go when \
+it makes sense: put every call a step needs in a single script, batch independent calls \
 together and chain the ones that depend on each other, instead of spending a round per \
 call, because each round re-sends the whole prompt. Do the processing and the decisions in \
 the script rather than back through the conversation: filter, join, compare and branch on \
 results there. Spend real effort on shrinking what you return: filter down to the lines \
 that answer the question, sort and de-duplicate them, and compact, count or summarise the \
 rest instead of dumping raw output — that result is all the model sees, so keep it as \
-small as the answer allows. Callable now:"
-                        .to_owned(),
-                );
+small as the answer allows. Callable now:",
+                    super::script::MAX_EXEC_MS / 1_000,
+                    super::script::MAX_CALLS,
+                    super::script::MAX_CALL_MS / 1_000
+                ));
                 lines.push(catalog);
             }
         }
@@ -7586,6 +7590,28 @@ mod tests {
         // The script is where output is cut down before it costs prompt room.
         assert!(
             prompt.contains("Spend real effort on shrinking what you return"),
+            "{prompt}"
+        );
+        // The limits a script runs under come from the sandbox, not from a copy in the prompt.
+        assert!(
+            prompt.contains(&format!(
+                "{} seconds of JavaScript",
+                super::super::script::MAX_EXEC_MS / 1_000
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "up to {} tool calls",
+                super::super::script::MAX_CALLS
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "not answered within {} seconds fails with a timeout",
+                super::super::script::MAX_CALL_MS / 1_000
+            )),
             "{prompt}"
         );
         assert!(

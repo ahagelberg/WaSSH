@@ -8,7 +8,9 @@
 //! JavaScript built-ins, a `console`, and `tools`; every `tools.<name>(args)` suspends the
 //! script until this crate answers with the tool's outcome, so nothing else reaches the
 //! host. One call is in flight at a time, which is all the agent's single waiting slot
-//! allows: a script may `Promise.all` a batch, but the calls still run in order.
+//! allows: a script may `Promise.all` a batch, but the calls still run in order. A call the
+//! agent does not answer within [`MAX_CALL_MS`] is failed by the agent, so a command that
+//! hangs rejects the promise instead of stalling the run forever.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +21,8 @@ use rquickjs::{Context, Function, Runtime};
 
 /// Longest a script may execute, not counting the time it spends waiting on a tool call.
 pub const MAX_EXEC_MS: u64 = 20_000;
+/// Longest a script waits on one tool call before it is failed with a timeout.
+pub const MAX_CALL_MS: u64 = 60_000;
 /// Memory the runtime may use.
 pub const MAX_HEAP_BYTES: usize = 64 * 1024 * 1024;
 /// Tool calls one run may make.

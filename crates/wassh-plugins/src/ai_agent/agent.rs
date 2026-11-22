@@ -194,6 +194,8 @@ struct ScriptRun {
     inner: Option<(ApiToolCall, u64)>,
     /// Every call the script has made so far.
     calls: Vec<ScriptRow>,
+    /// When the call it is waiting on started.
+    since: Option<std::time::Instant>,
     /// Where its events and answers travel.
     job: script::ScriptJob,
 }
@@ -1062,7 +1064,13 @@ impl Agent {
                 waiting: Waiting::Script,
                 ..
             }) => progressed = self.poll_script(session),
-            Some(Phase::Running { .. }) => progressed = self.poll_tool(session),
+            Some(Phase::Running { .. }) => {
+                progressed = if self.script_call_timed_out(session) {
+                    true
+                } else {
+                    self.poll_tool(session)
+                };
+            }
             _ => {}
         }
         progressed
@@ -1108,8 +1116,44 @@ impl Agent {
             failed: false,
         });
         run.inner = Some((inner.clone(), call.id));
+        run.since = Some(std::time::Instant::now());
         let turn = run.turn;
         self.dispatch(inner, turn, session);
+    }
+
+    /// Fail the script's pending call when it has waited too long, so a hung command cannot
+    /// hold the conversation forever.
+    fn script_call_timed_out(&mut self, session: Session<'_, '_>) -> bool {
+        let Some(((inner, _), since)) = self
+            .script
+            .as_ref()
+            .and_then(|run| run.inner.clone().zip(run.since))
+        else {
+            return false;
+        };
+        if since.elapsed() < std::time::Duration::from_millis(script::MAX_CALL_MS) {
+            return false;
+        }
+        // A command can be interrupted; the other waits are only dropped.
+        if let Some(Phase::Running {
+            waiting: Waiting::Command { key, .. },
+            ..
+        }) = &self.phase
+            && let Some(access) = session.as_mut()
+        {
+            access.cancel(key);
+        }
+        if let Some(run) = self.script.as_mut() {
+            run.since = None;
+        }
+        let seconds = script::MAX_CALL_MS / 1_000;
+        self.answer_script(
+            &inner,
+            call_label(&inner),
+            format!("The tool did not answer within {seconds} seconds."),
+            true,
+        );
+        true
     }
 
     /// Take the script's result: it becomes the `run_script` tool result, and nothing the
@@ -1787,6 +1831,7 @@ impl Agent {
         let Some((_, id)) = run.inner.take() else {
             return;
         };
+        run.since = None;
         if let Some(row) = run.calls.last_mut()
             && row.name == call.name
         {
@@ -2352,6 +2397,7 @@ impl Agent {
             turn,
             inner: None,
             calls: Vec::new(),
+            since: None,
             job: script::spawn(&code),
         });
         self.phase = Some(Phase::Running {
@@ -4798,6 +4844,78 @@ mod tests {
             agent.history.last(),
             Some(ApiMessage::Tool { content, .. }) if content.contains("nope")
         ));
+    }
+
+    #[test]
+    fn a_script_call_that_hangs_times_out() {
+        let mut agent = Agent::new();
+        agent
+            .scopes
+            .load(scopes::find("host-files").expect("the file scope"));
+        let mut fake = FakeSession::default();
+        // Start the script without driving it, so the call can be left unanswered.
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: serde_json::json!({
+                        "code": "await tools.dev_grep_search({ pattern: 'x', path: '/' });"
+                    })
+                    .to_string(),
+                },
+                &mut session,
+            );
+        }
+        // Poll until the sandbox hands the call over; the session never answers it.
+        for _ in 0..SCRIPT_POLL_STEPS {
+            if matches!(agent.phase, Some(Phase::Running { waiting: Waiting::Command { .. }, .. }))
+            {
+                break;
+            }
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.poll(&mut session);
+            std::thread::yield_now();
+        }
+        let command_key = agent.keys.probe.clone();
+        assert!(
+            matches!(agent.phase, Some(Phase::Running { waiting: Waiting::Command { .. }, .. })),
+            "the call is waiting on its command"
+        );
+        // Pretend the wait started before the limit.
+        let run = agent.script.as_mut().expect("the script is running");
+        run.since = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_millis(script::MAX_CALL_MS + 1),
+        );
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            assert!(agent.poll(&mut session), "the timeout looked at the call");
+        }
+        assert!(
+            fake.cancelled.iter().any(|key| *key == command_key),
+            "the hung command is stopped: {:?}",
+            fake.cancelled
+        );
+        assert!(
+            agent
+                .script
+                .as_ref()
+                .is_some_and(|run| run.inner.is_none()),
+            "the call was answered to the script"
+        );
+        assert!(
+            matches!(agent.phase, Some(Phase::Running { waiting: Waiting::Script, .. })),
+            "the sandbox holds the turn again"
+        );
+        drive_script(&mut agent, &mut fake);
+        let Some(Turn::Script { result, failed, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed, "{result:?}");
+        let result = result.clone().expect("the failure is recorded");
+        assert!(result.contains("did not answer within"), "{result}");
     }
 
     #[test]
