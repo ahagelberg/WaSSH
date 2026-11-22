@@ -161,6 +161,12 @@ const MIN_COMPOSER_WIDTH: f32 = 80.0;
 const TURN_GAP: f32 = 8.0;
 /// Share of the pane a chat message may take.
 const MESSAGE_BUBBLE_SHARE: f32 = 0.92;
+/// Lines a prompt bubble shows before its text scrolls.
+const PROMPT_BUBBLE_ROWS: usize = 8;
+/// Horizontal padding inside a chat bubble.
+const BUBBLE_PADDING_X: i8 = 8;
+/// Vertical padding inside a chat bubble.
+const BUBBLE_PADDING_Y: i8 = 6;
 /// Transparency of the context tags on the accent-filled user bubble.
 const USER_BUBBLE_TAG_ALPHA: u8 = 200;
 /// Lines the prompt editor opens with at least.
@@ -2231,7 +2237,13 @@ small as the answer allows. Callable now:",
                     {
                         edit_action = prompt_editor(ui, palette, edit);
                     } else {
-                        let reply = user_bubble(ui, palette, self.blocks(source, index), *meta);
+                        let reply = user_bubble(
+                            ui,
+                            palette,
+                            self.blocks(source, index),
+                            *meta,
+                            ("turn", index),
+                        );
                         if reply.clicked {
                             open = Some(index);
                         }
@@ -2940,7 +2952,8 @@ small as the answer allows. Callable now:",
                 // The backdrop spans the whole transcript, so nothing shows beside the
                 // pinned bubble where it scrolls underneath.
                 ui.set_min_width(ui.available_width());
-                user_bubble(ui, palette, &self.parsed[*index].blocks, *meta).clicked
+                user_bubble(ui, palette, &self.parsed[*index].blocks, *meta, ("pinned", *index))
+                    .clicked
             })
             .inner;
         Some(PinnedBubble {
@@ -3355,7 +3368,7 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
         egui::Frame::new()
             .fill(to_color32(palette.accent))
             .corner_radius(wassh_core::RADIUS)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(BUBBLE_PADDING_X, BUBBLE_PADDING_Y))
             .show(ui, |ui| {
                 ui.set_max_width(room);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -3421,14 +3434,22 @@ fn enter_press(ui: &mut Ui) -> Option<bool> {
 
 /// A user message: a bubble against the right edge, filled with the accent like a primary
 /// button and carrying white ink. Clicking it opens the prompt for editing.
-fn user_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block], meta: UserMeta) -> BubbleReply {
+fn user_bubble(
+    ui: &mut Ui,
+    palette: &Palette,
+    blocks: &[Block],
+    meta: UserMeta,
+    salt: (&'static str, usize),
+) -> BubbleReply {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
-    let response = ui
+    // Where a click opens the editor: the tags and the text, not the bubble's padding or
+    // the scroll bar the text may have grown.
+    let (rect, hit) = ui
         .with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            egui::Frame::new()
+            let bubble = egui::Frame::new()
                 .fill(to_color32(palette.accent))
                 .corner_radius(wassh_core::RADIUS)
-                .inner_margin(egui::Margin::symmetric(8, 6))
+                .inner_margin(egui::Margin::symmetric(BUBBLE_PADDING_X, BUBBLE_PADDING_Y))
                 .show(ui, |ui| {
                     ui.set_max_width(room);
                     // The prompt is a block that opens an editor, not text to select: no
@@ -3436,6 +3457,7 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block], meta: UserMeta)
                     ui.style_mut().interaction.selectable_labels = false;
                     // The frame hugs the right edge while its text stays left-aligned.
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        let mut hit = None;
                         // What went out with the message, like the reference's ctx tags.
                         if meta.attachments > 0 || meta.terminal {
                             let mut tags: Vec<String> = Vec::new();
@@ -3446,25 +3468,43 @@ fn user_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block], meta: UserMeta)
                             if meta.terminal {
                                 tags.push("+terminal".to_owned());
                             }
-                            ui.label(
-                                egui::RichText::new(tags.join("  "))
-                                    .size(9.5)
-                                    .color(egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA)),
+                            hit = Some(
+                                ui.label(
+                                    egui::RichText::new(tags.join("  ")).size(9.5).color(
+                                        egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA),
+                                    ),
+                                )
+                                .rect,
                             );
                         }
-                        super::markdown::draw(ui, Ink::on_accent(), blocks);
-                    });
-                })
-                .response
+                        // A long prompt must not push the conversation out of the pane:
+                        // past a few lines its text scrolls inside the bubble.
+                        let cap = super::markdown::body_line_height() * PROMPT_BUBBLE_ROWS as f32;
+                        let scrolled = egui::ScrollArea::vertical()
+                            .id_salt(("ai-prompt-bubble", salt))
+                            .max_height(cap)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                super::markdown::draw(ui, Ink::on_accent(), blocks);
+                            });
+                        hit.map_or(scrolled.inner_rect, |hit| hit.union(scrolled.inner_rect))
+                    })
+                    .inner
+                });
+            (bubble.response.rect, bubble.inner)
         })
         .inner;
     BubbleReply {
-        clicked: response
-            .interact(egui::Sense::click())
+        clicked: ui
+            .interact(
+                hit,
+                ui.make_persistent_id(("ai-prompt-click", salt)),
+                egui::Sense::click(),
+            )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text("Click to edit this message")
             .clicked(),
-        rect: response.rect,
+        rect,
     }
 }
 
@@ -3476,7 +3516,7 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block]) {
             .fill(to_color32(palette.bg_panel_2))
             .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
             .corner_radius(wassh_core::RADIUS)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(BUBBLE_PADDING_X, BUBBLE_PADDING_Y))
             .show(ui, |ui| {
                 ui.set_max_width(room);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -7019,6 +7059,7 @@ mod tests {
                         attachments: 0,
                         terminal: true,
                     },
+                    ("test", 0),
                 );
             });
             let shapes = std::mem::take(&mut output.shapes);
@@ -7074,6 +7115,7 @@ mod tests {
                             &palette,
                             &crate::ai_agent::markdown::blocks(&prompt),
                             UserMeta::default(),
+                            ("test", 0),
                         );
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
                             failed: false, running: false, turn_index: 0, copied: None,
@@ -7106,6 +7148,45 @@ mod tests {
             }
             assert!(found >= 5, "expected the bubbles and their contents, found {found}");
         }
+    }
+
+    /// A prompt long enough to fill the pane scrolls inside its bubble instead of pushing
+    /// the conversation out of the way.
+    #[test]
+    fn a_long_prompt_bubble_stops_at_eight_lines() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 3000.0),
+            )),
+            ..Default::default()
+        };
+        let prompt = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut height = 0.0;
+        for _ in 0..2 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                height = user_bubble(
+                    ui,
+                    &Palette::dark(),
+                    &crate::ai_agent::markdown::blocks(&prompt),
+                    UserMeta::default(),
+                    ("test", 0),
+                )
+                .rect
+                .height();
+            });
+            output.drop_without_applying_deltas();
+        }
+        let cap = crate::ai_agent::markdown::body_line_height() * PROMPT_BUBBLE_ROWS as f32;
+        let padding = 2.0 * f32::from(BUBBLE_PADDING_Y);
+        assert!(
+            height <= cap + padding + 1.0,
+            "the bubble must stop at {cap} + {padding} points: {height}"
+        );
     }
 
     #[test]
@@ -7231,6 +7312,7 @@ mod tests {
                 &palette,
                 &crate::ai_agent::markdown::blocks("hello"),
                 UserMeta::default(),
+                ("test", 0),
             );
         });
         let mut fill = None;
