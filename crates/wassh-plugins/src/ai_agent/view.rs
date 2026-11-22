@@ -25,12 +25,13 @@ use super::markdown::{Block, Ink};
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, DEFAULT_MAX_SUBAGENTS,
-    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
-    SAFE_RULES, SETTING_AUTO_COMPACT, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES,
-    SETTING_GLOBAL_PROMPT, SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
-    SETTING_HOST_RAG_FOLDER, SETTING_HOST_SCRIPT_MODE, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS,
-    SETTING_RAG_FOLDER, SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_SCRIPT_MODE,
-    SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS,
+    ImagePart, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, MAX_IMAGE_BYTES,
+    MAX_IMAGES, Protocol, ProviderConfig, SAFE_RULES, SETTING_AUTO_COMPACT,
+    SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
+    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, SETTING_HOST_RAG_FOLDER,
+    SETTING_HOST_SCRIPT_MODE, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
+    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_SCRIPT_MODE, SETTING_WEB_SEARCH_KEY,
+    SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS, image_media_type,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
 use super::rules::ApprovalScope;
@@ -373,8 +374,10 @@ pub fn parse_slash_input(raw: &str) -> Option<SlashInput> {
 pub struct Attachment {
     /// Path on this machine.
     pub path: String,
-    /// Its text.
+    /// Its text, empty when the file is an image.
     pub text: String,
+    /// The image, when the file is one the model can be shown.
+    pub image: Option<ImagePart>,
 }
 
 impl Attachment {
@@ -445,6 +448,8 @@ struct Queued {
     message: String,
     /// What travels with it, for the tags on its bubble.
     meta: UserMeta,
+    /// Images the message carries.
+    images: Vec<ImagePart>,
 }
 
 /// One turn's Markdown, with the fingerprint of the text it was parsed from.
@@ -1388,7 +1393,10 @@ model sees. Callable now:"
                 if let Some((turn, report)) = ended {
                     chat.turns.push(turn);
                     chat.history
-                        .push(super::protocol::ApiMessage::User { content: report });
+                        .push(super::protocol::ApiMessage::User {
+                            content: report,
+                            images: Vec::new(),
+                        });
                 }
             }
         }
@@ -1476,7 +1484,10 @@ model sees. Callable now:"
                 protocol: provider.protocol,
                 model,
                 system: CHAT_TITLE_SYSTEM_PROMPT.to_owned(),
-                messages: vec![super::protocol::ApiMessage::User { content: prompt }],
+                messages: vec![super::protocol::ApiMessage::User {
+                    content: prompt,
+                    images: Vec::new(),
+                }],
                 tools: Vec::new(),
                 max_tokens: 32,
             };
@@ -1532,11 +1543,12 @@ model sees. Callable now:"
         &mut self,
         message: &str,
         meta: UserMeta,
+        images: Vec<ImagePart>,
         settings: &serde_json::Map<String, Value>,
         host: &str,
         environment: &str,
     ) {
-        if !self.agent.push_user(message, meta) {
+        if !self.agent.push_user_with_images(message, meta, images) {
             return;
         }
         // The first message of a conversation stamps when it was started, for the list's
@@ -1854,6 +1866,7 @@ model sees. Callable now:"
                 system: SUMMARY_SYSTEM_PROMPT.to_owned(),
                 messages: vec![super::protocol::ApiMessage::User {
                     content: transcript,
+                    images: Vec::new(),
                 }],
                 tools: Vec::new(),
                 max_tokens: 1_024,
@@ -1960,6 +1973,7 @@ model sees. Callable now:"
                         content: format!(
                             "[Context carried over from the previous chat]\n{summary}"
                         ),
+                        images: Vec::new(),
                     });
                 } else {
                     self.agent
@@ -2015,10 +2029,10 @@ model sees. Callable now:"
             return;
         }
         match std::fs::metadata(path) {
-            Ok(meta) if meta.len() > MAX_ATTACHMENT_BYTES => {
+            Ok(meta) if meta.len() > MAX_IMAGE_BYTES as u64 => {
                 self.report_error(format!(
                     "{} is larger than {} bytes.",
-                    path, MAX_ATTACHMENT_BYTES
+                    path, MAX_IMAGE_BYTES
                 ));
                 return;
             }
@@ -2029,25 +2043,62 @@ model sees. Callable now:"
             }
         }
         match std::fs::read(path) {
-            Ok(bytes) if bytes.iter().take(2048).any(|byte| *byte == 0) => {
-                self.report_error(format!("{path} looks like a binary file."));
-            }
             Ok(bytes) => {
+                if let Some(media_type) = image_media_type(&bytes) {
+                    if self.attached_images().len() >= MAX_IMAGES {
+                        self.report_error(format!(
+                            "At most {MAX_IMAGES} images can be sent in one message."
+                        ));
+                        return;
+                    }
+                    self.attachments.push(Attachment {
+                        path: path.to_owned(),
+                        text: String::new(),
+                        image: Some(ImagePart {
+                            media_type: media_type.to_owned(),
+                            data: bytes,
+                        }),
+                    });
+                    return;
+                }
+                if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+                    self.report_error(format!(
+                        "{path} is larger than {MAX_ATTACHMENT_BYTES} bytes."
+                    ));
+                    return;
+                }
+                if bytes.iter().take(2048).any(|byte| *byte == 0) {
+                    self.report_error(format!("{path} looks like a binary file."));
+                    return;
+                }
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 let text: String = text.chars().take(MAX_ATTACHMENT_CHARS).collect();
                 self.attachments.push(Attachment {
                     path: path.to_owned(),
                     text,
+                    image: None,
                 });
             }
             Err(error) => self.report_error(format!("Cannot read {path}: {error}")),
         }
     }
 
+    /// The images the next message carries.
+    fn attached_images(&self) -> Vec<ImagePart> {
+        self.attachments
+            .iter()
+            .filter_map(|attachment| attachment.image.clone())
+            .collect()
+    }
+
     /// The user message with attachments and the terminal tail folded in.
     fn message_with_attachments(&self, text: &str, terminal: Option<&str>) -> String {
         let mut message = String::new();
         for attachment in &self.attachments {
+            if attachment.image.is_some() {
+                message.push_str(&format!("[Attached image {}]\n", attachment.name()));
+                continue;
+            }
             message.push_str(&format!(
                 "[Attached file {}]\n{}\n\n",
                 attachment.name(),
@@ -2415,7 +2466,7 @@ model sees. Callable now:"
         self.queued = None;
         // The files and terminal tail the first version carried are not in the transcript,
         // so the edited prompt goes out as written.
-        self.send_message(text, UserMeta::default(), settings, host, environment);
+        self.send_message(text, UserMeta::default(), Vec::new(), settings, host, environment);
     }
 
     /// Draw the popup a tag opened: what the scope is, the tools it carries, and the way to
@@ -4457,6 +4508,7 @@ impl Plugin for AiAgent {
                     self.send_message(
                         &queued.message,
                         queued.meta,
+                        queued.images,
                         context.settings,
                         &context.host_label,
                         &context.environment,
@@ -5080,6 +5132,7 @@ impl Plugin for AiAgent {
                     attachments: self.attachments.len(),
                     terminal: terminal.is_some(),
                 };
+                let images = self.attached_images();
                 self.draft.clear();
                 self.attachments.clear();
                 self.attach_terminal = false;
@@ -5089,14 +5142,16 @@ impl Plugin for AiAgent {
                         text,
                         message,
                         meta,
+                        images,
                     });
                 } else if self.agent.blocked() {
                     // Anything else joins the conversation the agent is in the middle of.
-                    self.agent.inject_user(&message, meta);
+                    self.agent.inject_user_with_images(&message, meta, images);
                 } else {
                     self.send_message(
                         &message,
                         meta,
+                        images,
                         context.settings,
                         &context.host_label,
                         &context.environment,
@@ -5652,7 +5707,8 @@ mod tests {
         assert_eq!(
             first,
             Some(crate::ai_agent::protocol::ApiMessage::User {
-                content: format!("question 2 {filler}")
+                content: format!("question 2 {filler}"),
+                images: Vec::new(),
             }),
             "the history keeps the messages after the fold point"
         );
@@ -6806,11 +6862,35 @@ mod tests {
     }
 
     #[test]
+    fn an_image_attachment_is_sent_as_an_image() {
+        let dir = std::env::temp_dir().join(format!("wassh-ai-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp folder");
+        let path = dir.join("dot.png");
+        std::fs::write(
+            &path,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0],
+        )
+        .expect("the image");
+        let mut plugin = AiAgent::default();
+        plugin.attach(path.to_str().expect("a path"));
+        let images = plugin.attached_images();
+        assert_eq!(images.len(), 1, "{images:?}");
+        assert_eq!(images[0].media_type, "image/png");
+        let message = plugin.message_with_attachments("look", None);
+        assert!(
+            message.starts_with("[Attached image dot.png]"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn attachments_and_the_terminal_tail_are_folded_into_the_message() {
         let mut plugin = AiAgent::default();
         plugin.attachments.push(Attachment {
             path: "/tmp/notes.txt".to_owned(),
             text: "line one".to_owned(),
+            image: None,
         });
         let message =
             plugin.message_with_attachments("summarise this", Some("$ uptime\nup 3 days"));
@@ -7678,6 +7758,7 @@ mod tests {
             .history
             .push(super::super::protocol::ApiMessage::User {
                 content: "first question".to_owned(),
+                images: Vec::new(),
             });
         plugin.generated_title = Some("First digest".to_owned());
         plugin.begin_new_chat();

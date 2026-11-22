@@ -6,12 +6,13 @@
 
 use std::sync::mpsc::Sender;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::protocol::{
-    join_url, ApiMessage, ApiToolCall, Completion, Protocol, ProviderConfig, ANTHROPIC_CHAT_PATH,
-    ANTHROPIC_MODELS_PATH, ANTHROPIC_VERSION, OPENAI_CHAT_PATH, OPENAI_EMBEDDINGS_PATH,
-    OPENAI_MODELS_PATH,
+    join_url, ApiMessage, ApiToolCall, Completion, ImagePart, Protocol, ProviderConfig,
+    ANTHROPIC_CHAT_PATH, ANTHROPIC_MODELS_PATH, ANTHROPIC_VERSION, OPENAI_CHAT_PATH,
+    OPENAI_EMBEDDINGS_PATH, OPENAI_MODELS_PATH,
 };
 
 /// Cap on the error text attached to a failed call.
@@ -57,7 +58,7 @@ pub fn openai_body(request: &CompletionRequest) -> Value {
     let mut messages = vec![json!({ "role": "system", "content": request.system })];
     for message in &request.messages {
         messages.push(match message {
-            ApiMessage::User { content } => json!({ "role": "user", "content": content }),
+            ApiMessage::User { content, images } => openai_user_message(content, images),
             ApiMessage::Tool {
                 tool_call_id,
                 content,
@@ -122,6 +123,52 @@ fn parse_arguments(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| json!({}))
 }
 
+/// A user message for an OpenAI endpoint: plain text, or text and images as parts.
+fn openai_user_message(content: &str, images: &[ImagePart]) -> Value {
+    if images.is_empty() {
+        return json!({ "role": "user", "content": content });
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    if !content.is_empty() {
+        parts.push(json!({ "type": "text", "text": content }));
+    }
+    for image in images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": data_url(image) }
+        }));
+    }
+    json!({ "role": "user", "content": parts })
+}
+
+/// `data:` URL an OpenAI-compatible endpoint accepts in an `image_url` part.
+fn data_url(image: &ImagePart) -> String {
+    format!(
+        "data:{};base64,{}",
+        image.media_type,
+        base64::engine::general_purpose::STANDARD.encode(&image.data)
+    )
+}
+
+/// The blocks of an Anthropic user turn: the text and one image block each.
+fn anthropic_user_blocks(content: &str, images: &[ImagePart]) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    if !content.is_empty() {
+        blocks.push(json!({ "type": "text", "text": content }));
+    }
+    for image in images {
+        blocks.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(&image.data)
+            }
+        }));
+    }
+    blocks
+}
+
 /// The request body for the Anthropic messages API.
 ///
 /// Anthropic needs strictly alternating roles, so consecutive user turns are
@@ -130,18 +177,20 @@ pub fn anthropic_body(request: &CompletionRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     for message in &request.messages {
         match message {
-            ApiMessage::User { content } => {
+            ApiMessage::User { content, images } => {
+                let mut blocks = anthropic_user_blocks(content, images);
                 if let Some(last) = messages.last_mut()
                     && last["role"] == "user"
                 {
-                    let previous = last["content"].as_array().cloned().unwrap_or_else(|| {
+                    let mut previous = last["content"].as_array().cloned().unwrap_or_else(|| {
                         vec![json!({ "type": "text", "text": last["content"].clone() })]
                     });
-                    let mut blocks = previous;
-                    blocks.push(json!({ "type": "text", "text": content }));
-                    last["content"] = Value::Array(blocks);
-                } else {
+                    previous.append(&mut blocks);
+                    last["content"] = Value::Array(previous);
+                } else if images.is_empty() {
                     messages.push(json!({ "role": "user", "content": content }));
+                } else {
+                    messages.push(json!({ "role": "user", "content": blocks }));
                 }
             }
             ApiMessage::Tool {
@@ -733,6 +782,7 @@ mod tests {
             messages: vec![
                 ApiMessage::User {
                     content: "hi".to_owned(),
+                    images: Vec::new(),
                 },
                 ApiMessage::Assistant {
                     content: "hello".to_owned(),
@@ -814,15 +864,50 @@ mod tests {
         req.messages = vec![
             ApiMessage::User {
                 content: "one".to_owned(),
+                images: Vec::new(),
             },
             ApiMessage::User {
                 content: "two".to_owned(),
+                images: Vec::new(),
             },
         ];
         let body = anthropic_body(&req);
         let messages = body["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 1, "Anthropic rejects repeated roles");
         assert_eq!(messages[0]["content"][1]["text"], "two");
+    }
+
+    #[test]
+    fn images_become_content_parts_for_both_protocols() {
+        let image = ImagePart {
+            media_type: "image/png".to_owned(),
+            data: vec![1, 2, 3],
+        };
+        let mut req = request(Protocol::Openai);
+        req.messages = vec![ApiMessage::User {
+            content: "look".to_owned(),
+            images: vec![image.clone()],
+        }];
+        let body = openai_body(&req);
+        assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+        let url = body["messages"][1]["content"][1]["image_url"]["url"]
+            .as_str()
+            .expect("a data URL");
+        assert_eq!(url, "data:image/png;base64,AQID");
+
+        let mut req = request(Protocol::Anthropic);
+        req.messages = vec![ApiMessage::User {
+            content: "look".to_owned(),
+            images: vec![image],
+        }];
+        let body = anthropic_body(&req);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(
+            body["messages"][0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "AQID");
     }
 
     #[test]

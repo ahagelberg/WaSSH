@@ -7,23 +7,27 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 
+use base64::Engine as _;
 use serde_json::Value;
 
 use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
 use super::protocol::{
-    ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, MAX_SUBAGENT_RESULT_CHARS,
-    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
-    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
+    ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, ImagePart,
+    MAX_SUBAGENT_RESULT_CHARS, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
+    TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
+    TOOL_LOAD_SCOPE,
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND,
-    TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY,
-    TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
-    TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH,
-    TOOL_WEB_SEARCH,
+    TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
+    TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
+    TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT,
+    TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
+    TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
+    TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
@@ -331,6 +335,13 @@ pub enum CommandThen {
         /// Whether an existing file may be replaced.
         overwrite: bool,
     },
+    /// Read the patch the probe printed, then apply it to `path`.
+    ReadPatchFile {
+        /// File the patch changes.
+        path: String,
+        /// Where the patch was read from, for the error message.
+        patch_path: String,
+    },
 }
 
 /// What follows a remote read.
@@ -359,6 +370,15 @@ pub enum ReadThen {
         /// Lines of context around each change.
         context: usize,
     },
+    /// Apply a unified diff and write the file back.
+    Patch {
+        /// The diff, `@@` hunks included.
+        patch: String,
+    },
+    /// Return the contents base64-encoded.
+    Base64,
+    /// Show the image to the model as a user message.
+    Image,
 }
 
 /// Settings the tools read.
@@ -655,7 +675,7 @@ pub struct Agent {
     /// They show up in the transcript straight away but only join the provider history
     /// once the run in front of them is done, so the model sees them after it finished
     /// the step it was on rather than before its own reply.
-    injected: std::collections::VecDeque<(String, UserMeta)>,
+    injected: std::collections::VecDeque<(String, UserMeta, Vec<ImagePart>)>,
     /// Clock used by the time-based tools; the view sets it every frame.
     pub now_ms: u64,
     /// The last command, kept so a refused `sudo` can be retried.
@@ -784,6 +804,16 @@ impl Agent {
 
     /// Add the user's turn, if the conversation is idle.
     pub fn push_user(&mut self, text: &str, meta: UserMeta) -> bool {
+        self.push_user_with_images(text, meta, Vec::new())
+    }
+
+    /// Add the user's turn with the images that went with it.
+    pub fn push_user_with_images(
+        &mut self,
+        text: &str,
+        meta: UserMeta,
+        images: Vec<ImagePart>,
+    ) -> bool {
         let text = text.trim();
         if text.is_empty() || self.blocked() {
             return false;
@@ -795,6 +825,7 @@ impl Agent {
         });
         self.history.push(ApiMessage::User {
             content: text.to_owned(),
+            images,
         });
         true
     }
@@ -805,6 +836,16 @@ impl Agent {
     /// in the middle of — and is folded into the provider history by
     /// [`Agent::flush_injected`] once that run is done.
     pub fn inject_user(&mut self, text: &str, meta: UserMeta) -> bool {
+        self.inject_user_with_images(text, meta, Vec::new())
+    }
+
+    /// Take a message typed mid-run, with the images that went with it.
+    pub fn inject_user_with_images(
+        &mut self,
+        text: &str,
+        meta: UserMeta,
+        images: Vec<ImagePart>,
+    ) -> bool {
         let text = text.trim();
         if text.is_empty() || !self.blocked() {
             return false;
@@ -814,7 +855,7 @@ impl Agent {
             text: text.to_owned(),
             meta,
         });
-        self.injected.push_back((text.to_owned(), meta));
+        self.injected.push_back((text.to_owned(), meta, images));
         true
     }
 
@@ -825,8 +866,11 @@ impl Agent {
         if self.phase.is_some() || self.injected.is_empty() {
             return false;
         }
-        for (text, _) in self.injected.drain(..) {
-            self.history.push(ApiMessage::User { content: text });
+        for (text, _, images) in self.injected.drain(..) {
+            self.history.push(ApiMessage::User {
+                content: text,
+                images,
+            });
         }
         self.needs_reply = true;
         true
@@ -887,7 +931,10 @@ impl Agent {
             return;
         }
         for report in self.pending_reports.drain(..) {
-            self.history.push(ApiMessage::User { content: report });
+            self.history.push(ApiMessage::User {
+            content: report,
+            images: Vec::new(),
+        });
         }
     }
 
@@ -1104,7 +1151,18 @@ impl Agent {
     fn poll_tool(&mut self, session: Session<'_, '_>) -> bool {
         enum Ready {
             Settle(String, String, bool),
+            /// Settle the tool call, then show the image to the model.
+            SettleImage {
+                label: String,
+                output: String,
+                image: ImagePart,
+            },
             WriteRemote(String, String),
+            ReadRemote {
+                path: String,
+                max: u64,
+                then: ReadThen,
+            },
         }
 
         let Some(Phase::Running {
@@ -1238,6 +1296,23 @@ impl Agent {
                             Ready::WriteRemote(path, content)
                         }
                     }
+                    CommandThen::ReadPatchFile { path, patch_path } => match output {
+                        Some(output) => Ready::ReadRemote {
+                            path,
+                            max: tools::MAX_FILE_READ_CHARS as u64,
+                            then: ReadThen::Patch {
+                                patch: output.stdout.clone(),
+                            },
+                        },
+                        None => Ready::Settle(
+                            format!("patch {path}"),
+                            format!(
+                                "Cannot read {patch_path}: {}",
+                                failure.unwrap_or_default()
+                            ),
+                            true,
+                        ),
+                    },
                 }
             }
             Waiting::Read { path, max, then } => {
@@ -1288,6 +1363,71 @@ impl Agent {
                     ReadThen::Diff { new, context } => {
                         let change = tools::diff_texts(&text, &new, context);
                         Ready::Settle(format!("diff {path}"), change, false)
+                    }
+                    ReadThen::Patch { patch } => {
+                        if content.truncated {
+                            Ready::Settle(
+                                format!("edit {path}"),
+                                format!("{path} is larger than the patch limit."),
+                                true,
+                            )
+                        } else {
+                            match tools::apply_unified_patch(&text, &patch) {
+                                Ok(updated) if updated == text => Ready::Settle(
+                                    format!("edit {path}"),
+                                    "The patch changed nothing.".to_owned(),
+                                    false,
+                                ),
+                                Ok(updated) => {
+                                    let diff = tools::diff_texts(
+                                        &text,
+                                        &updated,
+                                        tools::DIFF_CONTEXT_LINES_DEFAULT,
+                                    );
+                                    Ready::WriteRemote(path, format!("{updated}\u{0}{diff}"))
+                                }
+                                Err(error) => Ready::Settle(format!("edit {path}"), error, true),
+                            }
+                        }
+                    }
+                    ReadThen::Base64 => {
+                        let mut body = base64::engine::general_purpose::STANDARD.encode(&content.data);
+                        if content.truncated {
+                            body.push_str(
+                                "\n\n[Stopped at the base64 read limit; the file continues]",
+                            );
+                        }
+                        Ready::Settle(format!("read {path}"), body, false)
+                    }
+                    ReadThen::Image => {
+                        if content.truncated {
+                            Ready::Settle(
+                                format!("image {path}"),
+                                format!(
+                                    "{path} is larger than {} bytes.",
+                                    super::protocol::MAX_IMAGE_BYTES
+                                ),
+                                true,
+                            )
+                        } else if let Some(media_type) = super::protocol::image_media_type(&content.data)
+                        {
+                            Ready::SettleImage {
+                                label: format!("image {path}"),
+                                output: format!("The image {path} is shown to you now."),
+                                image: ImagePart {
+                                    media_type: media_type.to_owned(),
+                                    data: content.data.clone(),
+                                },
+                            }
+                        } else {
+                            Ready::Settle(
+                                format!("image {path}"),
+                                format!(
+                                    "{path} is not a PNG, JPEG, GIF or WebP image."
+                                ),
+                                true,
+                            )
+                        }
                     }
                 }
             }
@@ -1429,6 +1569,24 @@ impl Agent {
             Ready::Settle(label, output, failed) => {
                 self.phase = None;
                 self.settle(call, turn, label, output, failed, session);
+            }
+            Ready::ReadRemote { path, max, then } => {
+                self.start_read(call, turn, path, max, then, session);
+            }
+            Ready::SettleImage {
+                label,
+                output,
+                image,
+            } => {
+                self.settle(call.clone(), turn, label.clone(), output.clone(), false, session);
+                // A script decides what the model sees; an image it read stays out of the
+                // conversation until the model asks for it itself.
+                if !self.waiting_on(&call) {
+                    self.history.push(ApiMessage::User {
+                        content: label,
+                        images: vec![image],
+                    });
+                }
             }
             Ready::WriteRemote(target, payload) => {
                 // An edit packs the diff after a NUL so the file keeps its bytes.
@@ -2253,6 +2411,10 @@ impl Agent {
             TOOL_REMOTE_READ => {
                 let path =
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                if arguments["encoding"].as_str() == Some("base64") {
+                    self.start_read(call, turn, path, tools::MAX_BASE64_BYTES, ReadThen::Base64, session);
+                    return;
+                }
                 let max = arguments["maxChars"]
                     .as_u64()
                     .unwrap_or(32_000)
@@ -2300,6 +2462,19 @@ impl Agent {
                     path,
                     tools::MAX_FILE_READ_CHARS as u64,
                     ReadThen::View { start, lines },
+                    session,
+                );
+            }
+            TOOL_DEV_IMAGE => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                // One byte over the cap is enough to know the file is too big.
+                self.start_read(
+                    call,
+                    turn,
+                    path,
+                    super::protocol::MAX_IMAGE_BYTES as u64 + 1,
+                    ReadThen::Image,
                     session,
                 );
             }
@@ -2412,6 +2587,108 @@ impl Agent {
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let command = format!("rm -rf -- {} && echo removed", shell_quote(&path));
                 self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_STAT => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let command = tools::stat_command(&path);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_MOVE => {
+                let from =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let to = relative_remote(
+                    &self.cwd,
+                    arguments["destination"].as_str().unwrap_or_default(),
+                );
+                let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
+                let command = tools::move_command(&from, &to, overwrite);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_PATCH => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let patch = arguments["patch"].as_str().unwrap_or_default().trim().to_owned();
+                let patch_file = arguments["patchFile"].as_str().unwrap_or_default().trim();
+                if !patch.is_empty() {
+                    self.start_read(
+                        call,
+                        turn,
+                        path,
+                        tools::MAX_FILE_READ_CHARS as u64,
+                        ReadThen::Patch { patch },
+                        session,
+                    );
+                } else if !patch_file.is_empty() {
+                    let patch_path = relative_remote(&self.cwd, patch_file);
+                    let command = format!("cat {}", shell_quote(&patch_path));
+                    self.run_probe(
+                        call,
+                        turn,
+                        CommandThen::ReadPatchFile { path, patch_path },
+                        command,
+                        session,
+                    );
+                } else {
+                    let label = call_label(&call);
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        "Pass patch or patchFile.".to_owned(),
+                        true,
+                        session,
+                    );
+                }
+            }
+            TOOL_REMOTE_ZIP_LIST => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let command = tools::zip_list_command(&path);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_ZIP_READ => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let entry = arguments["entry"].as_str().unwrap_or_default();
+                let command = tools::zip_read_command(&path, entry);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_ZIP_EXTRACT => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let destination = relative_remote(
+                    &self.cwd,
+                    arguments["destination"].as_str().unwrap_or_default(),
+                );
+                let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
+                let command = tools::zip_extract_command(&path, &destination, overwrite);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_GIT_STATUS
+            | TOOL_GIT_DIFF
+            | TOOL_GIT_LOG
+            | TOOL_GIT_BRANCHES
+            | TOOL_GIT_COMMIT
+            | TOOL_GIT_CHECKOUT => {
+                let dir =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                match tools::git_command(name, arguments, &dir) {
+                    Some(command) => {
+                        self.run_probe(call, turn, CommandThen::Return, command, session)
+                    }
+                    None => {
+                        let label = call_label(&call);
+                        self.settle(
+                            call,
+                            turn,
+                            label,
+                            format!("{name} is not a git tool."),
+                            true,
+                            session,
+                        );
+                    }
+                }
             }
             TOOL_TERMINAL_READ => {
                 let screen = session
@@ -3333,7 +3610,7 @@ impl Agent {
         let mut out = String::new();
         for message in &self.history[..cut] {
             match message {
-                ApiMessage::User { content } => out.push_str(&format!("User: {content}\n")),
+                ApiMessage::User { content, .. } => out.push_str(&format!("User: {content}\n")),
                 ApiMessage::Assistant {
                     content,
                     tool_calls,
@@ -3381,7 +3658,9 @@ impl Agent {
 /// Characters one provider message carries, tool calls included.
 fn message_chars(message: &ApiMessage) -> usize {
     match message {
-        ApiMessage::User { content } => content.len(),
+        ApiMessage::User { content, images } => {
+            content.len() + images.iter().map(|image| image.data.len() / 4).sum::<usize>()
+        }
         ApiMessage::Assistant {
             content,
             tool_calls,
@@ -3496,6 +3775,39 @@ pub fn call_label(call: &ApiToolCall) -> String {
         TOOL_REMOTE_EDIT | TOOL_LOCAL_EDIT | TOOL_DEV_EDIT => {
             format!("edit {}", arguments["path"].as_str().unwrap_or_default())
         }
+        TOOL_REMOTE_PATCH | TOOL_LOCAL_PATCH | TOOL_LOCAL_MULTI_EDIT => {
+            format!("patch {}", arguments["path"].as_str().unwrap_or_default())
+        }
+        TOOL_REMOTE_STAT => format!("stat {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_REMOTE_MOVE => format!(
+            "move {} → {}",
+            arguments["path"].as_str().unwrap_or_default(),
+            arguments["destination"].as_str().unwrap_or_default()
+        ),
+        TOOL_REMOTE_ZIP_LIST => format!(
+            "zip list {}",
+            arguments["path"].as_str().unwrap_or_default()
+        ),
+        TOOL_REMOTE_ZIP_READ => format!(
+            "zip read {}",
+            arguments["entry"].as_str().unwrap_or_default()
+        ),
+        TOOL_REMOTE_ZIP_EXTRACT => format!(
+            "zip extract {}",
+            arguments["path"].as_str().unwrap_or_default()
+        ),
+        TOOL_GIT_STATUS => "git status".to_owned(),
+        TOOL_GIT_DIFF => "git diff".to_owned(),
+        TOOL_GIT_LOG => "git log".to_owned(),
+        TOOL_GIT_BRANCHES => "git branches".to_owned(),
+        TOOL_GIT_COMMIT => format!(
+            "git commit {}",
+            arguments["message"].as_str().unwrap_or_default()
+        ),
+        TOOL_GIT_CHECKOUT => format!(
+            "git checkout {}",
+            arguments["branch"].as_str().unwrap_or_default()
+        ),
         TOOL_REMOTE_DELETE | TOOL_LOCAL_DELETE => {
             format!("delete {}", arguments["path"].as_str().unwrap_or_default())
         }
@@ -3507,6 +3819,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
             arguments["namePattern"].as_str().unwrap_or_default()
         ),
         TOOL_DEV_DIFF => format!("diff {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_DEV_IMAGE => format!(
+            "image {}",
+            arguments["path"].as_str().unwrap_or_default()
+        ),
         TOOL_LOCAL_RUN => format!(
             "local $ {}",
             arguments["command"].as_str().unwrap_or_default()
@@ -3516,9 +3832,6 @@ pub fn call_label(call: &ApiToolCall) -> String {
             arguments["path"].as_str().unwrap_or_default(),
             arguments["destination"].as_str().unwrap_or_default()
         ),
-        TOOL_LOCAL_MULTI_EDIT | TOOL_LOCAL_PATCH => {
-            format!("edit {}", arguments["path"].as_str().unwrap_or_default())
-        }
         TOOL_LOCAL_REPLACE => format!(
             "replace {}",
             arguments["pattern"].as_str().unwrap_or_default()
@@ -3574,6 +3887,11 @@ fn is_writing_tool(name: &str) -> bool {
             | TOOL_REMOTE_WRITE
             | TOOL_REMOTE_EDIT
             | TOOL_REMOTE_DELETE
+            | TOOL_REMOTE_MOVE
+            | TOOL_REMOTE_PATCH
+            | TOOL_REMOTE_ZIP_EXTRACT
+            | TOOL_GIT_COMMIT
+            | TOOL_GIT_CHECKOUT
             | TOOL_LOCAL_WRITE
             | TOOL_LOCAL_EDIT
             | TOOL_LOCAL_DELETE
@@ -3902,8 +4220,22 @@ pub fn history_to_json(messages: &[ApiMessage]) -> Vec<Value> {
     messages
         .iter()
         .map(|message| match message {
-            ApiMessage::User { content } => {
-                serde_json::json!({ "role": "user", "content": content })
+            ApiMessage::User { content, images } => {
+                let mut stored = serde_json::json!({ "role": "user", "content": content });
+                if !images.is_empty() {
+                    stored["images"] = Value::Array(
+                        images
+                            .iter()
+                            .map(|image| {
+                                serde_json::json!({
+                                    "mediaType": image.media_type,
+                                    "data": base64::engine::general_purpose::STANDARD.encode(&image.data)
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                stored
             }
             ApiMessage::Assistant {
                 content,
@@ -3946,6 +4278,22 @@ pub fn history_from_json(items: &[Value]) -> Vec<ApiMessage> {
         .filter_map(|item| match item["role"].as_str()? {
             "user" => Some(ApiMessage::User {
                 content: item["content"].as_str().unwrap_or_default().to_owned(),
+                images: item["images"]
+                    .as_array()
+                    .map(|images| {
+                        images
+                            .iter()
+                            .filter_map(|image| {
+                                Some(ImagePart {
+                                    media_type: image["mediaType"].as_str()?.to_owned(),
+                                    data: base64::engine::general_purpose::STANDARD
+                                        .decode(image["data"].as_str()?)
+                                        .ok()?,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             "assistant" => Some(ApiMessage::Assistant {
                 content: item["content"].as_str().unwrap_or_default().to_owned(),
@@ -4054,7 +4402,7 @@ mod tests {
                 (agent.history.get(1), agent.history.get(2)),
                 (
                     Some(ApiMessage::Assistant { .. }),
-                    Some(ApiMessage::User { content })
+                    Some(ApiMessage::User { content, .. })
                 ) if content == "and check /etc too"
             ),
             "history: {:?}",
@@ -4142,6 +4490,7 @@ mod tests {
         agent.history = vec![
             ApiMessage::User {
                 content: "go".to_owned(),
+                images: Vec::new(),
             },
             ApiMessage::Assistant {
                 content: String::new(),
@@ -4772,7 +5121,8 @@ mod tests {
         assert_eq!(
             agent.history.first(),
             Some(&ApiMessage::User {
-                content: "question 2".to_owned()
+                content: "question 2".to_owned(),
+                images: Vec::new(),
             }),
             "the kept tail starts at the first message that stays"
         );
@@ -5351,6 +5701,8 @@ mod tests {
         typed: String,
         listing: Option<crate::files::SftpListing>,
         contents: std::collections::HashMap<String, String>,
+        /// Raw bytes for files whose content is not text.
+        blobs: std::collections::HashMap<String, Vec<u8>>,
         commands: Vec<(String, String)>,
         /// What each `exec_input` wrote to stdin.
         stdin: Vec<String>,
@@ -5408,6 +5760,12 @@ mod tests {
         fn remove(&mut self, _path: &str, _is_dir: bool) {}
         fn chmod(&mut self, _path: &str, _mode: u32) {}
         fn read(&mut self, path: &str, _max_bytes: u64) -> Option<crate::files::FileContent> {
+            if let Some(data) = self.blobs.get(path) {
+                return Some(crate::files::FileContent {
+                    data: data.clone(),
+                    truncated: false,
+                });
+            }
             self.contents
                 .get(path)
                 .map(|text| crate::files::FileContent {
@@ -5558,6 +5916,105 @@ mod tests {
             output,
             "127.0.0.1 localhost
 "
+        );
+    }
+
+    #[test]
+    fn an_image_tool_shows_the_model_the_picture() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.blobs.insert(
+            "/tmp/a.png".to_owned(),
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1],
+        );
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_IMAGE,
+            r#"{"path":"/tmp/a.png"}"#,
+        );
+        assert!(output.contains("is shown to you"), "{output}");
+        match agent.history.last() {
+            Some(ApiMessage::User { images, .. }) => {
+                assert_eq!(images.len(), 1, "{images:?}");
+                assert_eq!(images[0].media_type, "image/png");
+            }
+            other => panic!("expected the image message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stored_history_keeps_attached_images() {
+        let messages = vec![ApiMessage::User {
+            content: "look".to_owned(),
+            images: vec![ImagePart {
+                media_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            }],
+        }];
+        let stored = history_to_json(&messages);
+        assert_eq!(stored[0]["images"][0]["data"], "AQID");
+        assert_eq!(history_from_json(&stored), messages);
+    }
+
+    #[test]
+    fn a_remote_read_can_answer_in_base64() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.contents.insert("/bin/tool".to_owned(), "hi".to_owned());
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_REMOTE_READ,
+            r#"{"path":"/bin/tool","encoding":"base64"}"#,
+        );
+        assert_eq!(output, "aGk=");
+    }
+
+    #[test]
+    fn a_patch_file_is_read_then_applied_to_the_target() {
+        let mut agent = Agent::new();
+        when_offered(&mut agent, TOOL_REMOTE_PATCH);
+        let mut fake = FakeSession::default();
+        fake.contents
+            .insert("/srv/app/main.rs".to_owned(), "one\ntwo\n".to_owned());
+        fake.answers.insert(
+            PROBE_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "@@ -1,2 +1,2 @@\n one\n-two\n+three\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_REMOTE_PATCH.to_owned(),
+                arguments: r#"{"path":"/srv/app/main.rs","patchFile":"/srv/app/fix.diff"}"#
+                    .to_owned(),
+            },
+            &mut session,
+        );
+        for _ in 0..4 {
+            agent.poll(&mut session);
+        }
+        assert!(
+            fake.commands
+                .iter()
+                .any(|(_, command)| command == "cat '/srv/app/fix.diff'"),
+            "{:?}",
+            fake.commands
+        );
+        let write = fake.writes.last().cloned();
+        assert_eq!(
+            write.as_ref().map(|(path, _)| path.as_str()),
+            Some("/srv/app/main.rs")
+        );
+        assert!(
+            write.is_some_and(|(_, content)| content == b"one\nthree\n"),
+            "{:?}",
+            fake.writes
         );
     }
 
@@ -6112,7 +6569,7 @@ mod tests {
         // The answer joins the history once the conversation is between turns.
         agent.poll(&mut session);
         assert!(
-            matches!(agent.history.last(), Some(ApiMessage::User { content }) if content.contains("api.service is failing")),
+            matches!(agent.history.last(), Some(ApiMessage::User { content, .. }) if content.contains("api.service is failing")),
             "{:?}",
             agent.history
         );

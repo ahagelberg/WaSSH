@@ -5447,6 +5447,7 @@ version = "2.0.17"
 name = "wassh-plugins"
 version = "2.0.17"
 dependencies = [
+ "base64 0.22.1",
  "egui",
  "regex",
  "rfd",

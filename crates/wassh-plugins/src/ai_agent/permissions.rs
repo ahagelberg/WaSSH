@@ -14,11 +14,15 @@ use serde_json::{Map, Value};
 
 use super::protocol::{
     TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND, TOOL_DEV_GREP,
-    TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP,
+    TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_DEV_IMAGE, TOOL_GIT_BRANCHES, TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT,
+    TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS, TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT,
+    TOOL_LOCAL_GREP,
     TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE, TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ,
     TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN, TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE,
-    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_TERMINAL_KEYS,
-    TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST, TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ,
+    TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE, TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST,
+    TOOL_REMOTE_ZIP_READ, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
+    TOOL_TERMINAL_WRITE, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 /// Live-terminal tools.
@@ -148,6 +152,77 @@ pub const GATES: &[Gate] = &[
         default: Permission::Ask,
     },
     Gate {
+        tool: TOOL_REMOTE_STAT,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_REMOTE_ZIP_LIST,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_REMOTE_ZIP_READ,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_REMOTE_MOVE,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_REMOTE_PATCH,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_REMOTE_ZIP_EXTRACT,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_GIT_STATUS,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },    Gate {
+        tool: TOOL_GIT_DIFF,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_GIT_LOG,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_GIT_BRANCHES,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_GIT_COMMIT,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
+        tool: TOOL_GIT_CHECKOUT,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_WRITE,
+        default: Permission::Ask,
+    },
+    Gate {
         tool: TOOL_LOCAL_READ,
         group: Some(GROUP_LOCAL_FS),
         leader: TOOL_LOCAL_READ,
@@ -215,6 +290,12 @@ pub const GATES: &[Gate] = &[
     },
     Gate {
         tool: TOOL_DEV_VIEW,
+        group: Some(GROUP_REMOTE_FS),
+        leader: TOOL_REMOTE_READ,
+        default: Permission::Allow,
+    },
+    Gate {
+        tool: TOOL_DEV_IMAGE,
         group: Some(GROUP_REMOTE_FS),
         leader: TOOL_REMOTE_READ,
         default: Permission::Allow,
