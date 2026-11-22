@@ -1,5 +1,52 @@
 # Changelog
 
+## [2.0.18] - 2026-11-23
+
+### Added
+
+- Plan mode for the AI agent: a footer switch that makes the agent read and investigate only,
+  then tell you what it would change, where and why. Nothing on the host is touched until you
+  switch back to Agent mode. The mode is kept with the chat.
+- A Compact button in the chat footer, beside the mode switch, that folds the older part of a
+  long chat into a summary. The agent still remembers the gist, the recent messages stay, and
+  less of the model's context is spent on history. `/compact` does the same.
+- Script mode for the AI agent, a global setting with a per-host override. Instead of sending
+  a schema for every tool, the model writes a short JavaScript program that calls the tools it
+  needs, filters and joins their results and returns one compact result. It uses far less of
+  the prompt on tool descriptions and needs fewer rounds per task. A program may run for 20
+  seconds and make up to 100 calls, and a tool call that never answers is failed after a minute.
+- More tools for the connected host: file and folder details (`remote_fs_stat`), moving and
+  renaming (`remote_fs_move_file`), applying a patch from text or from a patch file
+  (`remote_fs_apply_patch`), listing, reading and extracting zip archives (`remote_fs_zip_list`,
+  `remote_fs_zip_read`, `remote_fs_zip_extract`), git status, diff, log, branches, commit and
+  checkout (`dev_git_status` and friends), and showing the model an image from the host
+  (`dev_view_image`).
+- Read a host file as base64 with `remote_fs_read_file` and `encoding: "base64"`, so binary
+  files can be looked at without garbling.
+- Send pictures to the AI agent: PNG, JPEG, GIF and WebP files can be attached to a message
+  (up to four per message, 4 MB each) and are sent to OpenAI-compatible and Anthropic models
+  as images. The chat history keeps them, and the model can also ask for an image on the host.
+- Shift+Enter starts a new line in the AI composer and when editing an earlier prompt. Enter
+  still sends, and Alt+Enter still queues the message for after the current run.
+- The free-answer box on the agent's question card now has a radio button of its own, so it is
+  clear when a typed answer replaces a picked option.
+
+### Changed
+
+- A long prompt in the chat is now limited to eight lines inside its bubble and scrolls, instead
+  of growing until it covers the whole conversation.
+- While a chat is being compacted, a progress bar says what is happening and the composer is
+  disabled, so a message cannot be typed into a conversation that is being rewritten.
+- Script mode's guidance asks the model to filter, sort, de-duplicate and summarise tool output
+  and to do several calls in one program rather than returning raw text or one round per call.
+
+### Fixed
+
+- A tool call made from a script no longer hangs the conversation when the command never
+  answers: it fails the call after 60 seconds with a timeout and lets the program carry on.
+- The terminal component only links its Windows console helper on Windows, so the build is
+  quiet on Linux and macOS.
+
 ## [2.0.17] - 2026-11-20
 
 ### Added
