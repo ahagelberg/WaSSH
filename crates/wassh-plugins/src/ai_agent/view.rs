@@ -153,6 +153,10 @@ const COMPACT_HINT: &str = "Fold the older part of this chat into a summary now.
 const COMPACT_LABEL: &str = "Compact";
 /// Said when Compact is pressed while a run is in flight.
 const COMPACT_BUSY: &str = "Stop the run before compacting the chat.";
+/// The bar's caption while the older part of the chat is folded into a summary.
+const COMPACTING_LABEL: &str = "Compacting the chat…";
+/// The bar's caption while a summary is being written.
+const SUMMARISING_LABEL: &str = "Summarising the chat…";
 /// Said when there is nothing old enough to fold.
 const COMPACT_EMPTY: &str = "Nothing to compact yet: the chat is as short as it gets.";
 /// Narrowest the composer text area gets.
@@ -4864,56 +4868,79 @@ impl Plugin for AiAgent {
                     }
                 }
 
+                // A summary runs off the frame, so the composer waits behind a bar that says
+                // what is happening rather than accepting a message nobody will read yet.
+                if let Some((mode, _, _)) = &self.summary {
+                    ui.add(
+                        egui::ProgressBar::new(0.0)
+                            .animate(true)
+                            .text(match mode {
+                                SummaryMode::Compact => COMPACTING_LABEL,
+                                SummaryMode::Summary | SummaryMode::Transfer => {
+                                    SUMMARISING_LABEL
+                                }
+                            })
+                            .fill(to_color32(palette.accent)),
+                    );
+                }
+
                 // Composer: the include tools stack in a column beside the prompt, both
                 // starting at the prompt's top edge.
                 ui.separator();
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        let attach = Button::new(ATTACH_GLYPH)
-                            .compact()
-                            .enabled(
-                                self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS,
-                            )
-                            .show(ui, palette);
-                        if attach.clicked() {
-                            self.pick_attachments();
-                        }
-                        let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
-                            .compact()
-                            .active(self.attach_terminal)
-                            .show(ui, palette);
-                        if terminal.clicked() {
-                            self.attach_terminal = !self.attach_terminal;
-                        }
-                    });
-                    let room = ui.available_width().max(MIN_COMPOSER_WIDTH);
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(room, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_width(room);
-                            let response = text_area_with_id(
-                                ui,
-                                palette,
-                                &mut self.draft,
-                                2,
-                                "Ask the agent…",
-                                self.composer_id,
-                            );
-                            if response.has_focus()
-                                && let Some(alt) = enter_press(ui)
-                            {
-                                submit = true;
-                                // Alt turns the send into a queue, like it does in other
-                                // chat clients.
-                                queue = alt;
+                let compacting = self.summary.is_some();
+                ui.add_enabled_ui(!compacting, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            let attach = Button::new(ATTACH_GLYPH)
+                                .compact()
+                                .enabled(
+                                    self.picking.is_none()
+                                        && self.attachments.len() < MAX_ATTACHMENTS,
+                                )
+                                .show(ui, palette);
+                            if attach.clicked() {
+                                self.pick_attachments();
                             }
-                        },
-                    );
+                            let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
+                                .compact()
+                                .active(self.attach_terminal)
+                                .show(ui, palette);
+                            if terminal.clicked() {
+                                self.attach_terminal = !self.attach_terminal;
+                            }
+                        });
+                        let room = ui.available_width().max(MIN_COMPOSER_WIDTH);
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(room, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(room);
+                                let response = text_area_with_id(
+                                    ui,
+                                    palette,
+                                    &mut self.draft,
+                                    2,
+                                    "Ask the agent…",
+                                    self.composer_id,
+                                );
+                                if response.has_focus()
+                                    && !compacting
+                                    && let Some(alt) = enter_press(ui)
+                                {
+                                    submit = true;
+                                    // Alt turns the send into a queue, like it does in
+                                    // other chat clients.
+                                    queue = alt;
+                                }
+                            },
+                        );
+                    });
                 });
 
                 // Provider and model, with the action at the right end of the same row.
-                let can_send = !self.providers.is_empty() && !self.draft.trim().is_empty();
+                let can_send = !compacting
+                    && !self.providers.is_empty()
+                    && !self.draft.trim().is_empty();
                 let action_state = self.action_state(can_send);
                 // The stop hint says whether a second press is coming.
                 let stop_hint = match action_state {
@@ -5176,7 +5203,7 @@ impl Plugin for AiAgent {
         }
         if let Some(command) = command {
             self.run_command(command, context.settings, &context.host_label);
-        } else if submit && !self.draft.trim().is_empty() {
+        } else if submit && self.summary.is_none() && !self.draft.trim().is_empty() {
             // Say why nothing would go out instead of dropping the message silently.
             if let Err(error) = self.ready() {
                 self.report_error(error);
@@ -5799,6 +5826,34 @@ mod tests {
         assert!(
             !request.contains("question 4"),
             "only what is being folded goes to the summariser: {request}"
+        );
+    }
+
+    #[test]
+    fn compacting_disables_the_composer_and_shows_a_progress_bar() {
+        let mut plugin = two_prompts();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let (_sender, events) = std::sync::mpsc::channel();
+        plugin.summary = Some((SummaryMode::Compact, 2, events));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts.contains(&COMPACTING_LABEL),
+            "the bar says what is happening: {texts:?}"
+        );
+        // Typing cannot reach a disabled composer.
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![egui::Event::Text("hello".to_owned())],
+        );
+        assert!(
+            plugin.draft.is_empty(),
+            "the disabled composer took text: {:?}",
+            plugin.draft
         );
     }
 
