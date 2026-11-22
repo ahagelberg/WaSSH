@@ -958,8 +958,10 @@ makes sense: put every call a step needs in a single script, batch independent c
 together and chain the ones that depend on each other, instead of spending a round per \
 call, because each round re-sends the whole prompt. Do the processing and the decisions in \
 the script rather than back through the conversation: filter, join, compare and branch on \
-results there, and return only the conclusion the answer needs — that result is all the \
-model sees. Callable now:"
+results there. Spend real effort on shrinking what you return: filter down to the lines \
+that answer the question, sort and de-duplicate them, and compact, count or summarise the \
+rest instead of dumping raw output — that result is all the model sees, so keep it as \
+small as the answer allows. Callable now:"
                         .to_owned(),
                 );
                 lines.push(catalog);
@@ -7579,6 +7581,11 @@ mod tests {
         );
         assert!(
             prompt.contains("Do the processing and the decisions in the script"),
+            "{prompt}"
+        );
+        // The script is where output is cut down before it costs prompt room.
+        assert!(
+            prompt.contains("Spend real effort on shrinking what you return"),
             "{prompt}"
         );
         assert!(
