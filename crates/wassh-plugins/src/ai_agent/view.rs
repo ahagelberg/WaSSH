@@ -3371,11 +3371,7 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
                         ui.scroll_to_rect(response.rect, Some(egui::Align::TOP));
                         edit.opening = false;
                     }
-                    if ui.memory(|memory| memory.has_focus(id))
-                        && ui.input_mut(|input| {
-                            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                        })
-                    {
+                    if ui.memory(|memory| memory.has_focus(id)) && enter_press(ui).is_some() {
                         action = EditAction::Submit;
                     }
                     if ui.input_mut(|input| {
@@ -3392,6 +3388,35 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
             });
     });
     action
+}
+
+/// The Enter a text field received this frame, if it was not Shift+Enter: `Some(alt)` when
+/// it was pressed, saying whether Alt came with it.
+///
+/// The key event's own modifiers are what count. Shift+Enter belongs to the field, which
+/// turns it into a newline, and the modifier state at the end of a frame need not be the
+/// one the key arrived with.
+fn enter_press(ui: &mut Ui) -> Option<bool> {
+    ui.input_mut(|input| {
+        let mut alt = None;
+        input.events.retain(|event| match event {
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if modifiers.shift {
+                    true
+                } else {
+                    alt = Some(modifiers.alt);
+                    false
+                }
+            }
+            _ => true,
+        });
+        alt
+    })
 }
 
 /// A user message: a bubble against the right edge, filled with the accent like a primary
@@ -4836,13 +4861,12 @@ impl Plugin for AiAgent {
                                 self.composer_id,
                             );
                             if response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                                && !ui.input(|input| input.modifiers.shift)
+                                && let Some(alt) = enter_press(ui)
                             {
                                 submit = true;
                                 // Alt turns the send into a queue, like it does in other
                                 // chat clients.
-                                queue = ui.input(|input| input.modifiers.alt);
+                                queue = alt;
                             }
                         },
                     );
@@ -6620,6 +6644,52 @@ mod tests {
             &plugin.agent.turns[2],
             Turn::User { text, .. } if text == "rewritten prompt"
         ));
+    }
+
+    #[test]
+    fn shift_enter_in_the_editor_writes_a_newline_instead_of_sending() {
+        let mut plugin = two_prompts();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        frame(&mut plugin, &mut settings, &ctx, click(row_of(&rows, "second prompt")));
+        let edit = plugin.editing.as_mut().expect("the prompt is being edited");
+        edit.text = "rewritten prompt".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(shift),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: shift,
+                },
+            ],
+        );
+
+        let edit = plugin.editing.as_ref().expect("the editor stays open");
+        assert!(
+            edit.text.contains('\n'),
+            "Shift+Enter must start a new line: {:?}",
+            edit.text
+        );
+        assert_eq!(
+            plugin.agent.turns.len(),
+            4,
+            "Shift+Enter does not send: {:?}",
+            plugin.agent.turns
+        );
     }
 
     /// Click the painted `text` and draw the frame that shows the result.
@@ -8803,9 +8873,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shift_enter_writes_a_newline_instead_of_sending() {
+        let mut settings = local_provider();
+        let (mut plugin, _worker) = busy_pane();
+        let ctx = egui::Context::default();
+        // The composer settles its height on the first frame; clicking the empty prompt
+        // is what focuses the text area for the key press.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let hint = rows
+            .iter()
+            .find(|(_, _, text)| text == "Ask the agent…")
+            .cloned()
+            .unwrap_or_else(|| panic!("the prompt has no hint: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(hint));
+        plugin.draft = "first line".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let turns = plugin.agent.turns.len();
+
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(shift),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: shift,
+                },
+            ],
+        );
+
+        assert!(
+            plugin.draft.contains('\n'),
+            "Shift+Enter must start a new line: {:?}",
+            plugin.draft
+        );
+        assert_eq!(
+            plugin.draft.replace('\n', ""),
+            "first line",
+            "the typed line is still there: {:?}",
+            plugin.draft
+        );
+        assert!(plugin.queued.is_none(), "Shift+Enter does not queue");
+        assert_eq!(
+            plugin.agent.turns.len(),
+            turns,
+            "Shift+Enter does not send a turn"
+        );
+    }
+
     /// The settings of a pane with one OpenAI-compatible provider that never answers.
-    fn local_provider() -> serde_json::Map<String, Value> {
-        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+    fn local_provider() -> serde_json::Map<String, Value> {        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
         let (base_url, _requests) = provider("", MODELS);
         [(
             PROVIDERS_KEY.to_owned(),
