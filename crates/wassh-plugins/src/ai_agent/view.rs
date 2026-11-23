@@ -13,24 +13,25 @@ use wassh_core::{Palette, RADIUS, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
-    select_width, small_button, small_button_enabled, text_area, text_area_with_id, ToastKind,
+    select_width, small_button, small_button_enabled, text_area_with_id, ToastKind,
 };
 
 use super::agent::{
     Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, Subagent, SubagentEnd, SubagentState,
-    ToolSettings, Turn, UserMeta, announce_wait, end_subagent, history_from_json, history_to_json,
+    ToolSettings, Turn, UserMeta, Waiting, announce_wait, end_subagent, history_from_json, history_to_json,
     subagents_from_json, subagents_to_json, turns_from_json, turns_to_json,
 };
 use super::markdown::{Block, Ink};
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, DEFAULT_MAX_SUBAGENTS,
-    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, Protocol, ProviderConfig,
-    SAFE_RULES, SETTING_AUTO_COMPACT, SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES,
-    SETTING_GLOBAL_PROMPT, SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
-    SETTING_HOST_RAG_FOLDER, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
-    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY, SETTING_WEB_SEARCH_PROVIDER,
-    TITLE_MAX_CHARS,
+    ImagePart, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, MAX_IMAGE_BYTES,
+    MAX_IMAGES, Protocol, ProviderConfig, SAFE_RULES, SETTING_AUTO_COMPACT,
+    SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
+    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, SETTING_HOST_RAG_FOLDER,
+    SETTING_HOST_SCRIPT_MODE, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
+    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_SCRIPT_MODE, SETTING_WEB_SEARCH_KEY,
+    SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS, image_media_type,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
 use super::rules::ApprovalScope;
@@ -45,8 +46,6 @@ use crate::{PluginId, PluginManifest};
 const CONVERSATION_KEY: &str = "conversation";
 /// Key the host's environment map is stored under.
 const MAP_KEY: &str = "envMap";
-/// Key the folder the user pinned for the map is stored under; empty means the host picks.
-const MAP_FOLDER_KEY: &str = "envMapFolder";
 /// Key the host's ports and services are stored under.
 const SYSTEM_KEY: &str = "envSystem";
 /// The scope that holds the environment map.
@@ -66,6 +65,8 @@ const DERIVED_SETTINGS: &[&str] = &[
     SETTING_HOST_RAG_FOLDER,
     SETTING_WEB_SEARCH_PROVIDER,
     SETTING_MAX_SUBAGENTS,
+    SETTING_SCRIPT_MODE,
+    SETTING_HOST_SCRIPT_MODE,
 ];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
@@ -116,8 +117,6 @@ const MAP_ATTEMPTS: u8 = 2;
 const MAP_EMPTY_NOTICE: &str = "The mapping pass described no files.";
 /// What the transcript says while it asks the model for the object again.
 const MAP_RETRY_NOTICE: &str = "The mapping answer had no file list; asking again.";
-/// Hint the popup's folder field shows while the host picks the tree itself.
-const MAP_FOLDER_HINT: &str = "auto: the project root above the session";
 
 /// Name the chat list gives the mapping sub-agent.
 const MAP_SUBAGENT_TITLE: &str = "map the project";
@@ -134,17 +133,44 @@ const SYSTEM_HEADING: &str = "Host setup (from env_system):";
 /// Transcript note left where the conversation was compacted.
 const COMPACTED_NOTICE: &str = "Earlier messages were compacted into a summary:";
 /// Gap between the provider and model dropdowns under the composer.
-const FOOTER_GAP: f32 = 6.0;
-/// Type size of the two dropdowns.
+const FOOTER_GAP: f32 = 6.0;/// Type size of the two dropdowns.
 const FOOTER_TEXT_SIZE: f32 = 11.0;
+/// Labels of the two modes the footer switches between.
+const MODE_PLAN_LABEL: &str = "Plan";
+/// The other mode's label.
+const MODE_AGENT_LABEL: &str = "Agent";
+/// What Plan mode means, on the mode button.
+const MODE_TO_AGENT_HINT: &str = "Plan mode: every tool only reads. Click for Agent mode, where \
+the agent may change files, run commands and act on the host.";
+/// What Agent mode means, on the mode button.
+const MODE_TO_PLAN_HINT: &str = "Agent mode: the agent may change files, run commands and act \
+on the host. Click for Plan mode, where it only reads.";
+/// Room two dropdowns need before the mode and Compact buttons are drawn at all.
+const MIN_SELECT_ROOM: f32 = 80.0;
+/// Tooltip of the Compact button.
+const COMPACT_HINT: &str = "Fold the older part of this chat into a summary now.";
+/// Caption of the Compact button.
+const COMPACT_LABEL: &str = "Compact";
+/// Said when Compact is pressed while a run is in flight.
+const COMPACT_BUSY: &str = "Stop the run before compacting the chat.";
+/// The bar's caption while the older part of the chat is folded into a summary.
+const COMPACTING_LABEL: &str = "Compacting the chat…";
+/// The bar's caption while a summary is being written.
+const SUMMARISING_LABEL: &str = "Summarising the chat…";
+/// Said when there is nothing old enough to fold.
+const COMPACT_EMPTY: &str = "Nothing to compact yet: the chat is as short as it gets.";
 /// Narrowest the composer text area gets.
 const MIN_COMPOSER_WIDTH: f32 = 80.0;
 /// Gap between two entries of the transcript.
 const TURN_GAP: f32 = 8.0;
 /// Share of the pane a chat message may take.
 const MESSAGE_BUBBLE_SHARE: f32 = 0.92;
-/// Height a prompt bubble reaches before its text is cut, with the way to open the rest.
-const PROMPT_BUBBLE_MAX_HEIGHT: f32 = 200.0;
+/// Lines a prompt bubble shows before its text scrolls.
+const PROMPT_BUBBLE_ROWS: usize = 8;
+/// Horizontal padding inside a chat bubble.
+const BUBBLE_PADDING_X: i8 = 8;
+/// Vertical padding inside a chat bubble.
+const BUBBLE_PADDING_Y: i8 = 6;
 /// Transparency of the context tags on the accent-filled user bubble.
 const USER_BUBBLE_TAG_ALPHA: u8 = 200;
 /// Lines the prompt editor opens with at least.
@@ -159,6 +185,22 @@ const EDIT_WHILE_BUSY: &str = "Stop the current run before editing an earlier me
 const BADGE_TINT: f32 = 0.25;
 /// Characters kept from one tool's output.
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
+/// Badge on a `run_script` card.
+const SCRIPT_BADGE: &str = "Script";
+/// Header of the program in a script card.
+const SCRIPT_CODE_LABEL: &str = "JavaScript";
+/// Header of what the script returned.
+const SCRIPT_RESULT_LABEL: &str = "Result";
+/// Header of what the script logged.
+const SCRIPT_CONSOLE_LABEL: &str = "Console";
+/// Marks a call the script made that worked.
+const SCRIPT_OK_MARK: &str = "✓";
+/// Marks a call the script made that failed.
+const SCRIPT_FAILED_MARK: &str = "✕";
+/// Marks a call the script made that has not answered yet.
+const SCRIPT_PENDING_MARK: &str = "…";
+/// Size of the program, the calls and the result in a script card.
+const SCRIPT_TEXT_SIZE: f32 = 10.5;
 /// Widest the output text gets before it has to shrink for its copy button.
 const MIN_OUTPUT_WIDTH: f32 = 60.0;
 /// What a card with nothing to show says instead of an empty box.
@@ -255,6 +297,27 @@ pub struct SlashCommand {
     pub description: &'static str,
 }
 
+/// The command the Compact button runs.
+const COMPACT_COMMAND: SlashCommand = SlashCommand {
+    name: "compact",
+    label: "/compact",
+    description: "Fold the older part of this chat into a summary",
+};
+
+/// The command that puts the chat back in Plan mode.
+const PLAN_COMMAND: SlashCommand = SlashCommand {
+    name: "plan",
+    label: "/plan",
+    description: "Plan mode: the agent can only read, and proposes instead of changing",
+};
+
+/// The command that puts the chat back in Agent mode.
+const AGENT_COMMAND: SlashCommand = SlashCommand {
+    name: "agent",
+    label: "/agent",
+    description: "Agent mode: the agent may change files, run commands and act on the host",
+};
+
 /// The commands the reference offers.
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
@@ -272,6 +335,9 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         label: "/new",
         description: "Start a new chat",
     },
+    COMPACT_COMMAND,
+    PLAN_COMMAND,
+    AGENT_COMMAND,
     SlashCommand {
         name: "transfer",
         label: "/transfer",
@@ -318,8 +384,10 @@ pub fn parse_slash_input(raw: &str) -> Option<SlashInput> {
 pub struct Attachment {
     /// Path on this machine.
     pub path: String,
-    /// Its text.
+    /// Its text, empty when the file is an image.
     pub text: String,
+    /// The image, when the file is one the model can be shown.
+    pub image: Option<ImagePart>,
 }
 
 impl Attachment {
@@ -377,6 +445,8 @@ pub struct StoredChat {
     pub compacted: Option<String>,
     /// Scopes it carried tools from.
     pub scopes: Loaded,
+    /// Whether it was a Plan-mode chat, which only reads.
+    pub plan: bool,
 }
 
 /// A message typed while a run was in flight.
@@ -388,6 +458,8 @@ struct Queued {
     message: String,
     /// What travels with it, for the tags on its bubble.
     meta: UserMeta,
+    /// Images the message carries.
+    images: Vec<ImagePart>,
 }
 
 /// One turn's Markdown, with the fingerprint of the text it was parsed from.
@@ -429,8 +501,6 @@ pub struct AiAgent {
     composer_id: egui::Id,
     /// Messages typed while a run was in flight, sent one at a time as it ends.
     queued: Vec<Queued>,
-    /// Turns whose prompt bubble shows its whole text rather than the cut preview.
-    expanded_prompts: std::collections::BTreeSet<usize>,
     /// Files attached to the next message.
     attachments: Vec<Attachment>,
     /// Whether the next message carries the recent terminal output.
@@ -484,6 +554,11 @@ pub struct AiAgent {
     applied: Option<serde_json::Map<String, Value>>,
     /// Search key the agent's tools were last given.
     applied_web_key: Option<String>,
+    /// Which chats the list shows its sub-agents for, by the chat's start stamp.
+    ///
+    /// Collapsed by default: a chat with sub-agents says how many there are and lists them
+    /// only when the user clicks it.
+    expanded_chats: std::collections::BTreeSet<u64>,
     /// Tool card whose copy button confirmed: which card, which button, and when.
     copied: Option<(usize, CopyTarget, u64)>,
     /// The scope popup a tag click opened, if any.
@@ -500,10 +575,6 @@ pub struct AiAgent {
     map_deep: Option<MapRun>,
     /// Set while a pass waits for the walk in front of it to finish.
     map_pass_after_scan: bool,
-    /// Folder the popup pinned for the map, empty to let the host find the project root.
-    map_folder: String,
-    /// Folder the host's plugin data holds, so a change is written once.
-    map_folder_saved: String,
     /// Set by the popup: show what the mapping pass is doing, call by call.
     map_more: bool,
     /// Which of the pane's two views is drawn.
@@ -563,7 +634,6 @@ impl Default for AiAgent {
             draft: String::new(),
             composer_id: egui::Id::unique("ai-agent-composer"),
             queued: Vec::new(),
-            expanded_prompts: std::collections::BTreeSet::new(),
             attachments: Vec::new(),
             attach_terminal: false,
             picking: None,
@@ -592,14 +662,13 @@ impl Default for AiAgent {
             applied_web_key: None,
             copied: None,
             scope_popup: None,
+            expanded_chats: std::collections::BTreeSet::new(),
             map_saved: 0,
             system_saved: 0,
             map_rebuild: false,
             map_deep_wanted: false,
             map_deep: None,
             map_pass_after_scan: false,
-            map_folder: String::new(),
-            map_folder_saved: String::new(),
             map_more: false,
             view: ChatView::List,
         }
@@ -688,7 +757,13 @@ fn build_request(
 ) -> CompletionRequest {
     agent.repair_history();
     let system = AiAgent::system_prompt(agent, settings, host, environment);
-    let tools = tools::specs(&agent.permissions, &agent.scopes, !agent.subagent);
+    let tools = tools::specs(
+        &agent.permissions,
+        &agent.scopes,
+        !agent.subagent,
+        agent.plan,
+        agent.script_mode,
+    );
     // Kept so compaction measures the scopes this conversation really carries.
     agent.prompt_chars = tools::prompt_chars(&tools, &system);
     CompletionRequest {
@@ -737,6 +812,7 @@ impl AiAgent {
             provider,
             compacted: self.agent.compacted.take(),
             scopes: std::mem::take(&mut self.agent.scopes),
+            plan: self.agent.plan,
         }
     }
 
@@ -770,7 +846,6 @@ impl AiAgent {
         self.questions = QuestionWizard::default();
         self.editing = None;
         self.queued.clear();
-        self.expanded_prompts.clear();
         self.parsed_sub.clear();
         // A pass belongs to the conversation that started it.
         self.map_deep = None;
@@ -802,6 +877,7 @@ impl AiAgent {
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
         self.agent.scopes = chat.scopes;
+        self.agent.plan = chat.plan;
         self.created = chat.created;
         self.generated_title = (chat.title != DEFAULT_CHAT_TITLE).then(|| chat.title.clone());
         // A digest this chat was still waiting for goes on being written here.
@@ -821,7 +897,6 @@ impl AiAgent {
         self.error = None;
         self.editing = None;
         self.queued.clear();
-        self.expanded_prompts.clear();
         self.map_deep = None;
         self.map_pass_after_scan = false;
         self.view = ChatView::Chat;
@@ -855,6 +930,16 @@ You cannot ask the main conversation to do work for you and you cannot start sub
             ),
             format!("Environment: {environment}."),
             format!("Current working directory: {}", agent.cwd),
+        ]);
+        if agent.plan {
+            lines.push(
+                "This chat is in Plan mode: every tool offered here only reads. Investigate \
+as far as the question needs, then answer with what you would change, where, and why — you \
+cannot change anything yourself, and the user switches to Agent mode to carry the plan out."
+                    .to_owned(),
+            );
+        }
+        lines.extend([
             String::new(),
             // Tools arrive by scope: sending every schema on every turn would spend the
             // prompt on tools nobody asked for.
@@ -880,6 +965,34 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             lines.push("Scopes to load, by id:".to_owned());
             for scope in loadable {
                 lines.push(format!("- {}: {}", scope.id, scope.summary));
+            }
+        }
+        // Script mode sends `run_script` instead of one schema per tool, so the tools it can
+        // call are spelled out here: a line each instead of a schema each.
+        if agent.script_mode {
+            let catalog =
+                tools::catalog(&agent.permissions, &agent.scopes, !agent.subagent, agent.plan);
+            if !catalog.is_empty() {
+                lines.push(String::new());
+                lines.push(format!(
+                    "Call tools from a script. `run_script` runs a JavaScript program in a \
+sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
+(`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
+— time spent waiting on a tool does not count — and up to {} tool calls; one call that has \
+not answered within {} seconds fails with a timeout. Run multiple tool calls in one go when \
+it makes sense: put every call a step needs in a single script, batch independent calls \
+together and chain the ones that depend on each other, instead of spending a round per \
+call, because each round re-sends the whole prompt. Do the processing and the decisions in \
+the script rather than back through the conversation: filter, join, compare and branch on \
+results there. Spend real effort on shrinking what you return: filter down to the lines \
+that answer the question, sort and de-duplicate them, and compact, count or summarise the \
+rest instead of dumping raw output — that result is all the model sees, so keep it as \
+small as the answer allows. Callable now:",
+                    super::script::MAX_EXEC_MS / 1_000,
+                    super::script::MAX_CALLS,
+                    super::script::MAX_CALL_MS / 1_000
+                ));
+                lines.push(catalog);
             }
         }
         // The map's digest: the tree this conversation already knows, so its turns go on
@@ -1088,6 +1201,14 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             setting_rules(settings, SETTING_HOST_ALLOW_RULES).unwrap_or_default();
         self.agent.host_deny = setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
         self.agent.permissions = Permissions::from_settings(settings);
+        self.agent.script_mode = settings
+            .get(SETTING_HOST_SCRIPT_MODE)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || settings
+                .get(SETTING_SCRIPT_MODE)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         self.agent.max_subagents = settings
             .get(SETTING_MAX_SUBAGENTS)
             .and_then(Value::as_u64)
@@ -1302,7 +1423,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 if let Some((turn, report)) = ended {
                     chat.turns.push(turn);
                     chat.history
-                        .push(super::protocol::ApiMessage::User { content: report });
+                        .push(super::protocol::ApiMessage::User {
+                            content: report,
+                            images: Vec::new(),
+                        });
                 }
             }
         }
@@ -1390,7 +1514,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 protocol: provider.protocol,
                 model,
                 system: CHAT_TITLE_SYSTEM_PROMPT.to_owned(),
-                messages: vec![super::protocol::ApiMessage::User { content: prompt }],
+                messages: vec![super::protocol::ApiMessage::User {
+                    content: prompt,
+                    images: Vec::new(),
+                }],
                 tools: Vec::new(),
                 max_tokens: 32,
             };
@@ -1446,11 +1573,12 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         &mut self,
         message: &str,
         meta: UserMeta,
+        images: Vec<ImagePart>,
         settings: &serde_json::Map<String, Value>,
         host: &str,
         environment: &str,
     ) {
-        if !self.agent.push_user(message, meta) {
+        if !self.agent.push_user_with_images(message, meta, images) {
             return;
         }
         // The first message of a conversation stamps when it was started, for the list's
@@ -1625,12 +1753,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         // The map belongs to the host, so it survives every chat on the connection.
         self.agent.map = super::map::EnvMap::from_json(settings.get(MAP_KEY));
         self.map_saved = self.agent.map.revision;
-        self.map_folder = settings
-            .get(MAP_FOLDER_KEY)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        self.map_folder_saved = self.map_folder.clone();
         self.agent.system = super::map::SystemFacts::from_json(settings.get(SYSTEM_KEY));
         self.system_saved = self.agent.system.revision;
         // The pane opens on the conversation it was in, or on the list when there is none.
@@ -1680,6 +1802,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
         self.agent.scopes = Loaded::from_json(stored.get("scopes"));
+        self.agent.plan = stored["planMode"].as_bool().unwrap_or(false);
         self.agent
             .adopt_subagents(subagents_from_json(stored.get("subagents")));
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
@@ -1721,6 +1844,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                             .filter(|summary| !summary.is_empty())
                             .map(str::to_owned),
                         scopes: Loaded::from_json(chat.get("scopes")),
+                        plan: chat["planMode"].as_bool().unwrap_or(false),
                         subagents: subagents_from_json(chat.get("subagents")),
                     }
                 })
@@ -1772,6 +1896,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 system: SUMMARY_SYSTEM_PROMPT.to_owned(),
                 messages: vec![super::protocol::ApiMessage::User {
                     content: transcript,
+                    images: Vec::new(),
                 }],
                 tools: Vec::new(),
                 max_tokens: 1_024,
@@ -1785,9 +1910,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 
     /// Compact the conversation once it would no longer fit the model's context window.
     ///
-    /// The model's window comes from the per-model settings rows, so a local model with a
-    /// small window is compacted far earlier than a long-context one. Only an idle chat is
-    /// compacted: folding under a running turn would take away what it is answering.
+    /// Off unless the host switched automatic compaction on: the model's window comes from
+    /// the per-model settings rows, so a local model with a small window would otherwise be
+    /// folded long before the user expects it. Only an idle chat is compacted: folding under
+    /// a running turn would take away what it is answering.
     fn compact_if_needed(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
         if self.summary.is_some()
             || self.agent.blocked()
@@ -1796,7 +1922,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             || !settings
                 .get(SETTING_AUTO_COMPACT)
                 .and_then(Value::as_bool)
-                .unwrap_or(true)
+                .unwrap_or(false)
         {
             return;
         }
@@ -1813,6 +1939,27 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         let Some(cut) = self.agent.compact_split(COMPACT_KEEP_MESSAGES) else {
+            return;
+        };
+        self.start_summary(SummaryMode::Compact, cut, settings, host);
+    }
+
+    /// Fold the older part of the chat into a summary because the user asked for it.
+    ///
+    /// This is what the Compact button and `/compact` do; with automatic compaction off it is
+    /// the only path, and it says so when there is nothing to fold.
+    fn compact_now(&mut self, settings: &serde_json::Map<String, Value>, host: &str) {
+        if self.summary.is_some() {
+            return;
+        }
+        if self.agent.blocked() || self.agent.needs_reply {
+            self.report_error(COMPACT_BUSY);
+            return;
+        }
+        let Some(cut) = self.agent.compact_split(COMPACT_KEEP_MESSAGES) else {
+            self.agent
+                .turns
+                .push(Turn::Notice(COMPACT_EMPTY.to_owned()));
             return;
         };
         self.start_summary(SummaryMode::Compact, cut, settings, host);
@@ -1856,6 +2003,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                         content: format!(
                             "[Context carried over from the previous chat]\n{summary}"
                         ),
+                        images: Vec::new(),
                     });
                 } else {
                     self.agent
@@ -1911,10 +2059,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return;
         }
         match std::fs::metadata(path) {
-            Ok(meta) if meta.len() > MAX_ATTACHMENT_BYTES => {
+            Ok(meta) if meta.len() > MAX_IMAGE_BYTES as u64 => {
                 self.report_error(format!(
                     "{} is larger than {} bytes.",
-                    path, MAX_ATTACHMENT_BYTES
+                    path, MAX_IMAGE_BYTES
                 ));
                 return;
             }
@@ -1925,25 +2073,62 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             }
         }
         match std::fs::read(path) {
-            Ok(bytes) if bytes.iter().take(2048).any(|byte| *byte == 0) => {
-                self.report_error(format!("{path} looks like a binary file."));
-            }
             Ok(bytes) => {
+                if let Some(media_type) = image_media_type(&bytes) {
+                    if self.attached_images().len() >= MAX_IMAGES {
+                        self.report_error(format!(
+                            "At most {MAX_IMAGES} images can be sent in one message."
+                        ));
+                        return;
+                    }
+                    self.attachments.push(Attachment {
+                        path: path.to_owned(),
+                        text: String::new(),
+                        image: Some(ImagePart {
+                            media_type: media_type.to_owned(),
+                            data: bytes,
+                        }),
+                    });
+                    return;
+                }
+                if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+                    self.report_error(format!(
+                        "{path} is larger than {MAX_ATTACHMENT_BYTES} bytes."
+                    ));
+                    return;
+                }
+                if bytes.iter().take(2048).any(|byte| *byte == 0) {
+                    self.report_error(format!("{path} looks like a binary file."));
+                    return;
+                }
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 let text: String = text.chars().take(MAX_ATTACHMENT_CHARS).collect();
                 self.attachments.push(Attachment {
                     path: path.to_owned(),
                     text,
+                    image: None,
                 });
             }
             Err(error) => self.report_error(format!("Cannot read {path}: {error}")),
         }
     }
 
+    /// The images the next message carries.
+    fn attached_images(&self) -> Vec<ImagePart> {
+        self.attachments
+            .iter()
+            .filter_map(|attachment| attachment.image.clone())
+            .collect()
+    }
+
     /// The user message with attachments and the terminal tail folded in.
     fn message_with_attachments(&self, text: &str, terminal: Option<&str>) -> String {
         let mut message = String::new();
         for attachment in &self.attachments {
+            if attachment.image.is_some() {
+                message.push_str(&format!("[Attached image {}]\n", attachment.name()));
+                continue;
+            }
             message.push_str(&format!(
                 "[Attached file {}]\n{}\n\n",
                 attachment.name(),
@@ -1973,6 +2158,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.draft.clear();
         match command.name {
             "new" => self.begin_new_chat(),
+            "compact" => self.compact_now(settings, host),
+            "plan" => self.agent.plan = true,
+            "agent" => self.agent.plan = false,
             "summary" | "context" => self.start_summary(SummaryMode::Summary, 0, settings, host),
             "transfer" => self.start_summary(SummaryMode::Transfer, 0, settings, host),
             _ => {}
@@ -2052,7 +2240,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         let mut open = None;
         let mut edit_action = EditAction::None;
-        let mut prompt_toggle = None;
         let editing = interactive
             .then(|| self.editing.as_ref().map(|edit| edit.index))
             .flatten();
@@ -2060,11 +2247,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let mut stop_command = false;
         let mut copy_output = None;
         let running = agent.running_command();
-        let last_user = agent
-            .turns
-            .iter()
-            .rposition(|turn| matches!(turn, Turn::User { .. }));
-        let turn_finished = agent.phase.is_none();
         for (index, turn) in agent.turns.iter().enumerate() {
             match turn {
                 Turn::User { meta, .. } => {
@@ -2078,14 +2260,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                             palette,
                             self.blocks(source, index),
                             *meta,
-                            self.expanded_prompts.contains(&index),
-                            ("prompt", index),
+                            ("turn", index),
                         );
                         if reply.clicked {
                             open = Some(index);
-                        }
-                        if reply.toggle {
-                            prompt_toggle = Some(index);
                         }
                         bubbles.push((index, reply.rect));
                     }
@@ -2121,19 +2299,43 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                             failed: *failed,
                             running: running == Some(index),
                             turn_index: index,
-                            collapsed: tool_output_is_collapsed(
-                                name,
-                                output,
-                                index,
-                                last_user,
-                                turn_finished,
-                            ),
                             copied: self.copied_recently(index),
                         },
                     );
                     stop_command |= reply.stop;
                     if let Some((target, text)) = reply.copy {
                         copy_output = Some((index, target, text));
+                    }
+                }
+                Turn::Script {
+                    code,
+                    calls,
+                    result,
+                    failed,
+                    console,
+                } => {
+                    let script_running = matches!(
+                        agent.phase,
+                        Some(Phase::Running {
+                            turn,
+                            waiting: Waiting::Script,
+                            ..
+                        }) if turn == index
+                    );
+                    if script_card(
+                        ui,
+                        palette,
+                        ScriptCardState {
+                            code,
+                            calls,
+                            result: result.as_deref(),
+                            failed: *failed,
+                            console,
+                            running: script_running,
+                            turn_index: index,
+                        },
+                    ) {
+                        stop_command = true;
                     }
                 }
                 Turn::Denied(reason) => {
@@ -2218,7 +2420,18 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             EditAction::None => None,
         };
         if stop_command && interactive {
+            // A command the script is waiting on is cancelled first, so it does not keep
+            // going on the host after the run is over.
             self.agent.stop_command(session);
+            if matches!(
+                self.agent.phase,
+                Some(Phase::Running {
+                    waiting: Waiting::Script,
+                    ..
+                })
+            ) {
+                self.agent.stop();
+            }
         }
         if let Some((index, target, text)) = copy_output {
             ui.ctx().copy_text(text);
@@ -2228,19 +2441,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 COPY_FEEDBACK_MS,
             ));
         }
-        if let Some(index) = prompt_toggle {
-            self.toggle_prompt(index);
-        }
         TranscriptReply {
             bubbles,
             submitted,
-        }
-    }
-
-    /// Show a prompt bubble whole, or cut it back to its preview.
-    fn toggle_prompt(&mut self, index: usize) {
-        if !self.expanded_prompts.remove(&index) {
-            self.expanded_prompts.insert(index);
         }
     }
 
@@ -2297,10 +2500,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         self.attachments.clear();
         self.attach_terminal = false;
         self.queued.clear();
-        self.expanded_prompts.clear();
         // The files and terminal tail the first version carried are not in the transcript,
         // so the edited prompt goes out as written.
-        self.send_message(text, UserMeta::default(), settings, host, environment);
+        self.send_message(text, UserMeta::default(), Vec::new(), settings, host, environment);
     }
 
     /// Draw the popup a tag opened: what the scope is, the tools it carries, and the way to
@@ -2321,7 +2523,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         let mut deep = false;
         let mut clear = false;
         let mut more = false;
-        let mut folder = self.map_folder.clone();
         let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
@@ -2407,11 +2608,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                                     }
                                 }
                             }
-                            ui.add(
-                                egui::TextEdit::singleline(&mut folder)
-                                    .hint_text(MAP_FOLDER_HINT)
-                                    .desired_width(f32::INFINITY),
-                            );
                             ui.horizontal(|ui| {
                                 scan = Button::new("Scan")
                                     .compact()
@@ -2444,9 +2640,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if clear {
             self.agent.map.clear();
         }
-        if folder.trim() != self.map_folder.trim() {
-            self.map_folder = folder;
-        }
         if scan {
             self.map_rebuild = true;
         }
@@ -2454,10 +2647,9 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             self.map_more = !self.map_more;
         }
         if deep {
-            // A folder the map was not built from needs the walk before the description; one
-            // that is not there yet is walked by the pass itself.
-            let pinned = self.map_folder.trim();
-            if !pinned.is_empty() && pinned != self.agent.map.root {
+            // A map that is not there yet means the cheap walk comes first; the description
+            // follows it.
+            if self.agent.map.is_empty() {
                 self.map_rebuild = true;
             }
             self.map_deep_wanted = true;
@@ -2475,12 +2667,6 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         if turn_off || clear || escape || pressed_outside {
             self.scope_popup = None;
         }
-    }
-
-    /// The tree a scan starts in: the folder the popup pinned, or none so the host finds the
-    /// project root itself.
-    fn map_root(&self) -> String {
-        self.map_folder.trim().to_owned()
     }
 
     /// Run the mapping pass a tool answer asked for, and take in the one that finished.
@@ -2646,14 +2832,10 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             return format!("Describing {}: {doing}", run.root);
         }
         if self.agent.map.is_empty() {
-            let pinned = self.map_root();
-            return match pinned.is_empty() {
-                true => format!(
-                    "Nothing mapped yet. A scan starts at the project root above {}.",
-                    self.agent.cwd
-                ),
-                false => format!("Nothing mapped yet. A scan starts at {pinned}."),
-            };
+            return format!(
+                "Nothing mapped yet. A scan starts at the project root above {}.",
+                self.agent.cwd
+            );
         }
         let map = &self.agent.map;
         let described = match map.summarised() {
@@ -2730,6 +2912,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
         }
         let mut open = None;
         let mut open_subagent = None;
+        let mut toggled = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-chats")
             .max_height(ui.available_height())
@@ -2737,23 +2920,24 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
             .show(ui, |ui| {
                 for index in chat_order(&self.chats) {
                     let chat = &self.chats[index];
-                    if chat_row(
-                        ui,
-                        palette,
-                        &chat.title,
-                        chat.turns.len(),
-                        &chat.model,
-                        &chat.cwd,
-                    ) {
+                    let expanded = self.expanded_chats.contains(&chat.created);
+                    let row = chat_row(ui, palette, chat, expanded);
+                    if row.open {
                         open = Some(index);
                     }
-                    for (position, sub) in chat.subagents.iter().enumerate() {
-                        if subagent_row(ui, palette, sub) {
-                            open_subagent = Some((index, position));
-                        }
+                    if row.toggle {
+                        toggled = Some(chat.created);
+                    }
+                    if let Some(position) = row.subagent {
+                        open_subagent = Some((index, position));
                     }
                 }
             });
+        if let Some(created) = toggled
+            && !self.expanded_chats.remove(&created)
+        {
+            self.expanded_chats.insert(created);
+        }
         if let Some((index, subagent)) = open_subagent {
             // Opening the parent puts its sub-agents back in the pane, in the same order.
             self.open_chat(index);
@@ -2796,20 +2980,13 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 // The backdrop spans the whole transcript, so nothing shows beside the
                 // pinned bubble where it scrolls underneath.
                 ui.set_min_width(ui.available_width());
-                user_bubble(
-                    ui,
-                    palette,
-                    &self.parsed[*index].blocks,
-                    *meta,
-                    self.expanded_prompts.contains(index),
-                    ("prompt-pinned", *index),
-                )
+                user_bubble(ui, palette, &self.parsed[*index].blocks, *meta, ("pinned", *index))
+                    .clicked
             })
             .inner;
         Some(PinnedBubble {
             index: *index,
-            clicked: reply.clicked,
-            toggle: reply.toggle,
+            clicked: reply,
         })
     }
 }
@@ -2899,7 +3076,10 @@ fn scope_tag(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
 }
 
 /// One sub-agent card under its chat: name, state and how much it has written.
-fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
+///
+/// The card it sits in decides what a click means, so this paints only and reports where it
+/// landed: a row inside a clickable card cannot win the pointer on its own.
+fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> egui::Rect {
     let state = sub.state();
     let (badge, colour) = match state {
         SubagentState::Running => ("running", palette.accent),
@@ -2908,7 +3088,7 @@ fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
         SubagentState::Failed => ("failed", palette.danger),
         SubagentState::Stopped => ("stopped", palette.text_muted),
     };
-    let response = egui::Frame::NONE
+    let rect = egui::Frame::NONE
         .fill(to_color32(palette.bg_panel))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
         .corner_radius(RADIUS)
@@ -2922,34 +3102,38 @@ fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> bool {
                         .color(to_color32(palette.text)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(badge)
-                            .size(10.0)
-                            .color(to_color32(colour)),
-                    );
+                    ui.label(egui::RichText::new(badge).size(10.0).color(to_color32(colour)));
                 });
             });
         })
-        .response;
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+        .response
+        .rect;
     ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), 4.0),
         egui::Sense::hover(),
     );
-    response.interact(egui::Sense::click()).clicked()
+    rect
 }
 
-/// One chat card: title above compact transcript, model and working-directory stats.
-fn chat_row(
-    ui: &mut Ui,
-    palette: &Palette,
-    title: &str,
-    turns: usize,
-    model: &str,
-    cwd: &str,
-) -> bool {
+/// What one chat card in the list reported.
+#[derive(Default)]
+struct ChatRowReply {
+    /// The card itself was clicked: open the chat.
+    open: bool,
+    /// The sub-agent note was clicked: show or hide the sub-agent cards.
+    toggle: bool,
+    /// One of the expanded sub-agent cards was clicked.
+    subagent: Option<usize>,
+}
+
+/// One chat card: title, a compact stats line, and its sub-agents behind a note.
+///
+/// A chat with sub-agents says how many there are in one clickable line instead of listing
+/// them: the list stays one card per conversation until the user asks to look inside.
+fn chat_row(ui: &mut Ui, palette: &Palette, chat: &StoredChat, expanded: bool) -> ChatRowReply {
+    let mut reply = ChatRowReply::default();
+    let mut note_rect = None;
+    let mut sub_rects: Vec<(usize, egui::Rect)> = Vec::new();
     let response = egui::Frame::NONE
         .fill(to_color32(palette.bg_panel_2))
         .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
@@ -2959,18 +3143,23 @@ fn chat_row(
             ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new(title)
+                    egui::RichText::new(&chat.title)
                         .size(CHAT_TITLE_TEXT_SIZE)
                         .strong()
                         .color(to_color32(palette.text)),
                 );
                 ui.add_space(4.0);
-                let model = if model.trim().is_empty() {
+                let turns = chat.turns.len();
+                let model = if chat.model.trim().is_empty() {
                     "No model"
                 } else {
-                    model
+                    chat.model.as_str()
                 };
-                let cwd = if cwd.trim().is_empty() { "/" } else { cwd };
+                let cwd = if chat.cwd.trim().is_empty() {
+                    "/"
+                } else {
+                    chat.cwd.as_str()
+                };
                 ui.label(
                     egui::RichText::new(format!(
                         "{} turn{} · {} · {}",
@@ -2982,17 +3171,56 @@ fn chat_row(
                     .size(10.0)
                     .color(to_color32(palette.text_muted)),
                 );
+                if chat.subagents.is_empty() {
+                    return;
+                }
+                ui.add_space(4.0);
+                let note = format!(
+                    "{} sub-agent{}",
+                    chat.subagents.len(),
+                    if chat.subagents.len() == 1 { "" } else { "s" }
+                );
+                note_rect = Some(
+                    ui.label(
+                        egui::RichText::new(note)
+                            .size(10.0)
+                            .color(to_color32(palette.accent)),
+                    )
+                    .rect,
+                );
+                if !expanded {
+                    return;
+                }
+                ui.add_space(4.0);
+                for (position, sub) in chat.subagents.iter().enumerate() {
+                    sub_rects.push((position, subagent_row(ui, palette, sub)));
+                }
             });
         })
         .response;
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
     ui.allocate_exact_size(
         egui::Vec2::new(ui.available_width(), 8.0),
         egui::Sense::hover(),
     );
-    response.interact(egui::Sense::click()).clicked()
+    // The card is clickable as a whole, which puts it above the note and the sub-agent cards
+    // in the pointer order, so where the press landed decides what it meant.
+    let clicked = response.interact(egui::Sense::click()).clicked();
+    let pointer = ui.ctx().input(|input| input.pointer.interact_pos());
+    if let Some(pos) = pointer {
+        let over_note = note_rect.is_some_and(|rect| rect.contains(pos));
+        let over_sub = sub_rects.iter().find(|(_, rect)| rect.contains(pos));
+        if over_note || over_sub.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if clicked {
+            match (over_note, over_sub) {
+                (true, _) => reply.toggle = true,
+                (false, Some((position, _))) => reply.subagent = Some(*position),
+                _ => reply.open = true,
+            }
+        }
+    }
+    reply
 }
 
 /// The answer a title worker has given, once it has one.
@@ -3123,8 +3351,6 @@ fn cropped_select<T: Clone + PartialEq>(
 struct BubbleReply {
     /// The bubble was clicked, asking to edit the prompt.
     clicked: bool,
-    /// The bubble asked for its whole text, or for the cut one back.
-    toggle: bool,
     /// Where the bubble landed on screen.
     rect: egui::Rect,
 }
@@ -3135,8 +3361,6 @@ struct PinnedBubble {
     index: usize,
     /// The pinned copy was clicked, asking to edit the prompt.
     clicked: bool,
-    /// The pinned copy asked for its whole text, or for the cut one back.
-    toggle: bool,
 }
 
 /// What the transcript reports after a frame: where each prompt landed, and the edited
@@ -3181,7 +3405,7 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
         egui::Frame::new()
             .fill(to_color32(palette.accent))
             .corner_radius(wassh_core::RADIUS)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(BUBBLE_PADDING_X, BUBBLE_PADDING_Y))
             .show(ui, |ui| {
                 ui.set_max_width(room);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -3197,11 +3421,7 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
                         ui.scroll_to_rect(response.rect, Some(egui::Align::TOP));
                         edit.opening = false;
                     }
-                    if ui.memory(|memory| memory.has_focus(id))
-                        && ui.input_mut(|input| {
-                            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                        })
-                    {
+                    if ui.memory(|memory| memory.has_focus(id)) && enter_press(ui).is_some() {
                         action = EditAction::Submit;
                     }
                     if ui.input_mut(|input| {
@@ -3220,28 +3440,53 @@ fn prompt_editor(ui: &mut Ui, palette: &Palette, edit: &mut MessageEdit) -> Edit
     action
 }
 
+/// The Enter a text field received this frame, if it was not Shift+Enter: `Some(alt)` when
+/// it was pressed, saying whether Alt came with it.
+///
+/// The key event's own modifiers are what count. Shift+Enter belongs to the field, which
+/// turns it into a newline, and the modifier state at the end of a frame need not be the
+/// one the key arrived with.
+fn enter_press(ui: &mut Ui) -> Option<bool> {
+    ui.input_mut(|input| {
+        let mut alt = None;
+        input.events.retain(|event| match event {
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if modifiers.shift {
+                    true
+                } else {
+                    alt = Some(modifiers.alt);
+                    false
+                }
+            }
+            _ => true,
+        });
+        alt
+    })
+}
+
 /// A user message: a bubble against the right edge, filled with the accent like a primary
 /// button and carrying white ink. Clicking it opens the prompt for editing.
-///
-/// A prompt taller than [`PROMPT_BUBBLE_MAX_HEIGHT`] is cut there, with a line under it that
-/// opens the rest, so one long paste does not fill the transcript.
 fn user_bubble(
     ui: &mut Ui,
     palette: &Palette,
     blocks: &[Block],
     meta: UserMeta,
-    open: bool,
-    key: (&'static str, usize),
+    salt: (&'static str, usize),
 ) -> BubbleReply {
     let room = ui.available_width() * MESSAGE_BUBBLE_SHARE;
-    let mut toggle = false;
-    let mut cut = false;
-    let response = ui
-        .with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-            let response = egui::Frame::new()
+    // Where a click opens the editor: the tags and the text, not the bubble's padding or
+    // the scroll bar the text may have grown.
+    let (rect, hit) = ui
+        .with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            let bubble = egui::Frame::new()
                 .fill(to_color32(palette.accent))
                 .corner_radius(wassh_core::RADIUS)
-                .inner_margin(egui::Margin::symmetric(8, 6))
+                .inner_margin(egui::Margin::symmetric(BUBBLE_PADDING_X, BUBBLE_PADDING_Y))
                 .show(ui, |ui| {
                     ui.set_max_width(room);
                     // The prompt is a block that opens an editor, not text to select: no
@@ -3249,6 +3494,7 @@ fn user_bubble(
                     ui.style_mut().interaction.selectable_labels = false;
                     // The frame hugs the right edge while its text stays left-aligned.
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        let mut hit = None;
                         // What went out with the message, like the reference's ctx tags.
                         if meta.attachments > 0 || meta.terminal {
                             let mut tags: Vec<String> = Vec::new();
@@ -3259,61 +3505,43 @@ fn user_bubble(
                             if meta.terminal {
                                 tags.push("+terminal".to_owned());
                             }
-                            ui.label(
-                                egui::RichText::new(tags.join("  "))
-                                    .size(9.5)
-                                    .color(egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA)),
+                            hit = Some(
+                                ui.label(
+                                    egui::RichText::new(tags.join("  ")).size(9.5).color(
+                                        egui::Color32::from_white_alpha(USER_BUBBLE_TAG_ALPHA),
+                                    ),
+                                )
+                                .rect,
                             );
                         }
-                        let mut prompt = egui::ScrollArea::vertical()
-                            // Every bubble has its own area: two user messages in one
-                            // transcript, and the pinned copy of the last one, share a
-                            // parent, so a shared id would be reported as a clash.
-                            .id_salt(key)
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                            )
-                            .scroll_source(
-                                egui::containers::scroll_area::ScrollSource::SCROLL_BAR,
-                            );
-                        if !open {
-                            prompt = prompt.max_height(PROMPT_BUBBLE_MAX_HEIGHT);
-                        }
-                        let shown = prompt.show(ui, |ui| {
-                            super::markdown::draw(ui, Ink::on_accent(), blocks);
-                        });
-                        cut = !open && shown.content_size.y > shown.inner_rect.height() + 1.0;
-                    });
-                })
-                .response;
-            // Under the bubble rather than inside it: a click there must not count as the
-            // click that opens the prompt for editing.
-            if cut || open {
-                let label = if open { "Show less" } else { "Show all" };
-                toggle = ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new(label)
-                                .size(9.5)
-                                .color(to_color32(palette.text_muted)),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked();
-            }
-            response
+                        // A long prompt must not push the conversation out of the pane:
+                        // past a few lines its text scrolls inside the bubble.
+                        let cap = super::markdown::body_line_height() * PROMPT_BUBBLE_ROWS as f32;
+                        let scrolled = egui::ScrollArea::vertical()
+                            .id_salt(("ai-prompt-bubble", salt))
+                            .max_height(cap)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                super::markdown::draw(ui, Ink::on_accent(), blocks);
+                            });
+                        hit.map_or(scrolled.inner_rect, |hit| hit.union(scrolled.inner_rect))
+                    })
+                    .inner
+                });
+            (bubble.response.rect, bubble.inner)
         })
         .inner;
     BubbleReply {
-        clicked: !toggle
-            && response
-                .interact(egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Click to edit this message")
-                .clicked(),
-        toggle,
-        rect: response.rect,
+        clicked: ui
+            .interact(
+                hit,
+                ui.make_persistent_id(("ai-prompt-click", salt)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Click to edit this message")
+            .clicked(),
+        rect,
     }
 }
 
@@ -3325,7 +3553,7 @@ fn assistant_bubble(ui: &mut Ui, palette: &Palette, blocks: &[Block]) {
             .fill(to_color32(palette.bg_panel_2))
             .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
             .corner_radius(wassh_core::RADIUS)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(BUBBLE_PADDING_X, BUBBLE_PADDING_Y))
             .show(ui, |ui| {
                 ui.set_max_width(room);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -3346,11 +3574,13 @@ enum CopyTarget {
 
 /// One tool call: the reference's `.ai-agent-tool` card — a badge, the call, its outcome
 /// and the output.
+///
+/// The card shows its header only until the user opens it: a transcript of several calls is
+/// read, not scrolled through.
 struct ToolCardState {
     failed: bool,
     running: bool,
     turn_index: usize,
-    collapsed: bool,
     /// Copy button still showing its confirmation, if any.
     copied: Option<CopyTarget>,
 }
@@ -3360,6 +3590,184 @@ struct ToolCardReply {
     stop: bool,
     /// The copy button that was clicked, with what it should put on the clipboard.
     copy: Option<(CopyTarget, String)>,
+}
+
+/// The parts of a `run_script` turn its card draws.
+struct ScriptCardState<'a> {
+    code: &'a str,
+    calls: &'a [super::agent::ScriptRow],
+    result: Option<&'a str>,
+    failed: bool,
+    console: &'a str,
+    running: bool,
+    turn_index: usize,
+}
+
+/// A `run_script` call: the program, the calls it made, and what came back.
+///
+/// One card rather than a card per inner call: a script may make dozens, and the transcript
+/// is meant to be read, not scrolled through. It shows its header only until the user opens
+/// it, like every other tool card.
+fn script_card(ui: &mut Ui, palette: &Palette, state: ScriptCardState<'_>) -> bool {
+    let ScriptCardState {
+        code,
+        calls,
+        result,
+        failed,
+        console,
+        running,
+        turn_index,
+    } = state;
+    let muted = to_color32(palette.text_muted);
+    let (outcome, outcome_colour) = if running {
+        ("running", muted)
+    } else if failed {
+        ("failed", to_color32(palette.danger))
+    } else {
+        ("ok", to_color32(palette.ok))
+    };
+    let mut stop = false;
+    egui::Frame::new()
+        .fill(to_color32(palette.bg_input))
+        .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
+        .corner_radius(wassh_core::RADIUS)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                ui.make_persistent_id(("ai-script", turn_index)),
+                false,
+            )
+            .show_header(ui, |ui| {
+                badge_pill(ui, palette, SCRIPT_BADGE, palette.accent);
+                ui.label(
+                    egui::RichText::new(format!("{} calls", calls.len()))
+                        .size(10.0)
+                        .color(muted),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(outcome)
+                            .size(10.0)
+                            .strong()
+                            .color(outcome_colour),
+                    );
+                    if running
+                        && Button::new("Stop")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                    {
+                        stop = true;
+                    }
+                });
+            })
+            .body(|ui| {
+                script_card_body(ui, palette, turn_index, code, calls, result, console);
+            });
+        });
+    stop
+}
+
+/// What an opened script card shows: the program, the calls it made, their result.
+fn script_card_body(
+    ui: &mut Ui,
+    palette: &Palette,
+    turn_index: usize,
+    code: &str,
+    calls: &[super::agent::ScriptRow],
+    result: Option<&str>,
+    console: &str,
+) {
+    let muted = to_color32(palette.text_muted);
+    egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        ui.make_persistent_id(("ai-script-code", turn_index)),
+        false,
+    )
+    .show_header(ui, |ui| {
+        ui.label(
+            egui::RichText::new(SCRIPT_CODE_LABEL)
+                .size(10.0)
+                .color(muted),
+        );
+    })
+    .body(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(code)
+                    .size(SCRIPT_TEXT_SIZE)
+                    .monospace()
+                    .color(to_color32(palette.text_muted)),
+            )
+            .wrap(),
+        );
+    });
+    for (call_index, row) in calls.iter().enumerate() {
+        let (mark, mark_colour) = if row.failed {
+            (SCRIPT_FAILED_MARK, to_color32(palette.danger))
+        } else if row.output.is_empty() {
+            (SCRIPT_PENDING_MARK, muted)
+        } else {
+            (SCRIPT_OK_MARK, to_color32(palette.ok))
+        };
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("ai-script-call", turn_index, call_index)),
+            false,
+        )
+        .show_header(ui, |ui| {
+            ui.label(egui::RichText::new(mark).size(10.0).color(mark_colour));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(row.label.as_str())
+                        .size(SCRIPT_TEXT_SIZE)
+                        .monospace()
+                        .color(to_color32(palette.text)),
+                )
+                .truncate(),
+            );
+        })
+        .body(|ui| {
+            tool_output(ui, palette, &card_preview(&row.output), false, false);
+        });
+    }
+    if !console.trim().is_empty() {
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("ai-script-console", turn_index)),
+            false,
+        )
+        .show_header(ui, |ui| {
+            ui.label(
+                egui::RichText::new(SCRIPT_CONSOLE_LABEL)
+                    .size(10.0)
+                    .color(muted),
+            );
+        })
+        .body(|ui| {
+            tool_output(ui, palette, &card_preview(console), false, false);
+        });
+    }
+    if let Some(result) = result {
+        ui.label(
+            egui::RichText::new(SCRIPT_RESULT_LABEL)
+                .size(10.0)
+                .color(muted),
+        );
+        tool_output(ui, palette, &card_preview(result), false, false);
+    }
+}
+
+/// The head of a long body, so a card cannot dominate the transcript.
+fn card_preview(text: &str) -> String {
+    if text.chars().count() <= TOOL_OUTPUT_MAX_CHARS {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+    format!("{head}\n…")
 }
 
 fn tool_card(
@@ -3374,7 +3782,6 @@ fn tool_card(
         failed,
         running,
         turn_index,
-        collapsed,
         copied,
     } = state;
     let shell = is_shell_tool(name);
@@ -3391,12 +3798,7 @@ fn tool_card(
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let shown = if output.chars().count() > TOOL_OUTPUT_MAX_CHARS {
-                let head: String = output.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
-                format!("{head}\n…")
-            } else {
-                output.to_owned()
-            };
+            let shown = card_preview(output);
             let (outcome, outcome_colour) = if running {
                 ("running", muted)
             } else if failed {
@@ -3404,70 +3806,17 @@ fn tool_card(
             } else {
                 ("ok", to_color32(palette.ok))
             };
-            if collapsed {
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    output_id,
-                    false,
-                )
-                    .show_header(ui, |ui| {
-                        badge_pill(ui, palette, badge, colour);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if shell
-                                && copy_button(ui, palette, copied == Some(CopyTarget::Command))
-                            {
-                                copy = Some((CopyTarget::Command, command.to_owned()));
-                            }
-                            ui.label(
-                                egui::RichText::new(outcome)
-                                    .size(10.0)
-                                    .strong()
-                                    .color(outcome_colour),
-                            );
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(label)
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(to_color32(palette.text)),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                        });
-                    })
-                    .body(|ui| {
-                        if tool_output(
-                            ui,
-                            palette,
-                            &shown,
-                            shell && !output.trim().is_empty(),
-                            copied == Some(CopyTarget::Output),
-                        ) {
-                            copy = Some((CopyTarget::Output, output.to_owned()));
-                        }
-                    });
-            } else {
-                ui.horizontal(|ui| {
-                    badge_pill(ui, palette, badge, colour);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(label)
-                                .size(11.0)
-                                .monospace()
-                                .color(to_color32(palette.text)),
-                        )
-                        .truncate(),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(outcome)
-                            .size(10.0)
-                            .strong()
-                            .color(outcome_colour),
-                    );
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                output_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                badge_pill(ui, palette, badge, colour);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if shell && copy_button(ui, palette, copied == Some(CopyTarget::Command)) {
+                        copy = Some((CopyTarget::Command, command.to_owned()));
+                    }
                     // The command is still going: offer to end it here rather than on the host.
                     if running
                         && Button::new("Stop")
@@ -3478,11 +3827,26 @@ fn tool_card(
                     {
                         stop = true;
                     }
-                    // The command line itself; its output has the button on its own row.
-                    if shell && row_copy_button(ui, palette, copied == Some(CopyTarget::Command)) {
-                        copy = Some((CopyTarget::Command, command.to_owned()));
-                    }
+                    ui.label(
+                        egui::RichText::new(outcome)
+                            .size(10.0)
+                            .strong()
+                            .color(outcome_colour),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(label)
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(to_color32(palette.text)),
+                            )
+                            .truncate(),
+                        );
+                    });
                 });
+            })
+            .body(|ui| {
                 if tool_output(
                     ui,
                     palette,
@@ -3492,7 +3856,7 @@ fn tool_card(
                 ) {
                     copy = Some((CopyTarget::Output, output.to_owned()));
                 }
-            }
+            });
         });
     ToolCardReply { stop, copy }
 }
@@ -3533,15 +3897,6 @@ fn tool_output(ui: &mut Ui, palette: &Palette, shown: &str, copyable: bool, copi
     copy
 }
 
-/// A copy button pushed to the right edge of the row being drawn.
-fn row_copy_button(ui: &mut Ui, palette: &Palette, copied: bool) -> bool {
-    let room = ui.available_width() - COPY_BUTTON_SIZE;
-    if room > 0.0 {
-        ui.add_space(room);
-    }
-    copy_button(ui, palette, copied)
-}
-
 /// The command a shell card shows, without its prompt marker, ready to paste.
 fn command_text(label: &str) -> &str {
     let label = label
@@ -3558,35 +3913,6 @@ fn is_shell_tool(name: &str) -> bool {
             | super::protocol::TOOL_RUN_SUDO
             | super::protocol::TOOL_LOCAL_RUN
     )
-}
-
-fn tool_output_is_collapsed(
-    name: &str,
-    output: &str,
-    index: usize,
-    last_user: Option<usize>,
-    turn_finished: bool,
-) -> bool {
-    let collapse_by_tool = is_shell_tool(name) || name.starts_with("remote_fs_");
-    let has_lots_of_output = output.chars().count() > TOOL_OUTPUT_MAX_CHARS;
-    (collapse_by_tool || has_lots_of_output)
-        && (turn_finished || last_user.is_some_and(|last_user| index < last_user))
-}
-
-#[test]
-fn tool_output_collapse_state_tracks_tool_and_output_size() {
-    use super::protocol::{TOOL_LOCAL_RUN, TOOL_RUN_COMMAND, TOOL_RUN_SUDO};
-
-    let small_output = "short output";
-    let large_output = format!("{}x", "x".repeat(TOOL_OUTPUT_MAX_CHARS));
-    assert!(tool_output_is_collapsed(TOOL_RUN_COMMAND, small_output, 3, None, true));
-    assert!(tool_output_is_collapsed(TOOL_RUN_SUDO, small_output, 3, Some(5), false));
-    assert!(tool_output_is_collapsed(TOOL_LOCAL_RUN, small_output, 3, Some(5), false));
-    assert!(!tool_output_is_collapsed(TOOL_RUN_COMMAND, small_output, 6, Some(5), false));
-    assert!(tool_output_is_collapsed("remote_fs_read_file", small_output, 3, None, true));
-    assert!(tool_output_is_collapsed("web_fetch", &large_output, 3, None, true));
-    assert!(!tool_output_is_collapsed("web_fetch", small_output, 3, None, true));
-    assert!(!tool_output_is_collapsed("web_fetch", &large_output, 3, None, false));
 }
 
 /// One tool's pill, e.g. `SSH` or `REMOTE FILESYSTEM`.
@@ -4098,10 +4424,22 @@ impl AiAgent {
                                     picked = true;
                                 }
                             }
-                            // "Write your own" is the text field itself, there from the
-                            // start: no option to pick before it can be used.
-                            let response =
-                                text_area(ui, palette, &mut draft.text, 2, "Your answer…");
+                            // "Write your own" has its own radio, and it is the answer the
+                            // moment the field holds text: picking it moves the cursor there.
+                            let custom = !draft.text.trim().is_empty();
+                            let answer_id = ui.make_persistent_id(("ai-answer", page));
+                            if ui.radio(custom, "Other").clicked() {
+                                draft.chosen = None;
+                                ui.memory_mut(|memory| memory.request_focus(answer_id));
+                            }
+                            let response = text_area_with_id(
+                                ui,
+                                palette,
+                                &mut draft.text,
+                                2,
+                                "Your answer…",
+                                answer_id,
+                            );
                             if !draft.text.trim().is_empty() {
                                 draft.chosen = None;
                             }
@@ -4279,8 +4617,8 @@ impl Plugin for AiAgent {
             self.map_pass_after_scan = false;
         }
         if std::mem::take(&mut self.map_rebuild) {
-            let root = self.map_root();
-            if let Err(error) = self.agent.start_map_scan(&root, &mut session) {
+            // The host picks the project root above the session.
+            if let Err(error) = self.agent.start_map_scan("", &mut session) {
                 self.report_error(error);
             }
         }
@@ -4309,6 +4647,7 @@ impl Plugin for AiAgent {
                     self.send_message(
                         &queued.message,
                         queued.meta,
+                        queued.images,
                         context.settings,
                         &context.host_label,
                         &context.environment,
@@ -4606,57 +4945,79 @@ impl Plugin for AiAgent {
                     }
                 }
 
+                // A summary runs off the frame, so the composer waits behind a bar that says
+                // what is happening rather than accepting a message nobody will read yet.
+                if let Some((mode, _, _)) = &self.summary {
+                    ui.add(
+                        egui::ProgressBar::new(0.0)
+                            .animate(true)
+                            .text(match mode {
+                                SummaryMode::Compact => COMPACTING_LABEL,
+                                SummaryMode::Summary | SummaryMode::Transfer => {
+                                    SUMMARISING_LABEL
+                                }
+                            })
+                            .fill(to_color32(palette.accent)),
+                    );
+                }
+
                 // Composer: the include tools stack in a column beside the prompt, both
                 // starting at the prompt's top edge.
                 ui.separator();
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        let attach = Button::new(ATTACH_GLYPH)
-                            .compact()
-                            .enabled(
-                                self.picking.is_none() && self.attachments.len() < MAX_ATTACHMENTS,
-                            )
-                            .show(ui, palette);
-                        if attach.clicked() {
-                            self.pick_attachments();
-                        }
-                        let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
-                            .compact()
-                            .active(self.attach_terminal)
-                            .show(ui, palette);
-                        if terminal.clicked() {
-                            self.attach_terminal = !self.attach_terminal;
-                        }
-                    });
-                    let room = ui.available_width().max(MIN_COMPOSER_WIDTH);
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(room, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_width(room);
-                            let response = text_area_with_id(
-                                ui,
-                                palette,
-                                &mut self.draft,
-                                2,
-                                "Ask the agent…",
-                                self.composer_id,
-                            );
-                            if response.has_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                                && !ui.input(|input| input.modifiers.shift)
-                            {
-                                submit = true;
-                                // Alt turns the send into a queue, like it does in other
-                                // chat clients.
-                                queue = ui.input(|input| input.modifiers.alt);
+                let compacting = self.summary.is_some();
+                ui.add_enabled_ui(!compacting, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            let attach = Button::new(ATTACH_GLYPH)
+                                .compact()
+                                .enabled(
+                                    self.picking.is_none()
+                                        && self.attachments.len() < MAX_ATTACHMENTS,
+                                )
+                                .show(ui, palette);
+                            if attach.clicked() {
+                                self.pick_attachments();
                             }
-                        },
-                    );
+                            let terminal = Button::new(TERMINAL_ATTACH_GLYPH)
+                                .compact()
+                                .active(self.attach_terminal)
+                                .show(ui, palette);
+                            if terminal.clicked() {
+                                self.attach_terminal = !self.attach_terminal;
+                            }
+                        });
+                        let room = ui.available_width().max(MIN_COMPOSER_WIDTH);
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(room, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(room);
+                                let response = text_area_with_id(
+                                    ui,
+                                    palette,
+                                    &mut self.draft,
+                                    2,
+                                    "Ask the agent…",
+                                    self.composer_id,
+                                );
+                                if response.has_focus()
+                                    && !compacting
+                                    && let Some(alt) = enter_press(ui)
+                                {
+                                    submit = true;
+                                    // Alt turns the send into a queue, like it does in
+                                    // other chat clients.
+                                    queue = alt;
+                                }
+                            },
+                        );
+                    });
                 });
 
                 // Provider and model, with the action at the right end of the same row.
-                let can_send = !self.providers.is_empty() && !self.draft.trim().is_empty();
+                let can_send = !compacting
+                    && !self.providers.is_empty()
+                    && !self.draft.trim().is_empty();
                 let action_state = self.action_state(can_send);
                 // The stop hint says whether a second press is coming.
                 let stop_hint = match action_state {
@@ -4668,6 +5029,8 @@ impl Plugin for AiAgent {
                     ActionState::Send => "",
                 };
                 let (chosen_provider, chosen_model, action_clicked) = {
+                    let mut plan_mode = self.agent.plan;
+                    let mut compact_clicked = false;
                     let provider_options: Vec<(usize, &str)> = self
                         .providers
                         .iter()
@@ -4684,7 +5047,8 @@ impl Plugin for AiAgent {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    ui.horizontal(|ui| {
+                    let chosen = ui
+                        .horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = FOOTER_GAP;
                         // The reference footer is set in the same small type as the rest.
                         ui.style_mut().text_styles.insert(
@@ -4701,6 +5065,38 @@ impl Plugin for AiAgent {
                                 .kind(ButtonKind::Danger)
                                 .active(true),
                         };
+                        // The mode says most about what this chat may do, so it leads; the
+                        // Compact button sits where the model dropdown starts. A pane too
+                        // narrow for both keeps the action and drops them.
+                        let mode_button = Button::new(if plan_mode {
+                            MODE_PLAN_LABEL
+                        } else {
+                            MODE_AGENT_LABEL
+                        })
+                        .compact()
+                        .active(plan_mode);
+                        let compact_button = Button::new(COMPACT_LABEL)
+                            .compact()
+                            .enabled(self.summary.is_none() && !self.agent.turns.is_empty());
+                        let controls = mode_button.size(ui).x
+                            + compact_button.size(ui).x
+                            + FOOTER_GAP;
+                        let room = (ui.available_width() - action.size(ui).x - FOOTER_GAP * 2.0)
+                            .max(0.0);
+                        if room >= controls + MIN_SELECT_ROOM * 2.0 {
+                            let hint = if plan_mode {
+                                MODE_TO_AGENT_HINT
+                            } else {
+                                MODE_TO_PLAN_HINT
+                            };
+                            if mode_button.show(ui, palette).on_hover_text(hint).clicked() {
+                                plan_mode = !plan_mode;
+                            }
+                            compact_clicked = compact_button
+                                .show(ui, palette)
+                                .on_hover_text(COMPACT_HINT)
+                                .clicked();
+                        }
                         if self.providers.is_empty() {
                             // The action comes first; the hint is cropped to what is left.
                             let room =
@@ -4751,7 +5147,14 @@ impl Plugin for AiAgent {
                         };
                         (provider, model, clicked)
                     })
-                    .inner
+                    .inner;
+                    if plan_mode != self.agent.plan {
+                        self.agent.plan = plan_mode;
+                    }
+                    if compact_clicked {
+                        command = Some(COMPACT_COMMAND);
+                    }
+                    chosen
                 };
                 if action_clicked {
                     match action_state {
@@ -4807,8 +5210,6 @@ impl Plugin for AiAgent {
             {
                 if pinned.clicked {
                     self.edit_prompt(pinned.index);
-                } else if pinned.toggle {
-                    self.toggle_prompt(pinned.index);
                 }
             }
         }
@@ -4880,7 +5281,7 @@ impl Plugin for AiAgent {
         }
         if let Some(command) = command {
             self.run_command(command, context.settings, &context.host_label);
-        } else if submit && !self.draft.trim().is_empty() {
+        } else if submit && self.summary.is_none() && !self.draft.trim().is_empty() {
             // Say why nothing would go out instead of dropping the message silently.
             if let Err(error) = self.ready() {
                 self.report_error(error);
@@ -4906,6 +5307,7 @@ impl Plugin for AiAgent {
                     attachments: self.attachments.len(),
                     terminal: terminal.is_some(),
                 };
+                let images = self.attached_images();
                 self.draft.clear();
                 self.attachments.clear();
                 self.attach_terminal = false;
@@ -4916,14 +5318,16 @@ impl Plugin for AiAgent {
                         text,
                         message,
                         meta,
+                        images,
                     });
                 } else if self.agent.blocked() {
                     // Anything else joins the conversation the agent is in the middle of.
-                    self.agent.inject_user(&message, meta);
+                    self.agent.inject_user_with_images(&message, meta, images);
                 } else {
                     self.send_message(
                         &message,
                         meta,
+                        images,
                         context.settings,
                         &context.host_label,
                         &context.environment,
@@ -4947,7 +5351,8 @@ impl Plugin for AiAgent {
                     "history": history_to_json(&chat.history),
                     "subagents": subagents_to_json(&chat.subagents),
                     "compacted": chat.compacted,
-                    "scopes": chat.scopes.to_json()
+                    "scopes": chat.scopes.to_json(),
+                    "planMode": chat.plan
                 })
             })
             .collect();
@@ -4965,6 +5370,7 @@ impl Plugin for AiAgent {
                 "subagents": subagents_to_json(&self.agent.subagents),
                 "compacted": self.agent.compacted,
                 "scopes": self.agent.scopes.to_json(),
+                "planMode": self.agent.plan,
                 "chats": chats
             }),
         );
@@ -4973,10 +5379,6 @@ impl Plugin for AiAgent {
         if self.agent.map.revision != self.map_saved {
             self.map_saved = self.agent.map.revision;
             context.set_value(MAP_KEY, self.agent.map.to_json());
-        }
-        if self.map_folder != self.map_folder_saved {
-            self.map_folder_saved = self.map_folder.clone();
-            context.set_value(MAP_FOLDER_KEY, json!(self.map_folder));
         }
         if self.agent.system.revision != self.system_saved {
             self.system_saved = self.agent.system.revision;
@@ -5481,7 +5883,8 @@ mod tests {
         assert_eq!(
             first,
             Some(crate::ai_agent::protocol::ApiMessage::User {
-                content: format!("question 2 {filler}")
+                content: format!("question 2 {filler}"),
+                images: Vec::new(),
             }),
             "the history keeps the messages after the fold point"
         );
@@ -5502,6 +5905,34 @@ mod tests {
         assert!(
             !request.contains("question 4"),
             "only what is being folded goes to the summariser: {request}"
+        );
+    }
+
+    #[test]
+    fn compacting_disables_the_composer_and_shows_a_progress_bar() {
+        let mut plugin = two_prompts();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let (_sender, events) = std::sync::mpsc::channel();
+        plugin.summary = Some((SummaryMode::Compact, 2, events));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert!(
+            texts.contains(&COMPACTING_LABEL),
+            "the bar says what is happening: {texts:?}"
+        );
+        // Typing cannot reach a disabled composer.
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![egui::Event::Text("hello".to_owned())],
+        );
+        assert!(
+            plugin.draft.is_empty(),
+            "the disabled composer took text: {:?}",
+            plugin.draft
         );
     }
 
@@ -5749,17 +6180,23 @@ mod tests {
         type CardFrame = (Vec<(i32, i32, String)>, Option<(CopyTarget, String)>);
         let ctx = egui::Context::default();
         let palette = Palette::dark();
+        let card_id = std::cell::Cell::new(None);
+        let time = std::cell::Cell::new(0.0_f64);
         let draw = |events: Vec<egui::Event>| -> CardFrame {
+            let now = time.get() + 0.1;
+            time.set(now);
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::Vec2::new(WIDE_PANE, 240.0),
                 )),
+                time: Some(now),
                 events,
                 ..Default::default()
             };
             let mut reply = None;
             let mut output = ctx.run_ui(input, |ui| {
+                card_id.set(Some(ui.make_persistent_id(("ai-command-output", 7))));
                 reply = Some(tool_card(
                     ui,
                     &palette,
@@ -5770,7 +6207,6 @@ mod tests {
                         failed: false,
                         running: false,
                         turn_index: 7,
-                        collapsed: false,
                         copied: None,
                     },
                 ));
@@ -5790,6 +6226,16 @@ mod tests {
             rows.sort();
             (rows, reply.and_then(|reply| reply.copy))
         };
+        draw(Vec::new());
+        // The card starts folded to its header: open it before looking for the output row.
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            &ctx,
+            card_id.get().expect("the card's collapsing id"),
+            false,
+        );
+        state.set_open(true);
+        state.store(&ctx);
+        // The body slides open: let the animation finish before clicking into it.
         draw(Vec::new());
         let (rows, _) = draw(Vec::new());
         let buttons: Vec<_> = rows
@@ -6374,6 +6820,52 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn shift_enter_in_the_editor_writes_a_newline_instead_of_sending() {
+        let mut plugin = two_prompts();
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        frame(&mut plugin, &mut settings, &ctx, click(row_of(&rows, "second prompt")));
+        let edit = plugin.editing.as_mut().expect("the prompt is being edited");
+        edit.text = "rewritten prompt".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(shift),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: shift,
+                },
+            ],
+        );
+
+        let edit = plugin.editing.as_ref().expect("the editor stays open");
+        assert!(
+            edit.text.contains('\n'),
+            "Shift+Enter must start a new line: {:?}",
+            edit.text
+        );
+        assert_eq!(
+            plugin.agent.turns.len(),
+            4,
+            "Shift+Enter does not send: {:?}",
+            plugin.agent.turns
+        );
+    }
+
     /// Click the painted `text` and draw the frame that shows the result.
     fn click_and_draw(
         plugin: &mut AiAgent,
@@ -6418,6 +6910,7 @@ mod tests {
             "Which language?",
             "Rust",
             "Go",
+            "Other",
             "Your answer…",
             "Previous",
             "Next",
@@ -6426,10 +6919,6 @@ mod tests {
             assert!(texts.contains(&expected), "{expected} missing: {texts:?}");
         }
         assert!(!texts.contains(&"Answer"), "not on the final question");
-        assert!(
-            !texts.contains(&"Other (write your own)"),
-            "the text field is the free answer: {texts:?}"
-        );
         // Picking an option is the answer: the card moves on by itself.
         let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Go");
         let texts: Vec<&str> = rows.iter().map(|(_, _, text)| text.as_str()).collect();
@@ -6489,9 +6978,164 @@ mod tests {
     }
 
     #[test]
+    fn the_other_radio_follows_the_custom_answer() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Asking {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: "ask_user".to_owned(),
+                arguments: String::new(),
+            },
+            questions: vec![super::super::agent::AgentQuestion {
+                text: "Which file?".to_owned(),
+                options: vec!["main.rs".to_owned(), "lib.rs".to_owned()],
+            }],
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        // While the field is empty an option is the selection.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "main.rs");
+        assert_eq!(plugin.questions.drafts[0].chosen, Some(0));
+        // Picking Other takes the selection back from the option.
+        let rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Other");
+        assert_eq!(plugin.questions.drafts[0].chosen, None);
+        // Typing in the field is the custom answer, and Other is what shows as selected.
+        let _rows = click_and_draw(&mut plugin, &mut settings, &ctx, &rows, "Your answer…");
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![egui::Event::Text("build.rs".to_owned())],
+        );
+        let draft = &plugin.questions.drafts[0];
+        assert_eq!(draft.text, "build.rs");
+        assert_eq!(draft.chosen, None, "the custom answer replaces the option");
+        assert_eq!(
+            plugin
+                .questions
+                .answer(0, &["main.rs".to_owned(), "lib.rs".to_owned()]),
+            Some("build.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_footer_switches_the_chat_between_agent_and_plan() {
+        let mut settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        // The composer panel settles its height on the first frame.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let mode = rows
+            .iter()
+            .find(|(_, _, text)| text == MODE_AGENT_LABEL)
+            .cloned()
+            .unwrap_or_else(|| panic!("the footer offers the mode: {rows:?}"));
+        assert!(!plugin.agent.plan, "a chat starts in Agent mode");
+        frame(&mut plugin, &mut settings, &ctx, click(mode));
+        assert!(plugin.agent.plan, "the mode button did not switch to Plan");
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            rows.iter().any(|(_, _, text)| text == MODE_PLAN_LABEL),
+            "the button names the mode the chat is in: {rows:?}"
+        );
+        // And the pane keeps it with the conversation.
+        assert_eq!(settings[CONVERSATION_KEY]["planMode"], json!(true));
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_the_mode_and_compact_buttons_first() {
+        let mut settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        frame_at(&mut plugin, &mut settings, &ctx, Vec::new(), NARROW_PANE);
+        let rows = frame_at(&mut plugin, &mut settings, &ctx, Vec::new(), NARROW_PANE);
+        assert!(
+            !rows.iter().any(|(_, _, text)| text == COMPACT_LABEL),
+            "a 120-point pane has no room for the buttons: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_compact_command_is_the_only_way_to_fold_when_automatic_compaction_is_off() {
+        let (base_url, _requests) = provider("", "{\"data\":[]}");
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent {
+            model: "test-model".to_owned(),
+            ..AiAgent::default()
+        };
+        plugin.agent.cwd = "/srv".to_owned();
+        // One frame loads the provider and keys the settings hold, as the pane does.
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.model = "test-model".to_owned();
+        for step in 0..8 {
+            assert!(plugin.agent.push_user(&format!("question {step}"), UserMeta::default()));
+        }
+
+        // Automatic compaction is off by default, however long the chat is.
+        assert!(
+            !settings
+                .get(SETTING_AUTO_COMPACT)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+        plugin.compact_if_needed(&settings, "dev");
+        assert!(plugin.summary.is_none(), "compaction ran on its own");
+
+        // Asking for it folds the older part, and says so when there is nothing to fold.
+        plugin.run_command(COMPACT_COMMAND, &settings, "dev");
+        assert!(plugin.summary.is_some(), "/compact did not start a summary");
+        plugin.summary = None;
+        let mut fresh = AiAgent {
+            providers: plugin.providers.clone(),
+            model: plugin.model.clone(),
+            ..AiAgent::default()
+        };
+        assert!(fresh.agent.push_user("only question", UserMeta::default()));
+        fresh.run_command(COMPACT_COMMAND, &settings, "dev");
+        assert!(fresh.summary.is_none(), "a short chat was folded anyway");
+        assert!(
+            fresh
+                .agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::Notice(text) if text == COMPACT_EMPTY)),
+            "the pane does not say why nothing happened: {:?}",
+            fresh.agent.turns
+        );
+    }
+
+    #[test]
+    fn the_mode_commands_switch_the_chat() {
+        let settings = serde_json::Map::new();
+        let mut plugin = AiAgent::default();
+        assert!(!plugin.agent.plan, "a chat starts in Agent mode");
+        plugin.run_command(PLAN_COMMAND, &settings, "dev");
+        assert!(plugin.agent.plan, "/plan did not switch the chat");
+        assert!(plugin.draft.is_empty(), "the command stayed in the composer");
+        plugin.run_command(AGENT_COMMAND, &settings, "dev");
+        assert!(!plugin.agent.plan, "/agent did not switch it back");
+    }
+
+    #[test]
     fn slash_commands_parse_like_the_reference() {
         let exact = parse_slash_input("/new").unwrap();
         assert_eq!(exact.exact.map(|command| command.name), Some("new"));
+        let compact = parse_slash_input("/compact").unwrap();
+        assert_eq!(compact.exact.map(|command| command.name), Some("compact"));
+        let plan = parse_slash_input("/plan").unwrap();
+        assert_eq!(plan.exact.map(|command| command.name), Some("plan"));
+        let agent = parse_slash_input("/agent").unwrap();
+        assert_eq!(agent.exact.map(|command| command.name), Some("agent"));
         let partial = parse_slash_input("/sum").unwrap();
         assert_eq!(partial.prefix, "sum");
         assert_eq!(partial.matches.len(), 1);
@@ -6508,11 +7152,35 @@ mod tests {
     }
 
     #[test]
+    fn an_image_attachment_is_sent_as_an_image() {
+        let dir = std::env::temp_dir().join(format!("wassh-ai-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp folder");
+        let path = dir.join("dot.png");
+        std::fs::write(
+            &path,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0],
+        )
+        .expect("the image");
+        let mut plugin = AiAgent::default();
+        plugin.attach(path.to_str().expect("a path"));
+        let images = plugin.attached_images();
+        assert_eq!(images.len(), 1, "{images:?}");
+        assert_eq!(images[0].media_type, "image/png");
+        let message = plugin.message_with_attachments("look", None);
+        assert!(
+            message.starts_with("[Attached image dot.png]"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn attachments_and_the_terminal_tail_are_folded_into_the_message() {
         let mut plugin = AiAgent::default();
         plugin.attachments.push(Attachment {
             path: "/tmp/notes.txt".to_owned(),
             text: "line one".to_owned(),
+            image: None,
         });
         let message =
             plugin.message_with_attachments("summarise this", Some("$ uptime\nup 3 days"));
@@ -6565,8 +7233,7 @@ mod tests {
                         attachments: 0,
                         terminal: true,
                     },
-                    false,
-                    ("prompt", 0),
+                    ("test", 0),
                 );
             });
             let shapes = std::mem::take(&mut output.shapes);
@@ -6622,14 +7289,15 @@ mod tests {
                             &palette,
                             &crate::ai_agent::markdown::blocks(&prompt),
                             UserMeta::default(),
-                            false,
-                            ("prompt", 1),
+                            ("test", 0),
                         );
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
-                            failed: false, running: false, turn_index: 0, collapsed: false, copied: None,
+                            failed: false, running: false, turn_index: 0, copied: None,
                         });
+                        // A folded card hides its body, so the long output is painted on its own.
+                        tool_output(ui, &palette, &terminal, true, false);
                         tool_card(ui, &palette, "run_command", &"long-command".repeat(30), &terminal, ToolCardState {
-                            failed: false, running: false, turn_index: 1, collapsed: true, copied: None,
+                            failed: false, running: false, turn_index: 1, copied: None,
                         });
                     });
                 });
@@ -6654,6 +7322,45 @@ mod tests {
             }
             assert!(found >= 5, "expected the bubbles and their contents, found {found}");
         }
+    }
+
+    /// A prompt long enough to fill the pane scrolls inside its bubble instead of pushing
+    /// the conversation out of the way.
+    #[test]
+    fn a_long_prompt_bubble_stops_at_eight_lines() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(WIDE_PANE, 3000.0),
+            )),
+            ..Default::default()
+        };
+        let prompt = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut height = 0.0;
+        for _ in 0..2 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                height = user_bubble(
+                    ui,
+                    &Palette::dark(),
+                    &crate::ai_agent::markdown::blocks(&prompt),
+                    UserMeta::default(),
+                    ("test", 0),
+                )
+                .rect
+                .height();
+            });
+            output.drop_without_applying_deltas();
+        }
+        let cap = crate::ai_agent::markdown::body_line_height() * PROMPT_BUBBLE_ROWS as f32;
+        let padding = 2.0 * f32::from(BUBBLE_PADDING_Y);
+        assert!(
+            height <= cap + padding + 1.0,
+            "the bubble must stop at {cap} + {padding} points: {height}"
+        );
     }
 
     #[test]
@@ -6707,14 +7414,16 @@ mod tests {
                 assert!(rect.rect.right() <= body.right().min(clipped.clip_rect.right()), "tool card exceeds pane: {:?} > {:?}", rect.rect, clipped.clip_rect);
             }
             if let egui::Shape::Text(text) = clipped.shape
-                && (text.galley.text().contains("long-path") || text.galley.text().contains("long-line"))
+                && (text.galley.text().contains("long-path")
+                    || text.galley.text().contains("long-line")
+                    || text.galley.text().contains("long-command"))
             {
                 found += 1;
                 let limit = body.right().min(clipped.clip_rect.right());
                 assert!(text.pos.x + text.galley.size().x <= limit, "text exceeds pane: {} > {limit}", text.pos.x + text.galley.size().x);
             }
         }
-        assert_eq!(found, 2, "the prompt and the tool output stay inside");
+        assert!(found >= 2, "the prompt and the cards stay inside: {found}");
     }
 
     #[test]
@@ -6777,8 +7486,7 @@ mod tests {
                 &palette,
                 &crate::ai_agent::markdown::blocks("hello"),
                 UserMeta::default(),
-                false,
-                ("prompt", 0),
+                ("test", 0),
             );
         });
         let mut fill = None;
@@ -7027,7 +7735,6 @@ mod tests {
                         failed: false,
                         running,
                         turn_index: 0,
-                        collapsed: false,
                         copied: None,
                     },
                 );
@@ -7076,7 +7783,6 @@ mod tests {
                         failed: false,
                         running: false,
                         turn_index: 4,
-                        collapsed: true,
                         copied: None,
                     },
                 );
@@ -7192,6 +7898,61 @@ mod tests {
     }
 
     #[test]
+    fn script_mode_puts_the_tool_catalog_in_the_prompt() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.script_mode = true;
+        let prompt =
+            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+        assert!(prompt.contains("Call tools from a script."), "{prompt}");
+        // The whole point of the mode: many tool calls per script, not one round per call.
+        assert!(
+            prompt.contains("Run multiple tool calls in one go when it makes sense"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Do the processing and the decisions in the script"),
+            "{prompt}"
+        );
+        // The script is where output is cut down before it costs prompt room.
+        assert!(
+            prompt.contains("Spend real effort on shrinking what you return"),
+            "{prompt}"
+        );
+        // The limits a script runs under come from the sandbox, not from a copy in the prompt.
+        assert!(
+            prompt.contains(&format!(
+                "{} seconds of JavaScript",
+                super::super::script::MAX_EXEC_MS / 1_000
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "up to {} tool calls",
+                super::super::script::MAX_CALLS
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "not answered within {} seconds fails with a timeout",
+                super::super::script::MAX_CALL_MS / 1_000
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("each round re-sends the whole prompt"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- run_command(command: string"),
+            "{prompt}"
+        );
+        // The root's tools are the only ones loaded, so nothing of a scope shows up.
+        assert!(!prompt.contains("- dev_grep_search("), "{prompt}");
+    }
+
+    #[test]
     fn the_prompt_names_the_loaded_scopes_and_what_can_be_loaded_next() {
         use super::super::permissions::{GROUP_LOCAL_FS, GROUP_REMOTE_FS, Permissions, group_key};
         let prompt_for = |groups: Vec<&str>, load: &[&str]| {
@@ -7218,7 +7979,7 @@ mod tests {
         assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(
             both.contains(
-                "- core: run_command, run_command_background, run_sudo, ask_user, \
+                "- core: run_command, run_command_background, run_script, run_sudo, ask_user, \
                  spawn_subagent, wait_subagent, get_current_time"
             ),
             "{both}"
@@ -7356,6 +8117,7 @@ mod tests {
             .history
             .push(super::super::protocol::ApiMessage::User {
                 content: "first question".to_owned(),
+                images: Vec::new(),
             });
         plugin.generated_title = Some("First digest".to_owned());
         plugin.begin_new_chat();
@@ -7766,7 +8528,7 @@ mod tests {
     }
 
     #[test]
-    fn the_graph_popup_scans_the_folder_it_is_given() {
+    fn the_graph_popup_scans_the_root_the_host_finds() {
         let mut settings = serde_json::Map::new();
         settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
         let mut plugin = AiAgent::default();
@@ -7788,28 +8550,23 @@ mod tests {
             .expect("the Graph scope has a tag");
         frame(&mut plugin, &mut settings, &ctx, click(tag));
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert!(
-            rows.iter().any(|(_, _, text)| text == MAP_FOLDER_HINT),
-            "the popup offers a folder to scan: {rows:?}"
-        );
-        assert_eq!(
-            plugin.map_root(),
-            "",
-            "the root of a stored map is not a folder the host must keep using"
-        );
-        plugin.map_folder = "/srv/app".to_owned();
-        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let scan = rows
             .iter()
             .find(|(_, _, text)| text == "Scan")
             .cloned()
-            .expect("the map popup offers Scan");
+            .unwrap_or_else(|| panic!("the map popup offers Scan: {rows:?}"));
+        // Scanning needs no folder: the host finds the project root itself, and a pane
+        // without a session says so instead of asking for one.
         frame(&mut plugin, &mut settings, &ctx, click(scan));
-        assert_eq!(plugin.map_root(), "/srv/app", "the scan walks the folder given");
+        // The click arms the rebuild; the frame after it runs the scan.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
         assert_eq!(
-            settings.get(MAP_FOLDER_KEY).and_then(Value::as_str),
-            Some("/srv/app"),
-            "the folder is kept with the host"
+            plugin.error.as_deref(),
+            Some("The session is not connected.")
+        );
+        assert!(
+            !settings.contains_key("envMapFolder"),
+            "the pane keeps no folder of its own"
         );
     }
 
@@ -8530,6 +9287,7 @@ mod tests {
             text: "third opinion".to_owned(),
             message: "third opinion".to_owned(),
             meta: UserMeta::default(),
+            images: Vec::new(),
         });
         plugin.agent.phase = None;
         plugin.agent.needs_reply = false;
@@ -8574,82 +9332,64 @@ mod tests {
     }
 
     #[test]
-    fn a_long_prompt_is_cut_until_it_is_opened() {
-        let mut plugin = AiAgent::default();
-        let long = (0..60)
-            .map(|line| format!("line {line} of a pasted log"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        plugin.agent.turns.push(Turn::User {
-            text: long,
-            meta: UserMeta::default(),
-        });
-        let cut = prompt_bubble_height(&mut plugin);
-        assert!(
-            cut <= PROMPT_BUBBLE_MAX_HEIGHT + PROMPT_BUBBLE_SLACK,
-            "the prompt bubble took {cut} points"
-        );
-
-        let mut settings = serde_json::Map::new();
+    fn shift_enter_writes_a_newline_instead_of_sending() {
+        let mut settings = local_provider();
+        let (mut plugin, _worker) = busy_pane();
         let ctx = egui::Context::default();
+        // The composer settles its height on the first frame; clicking the empty prompt
+        // is what focuses the text area for the key press.
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let show = rows
+        let hint = rows
             .iter()
-            .find(|(_, _, text)| text == "Show all")
+            .find(|(_, _, text)| text == "Ask the agent…")
             .cloned()
-            .expect("a cut prompt offers the rest");
-        frame(&mut plugin, &mut settings, &ctx, click(show));
-        assert!(
-            plugin.editing.is_none(),
-            "opening the rest must not open the editor"
-        );
-        assert!(plugin.expanded_prompts.contains(&0), "the prompt opens");
-        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert!(
-            rows.iter().any(|(_, _, text)| text == "Show less"),
-            "the open prompt offers the cut back: {rows:?}"
-        );
-        let open = prompt_bubble_height(&mut plugin);
-        assert!(
-            open > cut + PROMPT_BUBBLE_SLACK,
-            "the open bubble is not taller: {cut} -> {open}"
-        );
-    }
+            .unwrap_or_else(|| panic!("the prompt has no hint: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(hint));
+        plugin.draft = "first line".to_owned();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let turns = plugin.agent.turns.len();
 
-    /// Points a prompt bubble may add around its cut text: margins and the toggle line.
-    const PROMPT_BUBBLE_SLACK: f32 = 40.0;
-
-    /// Height of the accent-filled prompt bubble the transcript draws.
-    fn prompt_bubble_height(plugin: &mut AiAgent) -> f32 {
-        let ctx = egui::Context::default();
-        let palette = Palette::dark();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::Vec2::new(WIDE_PANE, 600.0),
-            )),
+        let shift = egui::Modifiers {
+            shift: true,
             ..Default::default()
         };
-        let muted = to_color32(palette.text_muted);
-        let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
-        let mut output = ctx.run_ui(input, |ui| {
-            plugin.transcript(ui, &palette, muted, &mut session, TranscriptSource::Main);
-        });
-        let mut height: f32 = 0.0;
-        for clipped in std::mem::take(&mut output.shapes) {
-            if let egui::Shape::Rect(rect) = clipped.shape
-                && rect.fill == to_color32(palette.accent)
-            {
-                height = height.max(rect.rect.height());
-            }
-        }
-        output.drop_without_applying_deltas();
-        height
+        frame(
+            &mut plugin,
+            &mut settings,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(shift),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: shift,
+                },
+            ],
+        );
+
+        assert!(
+            plugin.draft.contains('\n'),
+            "Shift+Enter must start a new line: {:?}",
+            plugin.draft
+        );
+        assert_eq!(
+            plugin.draft.replace('\n', ""),
+            "first line",
+            "the typed line is still there: {:?}",
+            plugin.draft
+        );
+        assert!(plugin.queued.is_empty(), "Shift+Enter does not queue");
+        assert_eq!(
+            plugin.agent.turns.len(),
+            turns,
+            "Shift+Enter does not send a turn"
+        );
     }
 
     /// The settings of a pane with one OpenAI-compatible provider that never answers.
-    fn local_provider() -> serde_json::Map<String, Value> {
-        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+    fn local_provider() -> serde_json::Map<String, Value> {        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
         let (base_url, _requests) = provider("", MODELS);
         [(
             PROVIDERS_KEY.to_owned(),
@@ -8808,7 +9548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_filed_subagent_is_listed_and_opens_read_only() {
+    fn a_filed_chats_subagents_open_from_its_note() {
         let mut plugin = filed_chat_with_a_subagent();
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -8816,12 +9556,32 @@ mod tests {
         frame(&mut plugin, &mut settings, &ctx, click_back());
         assert_eq!(plugin.view, ChatView::List);
 
+        // The card says how many sub-agents there are and lists none of them yet.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, _, text)| text == "\u{21b3} check the logs"),
+            "a sub-agent card is listed before it is asked for: {rows:?}"
+        );
+        let note = rows
+            .iter()
+            .find(|(_, _, text)| text == "1 sub-agent")
+            .cloned()
+            .unwrap_or_else(|| panic!("the chat does not name its sub-agents: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(note));
+        assert_eq!(
+            plugin.view,
+            ChatView::List,
+            "the note expands the card instead of opening the chat"
+        );
+
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let row = rows
             .iter()
             .find(|(_, _, text)| text == "\u{21b3} check the logs")
             .cloned()
-            .unwrap_or_else(|| panic!("the sub-agent is not listed: {rows:?}"));
+            .unwrap_or_else(|| panic!("the sub-agent is not listed after the note: {rows:?}"));
         frame(&mut plugin, &mut settings, &ctx, click(row));
         assert_eq!(
             plugin.view,
@@ -8842,6 +9602,35 @@ mod tests {
         // Back returns to the chat that owns it rather than to the list.
         frame(&mut plugin, &mut settings, &ctx, click_back());
         assert_eq!(plugin.view, ChatView::Chat);
+        frame(&mut plugin, &mut settings, &ctx, click_back());
+        assert_eq!(plugin.view, ChatView::List);
+
+        // The note folds them away again, and the card still opens the chat.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let note = rows
+            .iter()
+            .find(|(_, _, text)| text == "1 sub-agent")
+            .cloned()
+            .expect("the note is still there");
+        frame(&mut plugin, &mut settings, &ctx, click(note));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, _, text)| text == "\u{21b3} check the logs"),
+            "the note did not hide the sub-agent cards: {rows:?}"
+        );
+        let stats = rows
+            .iter()
+            .find(|(_, _, text)| text.starts_with("1 turn"))
+            .cloned()
+            .expect("the card keeps its stats line");
+        frame(&mut plugin, &mut settings, &ctx, click(stats));
+        assert_eq!(
+            plugin.view,
+            ChatView::Chat,
+            "the card opens the chat it belongs to"
+        );
     }
 
     #[test]

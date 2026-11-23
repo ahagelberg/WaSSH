@@ -32,6 +32,12 @@ const ON_ACCENT_PLATE_ALPHA: u8 = 56;
 /// Alpha of a bold run's plate on the accent bubble.
 const ON_ACCENT_STRONG_ALPHA: u8 = 40;
 
+/// Height of one line of body text, so a caller capping a panel counts the same lines the
+/// document draws.
+pub(super) fn body_line_height() -> f32 {
+    BODY_TEXT_SIZE * LINE_SPACING
+}
+
 /// The colours a document is drawn in.
 ///
 /// The pane hands it its own tokens; the user bubble is an accent fill like a primary

@@ -21,15 +21,19 @@ use serde_json::{Value, json};
 
 use super::protocol::{
     TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
-    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
+    TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
+    TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
+    TOOL_LOAD_SCOPE,
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND,
-    TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
-    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
+    TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
+    TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT,
+    TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
+    TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
+    TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 
 use super::agent::shell_quote;
@@ -43,6 +47,12 @@ pub const MAX_FETCH_CHARS: usize = 32_000;
 pub const MAX_READ_CHARS_DEFAULT: usize = 32_000;
 /// Longest file a read tool returns.
 pub const MAX_FILE_READ_CHARS: usize = 256_000;
+/// Bytes a base64 read returns before it stops, so the encoded text stays inside a prompt.
+pub const MAX_BASE64_BYTES: u64 = 24_000;
+/// Rows a zip listing returns.
+pub const MAX_ZIP_LIST_ROWS: usize = 400;
+/// Most commits a git log returns.
+pub const MAX_GIT_LOG_COMMITS: usize = 200;
 /// Most entries a listing returns.
 pub const MAX_DIR_ENTRIES: usize = 200;
 /// Lines a `dev_view_file` call shows when it does not say.
@@ -100,6 +110,13 @@ pub struct ToolSpec {
 
 /// Every tool, in the reference's order.
 pub const TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: TOOL_RUN_SCRIPT,
+        description: "Run a short JavaScript program that calls the other tools itself: \
+`await tools.<name>(args)` resolves to the tool's JSON result (`{ok, text}`), a failed call \
+throws, and the value you return is the result. Batch, filter or join several calls in one \
+turn and hand back only what the answer needs.",
+    },
     ToolSpec {
         name: TOOL_RUN_COMMAND,
         description: "Run a shell command on the connected SSH host and return its output and exit \
@@ -160,6 +177,57 @@ Returns as soon as it is done; a sub-agent still working keeps the call waiting.
     ToolSpec {
         name: TOOL_REMOTE_EDIT,
         description: "Replace a block of text in a file on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_REMOTE_STAT,
+        description: "Describe a file or directory on the connected host: kind, size, mode, \
+owner and modification time.",
+    },
+    ToolSpec {
+        name: TOOL_REMOTE_MOVE,
+        description: "Move or rename a file or directory on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_REMOTE_PATCH,
+        description: "Apply a unified diff to a file on the connected host, given inline or as a \
+patch file.",
+    },
+    ToolSpec {
+        name: TOOL_REMOTE_ZIP_LIST,
+        description: "List the entries of a zip archive on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_REMOTE_ZIP_READ,
+        description: "Read one entry of a zip archive on the connected host as text.",
+    },
+    ToolSpec {
+        name: TOOL_REMOTE_ZIP_EXTRACT,
+        description: "Extract a zip archive on the connected host into a directory.",
+    },
+    ToolSpec {
+        name: TOOL_GIT_STATUS,
+        description: "Show the branch and the changed, staged and untracked files of a git \
+repository on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_GIT_DIFF,
+        description: "Show uncommitted changes in a git repository on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_GIT_LOG,
+        description: "List the recent commits of a git repository on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_GIT_BRANCHES,
+        description: "List the local and remote branches of a git repository on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_GIT_COMMIT,
+        description: "Commit changes in a git repository on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_GIT_CHECKOUT,
+        description: "Switch to, or create, a branch in a git repository on the connected host.",
     },
     ToolSpec {
         name: TOOL_LOCAL_READ,
@@ -243,6 +311,10 @@ lines, using ripgrep when the host has it.",
     ToolSpec {
         name: TOOL_DEV_DIFF,
         description: "Show the difference between two versions of a file on the connected host.",
+    },
+    ToolSpec {
+        name: TOOL_DEV_IMAGE,
+        description: "Show the model an image file on the connected host (PNG, JPEG, GIF or WebP).",
     },
     ToolSpec {
         name: TOOL_ENV_SCAN,
@@ -379,6 +451,13 @@ fn parameters(name: &str) -> (Value, Value) {
     let number = |description: &str| json!({ "type": "number", "description": description });
     let boolean = |description: &str| json!({ "type": "boolean", "description": description });
     match name {
+        TOOL_RUN_SCRIPT => (
+            json!({
+                "code": string("The JavaScript program. `await tools.<name>(args)` calls a tool \
+and resolves to its JSON result; a failed call throws. Return the compact result you need.")
+            }),
+            json!(["code"]),
+        ),
         TOOL_RUN_COMMAND => (
             json!({ "command": string("The command line to run, exactly as it would be typed.") }),
             json!(["command"]),
@@ -442,7 +521,15 @@ fn parameters(name: &str) -> (Value, Value) {
             }),
             json!(["query"]),
         ),
-        TOOL_REMOTE_READ | TOOL_LOCAL_READ => (
+        TOOL_REMOTE_READ => (
+            json!({
+                "path": string("File to read."),
+                "maxChars": number("How much text to return (default 32000, cap 256000)."),
+                "encoding": string("text (default) or base64 for binary files.")
+            }),
+            json!(["path"]),
+        ),
+        TOOL_LOCAL_READ => (
             json!({
                 "path": string("File to read."),
                 "maxChars": number("How much text to return (default 32000, cap 256000).")
@@ -464,6 +551,86 @@ fn parameters(name: &str) -> (Value, Value) {
         TOOL_REMOTE_DELETE => (
             json!({ "path": string("File or directory to delete.") }),
             json!(["path"]),
+        ),
+        TOOL_REMOTE_STAT => (
+            json!({ "path": string("File or directory to describe.") }),
+            json!(["path"]),
+        ),
+        TOOL_REMOTE_MOVE => (
+            json!({
+                "path": string("File or directory to move."),
+                "destination": string("New path."),
+                "overwrite": boolean("Replace the destination when it exists (default false).")
+            }),
+            json!(["path", "destination"]),
+        ),
+        TOOL_REMOTE_PATCH => (
+            json!({
+                "path": string("File the patch changes."),
+                "patch": string("Unified diff with @@ hunks."),
+                "patchFile": string("Host path of a file holding the diff; used when patch is absent.")
+            }),
+            json!(["path"]),
+        ),
+        TOOL_REMOTE_ZIP_LIST => (
+            json!({ "path": string("Zip archive to list.") }),
+            json!(["path"]),
+        ),
+        TOOL_REMOTE_ZIP_READ => (
+            json!({
+                "path": string("Zip archive."),
+                "entry": string("Entry name, exactly as the listing shows it.")
+            }),
+            json!(["path", "entry"]),
+        ),
+        TOOL_REMOTE_ZIP_EXTRACT => (
+            json!({
+                "path": string("Zip archive."),
+                "destination": string("Directory to extract into."),
+                "overwrite": boolean("Replace existing files (default false).")
+            }),
+            json!(["path", "destination"]),
+        ),
+        TOOL_GIT_STATUS => (
+            json!({ "path": string("Repository directory (default: the working directory).") }),
+            json!([]),
+        ),
+        TOOL_GIT_DIFF => (
+            json!({
+                "path": string("Repository directory (default: the working directory)."),
+                "file": string("Only this path inside the repository."),
+                "staged": boolean("Show staged changes instead of the working tree."),
+                "contextLines": number("Lines of context around each change (default 3, cap 20).")
+            }),
+            json!([]),
+        ),
+        TOOL_GIT_LOG => (
+            json!({
+                "path": string("Repository directory (default: the working directory)."),
+                "file": string("Only commits touching this path."),
+                "limit": number("How many commits (default 50, cap 200).")
+            }),
+            json!([]),
+        ),
+        TOOL_GIT_BRANCHES => (
+            json!({ "path": string("Repository directory (default: the working directory).") }),
+            json!([]),
+        ),
+        TOOL_GIT_COMMIT => (
+            json!({
+                "path": string("Repository directory (default: the working directory)."),
+                "message": string("Commit message."),
+                "all": boolean("Stage tracked changes first (default false).")
+            }),
+            json!(["message"]),
+        ),
+        TOOL_GIT_CHECKOUT => (
+            json!({
+                "path": string("Repository directory (default: the working directory)."),
+                "branch": string("Branch to switch to."),
+                "create": boolean("Create the branch (default false).")
+            }),
+            json!(["branch"]),
         ),
         TOOL_REMOTE_EDIT | TOOL_LOCAL_EDIT | TOOL_DEV_EDIT => (
             json!({
@@ -492,6 +659,10 @@ fn parameters(name: &str) -> (Value, Value) {
                 "endLine": number("Last line (inclusive)."),
                 "maxLines": number("Most lines to show (default 300).")
             }),
+            json!(["path"]),
+        ),
+        TOOL_DEV_IMAGE => (
+            json!({ "path": string("Image file to show the model.") }),
             json!(["path"]),
         ),
         TOOL_DEV_CREATE => (
@@ -667,21 +838,50 @@ fn parameters(name: &str) -> (Value, Value) {
     }
 }
 
-/// Every tool schema this host may use, ready for the provider.
-/// Every tool schema this conversation sends: the scope tools plus what the loaded scopes
-/// hold and the host may use.
+/// The tools this conversation may use: the loaded scopes' tools the host permits, minus the
+/// sub-agent drivers when this conversation is itself a sub-agent.
+pub fn available(
+    permissions: &Permissions,
+    loaded: &Loaded,
+    subagents: bool,
+    plan: bool,
+) -> impl Iterator<Item = &'static ToolSpec> {
+    TOOL_SPECS
+        .iter()
+        .filter(move |spec| subagents || !is_subagent_tool(spec.name))
+        .filter(move |spec| loaded.holds(spec.name) && permissions.offers(spec.name))
+        .filter(move |spec| !plan || plan_safe(spec.name))
+}
+
+/// Whether Plan mode offers a tool.
+///
+/// `run_script` is offered because the calls a script makes are checked one by one: a script
+/// that writes is refused when it asks, not before it starts.
+pub fn plan_safe(name: &str) -> bool {
+    is_read_only(name) || name == TOOL_RUN_SCRIPT
+}
+
+/// Every tool schema this conversation sends.
 ///
 /// Tools of scopes that are not loaded are left out on purpose — that is what keeps the
-/// prompt from carrying the whole toolset whether or not it is needed.
-pub fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool) -> Vec<Value> {
+/// prompt from carrying the whole toolset whether or not it is needed. `plan` narrows it
+/// further to what only reads; `script` replaces the scopes' schemas with `run_script` alone,
+/// whose API the system prompt spells out a line per tool instead of a schema.
+pub fn specs(
+    permissions: &Permissions,
+    loaded: &Loaded,
+    subagents: bool,
+    plan: bool,
+    script: bool,
+) -> Vec<Value> {
+    if script {
+        return available(permissions, loaded, subagents, plan)
+            .filter(|spec| spec.name == TOOL_RUN_SCRIPT)
+            .map(|spec| spec.schema())
+            .collect();
+    }
     let mut specs: Vec<Value> = SCOPE_TOOLS.iter().map(|spec| spec.schema()).collect();
-    specs.extend(
-        TOOL_SPECS
-            .iter()
-            .filter(|spec| subagents || !is_subagent_tool(spec.name))
-            .filter(|spec| loaded.holds(spec.name) && permissions.offers(spec.name))
-            .map(|spec| spec.schema()),
-    );
+    specs.extend(available(permissions, loaded, subagents, plan).map(|spec| spec.schema()));
     // Tools a pane offers are listed as they are: their calls run commands, which the
     // approval rules already gate.
     for scope in loaded.scopes() {
@@ -692,10 +892,95 @@ pub fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool) -> Vec
             crate::plugin::tools_of(pane)
                 .iter()
                 .filter(|tool| permissions.offers(tool.name))
+                .filter(|tool| !plan || tool.read_only)
                 .map(PluginTool::schema),
         );
     }
     specs
+}
+
+/// The script API, one line per tool a script may call.
+///
+/// A line is all the prompt needs: the argument names and types, and what the tool is for.
+/// That is a fraction of what the same tools' schemas cost, and it is why script mode can
+/// carry the whole toolset in a request.
+pub fn catalog(permissions: &Permissions, loaded: &Loaded, subagents: bool, plan: bool) -> String {
+    let mut lines: Vec<String> = available(permissions, loaded, subagents, plan)
+        .filter(|spec| spec.name != TOOL_RUN_SCRIPT)
+        .map(|spec| {
+            let (properties, required) = parameters(spec.name);
+            format!(
+                "- {}({}) — {}",
+                spec.name,
+                signature(&properties, &required),
+                first_sentence(spec.description)
+            )
+        })
+        .collect();
+    for scope in loaded.scopes() {
+        let Some(pane) = scope.pane else {
+            continue;
+        };
+        for tool in crate::plugin::tools_of(pane) {
+            if !permissions.offers(tool.name) || (plan && !tool.read_only) {
+                continue;
+            }
+            lines.push(format!(
+                "- {}({}) — {}",
+                tool.name,
+                signature(&tool.parameters["properties"], &tool.parameters["required"]),
+                first_sentence(tool.description)
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// A tool's arguments as `name: type` pairs, `?` marking the optional ones.
+fn signature(properties: &Value, required: &Value) -> String {
+    let Some(map) = properties.as_object() else {
+        return String::new();
+    };
+    let required: Vec<&str> = required
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    map.iter()
+        .map(|(key, schema)| {
+            let ty = type_label(schema);
+            if required.contains(&key.as_str()) {
+                format!("{key}: {ty}")
+            } else {
+                format!("{key}?: {ty}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The type a schema declares, spelled the way a catalog line reads best.
+fn type_label(schema: &Value) -> String {
+    if let Some(options) = schema["enum"].as_array() {
+        return options
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|option| format!("\"{option}\""))
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    match schema["type"].as_str() {
+        Some("array") => format!("{}[]", schema["items"]["type"].as_str().unwrap_or("any")),
+        Some(ty) => ty.to_owned(),
+        None => "any".to_owned(),
+    }
+}
+
+/// The first sentence of a description, which is all a catalog line needs.
+fn first_sentence(text: &str) -> &str {
+    match text.find(". ") {
+        Some(end) => &text[..=end],
+        None => text,
+    }
 }
 
 /// Characters the tool schemas and `system` take out of one request.
@@ -743,7 +1028,20 @@ pub fn needs_session(name: &str) -> bool {
             | TOOL_REMOTE_LIST
             | TOOL_REMOTE_DELETE
             | TOOL_REMOTE_EDIT
+            | TOOL_REMOTE_STAT
+            | TOOL_REMOTE_MOVE
+            | TOOL_REMOTE_PATCH
+            | TOOL_REMOTE_ZIP_LIST
+            | TOOL_REMOTE_ZIP_READ
+            | TOOL_REMOTE_ZIP_EXTRACT
+            | TOOL_GIT_STATUS
+            | TOOL_GIT_DIFF
+            | TOOL_GIT_LOG
+            | TOOL_GIT_BRANCHES
+            | TOOL_GIT_COMMIT
+            | TOOL_GIT_CHECKOUT
             | TOOL_DEV_VIEW
+            | TOOL_DEV_IMAGE
             | TOOL_DEV_EDIT
             | TOOL_DEV_CREATE
             | TOOL_DEV_LIST
@@ -760,34 +1058,54 @@ pub fn needs_session(name: &str) -> bool {
     )
 }
 
-/// Tools that read only, so they never need approval.
+/// Tools that only read, which is all Plan mode offers.
 ///
-/// Documented here because the reference lists the same set; the permission
-/// check itself only ever gates `run_command`.
-#[allow(dead_code)]
+/// Reads, listings, searches and diffs, the terminal's screen, the system probes and the map
+/// queries — plus the tools that ask the user or move along the graph. Anything that writes a
+/// file, types into a terminal, runs a shell command or changes a container is not here.
 pub fn is_read_only(name: &str) -> bool {
     matches!(
         name,
         TOOL_REMOTE_READ
             | TOOL_REMOTE_LIST
+            | TOOL_REMOTE_STAT
+            | TOOL_REMOTE_ZIP_LIST
+            | TOOL_REMOTE_ZIP_READ
+            | TOOL_GIT_STATUS
+            | TOOL_GIT_DIFF
+            | TOOL_GIT_LOG
+            | TOOL_GIT_BRANCHES
             | TOOL_LOCAL_READ
             | TOOL_LOCAL_LIST
             | TOOL_LOCAL_GREP
             | TOOL_CURRENT_TIME
             | TOOL_RAG_SEARCH
             | TOOL_DEV_VIEW
+            | TOOL_DEV_IMAGE
             | TOOL_DEV_LIST
             | TOOL_DEV_GREP
             | TOOL_DEV_FIND
             | TOOL_DEV_DIFF
+            | TOOL_ENV_SCAN
+            | TOOL_ENV_SYSTEM
+            | TOOL_ENV_FIND
+            | TOOL_ENV_OUTLINE
+            | TOOL_ENV_OVERVIEW
+            | TOOL_ENV_SEARCH
             | TOOL_TERMINAL_READ
+            | TOOL_TERMINAL_WAIT
             | TOOL_WEB_FETCH
             | TOOL_WEB_SEARCH
             | TOOL_SYSTEM_OVERVIEW
             | TOOL_SYSTEM_PROCESSES
             | TOOL_SYSTEM_DISK
             | TOOL_SYSTEM_MEMORY
-    )
+            | TOOL_ASK_USER
+            | TOOL_LOAD_SCOPE
+            | TOOL_UNLOAD_SCOPE
+            | TOOL_SPAWN_SUBAGENT
+            | TOOL_WAIT_SUBAGENT
+    ) || plugin_tool(name).is_some_and(|tool| tool.read_only)
 }
 
 /// The local root operations resolve against: the user's home directory.
@@ -1180,6 +1498,115 @@ pub fn dev_tree_command(args: &Value, root: &str) -> String {
         "find {} -maxdepth {depth} {SKIPPED_TREE_DIRS} 2>/dev/null | head -n {MAX_DIR_ENTRIES}",
         shell_quote(root)
     )
+}
+
+/// The shell command `remote_fs_stat` runs on the connected host.
+///
+/// GNU coreutils and BSD `stat` take different format flags, so both are tried.
+pub fn stat_command(path: &str) -> String {
+    let path = shell_quote(path);
+    format!(
+        "if [ -e {path} ] || [ -L {path} ]; then \
+         if stat -c 'type=%F' {path} >/dev/null 2>&1; then \
+         stat -c 'type=%F\\nsize=%s bytes\\nmode=%a\\nowner=%U\\ngroup=%G\\nmodified=%y' {path}; \
+         else stat -f 'type=%HT\\nsize=%z bytes\\nmode=%Lp\\nowner=%Su\\ngroup=%Sg\\nmodified=%Sm' {path}; \
+         fi; \
+         target=$(readlink {path} 2>/dev/null); [ -n \"$target\" ] && printf 'target=%s\\n' \"$target\"; \
+         else echo 'not found'; fi"
+    )
+}
+
+/// The shell command `remote_fs_move_file` runs on the connected host.
+pub fn move_command(from: &str, to: &str, overwrite: bool) -> String {
+    let from = shell_quote(from);
+    let to = shell_quote(to);
+    let guard = if overwrite {
+        String::new()
+    } else {
+        format!("[ -e {to} ] && {{ echo 'destination exists'; exit 1; }}; ")
+    };
+    format!(
+        "if [ ! -e {from} ]; then echo 'source does not exist'; exit 1; fi; \
+         {guard}mkdir -p \"$(dirname {to})\" && mv {from} {to} && echo moved"
+    )
+}
+
+/// The shell command `remote_fs_zip_list` runs on the connected host.
+pub fn zip_list_command(path: &str) -> String {
+    format!(
+        "unzip -l {} 2>&1 | head -n {MAX_ZIP_LIST_ROWS}",
+        shell_quote(path)
+    )
+}
+
+/// The shell command `remote_fs_zip_read` runs on the connected host.
+pub fn zip_read_command(path: &str, entry: &str) -> String {
+    format!("unzip -p {} {} 2>&1", shell_quote(path), shell_quote(entry))
+}
+
+/// The shell command `remote_fs_zip_extract` runs on the connected host.
+pub fn zip_extract_command(path: &str, destination: &str, overwrite: bool) -> String {
+    let overwrite = if overwrite { "-o" } else { "-n" };
+    let destination = shell_quote(destination);
+    format!(
+        "mkdir -p {destination} && unzip -q {overwrite} {} -d {destination} && \
+         find {destination} -maxdepth {MAX_DEV_TREE_DEPTH} | head -n {MAX_DIR_ENTRIES}",
+        shell_quote(path)
+    )
+}
+
+/// The shell command a git tool runs in `dir` on the connected host.
+pub fn git_command(name: &str, args: &Value, dir: &str) -> Option<String> {
+    let root = shell_quote(dir);
+    let file = args["file"]
+        .as_str()
+        .map(str::trim)
+        .filter(|file| !file.is_empty())
+        .map(|file| format!(" -- {}", shell_quote(file)))
+        .unwrap_or_default();
+    let command = match name {
+        TOOL_GIT_STATUS => format!("git -C {root} status --short --branch"),
+        TOOL_GIT_DIFF => {
+            let staged = if args["staged"].as_bool().unwrap_or(false) {
+                " --staged"
+            } else {
+                ""
+            };
+            let context = args["contextLines"].as_u64().map_or(String::new(), |lines| {
+                format!(" --unified={}", lines.min(DIFF_CONTEXT_LINES_MAX as u64))
+            });
+            format!("git -C {root} diff{staged}{context}{file}")
+        }
+        TOOL_GIT_LOG => {
+            let limit = args["limit"]
+                .as_u64()
+                .map_or(DEV_SEARCH_MATCHES_DEFAULT as u64, |limit| {
+                    limit.clamp(1, MAX_GIT_LOG_COMMITS as u64)
+                });
+            format!("git -C {root} log --oneline -n {limit}{file}")
+        }
+        TOOL_GIT_BRANCHES => format!("git -C {root} branch --all --verbose --no-abbrev"),
+        TOOL_GIT_COMMIT => {
+            let message = shell_quote(args["message"].as_str().unwrap_or_default());
+            let all = if args["all"].as_bool().unwrap_or(false) {
+                " -a"
+            } else {
+                ""
+            };
+            format!("git -C {root} commit{all} -m {message}")
+        }
+        TOOL_GIT_CHECKOUT => {
+            let branch = shell_quote(args["branch"].as_str().unwrap_or_default());
+            let create = if args["create"].as_bool().unwrap_or(false) {
+                "-b "
+            } else {
+                ""
+            };
+            format!("git -C {root} checkout {create}{branch}")
+        }
+        _ => return None,
+    };
+    Some(format!("{command} 2>&1"))
 }
 
 /// `local_fs_delete_file`.
@@ -1892,7 +2319,7 @@ mod tests {
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), true);
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true, false, false);
         assert_eq!(
             schemas.len(),
             TOOL_SPECS.len() + crate::plugin::tools().count() + SCOPE_TOOLS.len()
@@ -1931,12 +2358,13 @@ mod tests {
 
     #[test]
     fn a_fresh_conversation_carries_the_scope_tools_and_the_root_only() {
-        let schemas = specs(&everything_allowed(), &Loaded::new(), true);
+        let schemas = specs(&everything_allowed(), &Loaded::new(), true, false, false);
         assert_eq!(
             names(&schemas),
             [
                 TOOL_LOAD_SCOPE,
                 TOOL_UNLOAD_SCOPE,
+                TOOL_RUN_SCRIPT,
                 TOOL_RUN_COMMAND,
                 TOOL_RUN_COMMAND_BACKGROUND,
                 TOOL_RUN_SUDO,
@@ -1950,7 +2378,7 @@ mod tests {
 
     #[test]
     fn a_subagent_is_not_offered_the_tools_that_drive_subagents() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), false);
+        let schemas = specs(&everything_allowed(), &everything_loaded(), false, false, false);
         let names = names(&schemas);
         assert!(!names.contains(&TOOL_SPAWN_SUBAGENT));
         assert!(!names.contains(&TOOL_WAIT_SUBAGENT));
@@ -1958,28 +2386,94 @@ mod tests {
     }
 
     #[test]
+    fn script_mode_sends_run_script_and_nothing_else() {
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true, false, true);
+        assert_eq!(names(&schemas), [TOOL_RUN_SCRIPT]);
+        // Plan mode keeps it: the calls it makes are checked one by one.
+        let planned = specs(&everything_allowed(), &everything_loaded(), true, true, true);
+        assert_eq!(names(&planned), [TOOL_RUN_SCRIPT]);
+    }
+
+    #[test]
+    fn the_catalog_carries_one_line_per_tool_a_script_may_call() {
+        let listed = catalog(&everything_allowed(), &everything_loaded(), true, false);
+        assert!(
+            listed.contains("- run_command(command: string)"),
+            "{listed}"
+        );
+        assert!(listed.contains("- dev_grep_search("), "{listed}");
+        assert!(listed.contains("- docker_containers()"), "{listed}");
+        assert!(!listed.contains("- run_script("), "{listed}");
+        // Plan mode leaves out what changes something.
+        let planned = catalog(&everything_allowed(), &everything_loaded(), true, true);
+        assert!(!planned.contains("- remote_fs_write_file("), "{planned}");
+        assert!(planned.contains("- dev_grep_search("), "{planned}");
+    }
+
+    #[test]
     fn loading_a_scope_is_what_puts_its_schemas_in_the_request() {
         let permissions = everything_allowed();
         let mut loaded = Loaded::new();
         loaded.load(super::super::scopes::find("host-files").unwrap());
-        let schemas = specs(&permissions, &loaded, true);
+        let schemas = specs(&permissions, &loaded, true, false, false);
         assert!(names(&schemas).contains(&TOOL_DEV_VIEW));
         assert!(!names(&schemas).contains(&TOOL_LOCAL_READ));
         loaded.load(super::super::scopes::find("docker").unwrap());
-        assert!(names(&specs(&permissions, &loaded, true)).contains(&"docker_containers"));
+        assert!(names(&specs(&permissions, &loaded, true, false, false)).contains(&"docker_containers"));
     }
 
     #[test]
     fn the_root_request_costs_a_fraction_of_the_loadouts() {
         let permissions = everything_allowed();
-        let base = specs(&permissions, &Loaded::new(), true);
-        let all = specs(&permissions, &everything_loaded(), true);
+        let base = specs(&permissions, &Loaded::new(), true, false, false);
+        let all = specs(&permissions, &everything_loaded(), true, false, false);
         let base = prompt_chars(&base, "");
         let all = prompt_chars(&all, "");
         assert!(
             base * 5 < all,
             "the base request is {base} chars of {all}, which is not a saving worth the hop"
         );
+    }
+
+    #[test]
+    fn plan_mode_sends_only_the_tools_that_read() {
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true, true, false);
+        let names = names(&schemas);
+        for kept in [
+            TOOL_DEV_VIEW,
+            TOOL_DEV_GREP,
+            TOOL_LOCAL_READ,
+            TOOL_REMOTE_LIST,
+            TOOL_TERMINAL_READ,
+            TOOL_WEB_FETCH,
+            TOOL_SYSTEM_OVERVIEW,
+            TOOL_ENV_FIND,
+            TOOL_ASK_USER,
+            TOOL_LOAD_SCOPE,
+            "docker_containers",
+        ] {
+            assert!(names.contains(&kept), "{kept} should survive Plan mode: {names:?}");
+        }
+        for dropped in [
+            TOOL_RUN_COMMAND,
+            TOOL_RUN_COMMAND_BACKGROUND,
+            TOOL_RUN_SUDO,
+            TOOL_LOCAL_RUN,
+            TOOL_DEV_EDIT,
+            TOOL_DEV_CREATE,
+            TOOL_REMOTE_WRITE,
+            TOOL_REMOTE_DELETE,
+            TOOL_LOCAL_DELETE,
+            TOOL_TERMINAL_WRITE,
+            TOOL_TERMINAL_KEYS,
+            "docker_start",
+            "docker_remove",
+        ] {
+            assert!(
+                !names.contains(&dropped),
+                "{dropped} changes something and must stay out of Plan mode"
+            );
+        }
     }
 
     #[test]
@@ -1993,7 +2487,7 @@ mod tests {
         ]));
         assert_eq!(permissions.decision(TOOL_TERMINAL_KEYS), Permission::Ask);
         assert_eq!(permissions.decision(TOOL_TERMINAL_WRITE), Permission::Deny);
-        let schemas = specs(&permissions, &everything_loaded(), true);
+        let schemas = specs(&permissions, &everything_loaded(), true, false, false);
         assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
         assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
     }
@@ -2377,6 +2871,71 @@ mod tests {
             "{tree}"
         );
         assert!(tree.ends_with(&format!("head -n {MAX_DIR_ENTRIES}")), "{tree}");
+    }
+
+    #[test]
+    fn the_host_file_tools_build_the_commands_they_run() {
+        let stat = stat_command("/srv/app/main.rs");
+        assert!(stat.contains("stat -c 'type=%F'"), "{stat}");
+        assert!(stat.contains("stat -f 'type=%HT"), "{stat}");
+        assert!(stat.contains("readlink '/srv/app/main.rs'"), "{stat}");
+
+        // Replacing an existing destination takes an explicit overwrite.
+        let guarded = move_command("/srv/a", "/srv/b", false);
+        assert!(guarded.contains("[ -e '/srv/b' ] &&"), "{guarded}");
+        let replaced = move_command("/srv/a", "/srv/b", true);
+        assert!(!replaced.contains("destination exists"), "{replaced}");
+        assert!(replaced.contains("mv '/srv/a' '/srv/b'"), "{replaced}");
+
+        let list = zip_list_command("/srv/a.zip");
+        assert!(list.contains("unzip -l '/srv/a.zip'"), "{list}");
+        let entry = zip_read_command("/srv/a.zip", "src/main.rs");
+        assert!(entry.contains("unzip -p '/srv/a.zip' 'src/main.rs'"), "{entry}");
+        let extract = zip_extract_command("/srv/a.zip", "/srv/out", false);
+        assert!(
+            extract.contains("unzip -q -n '/srv/a.zip' -d '/srv/out'"),
+            "{extract}"
+        );
+        let over = zip_extract_command("/srv/a.zip", "/srv/out", true);
+        assert!(over.contains("unzip -q -o '/srv/a.zip'"), "{over}");
+    }
+
+    #[test]
+    fn the_git_tools_are_shell_lines_for_the_repository() {
+        let status = git_command(TOOL_GIT_STATUS, &json!({}), "/srv/app").unwrap();
+        assert!(
+            status.contains("git -C '/srv/app' status --short --branch"),
+            "{status}"
+        );
+        let diff = git_command(
+            TOOL_GIT_DIFF,
+            &json!({ "staged": true, "file": "src/main.rs", "contextLines": 9 }),
+            "/srv/app",
+        )
+        .unwrap();
+        assert!(
+            diff.contains("diff --staged --unified=9 -- 'src/main.rs'"),
+            "{diff}"
+        );
+        let log = git_command(TOOL_GIT_LOG, &json!({ "limit": 900 }), "/srv/app").unwrap();
+        assert!(
+            log.contains(&format!("-n {MAX_GIT_LOG_COMMITS}")),
+            "{log}"
+        );
+        let commit = git_command(
+            TOOL_GIT_COMMIT,
+            &json!({ "message": "why", "all": true }),
+            "/srv/app",
+        )
+        .unwrap();
+        assert!(commit.contains("commit -a -m 'why'"), "{commit}");
+        let checkout = git_command(
+            TOOL_GIT_CHECKOUT,
+            &json!({ "branch": "feature/x", "create": true }),
+            "/srv/app",
+        )
+        .unwrap();
+        assert!(checkout.contains("checkout -b 'feature/x'"), "{checkout}");
     }
 
     #[test]

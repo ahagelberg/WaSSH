@@ -555,9 +555,11 @@ const AI_AGENT_APP: &[SettingsField] = &[
     ),
     boolean(
         "autoCompact",
-        "Compact long chats",
-        true,
-        "Summarise the older part of the chat into the prompt once it would no longer fit the model's context window.",
+        "Compact long chats automatically",
+        false,
+        "Summarise the older part of the chat into the prompt once it would no longer fit the \
+model's context window. Off by default: the Compact button and /compact fold the chat whenever \
+you ask them to.",
     ),
     number(
         "maxSubagents",
@@ -565,6 +567,14 @@ const AI_AGENT_APP: &[SettingsField] = &[
         5,
         "How many sub-agents may run in the background at once. A spawn beyond this is refused \
 and the model is told to wait for one to finish.",
+    ),
+    boolean(
+        "scriptMode",
+        "Script mode",
+        false,
+        "Send the tools as a script API instead of one schema per tool. The model then writes a \
+short JavaScript program that calls several tools and returns one compact result, which saves \
+most of the prompt tokens the tool schemas take and cuts the rounds a task needs.",
     ),
     group(
         "globalKnowledgeGroup",
@@ -605,6 +615,12 @@ const AI_AGENT_HOST: &[SettingsField] = &[
         "Host knowledge folder",
         "",
         "Additional local folder of documents indexed just for this host, combined with the global knowledge folder.",
+    ),
+    boolean(
+        "hostScriptMode",
+        "Script mode for this host",
+        false,
+        "Turn script mode on for this host as well, even when it is off app-wide.",
     ),
     string_list(
         "allowRules",
@@ -1356,8 +1372,9 @@ mod tests {
             [
                 "Global prompt text",
                 "Model context windows",
-                "Compact long chats",
+                "Compact long chats automatically",
                 "Sub-agents at a time",
+                "Script mode",
                 "Global knowledge",
                 "Default allow rules",
                 "Default deny rules",

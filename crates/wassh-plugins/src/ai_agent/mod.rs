@@ -13,22 +13,23 @@ mod providers;
 mod rag;
 mod rules;
 mod scopes;
+mod script;
 mod settings_ui;
 mod tools;
 mod view;
 mod web;
 
 pub use agent::{
-    Agent, CommandKeys, Phase, SpawnRequest, Subagent, SubagentEnd, SubagentState, ToolSettings,
-    Turn, Waiting,
+    Agent, CommandKeys, Phase, ScriptRow, SpawnRequest, Subagent, SubagentEnd, SubagentState,
+    ToolSettings, Turn, Waiting,
 };
 pub use permissions::{GATES, GROUPS, Permission, Permissions, group_key, setting_key};
 pub use protocol::{
     ApiMessage, ApiToolCall, Completion, DATA_VERSION, DEFAULT_CHAT_TITLE, PROVIDER_CUSTOM,
-    PROVIDER_TYPES, Protocol, ProviderConfig, ProviderType, SAFE_RULES,
-    SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
-    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, TITLE_MAX_CHARS,
-    join_url,
+    PROVIDER_TYPES, Protocol, ProviderConfig, ProviderType, SAFE_RULES, SETTING_DEFAULT_ALLOW_RULES,
+    SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT, SETTING_HOST_ALLOW_RULES,
+    SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, SETTING_HOST_SCRIPT_MODE, SETTING_SCRIPT_MODE,
+    TITLE_MAX_CHARS, TOOL_RUN_SCRIPT, join_url,
 };
 pub use providers::{CompletionRequest, EmbedConfig, StreamEvent, provider_models};
 pub use rules::{ApprovalScope, RuleDecision, approval_scopes, decide_command};

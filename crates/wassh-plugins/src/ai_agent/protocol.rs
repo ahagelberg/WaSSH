@@ -40,6 +40,10 @@ pub const SETTING_MODEL_CONTEXTS: &str = "modelContexts";
 pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
 /// Setting key: how many sub-agents may run at the same time.
 pub const SETTING_MAX_SUBAGENTS: &str = "maxSubagents";
+/// Setting key: send the tools as a script API instead of one schema per tool.
+pub const SETTING_SCRIPT_MODE: &str = "scriptMode";
+/// Setting key: this host's script mode, which wins over the app-wide one.
+pub const SETTING_HOST_SCRIPT_MODE: &str = "hostScriptMode";
 /// Sub-agents allowed at once when nothing is stored.
 pub const DEFAULT_MAX_SUBAGENTS: usize = 5;
 /// Longest sub-agent answer handed back to the model.
@@ -47,6 +51,8 @@ pub const MAX_SUBAGENT_RESULT_CHARS: usize = 8_000;
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";
+/// Tool: run a short JavaScript program that calls the other tools and returns one result.
+pub const TOOL_RUN_SCRIPT: &str = "run_script";
 /// Tool: start a shell command in the background without waiting for it.
 pub const TOOL_RUN_COMMAND_BACKGROUND: &str = "run_command_background";
 /// Tool: run a shell command as root, asking the user for the password first.
@@ -71,6 +77,30 @@ pub const TOOL_REMOTE_LIST: &str = "remote_fs_list_dir";
 pub const TOOL_REMOTE_DELETE: &str = "remote_fs_delete_file";
 /// Tool: edit a remote file in place.
 pub const TOOL_REMOTE_EDIT: &str = "remote_fs_edit_file";
+/// Tool: describe one path on the remote host.
+pub const TOOL_REMOTE_STAT: &str = "remote_fs_stat";
+/// Tool: move or rename a path on the remote host.
+pub const TOOL_REMOTE_MOVE: &str = "remote_fs_move_file";
+/// Tool: apply a unified diff to a remote file.
+pub const TOOL_REMOTE_PATCH: &str = "remote_fs_apply_patch";
+/// Tool: list the entries of a remote zip archive.
+pub const TOOL_REMOTE_ZIP_LIST: &str = "remote_fs_zip_list";
+/// Tool: read one entry of a remote zip archive.
+pub const TOOL_REMOTE_ZIP_READ: &str = "remote_fs_zip_read";
+/// Tool: extract a remote zip archive into a directory.
+pub const TOOL_REMOTE_ZIP_EXTRACT: &str = "remote_fs_zip_extract";
+/// Tool: the working tree state of a git repository on the connected host.
+pub const TOOL_GIT_STATUS: &str = "dev_git_status";
+/// Tool: uncommitted changes in a git repository on the connected host.
+pub const TOOL_GIT_DIFF: &str = "dev_git_diff";
+/// Tool: recent commits in a git repository on the connected host.
+pub const TOOL_GIT_LOG: &str = "dev_git_log";
+/// Tool: local and remote branches of a git repository on the connected host.
+pub const TOOL_GIT_BRANCHES: &str = "dev_git_branches";
+/// Tool: commit changes in a git repository on the connected host.
+pub const TOOL_GIT_COMMIT: &str = "dev_git_commit";
+/// Tool: switch or create a branch in a git repository on the connected host.
+pub const TOOL_GIT_CHECKOUT: &str = "dev_git_checkout";
 /// Tool: read a local file.
 pub const TOOL_LOCAL_READ: &str = "local_fs_read_file";
 /// Tool: write a local file.
@@ -111,6 +141,8 @@ pub const TOOL_DEV_GREP: &str = "dev_grep_search";
 pub const TOOL_DEV_FIND: &str = "dev_find_files";
 /// Tool: diff a file on the connected host.
 pub const TOOL_DEV_DIFF: &str = "dev_diff_file";
+/// Tool: show the model an image file on the connected host.
+pub const TOOL_DEV_IMAGE: &str = "dev_view_image";
 /// Tool: build or refresh the environment map.
 pub const TOOL_ENV_SCAN: &str = "env_scan";
 /// Tool: look a path or a declaration up in the environment map.
@@ -178,6 +210,10 @@ pub const MAX_ATTACHMENTS: usize = 8;
 pub const MAX_ATTACHMENT_BYTES: u64 = 200_000;
 /// Longest attachment text sent to the model.
 pub const MAX_ATTACHMENT_CHARS: usize = 100_000;
+/// Largest image sent with one message.
+pub const MAX_IMAGE_BYTES: usize = 4_000_000;
+/// Images one message may carry.
+pub const MAX_IMAGES: usize = 4;
 
 /// Provider id of the local Ollama server.
 pub const PROVIDER_OLLAMA: &str = "ollama";
@@ -360,6 +396,32 @@ pub struct ApiToolCall {
     pub arguments: String,
 }
 
+/// An image the model is shown with a user message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImagePart {
+    /// MIME type, such as `image/png`.
+    pub media_type: String,
+    /// The bytes themselves.
+    pub data: Vec<u8>,
+}
+
+/// MIME type of the image `bytes` hold, for the formats OpenAI and Anthropic both take.
+pub fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    None
+}
+
 /// One message in the provider's shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiMessage {
@@ -367,6 +429,8 @@ pub enum ApiMessage {
     User {
         /// Text sent to the model.
         content: String,
+        /// Images sent alongside it, for providers that take them.
+        images: Vec<ImagePart>,
     },
     /// The assistant's turn, with the tool calls it asked for.
     Assistant {

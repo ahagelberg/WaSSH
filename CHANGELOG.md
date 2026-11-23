@@ -1,6 +1,53 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.18] - 2026-11-23
+
+### Added
+
+- Plan mode for the AI agent: a footer switch that makes the agent read and investigate only,
+  then tell you what it would change, where and why. Nothing on the host is touched until you
+  switch back to Agent mode. The mode is kept with the chat.
+- A Compact button in the chat footer, beside the mode switch, that folds the older part of a
+  long chat into a summary. The agent still remembers the gist, the recent messages stay, and
+  less of the model's context is spent on history. `/compact` does the same.
+- Script mode for the AI agent, a global setting with a per-host override. Instead of sending
+  a schema for every tool, the model writes a short JavaScript program that calls the tools it
+  needs, filters and joins their results and returns one compact result. It uses far less of
+  the prompt on tool descriptions and needs fewer rounds per task. A program may run for 20
+  seconds and make up to 100 calls, and a tool call that never answers is failed after a minute.
+- More tools for the connected host: file and folder details (`remote_fs_stat`), moving and
+  renaming (`remote_fs_move_file`), applying a patch from text or from a patch file
+  (`remote_fs_apply_patch`), listing, reading and extracting zip archives (`remote_fs_zip_list`,
+  `remote_fs_zip_read`, `remote_fs_zip_extract`), git status, diff, log, branches, commit and
+  checkout (`dev_git_status` and friends), and showing the model an image from the host
+  (`dev_view_image`).
+- Read a host file as base64 with `remote_fs_read_file` and `encoding: "base64"`, so binary
+  files can be looked at without garbling.
+- Send pictures to the AI agent: PNG, JPEG, GIF and WebP files can be attached to a message
+  (up to four per message, 4 MB each) and are sent to OpenAI-compatible and Anthropic models
+  as images. The chat history keeps them, and the model can also ask for an image on the host.
+- Shift+Enter starts a new line in the AI composer and when editing an earlier prompt. Enter
+  still sends, and Alt+Enter still queues the message for after the current run.
+- The free-answer box on the agent's question card now has a radio button of its own, so it is
+  clear when a typed answer replaces a picked option.
+
+### Changed
+
+- A long prompt in the chat is now limited to eight lines inside its bubble and scrolls, instead
+  of growing until it covers the whole conversation.
+- While a chat is being compacted, a progress bar says what is happening and the composer is
+  disabled, so a message cannot be typed into a conversation that is being rewritten.
+- Script mode's guidance asks the model to filter, sort, de-duplicate and summarise tool output
+  and to do several calls in one program rather than returning raw text or one round per call.
+
+### Fixed
+
+- A tool call made from a script no longer hangs the conversation when the command never
+  answers: it fails the call after 60 seconds with a timeout and lets the program carry on.
+- The terminal component only links its Windows console helper on Windows, so the build is
+  quiet on Linux and macOS.
+
+## [2.0.17] - 2026-11-20
 
 ### Added
 
@@ -21,6 +68,12 @@
     the button stays on and a second press stops them.
   - Sub-agents persist with their chat and keep working while it is filed; a restart brings them
     back stopped. How many may run at once is a global setting (`maxSubagents`, 5 by default).
+- Start a command in the background: `run_command_background` sits in the core scope beside
+  `run_command`, runs the command under `nohup` with its output discarded and answers with its
+  process id, so a server or a long job no longer holds the conversation. The command rules that
+  gate `run_command` gate it too.
+- Give the question card a Stop of its own: it ends the prompt and the run without an answer,
+  instead of leaving the question open with no way out but typing one.
 - Give the AI pane a New chat button in the header: on the chat list beside "Chats", and in a chat
   beside its title. It files the open conversation and starts an empty one.
 - Add two scroll switches to Options → Appearance, each with a per-host override in a host's
@@ -42,9 +95,13 @@
   JetBrains Mono and Source Code Pro — and offer them in the terminal's font list beside the ones
   the computer has, so the terminal looks the same on a machine with no programming font installed.
   The default family is one of them, and each font ships with its licence.
+- Name the environment map's scope "Graph" wherever the pane shows it — on its tag, in the scope
+  popup and in the line reporting what is mapped — while the agent still loads it as `env`.
 
 ### Changed
 
+- Report the AI agent's errors as toasts as well as under the transcript, so a failed send, a
+  broken provider or a summary that came back empty is seen wherever the pane is docked.
 - `env_search` ranks and answers with a file's summary where a mapping pass wrote one, and
   `env_outline` shows the summary and the connections beside the declarations.
 - List the AI pane's chats in the order they were started, newest on top, so reopening one does not
@@ -56,8 +113,9 @@
   lists them as their own rows, each with its own Edit and ✕, and they go out one at a time in the
   order they were written. The queue belongs to the conversation it was written in and is dropped
   when another chat opens.
-- Cut a prompt bubble at 200 points of text: a pasted log no longer fills the transcript, and a
-  **Show all** line under the bubble opens the rest (and **Show less** folds it back).
+- Lead the agent's guidance with the Graph scope once the development tools are loaded but the map
+  is not, and name the scope to load when the host's file tools are still out of reach instead of
+  letting it reach for `cat`, `grep` and `sed`.
 
 ### Fixed
 

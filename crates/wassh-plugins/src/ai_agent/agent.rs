@@ -7,22 +7,27 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 
+use base64::Engine as _;
 use serde_json::Value;
 
 use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
 use super::protocol::{
-    ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, MAX_SUBAGENT_RESULT_CHARS,
-    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
-    TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
-    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_LOAD_SCOPE,
+    ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, ImagePart,
+    MAX_SUBAGENT_RESULT_CHARS, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
+    TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
+    TOOL_LOAD_SCOPE,
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
-    TOOL_REMOTE_READ, TOOL_REMOTE_WRITE, TOOL_RUN_COMMAND, TOOL_RUN_COMMAND_BACKGROUND,
-    TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT, TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW,
-    TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT,
-    TOOL_TERMINAL_WRITE, TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
+    TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
+    TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT,
+    TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
+    TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
+    TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
@@ -30,6 +35,7 @@ use super::rules::{
     ApprovalScope, RuleDecision, approval_scopes, decide_command,
 };
 use super::scopes::{self, Loaded, Scope};
+use super::script::{self, ScriptEvent, ScriptReply};
 use super::tools::{self, ToolResult};
 use super::web;
 use crate::plugin::SessionAccess;
@@ -42,6 +48,8 @@ type Session<'a, 'b> = &'a mut Option<&'b mut dyn SessionAccess>;
 
 /// Longest command output handed to the model.
 pub const MAX_OUTPUT_CHARS: usize = 64_000;
+/// Prefix of the call ids a script's tool calls carry; they never reach the provider.
+const SCRIPT_CALL_PREFIX: &str = "script-";
 /// Hits `env_find` returns when the call does not say.
 const ENV_FIND_HITS_DEFAULT: usize = 30;
 /// Files `env_search` ranks when the call does not say.
@@ -82,6 +90,14 @@ pub const EMPTY_ANSWER: &str = "The model returned an empty answer.";
 pub const NOT_PERMITTED: &str = "This action is not permitted.";
 /// Said when the user turns an action down.
 pub const DENIED_BY_USER: &str = "Action denied by user.";
+/// Said when a Plan-mode chat is asked to change something.
+pub const PLAN_READ_ONLY: &str = "This chat is in Plan mode, which only reads. Switch it to Agent \
+mode to change anything.";
+/// Said when a script-mode chat calls a tool directly instead of from a script.
+pub const SCRIPT_MODE_ONLY: &str = "This chat is in script mode, so the tools are called from \
+inside `run_script`: call run_script with a program that awaits `tools.<name>({ ... })`.";
+/// Question shown when `ask_user` carried none.
+const QUESTION_FALLBACK: &str = "The agent needs your input.";
 /// Answer given to a tool call the user stopped before it ran.
 pub const STOPPED_BY_USER: &str = "Stopped by the user before this ran.";
 /// System prompt used when summarising a chat for a new one.
@@ -136,10 +152,52 @@ pub enum Turn {
         /// The user's answer, when it came.
         answer: Option<String>,
     },
+    /// A script the agent ran, with the calls it made.
+    Script {
+        /// The program it wrote.
+        code: String,
+        /// The calls it made, in order.
+        calls: Vec<ScriptRow>,
+        /// The result handed back to the model, once it came.
+        result: Option<String>,
+        /// Whether the script failed.
+        failed: bool,
+        /// What the script logged, shown to the reader only.
+        console: String,
+    },
     /// Something that went wrong.
     Error(String),
     /// A note from a slash command.
     Notice(String),
+}
+
+/// One tool call a script made, for its transcript card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptRow {
+    /// Tool name.
+    pub name: String,
+    /// One-line summary of the call.
+    pub label: String,
+    /// What the tool returned.
+    pub output: String,
+    /// Whether it failed.
+    pub failed: bool,
+}
+
+/// A script the agent is running.
+struct ScriptRun {
+    /// The call the model made.
+    outer: ApiToolCall,
+    /// Its transcript line.
+    turn: usize,
+    /// The call the script is waiting on, with the id it waits under.
+    inner: Option<(ApiToolCall, u64)>,
+    /// Every call the script has made so far.
+    calls: Vec<ScriptRow>,
+    /// When the call it is waiting on started.
+    since: Option<std::time::Instant>,
+    /// Where its events and answers travel.
+    job: script::ScriptJob,
 }
 
 /// A question the agent asks, with optional selectable answers.
@@ -254,6 +312,8 @@ pub enum Waiting {
         /// When the wait gives up, in milliseconds since the epoch.
         until_ms: u64,
     },
+    /// A script in its sandbox, until it returns or asks for another tool.
+    Script,
 }
 
 /// What follows a probe command.
@@ -276,6 +336,13 @@ pub enum CommandThen {
         content: String,
         /// Whether an existing file may be replaced.
         overwrite: bool,
+    },
+    /// Read the patch the probe printed, then apply it to `path`.
+    ReadPatchFile {
+        /// File the patch changes.
+        path: String,
+        /// Where the patch was read from, for the error message.
+        patch_path: String,
     },
 }
 
@@ -305,6 +372,15 @@ pub enum ReadThen {
         /// Lines of context around each change.
         context: usize,
     },
+    /// Apply a unified diff and write the file back.
+    Patch {
+        /// The diff, `@@` hunks included.
+        patch: String,
+    },
+    /// Return the contents base64-encoded.
+    Base64,
+    /// Show the image to the model as a user message.
+    Image,
 }
 
 /// Settings the tools read.
@@ -587,6 +663,9 @@ pub struct Agent {
     pub tools: ToolSettings,
     /// What this host may do, read from the plugin settings.
     pub permissions: Permissions,
+    /// Whether this chat only reads: Plan mode offers the read-only tools and refuses the
+    /// rest even if the model asks for one.
+    pub plan: bool,
     /// The scopes whose tools this conversation carries.
     pub scopes: Loaded,
     /// Characters the last request spent on the system prompt and the tool schemas.
@@ -598,7 +677,7 @@ pub struct Agent {
     /// They show up in the transcript straight away but only join the provider history
     /// once the run in front of them is done, so the model sees them after it finished
     /// the step it was on rather than before its own reply.
-    injected: std::collections::VecDeque<(String, UserMeta)>,
+    injected: std::collections::VecDeque<(String, UserMeta, Vec<ImagePart>)>,
     /// Clock used by the time-based tools; the view sets it every frame.
     pub now_ms: u64,
     /// The last command, kept so a refused `sudo` can be retried.
@@ -637,6 +716,10 @@ pub struct Agent {
     /// Answers from sub-agents, held until the conversation is between turns so a tool
     /// call of its own is never separated from its result.
     pending_reports: Vec<String>,
+    /// The script this conversation is running, if any.
+    script: Option<ScriptRun>,
+    /// Whether the tools are offered as a script API instead of one schema per tool.
+    pub script_mode: bool,
 }
 
 impl Agent {
@@ -708,6 +791,8 @@ impl Agent {
         self.needs_reply = false;
         self.compacted = None;
         self.scopes = Loaded::new();
+        self.plan = false;
+        self.script = None;
         self.spawn_request = None;
         self.pending_reports.clear();
         for sub in &mut self.subagents {
@@ -721,6 +806,16 @@ impl Agent {
 
     /// Add the user's turn, if the conversation is idle.
     pub fn push_user(&mut self, text: &str, meta: UserMeta) -> bool {
+        self.push_user_with_images(text, meta, Vec::new())
+    }
+
+    /// Add the user's turn with the images that went with it.
+    pub fn push_user_with_images(
+        &mut self,
+        text: &str,
+        meta: UserMeta,
+        images: Vec<ImagePart>,
+    ) -> bool {
         let text = text.trim();
         if text.is_empty() || self.blocked() {
             return false;
@@ -732,6 +827,7 @@ impl Agent {
         });
         self.history.push(ApiMessage::User {
             content: text.to_owned(),
+            images,
         });
         true
     }
@@ -742,6 +838,16 @@ impl Agent {
     /// in the middle of — and is folded into the provider history by
     /// [`Agent::flush_injected`] once that run is done.
     pub fn inject_user(&mut self, text: &str, meta: UserMeta) -> bool {
+        self.inject_user_with_images(text, meta, Vec::new())
+    }
+
+    /// Take a message typed mid-run, with the images that went with it.
+    pub fn inject_user_with_images(
+        &mut self,
+        text: &str,
+        meta: UserMeta,
+        images: Vec<ImagePart>,
+    ) -> bool {
         let text = text.trim();
         if text.is_empty() || !self.blocked() {
             return false;
@@ -751,7 +857,7 @@ impl Agent {
             text: text.to_owned(),
             meta,
         });
-        self.injected.push_back((text.to_owned(), meta));
+        self.injected.push_back((text.to_owned(), meta, images));
         true
     }
 
@@ -762,8 +868,11 @@ impl Agent {
         if self.phase.is_some() || self.injected.is_empty() {
             return false;
         }
-        for (text, _) in self.injected.drain(..) {
-            self.history.push(ApiMessage::User { content: text });
+        for (text, _, images) in self.injected.drain(..) {
+            self.history.push(ApiMessage::User {
+                content: text,
+                images,
+            });
         }
         self.needs_reply = true;
         true
@@ -824,7 +933,10 @@ impl Agent {
             return;
         }
         for report in self.pending_reports.drain(..) {
-            self.history.push(ApiMessage::User { content: report });
+            self.history.push(ApiMessage::User {
+            content: report,
+            images: Vec::new(),
+        });
         }
     }
 
@@ -948,17 +1060,153 @@ impl Agent {
                     progressed = true;
                 }
             }
-            Some(Phase::Running { .. }) => progressed = self.poll_tool(session),
+            Some(Phase::Running {
+                waiting: Waiting::Script,
+                ..
+            }) => progressed = self.poll_script(session),
+            Some(Phase::Running { .. }) => {
+                progressed = if self.script_call_timed_out(session) {
+                    true
+                } else {
+                    self.poll_tool(session)
+                };
+            }
             _ => {}
         }
         progressed
+    }
+
+    /// Drive the running script: dispatch the calls it makes, or take its result.
+    fn poll_script(&mut self, session: Session<'_, '_>) -> bool {
+        let Some(run) = &self.script else {
+            return false;
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = run.job.events.try_recv() {
+            events.push(event);
+        }
+        let mut progressed = false;
+        for event in events {
+            progressed = true;
+            match event {
+                ScriptEvent::Call(call) => self.start_script_call(call, &mut *session),
+                ScriptEvent::Finished { result, console } => {
+                    self.finish_script(result, console, session);
+                    break;
+                }
+            }
+        }
+        progressed
+    }
+
+    /// Run one call the script asked for, through the same gates a direct call takes.
+    fn start_script_call(&mut self, call: script::ScriptCall, session: Session<'_, '_>) {
+        let Some(run) = self.script.as_mut() else {
+            return;
+        };
+        let inner = ApiToolCall {
+            id: format!("{SCRIPT_CALL_PREFIX}{}", call.id),
+            name: call.name,
+            arguments: call.arguments,
+        };
+        run.calls.push(ScriptRow {
+            name: inner.name.clone(),
+            label: call_label(&inner),
+            output: String::new(),
+            failed: false,
+        });
+        run.inner = Some((inner.clone(), call.id));
+        run.since = Some(std::time::Instant::now());
+        let turn = run.turn;
+        self.dispatch(inner, turn, session);
+    }
+
+    /// Fail the script's pending call when it has waited too long, so a hung command cannot
+    /// hold the conversation forever.
+    fn script_call_timed_out(&mut self, session: Session<'_, '_>) -> bool {
+        let Some(((inner, _), since)) = self
+            .script
+            .as_ref()
+            .and_then(|run| run.inner.clone().zip(run.since))
+        else {
+            return false;
+        };
+        if since.elapsed() < std::time::Duration::from_millis(script::MAX_CALL_MS) {
+            return false;
+        }
+        // A command can be interrupted; the other waits are only dropped.
+        if let Some(Phase::Running {
+            waiting: Waiting::Command { key, .. },
+            ..
+        }) = &self.phase
+            && let Some(access) = session.as_mut()
+        {
+            access.cancel(key);
+        }
+        if let Some(run) = self.script.as_mut() {
+            run.since = None;
+        }
+        let seconds = script::MAX_CALL_MS / 1_000;
+        self.answer_script(
+            &inner,
+            call_label(&inner),
+            format!("The tool did not answer within {seconds} seconds."),
+            true,
+        );
+        true
+    }
+
+    /// Take the script's result: it becomes the `run_script` tool result, and nothing the
+    /// script did in between enters the provider history.
+    fn finish_script(
+        &mut self,
+        result: Result<String, String>,
+        console: String,
+        session: Session<'_, '_>,
+    ) {        let Some(run) = self.script.take() else {
+            return;
+        };
+        self.phase = None;
+        let (text, failed) = match result {
+            Ok(payload) => (script::clamp_result(payload), false),
+            Err(problem) => (format!("The script failed: {problem}"), true),
+        };
+        if let Some(Turn::Script {
+            calls,
+            result: slot,
+            failed: flag,
+            console: logged,
+            ..
+        }) = self.turns.get_mut(run.turn)
+        {
+            *calls = run.calls;
+            *slot = Some(text.clone());
+            *flag = failed;
+            *logged = console;
+        }
+        self.history.push(ApiMessage::Tool {
+            tool_call_id: run.outer.id.clone(),
+            content: text,
+        });
+        self.advance(session);
     }
 
     /// Poll the running tool and move the turn on when it answers.
     fn poll_tool(&mut self, session: Session<'_, '_>) -> bool {
         enum Ready {
             Settle(String, String, bool),
+            /// Settle the tool call, then show the image to the model.
+            SettleImage {
+                label: String,
+                output: String,
+                image: ImagePart,
+            },
             WriteRemote(String, String),
+            ReadRemote {
+                path: String,
+                max: u64,
+                then: ReadThen,
+            },
         }
 
         let Some(Phase::Running {
@@ -971,6 +1219,7 @@ impl Agent {
         };
         let (call, turn) = (call.clone(), *turn);
         let ready = match waiting {
+            Waiting::Script => return false,
             Waiting::Command { key, then } => {
                 let (key, then) = (key.clone(), then.clone());
                 let (output, failure) = match session.as_ref() {
@@ -1025,7 +1274,7 @@ impl Agent {
                             visible.push_str(SUDO_HINT);
                         }
                         Ready::Settle(
-                            self.label(turn),
+                            self.turn_label(turn, &call),
                             command_result_text(&visible, exit_code, truncated),
                             exit_code.is_some_and(|code| code != 0) || refused_sudo,
                         )
@@ -1091,6 +1340,23 @@ impl Agent {
                             Ready::WriteRemote(path, content)
                         }
                     }
+                    CommandThen::ReadPatchFile { path, patch_path } => match output {
+                        Some(output) => Ready::ReadRemote {
+                            path,
+                            max: tools::MAX_FILE_READ_CHARS as u64,
+                            then: ReadThen::Patch {
+                                patch: output.stdout.clone(),
+                            },
+                        },
+                        None => Ready::Settle(
+                            format!("patch {path}"),
+                            format!(
+                                "Cannot read {patch_path}: {}",
+                                failure.unwrap_or_default()
+                            ),
+                            true,
+                        ),
+                    },
                 }
             }
             Waiting::Read { path, max, then } => {
@@ -1141,6 +1407,71 @@ impl Agent {
                     ReadThen::Diff { new, context } => {
                         let change = tools::diff_texts(&text, &new, context);
                         Ready::Settle(format!("diff {path}"), change, false)
+                    }
+                    ReadThen::Patch { patch } => {
+                        if content.truncated {
+                            Ready::Settle(
+                                format!("edit {path}"),
+                                format!("{path} is larger than the patch limit."),
+                                true,
+                            )
+                        } else {
+                            match tools::apply_unified_patch(&text, &patch) {
+                                Ok(updated) if updated == text => Ready::Settle(
+                                    format!("edit {path}"),
+                                    "The patch changed nothing.".to_owned(),
+                                    false,
+                                ),
+                                Ok(updated) => {
+                                    let diff = tools::diff_texts(
+                                        &text,
+                                        &updated,
+                                        tools::DIFF_CONTEXT_LINES_DEFAULT,
+                                    );
+                                    Ready::WriteRemote(path, format!("{updated}\u{0}{diff}"))
+                                }
+                                Err(error) => Ready::Settle(format!("edit {path}"), error, true),
+                            }
+                        }
+                    }
+                    ReadThen::Base64 => {
+                        let mut body = base64::engine::general_purpose::STANDARD.encode(&content.data);
+                        if content.truncated {
+                            body.push_str(
+                                "\n\n[Stopped at the base64 read limit; the file continues]",
+                            );
+                        }
+                        Ready::Settle(format!("read {path}"), body, false)
+                    }
+                    ReadThen::Image => {
+                        if content.truncated {
+                            Ready::Settle(
+                                format!("image {path}"),
+                                format!(
+                                    "{path} is larger than {} bytes.",
+                                    super::protocol::MAX_IMAGE_BYTES
+                                ),
+                                true,
+                            )
+                        } else if let Some(media_type) = super::protocol::image_media_type(&content.data)
+                        {
+                            Ready::SettleImage {
+                                label: format!("image {path}"),
+                                output: format!("The image {path} is shown to you now."),
+                                image: ImagePart {
+                                    media_type: media_type.to_owned(),
+                                    data: content.data.clone(),
+                                },
+                            }
+                        } else {
+                            Ready::Settle(
+                                format!("image {path}"),
+                                format!(
+                                    "{path} is not a PNG, JPEG, GIF or WebP image."
+                                ),
+                                true,
+                            )
+                        }
                     }
                 }
             }
@@ -1207,8 +1538,8 @@ impl Agent {
                 }
             }
             Waiting::Worker { events } => match events.try_recv() {
-                Ok(Ok(output)) => Ready::Settle(self.label(turn), output, false),
-                Ok(Err(error)) => Ready::Settle(self.label(turn), error, true),
+                Ok(Ok(output)) => Ready::Settle(self.turn_label(turn, &call), output, false),
+                Ok(Err(error)) => Ready::Settle(self.turn_label(turn, &call), error, true),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Ready::Settle(
                     self.label(turn),
                     "The tool stopped without an answer.".to_owned(),
@@ -1282,6 +1613,24 @@ impl Agent {
             Ready::Settle(label, output, failed) => {
                 self.phase = None;
                 self.settle(call, turn, label, output, failed, session);
+            }
+            Ready::ReadRemote { path, max, then } => {
+                self.start_read(call, turn, path, max, then, session);
+            }
+            Ready::SettleImage {
+                label,
+                output,
+                image,
+            } => {
+                self.settle(call.clone(), turn, label.clone(), output.clone(), false, session);
+                // A script decides what the model sees; an image it read stays out of the
+                // conversation until the model asks for it itself.
+                if !self.waiting_on(&call) {
+                    self.history.push(ApiMessage::User {
+                        content: label,
+                        images: vec![image],
+                    });
+                }
             }
             Ready::WriteRemote(target, payload) => {
                 // An edit packs the diff after a NUL so the file keeps its bytes.
@@ -1431,6 +1780,20 @@ impl Agent {
             .unwrap_or_default()
     }
 
+    /// The label of a call: its tool turn's when it has one, else the call's own.
+    ///
+    /// A script's calls have no tool turn of their own — they live on the script's card —
+    /// so the call itself names them.
+    fn turn_label(&self, turn: usize, call: &ApiToolCall) -> String {
+        self.turns
+            .get(turn)
+            .and_then(|turn| match turn {
+                Turn::Tool { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| call_label(call))
+    }
+
     /// Record a tool result and move on to the next call or the next reply.
     fn settle(
         &mut self,
@@ -1441,6 +1804,12 @@ impl Agent {
         failed: bool,
         session: Session<'_, '_>,
     ) {
+        // A call a script made is not part of the provider history: its result goes back to
+        // the sandbox, which decides what the model ever sees.
+        if self.waiting_on(&call) {
+            self.answer_script(&call, label, output, failed);
+            return;
+        }
         if let Some(Turn::Tool {
             label: turn_label,
             output: turn_output,
@@ -1464,6 +1833,52 @@ impl Agent {
             content: output,
         });
         self.advance(session);
+    }
+
+    /// Whether the script is waiting on this call.
+    fn waiting_on(&self, call: &ApiToolCall) -> bool {
+        self.script.as_ref().is_some_and(|run| {
+            run.inner
+                .as_ref()
+                .is_some_and(|(inner, _)| inner.id == call.id)
+        })
+    }
+
+    /// Hand a finished tool back to the script that asked for it and resume the script.
+    fn answer_script(&mut self, call: &ApiToolCall, label: String, output: String, failed: bool) {
+        let Some(run) = self.script.as_mut() else {
+            return;
+        };
+        let Some((_, id)) = run.inner.take() else {
+            return;
+        };
+        run.since = None;
+        if let Some(row) = run.calls.last_mut()
+            && row.name == call.name
+        {
+            row.label = label;
+            row.failed = failed;
+            row.output = output.clone();
+        }
+        // A successful call resolves to the tool's JSON result; a failed one rejects with
+        // the message, so `try { ... } catch` reads the way JavaScript expects.
+        let text = if failed {
+            output
+        } else {
+            serde_json::json!({ "ok": true, "text": output }).to_string()
+        };
+        run.job.reply(ScriptReply {
+            id,
+            ok: !failed,
+            text,
+        });
+        let outer = run.outer.clone();
+        let turn = run.turn;
+        self.phase = Some(Phase::Running {
+            call: outer,
+            turn,
+            waiting: Waiting::Script,
+        });
     }
 
     /// Run the next queued call, or ask the model again.
@@ -1549,13 +1964,21 @@ impl Agent {
 
     /// Run one call, or park the agent on whatever it needs.
     fn dispatch(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
+        // Nothing to approve in Plan mode: a call that changes something is refused before
+        // the user is asked about a tool the chat will not run.
+        if self.plan_blocks(&call.name) {
+            let label = call_label(&call);
+            self.settle(call, turn, label, PLAN_READ_ONLY.to_owned(), true, session);
+            return;
+        }
         match self.permission(&call.name) {
             Permission::Allow => {}
             Permission::Deny => {
+                let label = call_label(&call);
                 self.settle(
                     call,
                     turn,
-                    self.label(turn),
+                    label,
                     NOT_PERMITTED.to_owned(),
                     false,
                     session,
@@ -1564,7 +1987,7 @@ impl Agent {
             }
             Permission::Ask => {
                 self.phase = Some(Phase::Allowing {
-                    label: self.label(turn),
+                    label: call_label(&call),
                     call,
                     turn,
                 });
@@ -1604,12 +2027,20 @@ impl Agent {
         }
     }
 
+    /// Whether Plan mode forbids a call.
+    fn plan_blocks(&self, tool: &str) -> bool {
+        self.plan && !tools::plan_safe(tool)
+    }
+
     /// Whether a tool should be offered to the model for this session.
     ///
-    /// A tool exists, belongs to a scope this conversation loaded, and the host may use it.
-    /// That one answer decides both what the request carries and what the prompt names.
+    /// A tool exists, belongs to a scope this conversation loaded, the host may use it, and
+    /// — in Plan mode — it only reads. That one answer decides both what the request carries
+    /// and what the prompt names.
     pub fn offers_tool(&self, tool: &str) -> bool {
-        (tools::is_scope_tool(tool) || self.scopes.holds(tool)) && self.permission(tool) != Permission::Deny
+        (tools::is_scope_tool(tool) || self.scopes.holds(tool))
+            && self.permission(tool) != Permission::Deny
+            && (!self.plan || tools::plan_safe(tool))
     }
 
     /// Bring a scope's tools into the conversation.
@@ -1737,6 +2168,28 @@ impl Agent {
             );
             return;
         }
+        // Script mode offers one tool: everything else is called from inside the program.
+        // The calls a script makes are let through — they are what the sandbox asked for.
+        if self.script_mode && name != TOOL_RUN_SCRIPT && !self.waiting_on(&call) {
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                SCRIPT_MODE_ONLY.to_owned(),
+                true,
+                session,
+            );
+            return;
+        }
+        // Plan mode offers read-only tools, so a call that changes something can only come
+        // from an earlier turn or a mode switch made under a prompt: refuse it rather than
+        // trust the request to have been enough.
+        if self.plan_blocks(&name) {
+            let label = call_label(&call);
+            self.settle(call, turn, label, PLAN_READ_ONLY.to_owned(), true, session);
+            return;
+        }
 
         // A write, an edit or a delete leaves the map stale for that one path.
         if is_writing_tool(&name)
@@ -1763,6 +2216,7 @@ impl Agent {
         }
 
         match name.as_str() {
+            TOOL_RUN_SCRIPT => self.start_task_script(call, turn, &arguments, session),
             TOOL_LOAD_SCOPE => {
                 let asked = arguments["scope"].as_str().unwrap_or_default().to_owned();
                 let (output, failed) = match self.load_scope(&asked) {
@@ -1782,44 +2236,7 @@ impl Agent {
                 self.settle(call, turn, label, output, failed, session);
             }
             TOOL_ASK_USER => {
-                let questions = arguments["questions"]
-                    .as_array()
-                    .map(|questions| {
-                        questions
-                            .iter()
-                            .filter_map(|question| {
-                                let text = question["question"]
-                                    .as_str()
-                                    .map(str::trim)
-                                    .filter(|text| !text.is_empty())?;
-                                let options = question["options"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(Value::as_str)
-                                    .map(str::trim)
-                                    .filter(|option| !option.is_empty())
-                                    .map(str::to_owned)
-                                    .collect();
-                                Some(AgentQuestion {
-                                    text: text.to_owned(),
-                                    options,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|questions| !questions.is_empty())
-                    .unwrap_or_else(|| {
-                        let text = arguments["text"]
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|text| !text.is_empty())
-                            .unwrap_or("The agent needs your input.");
-                        vec![AgentQuestion {
-                            text: text.to_owned(),
-                            options: Vec::new(),
-                        }]
-                    });
+                let questions = asked_questions(&arguments);
                 self.phase = Some(Phase::Asking { call, questions });
             }
             TOOL_RUN_COMMAND => {
@@ -1949,6 +2366,68 @@ impl Agent {
         }
     }
 
+    /// Start a script in its sandbox. It reports back through [`Waiting::Script`], and the
+    /// calls it makes are dispatched like any other tool's.
+    fn start_task_script(
+        &mut self,
+        call: ApiToolCall,
+        turn: usize,
+        arguments: &Value,
+        session: Session<'_, '_>,
+    ) {
+        if self.script.is_some() {
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                "A script cannot start another script; call the tool itself.".to_owned(),
+                true,
+                session,
+            );
+            return;
+        }
+        let Some(code) = arguments["code"]
+            .as_str()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned)
+        else {
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                "The code argument was missing or empty.".to_owned(),
+                true,
+                session,
+            );
+            return;
+        };
+        if let Some(slot) = self.turns.get_mut(turn) {
+            *slot = Turn::Script {
+                code: code.clone(),
+                calls: Vec::new(),
+                result: None,
+                failed: false,
+                console: String::new(),
+            };
+        }
+        self.script = Some(ScriptRun {
+            outer: call.clone(),
+            turn,
+            inner: None,
+            calls: Vec::new(),
+            since: None,
+            job: script::spawn(&code),
+        });
+        self.phase = Some(Phase::Running {
+            call,
+            turn,
+            waiting: Waiting::Script,
+        });
+    }
+
     /// Run a tool a pane offered.
     ///
     /// The call becomes a command on the session's host, so it is approved the way a typed
@@ -1999,6 +2478,10 @@ impl Agent {
             TOOL_REMOTE_READ => {
                 let path =
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                if arguments["encoding"].as_str() == Some("base64") {
+                    self.start_read(call, turn, path, tools::MAX_BASE64_BYTES, ReadThen::Base64, session);
+                    return;
+                }
                 let max = arguments["maxChars"]
                     .as_u64()
                     .unwrap_or(32_000)
@@ -2046,6 +2529,19 @@ impl Agent {
                     path,
                     tools::MAX_FILE_READ_CHARS as u64,
                     ReadThen::View { start, lines },
+                    session,
+                );
+            }
+            TOOL_DEV_IMAGE => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                // One byte over the cap is enough to know the file is too big.
+                self.start_read(
+                    call,
+                    turn,
+                    path,
+                    super::protocol::MAX_IMAGE_BYTES as u64 + 1,
+                    ReadThen::Image,
                     session,
                 );
             }
@@ -2158,6 +2654,108 @@ impl Agent {
                     relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
                 let command = format!("rm -rf -- {} && echo removed", shell_quote(&path));
                 self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_STAT => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let command = tools::stat_command(&path);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_MOVE => {
+                let from =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let to = relative_remote(
+                    &self.cwd,
+                    arguments["destination"].as_str().unwrap_or_default(),
+                );
+                let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
+                let command = tools::move_command(&from, &to, overwrite);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_PATCH => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let patch = arguments["patch"].as_str().unwrap_or_default().trim().to_owned();
+                let patch_file = arguments["patchFile"].as_str().unwrap_or_default().trim();
+                if !patch.is_empty() {
+                    self.start_read(
+                        call,
+                        turn,
+                        path,
+                        tools::MAX_FILE_READ_CHARS as u64,
+                        ReadThen::Patch { patch },
+                        session,
+                    );
+                } else if !patch_file.is_empty() {
+                    let patch_path = relative_remote(&self.cwd, patch_file);
+                    let command = format!("cat {}", shell_quote(&patch_path));
+                    self.run_probe(
+                        call,
+                        turn,
+                        CommandThen::ReadPatchFile { path, patch_path },
+                        command,
+                        session,
+                    );
+                } else {
+                    let label = call_label(&call);
+                    self.settle(
+                        call,
+                        turn,
+                        label,
+                        "Pass patch or patchFile.".to_owned(),
+                        true,
+                        session,
+                    );
+                }
+            }
+            TOOL_REMOTE_ZIP_LIST => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let command = tools::zip_list_command(&path);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_ZIP_READ => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let entry = arguments["entry"].as_str().unwrap_or_default();
+                let command = tools::zip_read_command(&path, entry);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_REMOTE_ZIP_EXTRACT => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                let destination = relative_remote(
+                    &self.cwd,
+                    arguments["destination"].as_str().unwrap_or_default(),
+                );
+                let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
+                let command = tools::zip_extract_command(&path, &destination, overwrite);
+                self.run_probe(call, turn, CommandThen::Return, command, session);
+            }
+            TOOL_GIT_STATUS
+            | TOOL_GIT_DIFF
+            | TOOL_GIT_LOG
+            | TOOL_GIT_BRANCHES
+            | TOOL_GIT_COMMIT
+            | TOOL_GIT_CHECKOUT => {
+                let dir =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                match tools::git_command(name, arguments, &dir) {
+                    Some(command) => {
+                        self.run_probe(call, turn, CommandThen::Return, command, session)
+                    }
+                    None => {
+                        let label = call_label(&call);
+                        self.settle(
+                            call,
+                            turn,
+                            label,
+                            format!("{name} is not a git tool."),
+                            true,
+                            session,
+                        );
+                    }
+                }
             }
             TOOL_TERMINAL_READ => {
                 let screen = session
@@ -2495,6 +3093,8 @@ impl Agent {
         agent.session_allow = self.session_allow.clone();
         agent.session_deny = self.session_deny.clone();
         agent.allow_all = self.allow_all;
+        agent.plan = self.plan;
+        agent.script_mode = self.script_mode;
         agent.tools = self.tools.clone();
         agent.max_subagents = self.max_subagents;
         agent.push_user(prompt, UserMeta::default());
@@ -2886,6 +3486,17 @@ impl Agent {
     /// one the provider accepts: an assistant turn that asked for a tool must be followed by
     /// that tool's result, or the next request fails with a 400.
     pub fn stop(&mut self) {
+        // A script's own calls never enter the history, so the run is answered as one call.
+        if let Some(run) = self.script.take() {
+            run.job.stop();
+            self.queue.clear();
+            self.phase = None;
+            if let Some(Turn::Script { failed, .. }) = self.turns.get_mut(run.turn) {
+                *failed = true;
+            }
+            self.abandon_tool(run.outer, run.turn);
+            return;
+        }
         if let Some(spawn) = self.spawn_request.take() {
             self.abandon_tool(spawn.call, spawn.turn);
         }
@@ -3006,6 +3617,18 @@ impl Agent {
                     let body: String = output.chars().take(2_000).collect();
                     out.push_str(&format!("Tool {label}: {body}\n"));
                 }
+                Turn::Script {
+                    code,
+                    calls,
+                    result,
+                    ..
+                } => {
+                    out.push_str(&format!("Script ({} calls):\n{code}\n", calls.len()));
+                    if let Some(result) = result {
+                        let body: String = result.chars().take(2_000).collect();
+                        out.push_str(&format!("Result: {body}\n"));
+                    }
+                }
                 Turn::Denied(reason) => out.push_str(&format!("Denied: {reason}\n")),
                 Turn::Question { text, answer } => out.push_str(&format!(
                     "Question: {text}\nAnswer: {}\n",
@@ -3054,7 +3677,7 @@ impl Agent {
         let mut out = String::new();
         for message in &self.history[..cut] {
             match message {
-                ApiMessage::User { content } => out.push_str(&format!("User: {content}\n")),
+                ApiMessage::User { content, .. } => out.push_str(&format!("User: {content}\n")),
                 ApiMessage::Assistant {
                     content,
                     tool_calls,
@@ -3102,7 +3725,9 @@ impl Agent {
 /// Characters one provider message carries, tool calls included.
 fn message_chars(message: &ApiMessage) -> usize {
     match message {
-        ApiMessage::User { content } => content.len(),
+        ApiMessage::User { content, images } => {
+            content.len() + images.iter().map(|image| image.data.len() / 4).sum::<usize>()
+        }
         ApiMessage::Assistant {
             content,
             tool_calls,
@@ -3117,6 +3742,65 @@ fn message_chars(message: &ApiMessage) -> usize {
         }
         ApiMessage::Tool { content, .. } => content.len(),
     }
+}
+
+/// The questions an `ask_user` call asks.
+///
+/// The documented shape is `{ "questions": [{ "question", "options" }] }`, but a script
+/// makes the bare forms the natural ones: `tools.ask_user([{ question, options }])`,
+/// `tools.ask_user({ question })` or `tools.ask_user("…")`. Every shape a model writes is
+/// read here, so a real question never degrades to a card with no text and no options.
+fn asked_questions(arguments: &Value) -> Vec<AgentQuestion> {
+    let listed = &arguments["questions"];
+    let items: Vec<&Value> = match arguments {
+        Value::Array(items) => items.iter().collect(),
+        Value::String(_) => vec![arguments],
+        Value::Object(map) if map.contains_key("question") => vec![arguments],
+        Value::Object(_) => match listed {
+            Value::Array(items) => items.iter().collect(),
+            Value::String(_) => vec![listed],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let questions: Vec<AgentQuestion> = items
+        .into_iter()
+        .filter_map(|item| {
+            if let Some(text) = item.as_str().and_then(question_text) {
+                return Some(AgentQuestion {
+                    text,
+                    options: Vec::new(),
+                });
+            }
+            let text = item["question"].as_str().and_then(question_text)?;
+            let options = item["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(question_text)
+                .collect();
+            Some(AgentQuestion { text, options })
+        })
+        .collect();
+    if !questions.is_empty() {
+        return questions;
+    }
+    let text = arguments["text"]
+        .as_str()
+        .and_then(question_text)
+        .or_else(|| arguments.as_str().and_then(question_text))
+        .unwrap_or_else(|| QUESTION_FALLBACK.to_owned());
+    vec![AgentQuestion {
+        text,
+        options: Vec::new(),
+    }]
+}
+
+/// A trimmed, non-empty string.
+fn question_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// The label shown for a tool call.
@@ -3158,6 +3842,39 @@ pub fn call_label(call: &ApiToolCall) -> String {
         TOOL_REMOTE_EDIT | TOOL_LOCAL_EDIT | TOOL_DEV_EDIT => {
             format!("edit {}", arguments["path"].as_str().unwrap_or_default())
         }
+        TOOL_REMOTE_PATCH | TOOL_LOCAL_PATCH | TOOL_LOCAL_MULTI_EDIT => {
+            format!("patch {}", arguments["path"].as_str().unwrap_or_default())
+        }
+        TOOL_REMOTE_STAT => format!("stat {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_REMOTE_MOVE => format!(
+            "move {} → {}",
+            arguments["path"].as_str().unwrap_or_default(),
+            arguments["destination"].as_str().unwrap_or_default()
+        ),
+        TOOL_REMOTE_ZIP_LIST => format!(
+            "zip list {}",
+            arguments["path"].as_str().unwrap_or_default()
+        ),
+        TOOL_REMOTE_ZIP_READ => format!(
+            "zip read {}",
+            arguments["entry"].as_str().unwrap_or_default()
+        ),
+        TOOL_REMOTE_ZIP_EXTRACT => format!(
+            "zip extract {}",
+            arguments["path"].as_str().unwrap_or_default()
+        ),
+        TOOL_GIT_STATUS => "git status".to_owned(),
+        TOOL_GIT_DIFF => "git diff".to_owned(),
+        TOOL_GIT_LOG => "git log".to_owned(),
+        TOOL_GIT_BRANCHES => "git branches".to_owned(),
+        TOOL_GIT_COMMIT => format!(
+            "git commit {}",
+            arguments["message"].as_str().unwrap_or_default()
+        ),
+        TOOL_GIT_CHECKOUT => format!(
+            "git checkout {}",
+            arguments["branch"].as_str().unwrap_or_default()
+        ),
         TOOL_REMOTE_DELETE | TOOL_LOCAL_DELETE => {
             format!("delete {}", arguments["path"].as_str().unwrap_or_default())
         }
@@ -3169,6 +3886,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
             arguments["namePattern"].as_str().unwrap_or_default()
         ),
         TOOL_DEV_DIFF => format!("diff {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_DEV_IMAGE => format!(
+            "image {}",
+            arguments["path"].as_str().unwrap_or_default()
+        ),
         TOOL_LOCAL_RUN => format!(
             "local $ {}",
             arguments["command"].as_str().unwrap_or_default()
@@ -3178,9 +3899,6 @@ pub fn call_label(call: &ApiToolCall) -> String {
             arguments["path"].as_str().unwrap_or_default(),
             arguments["destination"].as_str().unwrap_or_default()
         ),
-        TOOL_LOCAL_MULTI_EDIT | TOOL_LOCAL_PATCH => {
-            format!("edit {}", arguments["path"].as_str().unwrap_or_default())
-        }
         TOOL_LOCAL_REPLACE => format!(
             "replace {}",
             arguments["pattern"].as_str().unwrap_or_default()
@@ -3236,6 +3954,11 @@ fn is_writing_tool(name: &str) -> bool {
             | TOOL_REMOTE_WRITE
             | TOOL_REMOTE_EDIT
             | TOOL_REMOTE_DELETE
+            | TOOL_REMOTE_MOVE
+            | TOOL_REMOTE_PATCH
+            | TOOL_REMOTE_ZIP_EXTRACT
+            | TOOL_GIT_COMMIT
+            | TOOL_GIT_CHECKOUT
             | TOOL_LOCAL_WRITE
             | TOOL_LOCAL_EDIT
             | TOOL_LOCAL_DELETE
@@ -3408,6 +4131,28 @@ pub fn turns_to_json(turns: &[Turn]) -> Vec<Value> {
                 "failed": failed
             }),
             Turn::Denied(reason) => serde_json::json!({ "role": "denied", "text": reason }),
+            Turn::Script {
+                code,
+                calls,
+                result,
+                failed,
+                console,
+            } => serde_json::json!({
+                "role": "script",
+                "code": code,
+                "calls": calls
+                    .iter()
+                    .map(|row| serde_json::json!({
+                        "name": row.name,
+                        "label": row.label,
+                        "output": row.output,
+                        "failed": row.failed
+                    }))
+                    .collect::<Vec<_>>(),
+                "result": result,
+                "failed": failed,
+                "console": console
+            }),
             Turn::Question { text, answer } => {
                 serde_json::json!({ "role": "question", "text": text, "answer": answer })
             }
@@ -3449,6 +4194,23 @@ pub fn turns_from_json(items: &[Value]) -> Vec<Turn> {
                     failed: item["failed"].as_bool().unwrap_or(false),
                 }),
                 "denied" => Some(Turn::Denied(text())),
+                "script" => Some(Turn::Script {
+                    code: item["code"].as_str().unwrap_or_default().to_owned(),
+                    calls: item["calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|row| ScriptRow {
+                            name: row["name"].as_str().unwrap_or_default().to_owned(),
+                            label: row["label"].as_str().unwrap_or_default().to_owned(),
+                            output: row["output"].as_str().unwrap_or_default().to_owned(),
+                            failed: row["failed"].as_bool().unwrap_or(false),
+                        })
+                        .collect(),
+                    result: item["result"].as_str().map(str::to_owned),
+                    failed: item["failed"].as_bool().unwrap_or(false),
+                    console: item["console"].as_str().unwrap_or_default().to_owned(),
+                }),
                 "question" => Some(Turn::Question {
                     text: text(),
                     answer: item["answer"].as_str().map(str::to_owned),
@@ -3525,8 +4287,22 @@ pub fn history_to_json(messages: &[ApiMessage]) -> Vec<Value> {
     messages
         .iter()
         .map(|message| match message {
-            ApiMessage::User { content } => {
-                serde_json::json!({ "role": "user", "content": content })
+            ApiMessage::User { content, images } => {
+                let mut stored = serde_json::json!({ "role": "user", "content": content });
+                if !images.is_empty() {
+                    stored["images"] = Value::Array(
+                        images
+                            .iter()
+                            .map(|image| {
+                                serde_json::json!({
+                                    "mediaType": image.media_type,
+                                    "data": base64::engine::general_purpose::STANDARD.encode(&image.data)
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                stored
             }
             ApiMessage::Assistant {
                 content,
@@ -3569,6 +4345,22 @@ pub fn history_from_json(items: &[Value]) -> Vec<ApiMessage> {
         .filter_map(|item| match item["role"].as_str()? {
             "user" => Some(ApiMessage::User {
                 content: item["content"].as_str().unwrap_or_default().to_owned(),
+                images: item["images"]
+                    .as_array()
+                    .map(|images| {
+                        images
+                            .iter()
+                            .filter_map(|image| {
+                                Some(ImagePart {
+                                    media_type: image["mediaType"].as_str()?.to_owned(),
+                                    data: base64::engine::general_purpose::STANDARD
+                                        .decode(image["data"].as_str()?)
+                                        .ok()?,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             "assistant" => Some(ApiMessage::Assistant {
                 content: item["content"].as_str().unwrap_or_default().to_owned(),
@@ -3602,6 +4394,9 @@ pub fn history_from_json(items: &[Value]) -> Vec<ApiMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Polls a running script may take before the test calls it stuck.
+    const SCRIPT_POLL_STEPS: usize = 10_000;
 
     #[test]
     fn a_wrapped_command_reports_status_and_directory() {
@@ -3674,7 +4469,7 @@ mod tests {
                 (agent.history.get(1), agent.history.get(2)),
                 (
                     Some(ApiMessage::Assistant { .. }),
-                    Some(ApiMessage::User { content })
+                    Some(ApiMessage::User { content, .. })
                 ) if content == "and check /etc too"
             ),
             "history: {:?}",
@@ -3762,6 +4557,7 @@ mod tests {
         agent.history = vec![
             ApiMessage::User {
                 content: "go".to_owned(),
+                images: Vec::new(),
             },
             ApiMessage::Assistant {
                 content: String::new(),
@@ -3996,6 +4792,292 @@ mod tests {
         assert!(agent.needs_reply);
     }
 
+    /// Answer every tool a running script asks for until the run is over.
+    fn drive_script(agent: &mut Agent, fake: &mut FakeSession) {
+        let mut session: Option<&mut dyn SessionAccess> = Some(fake);
+        for _ in 0..SCRIPT_POLL_STEPS {
+            if !agent.blocked() {
+                return;
+            }
+            agent.poll(&mut session);
+            std::thread::yield_now();
+        }
+        panic!("the script never finished");
+    }
+
+    /// Start a script the way the model does.
+    fn start_script(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut *fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: serde_json::json!({ "code": code }).to_string(),
+                },
+                &mut session,
+            );
+        }
+        drive_script(agent, fake);
+    }
+
+    #[test]
+    fn a_script_runs_its_calls_and_answers_with_one_result() {
+        let mut agent = Agent::new();
+        agent.now_ms = 1_700_000_000_000;
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "const a = await tools.get_current_time({});\n\
+             const b = await tools.get_current_time({});\n\
+             return { stamps: [a.text, b.text] };",
+        );
+        let Some(Turn::Script { calls, result, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|row| !row.failed && !row.output.is_empty()));
+        let result = result.clone().expect("the script returned");
+        assert!(result.contains("1700000000000"), "{result}");
+        // The script's own calls stay out of the provider history: the model reads one result.
+        let answers = agent
+            .history
+            .iter()
+            .filter(|message| matches!(message, ApiMessage::Tool { .. }))
+            .count();
+        assert_eq!(answers, 1, "{:?}", agent.history);
+        assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn a_script_that_throws_answers_with_its_error() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_script(&mut agent, &mut fake, "throw new Error('nope');");
+        let Some(Turn::Script { failed, result, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed);
+        let result = result.clone().expect("the failure is recorded");
+        assert!(result.contains("nope"), "{result}");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content.contains("nope")
+        ));
+    }
+
+    #[test]
+    fn a_script_call_that_hangs_times_out() {
+        let mut agent = Agent::new();
+        agent
+            .scopes
+            .load(scopes::find("host-files").expect("the file scope"));
+        let mut fake = FakeSession::default();
+        // Start the script without driving it, so the call can be left unanswered.
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: serde_json::json!({
+                        "code": "await tools.dev_grep_search({ pattern: 'x', path: '/' });"
+                    })
+                    .to_string(),
+                },
+                &mut session,
+            );
+        }
+        // Poll until the sandbox hands the call over; the session never answers it.
+        for _ in 0..SCRIPT_POLL_STEPS {
+            if matches!(agent.phase, Some(Phase::Running { waiting: Waiting::Command { .. }, .. }))
+            {
+                break;
+            }
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.poll(&mut session);
+            std::thread::yield_now();
+        }
+        let command_key = agent.keys.probe.clone();
+        assert!(
+            matches!(agent.phase, Some(Phase::Running { waiting: Waiting::Command { .. }, .. })),
+            "the call is waiting on its command"
+        );
+        // Pretend the wait started before the limit.
+        let run = agent.script.as_mut().expect("the script is running");
+        run.since = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_millis(script::MAX_CALL_MS + 1),
+        );
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            assert!(agent.poll(&mut session), "the timeout looked at the call");
+        }
+        assert!(
+            fake.cancelled.iter().any(|key| *key == command_key),
+            "the hung command is stopped: {:?}",
+            fake.cancelled
+        );
+        assert!(
+            agent
+                .script
+                .as_ref()
+                .is_some_and(|run| run.inner.is_none()),
+            "the call was answered to the script"
+        );
+        assert!(
+            matches!(agent.phase, Some(Phase::Running { waiting: Waiting::Script, .. })),
+            "the sandbox holds the turn again"
+        );
+        drive_script(&mut agent, &mut fake);
+        let Some(Turn::Script { result, failed, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed, "{result:?}");
+        let result = result.clone().expect("the failure is recorded");
+        assert!(result.contains("did not answer within"), "{result}");
+    }
+
+    #[test]
+    fn a_script_cannot_start_another_script() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "await tools.run_script({ code: 'return 1;' });",
+        );
+        let Some(Turn::Script { calls, failed, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed, "the rejection ends the run");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].failed);
+        assert!(
+            calls[0].output.contains("cannot start another script"),
+            "{}",
+            calls[0].output
+        );
+    }
+
+    #[test]
+    fn plan_mode_offers_run_script_and_refuses_what_it_would_change() {
+        let mut agent = Agent::new();
+        agent.plan = true;
+        assert!(agent.offers_tool(TOOL_RUN_SCRIPT));
+        when_offered(&mut agent, TOOL_REMOTE_WRITE);
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "await tools.remote_fs_write_file({ path: '/tmp/x', content: 'hi' });",
+        );
+        let Some(Turn::Script { calls, failed, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].output.contains(PLAN_READ_ONLY), "{}", calls[0].output);
+    }
+
+    #[test]
+    fn script_mode_refuses_a_tool_call_that_does_not_come_from_a_script() {
+        let mut agent = Agent::new();
+        agent.script_mode = true;
+        agent.now_ms = 1_700_000_000_000;
+        let mut fake = FakeSession::default();
+        let output = run_tool(&mut agent, &mut fake, TOOL_CURRENT_TIME, "{}");
+        assert!(output.contains("script mode"), "{output}");
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Tool { failed: true, .. })
+        ));
+
+        // The same tool runs when the script asks for it.
+        let mut scripted = Agent::new();
+        scripted.script_mode = true;
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut scripted,
+            &mut fake,
+            "const now = await tools.get_current_time({});\nreturn now.text.length;",
+        );
+        assert!(matches!(
+            scripted.turns.last(),
+            Some(Turn::Script { failed: false, .. })
+        ));
+    }
+
+    #[test]
+    fn stopping_a_script_answers_the_one_call_and_leaves_the_history_valid() {
+        let mut agent = Agent::new();
+        let call = ApiToolCall {
+            id: "c1".to_owned(),
+            name: TOOL_RUN_SCRIPT.to_owned(),
+            arguments: serde_json::json!({ "code": "await tools.get_current_time({});" })
+                .to_string(),
+        };
+        agent.history.push(ApiMessage::Assistant {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![call.clone()],
+        });
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(call, &mut session);
+        }
+        agent.stop();
+        assert!(!agent.blocked());
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Script { failed: true, .. })
+        ));
+        // The history stays one the provider accepts: the call is answered once.
+        assert_eq!(agent.history.len(), 2, "{:?}", agent.history);
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == STOPPED_BY_USER
+        ));
+    }
+
+    #[test]
+    fn ask_user_is_read_from_every_shape_a_model_writes() {
+        let ask = |arguments: &str| {
+            let mut agent = Agent::new();
+            let mut session: Option<&mut dyn SessionAccess> = None;
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_ASK_USER.to_owned(),
+                    arguments: arguments.to_owned(),
+                },
+                &mut session,
+            );
+            match &agent.phase {
+                Some(Phase::Asking { questions, .. }) => questions.clone(),
+                _ => panic!("expected a question card"),
+            }
+        };
+
+        // A bare array, which is what a script writes as `tools.ask_user([...])`.
+        let questions = ask(
+            r#"[{"question":"Which host?","options":["dev","prod"]},{"question":"Then what?"}]"#,
+        );
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].text, "Which host?");
+        assert_eq!(questions[0].options, ["dev", "prod"]);
+        assert_eq!(questions[1].text, "Then what?");
+        assert_eq!(ask(r#"{"question":"Which file?"}"#)[0].text, "Which file?");
+        assert_eq!(ask(r#""Which host?""#)[0].text, "Which host?");
+        // The documented shape and the old single text keep working.
+        assert_eq!(ask(r#"{"questions":[{"question":"Why?"}]}"#)[0].text, "Why?");
+        assert_eq!(ask(r#"{"text":"Really?"}"#)[0].text, "Really?");
+        // Nothing usable still asks something the user can answer.
+        assert_eq!(ask("{}")[0].text, QUESTION_FALLBACK);
+    }
+
     #[test]
     fn ask_user_waits_for_every_question_before_continuing() {
         let mut agent = Agent::new();
@@ -4178,7 +5260,8 @@ mod tests {
         assert_eq!(
             agent.history.first(),
             Some(&ApiMessage::User {
-                content: "question 2".to_owned()
+                content: "question 2".to_owned(),
+                images: Vec::new(),
             }),
             "the kept tail starts at the first message that stays"
         );
@@ -4578,6 +5661,64 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_offers_reads_and_refuses_what_changes_something() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_REMOTE_FS),
+            Value::Bool(true),
+        )]));
+        agent.scopes.load(scopes::find("host-files").unwrap());
+        agent.plan = true;
+        assert!(agent.offers_tool(TOOL_DEV_VIEW));
+        assert!(!agent.offers_tool(TOOL_DEV_EDIT));
+        assert!(!agent.offers_tool(TOOL_RUN_COMMAND));
+        assert!(agent.offers_tool(TOOL_LOAD_SCOPE));
+
+        let mut fake = FakeSession::default();
+        fake.contents
+            .insert("/srv/app/main.rs".to_owned(), "fn main() {}\n".to_owned());
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.cwd = "/srv/app".to_owned();
+        // A call that changes something is answered, not run, even though this host would
+        // allow it in Agent mode.
+        agent.begin_tool(
+            ApiToolCall {
+                id: "edit".to_owned(),
+                name: TOOL_DEV_EDIT.to_owned(),
+                arguments: r#"{"path":"main.rs","oldText":"main","newText":"start"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(
+            matches!(
+                agent.turns.last(),
+                Some(Turn::Tool { failed: true, output, .. }) if output == PLAN_READ_ONLY
+            ),
+            "{:?}",
+            agent.turns.last()
+        );
+        // Reading still answers.
+        agent.begin_tool(
+            ApiToolCall {
+                id: "view".to_owned(),
+                name: TOOL_DEV_VIEW.to_owned(),
+                arguments: r#"{"path":"main.rs"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(
+            matches!(agent.turns.last(), Some(Turn::Tool { failed: false, .. })),
+            "{:?}",
+            agent.turns.last()
+        );
+
+        // And a sub-agent works under the same restriction.
+        let index = agent.begin_subagent("look", "read main.rs");
+        assert!(agent.subagents[index].agent.plan);
+        assert!(!agent.subagents[index].agent.offers_tool(TOOL_DEV_EDIT));
+    }
+
+    #[test]
     fn the_scope_tools_walk_the_graph_and_carry_the_tools_along() {
         let mut agent = Agent::new();
         agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
@@ -4699,6 +5840,8 @@ mod tests {
         typed: String,
         listing: Option<crate::files::SftpListing>,
         contents: std::collections::HashMap<String, String>,
+        /// Raw bytes for files whose content is not text.
+        blobs: std::collections::HashMap<String, Vec<u8>>,
         commands: Vec<(String, String)>,
         /// What each `exec_input` wrote to stdin.
         stdin: Vec<String>,
@@ -4756,6 +5899,12 @@ mod tests {
         fn remove(&mut self, _path: &str, _is_dir: bool) {}
         fn chmod(&mut self, _path: &str, _mode: u32) {}
         fn read(&mut self, path: &str, _max_bytes: u64) -> Option<crate::files::FileContent> {
+            if let Some(data) = self.blobs.get(path) {
+                return Some(crate::files::FileContent {
+                    data: data.clone(),
+                    truncated: false,
+                });
+            }
             self.contents
                 .get(path)
                 .map(|text| crate::files::FileContent {
@@ -4922,6 +6071,105 @@ mod tests {
             output,
             "127.0.0.1 localhost
 "
+        );
+    }
+
+    #[test]
+    fn an_image_tool_shows_the_model_the_picture() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.blobs.insert(
+            "/tmp/a.png".to_owned(),
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1],
+        );
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_DEV_IMAGE,
+            r#"{"path":"/tmp/a.png"}"#,
+        );
+        assert!(output.contains("is shown to you"), "{output}");
+        match agent.history.last() {
+            Some(ApiMessage::User { images, .. }) => {
+                assert_eq!(images.len(), 1, "{images:?}");
+                assert_eq!(images[0].media_type, "image/png");
+            }
+            other => panic!("expected the image message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stored_history_keeps_attached_images() {
+        let messages = vec![ApiMessage::User {
+            content: "look".to_owned(),
+            images: vec![ImagePart {
+                media_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            }],
+        }];
+        let stored = history_to_json(&messages);
+        assert_eq!(stored[0]["images"][0]["data"], "AQID");
+        assert_eq!(history_from_json(&stored), messages);
+    }
+
+    #[test]
+    fn a_remote_read_can_answer_in_base64() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.contents.insert("/bin/tool".to_owned(), "hi".to_owned());
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_REMOTE_READ,
+            r#"{"path":"/bin/tool","encoding":"base64"}"#,
+        );
+        assert_eq!(output, "aGk=");
+    }
+
+    #[test]
+    fn a_patch_file_is_read_then_applied_to_the_target() {
+        let mut agent = Agent::new();
+        when_offered(&mut agent, TOOL_REMOTE_PATCH);
+        let mut fake = FakeSession::default();
+        fake.contents
+            .insert("/srv/app/main.rs".to_owned(), "one\ntwo\n".to_owned());
+        fake.answers.insert(
+            PROBE_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "@@ -1,2 +1,2 @@\n one\n-two\n+three\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_REMOTE_PATCH.to_owned(),
+                arguments: r#"{"path":"/srv/app/main.rs","patchFile":"/srv/app/fix.diff"}"#
+                    .to_owned(),
+            },
+            &mut session,
+        );
+        for _ in 0..4 {
+            agent.poll(&mut session);
+        }
+        assert!(
+            fake.commands
+                .iter()
+                .any(|(_, command)| command == "cat '/srv/app/fix.diff'"),
+            "{:?}",
+            fake.commands
+        );
+        let write = fake.writes.last().cloned();
+        assert_eq!(
+            write.as_ref().map(|(path, _)| path.as_str()),
+            Some("/srv/app/main.rs")
+        );
+        assert!(
+            write.is_some_and(|(_, content)| content == b"one\nthree\n"),
+            "{:?}",
+            fake.writes
         );
     }
 
@@ -5476,7 +6724,7 @@ mod tests {
         // The answer joins the history once the conversation is between turns.
         agent.poll(&mut session);
         assert!(
-            matches!(agent.history.last(), Some(ApiMessage::User { content }) if content.contains("api.service is failing")),
+            matches!(agent.history.last(), Some(ApiMessage::User { content, .. }) if content.contains("api.service is failing")),
             "{:?}",
             agent.history
         );
