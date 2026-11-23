@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Keep a chat answering after the agent looks at a picture: the picture travelled to the model
+  before the answer to the call that read it, so the next request was refused with "an assistant
+  message with 'tool_calls' must be followed by tool messages". A picture now arrives after every
+  call of the turn is answered, and one a script read never reaches the conversation at all, since
+  the script's single result is what the model reads.
+
 ## [2.0.19] - 2026-11-23
 
 ### Changed

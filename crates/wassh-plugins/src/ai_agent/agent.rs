@@ -716,6 +716,9 @@ pub struct Agent {
     /// Answers from sub-agents, held until the conversation is between turns so a tool
     /// call of its own is never separated from its result.
     pending_reports: Vec<String>,
+    /// Pictures read by tools, held until every call of the turn is answered so the image
+    /// message lands after the last tool result rather than in the middle of them.
+    shown_images: Vec<(String, ImagePart)>,
     /// The script this conversation is running, if any.
     script: Option<ScriptRun>,
     /// Whether the tools are offered as a script API instead of one schema per tool.
@@ -795,6 +798,7 @@ impl Agent {
         self.script = None;
         self.spawn_request = None;
         self.pending_reports.clear();
+        self.shown_images.clear();
         for sub in &mut self.subagents {
             if sub.running() {
                 sub.agent.stop();
@@ -1622,15 +1626,14 @@ impl Agent {
                 output,
                 image,
             } => {
-                self.settle(call.clone(), turn, label.clone(), output.clone(), false, session);
                 // A script decides what the model sees; an image it read stays out of the
-                // conversation until the model asks for it itself.
-                if !self.waiting_on(&call) {
-                    self.history.push(ApiMessage::User {
-                        content: label,
-                        images: vec![image],
-                    });
+                // conversation until the model asks for it itself. Both reads happen before
+                // settling, since answering the script clears the call it was waiting on.
+                let scripted = self.waiting_on(&call);
+                if !scripted {
+                    self.shown_images.push((label.clone(), image));
                 }
+                self.settle(call, turn, label, output, false, session);
             }
             Ready::WriteRemote(target, payload) => {
                 // An edit packs the diff after a NUL so the file keeps its bytes.
@@ -1886,6 +1889,15 @@ impl Agent {
         if let Some(next) = self.queue.pop_front() {
             self.begin_tool(next, session);
         } else {
+            // A picture a tool read joins the conversation only once every call of the turn
+            // is answered: the provider wants an assistant turn's calls answered before
+            // anything else, and a picture in between would leave them unanswered.
+            for (content, image) in std::mem::take(&mut self.shown_images) {
+                self.history.push(ApiMessage::User {
+                    content,
+                    images: vec![image],
+                });
+            }
             self.needs_reply = true;
         }
     }
@@ -3486,6 +3498,8 @@ impl Agent {
     /// one the provider accepts: an assistant turn that asked for a tool must be followed by
     /// that tool's result, or the next request fails with a 400.
     pub fn stop(&mut self) {
+        // A picture the stopped turn was going to show is no longer owed.
+        self.shown_images.clear();
         // A script's own calls never enter the history, so the run is answered as one call.
         if let Some(run) = self.script.take() {
             run.job.stop();
@@ -6096,6 +6110,124 @@ mod tests {
             }
             other => panic!("expected the image message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_picture_a_script_reads_stays_out_of_the_provider_history() {
+        let mut agent = Agent::new();
+        agent
+            .scopes
+            .load(scopes::find("host-files").expect("the file scope"));
+        let mut fake = FakeSession::default();
+        fake.blobs
+            .insert("/tmp/inbox.png".to_owned(), png_bytes());
+        start_script(
+            &mut agent,
+            &mut fake,
+            "const r = await tools.dev_view_image({ path: '/tmp/inbox.png' });\n\
+             return { text: r.text };",
+        );
+        // The picture belongs to the script: the model reads the one result instead, so no
+        // message is left between the script call and the answer to it.
+        assert!(
+            agent
+                .history
+                .iter()
+                .all(|message| !matches!(message, ApiMessage::User { .. })),
+            "{:?}",
+            agent.history
+        );
+        assert!(
+            matches!(
+                agent.history.last(),
+                Some(ApiMessage::Tool { content, .. }) if content.contains("is shown to you")
+            ),
+            "{:?}",
+            agent.history
+        );
+        assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn a_picture_read_between_two_calls_waits_for_both_answers() {
+        let mut agent = Agent::new();
+        agent.app_allow = vec!["pwd".to_owned()];
+        when_offered(&mut agent, TOOL_DEV_IMAGE);
+        let mut fake = FakeSession::default();
+        fake.blobs.insert("/tmp/a.png".to_owned(), png_bytes());
+        agent.turns.push(Turn::Assistant {
+            text: String::new(),
+            stopped: false,
+        });
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.finish_reply(
+                0,
+                Ok(Completion {
+                    text: String::new(),
+                    tool_calls: vec![
+                        ApiToolCall {
+                            id: "image".to_owned(),
+                            name: TOOL_DEV_IMAGE.to_owned(),
+                            arguments: r#"{"path":"/tmp/a.png"}"#.to_owned(),
+                        },
+                        ApiToolCall {
+                            id: "command".to_owned(),
+                            name: TOOL_RUN_COMMAND.to_owned(),
+                            arguments: r#"{"command":"pwd"}"#.to_owned(),
+                        },
+                    ],
+                    ..Completion::default()
+                }),
+                &mut session,
+            );
+            // The picture answers first, while the command is still out.
+            agent.poll(&mut session);
+        }
+        // The image message waits so the command's own result follows the call it answers.
+        assert!(
+            matches!(agent.history.last(), Some(ApiMessage::Tool { tool_call_id, .. }) if tool_call_id == "image"),
+            "{:?}",
+            agent.history
+        );
+        assert!(
+            agent
+                .shown_images
+                .iter()
+                .any(|(content, _)| content.contains("/tmp/a.png")),
+            "the picture is not held: {:?}",
+            agent.history
+        );
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "/srv/app\n__WASSH_STATUS:0__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.poll(&mut session);
+        }
+        // Both calls are answered before the picture joins the conversation.
+        assert!(
+            matches!(
+                &agent.history[agent.history.len() - 2],
+                ApiMessage::Tool { tool_call_id, .. } if tool_call_id == "command"
+            ),
+            "{:?}",
+            agent.history
+        );
+        match agent.history.last() {
+            Some(ApiMessage::User { images, .. }) => assert_eq!(images.len(), 1),
+            other => panic!("expected the image message, got {other:?}"),
+        }
+    }
+
+    /// A one-pixel PNG: the header is what `dev_view_image` reads the type from.
+    fn png_bytes() -> Vec<u8> {
+        vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1]
     }
 
     #[test]

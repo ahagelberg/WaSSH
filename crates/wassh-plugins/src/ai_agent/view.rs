@@ -5207,10 +5207,9 @@ impl Plugin for AiAgent {
                 && self.editing.is_none()
                 && let Some(pinned) =
                     self.pinned_bubble(ui, palette, scroll.inner_rect, &reply.bubbles)
+                && pinned.clicked
             {
-                if pinned.clicked {
-                    self.edit_prompt(pinned.index);
-                }
+                self.edit_prompt(pinned.index);
             }
         }
         if let Some((index, text)) = reply.submitted {
