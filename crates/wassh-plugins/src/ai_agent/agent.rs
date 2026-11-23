@@ -4813,8 +4813,11 @@ mod tests {
             if !agent.blocked() {
                 return;
             }
-            agent.poll(&mut session);
-            std::thread::yield_now();
+            if !agent.poll(&mut session) {
+                // The sandbox runs on its own thread: give it the processor rather than
+                // spending the poll budget before it has started.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         panic!("the script never finished");
     }
