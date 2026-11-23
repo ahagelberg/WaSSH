@@ -987,7 +987,8 @@ the script rather than back through the conversation: filter, join, compare and 
 results there. Spend real effort on shrinking what you return: filter down to the lines \
 that answer the question, sort and de-duplicate them, and compact, count or summarise the \
 rest instead of dumping raw output — that result is all the model sees, so keep it as \
-small as the answer allows. Callable now:",
+small as the answer allows. Every tool the guidance below names is called the same way: from \
+a script, never as a tool of the turn. Callable now:",
                     super::script::MAX_EXEC_MS / 1_000,
                     super::script::MAX_CALLS,
                     super::script::MAX_CALL_MS / 1_000
@@ -2743,6 +2744,9 @@ small as the answer allows. Callable now:",
             .replace("{root}", &root)
             .replace("{files}", &super::map::MAX_MAPPED_FILES.to_string());
         let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt);
+        // The pass is a numbered procedure of direct calls, so it runs with the tools of its
+        // scopes rather than the one script tool a script-mode chat sends.
+        self.agent.subagents[index].agent.script_mode = false;
         match self.request_for(Some(index), settings, host, environment) {
             Some(request) => {
                 if let Some(sub) = self.agent.subagents.get_mut(index) {
@@ -7947,6 +7951,12 @@ mod tests {
             prompt.contains("- run_command(command: string"),
             "{prompt}"
         );
+        // The guidance names tools the way a chat without scripts does: say that a script
+        // calls them, or the model calls one of them as a tool of the turn and is refused.
+        assert!(
+            prompt.contains("Every tool the guidance below names is called the same way"),
+            "{prompt}"
+        );
         // The root's tools are the only ones loaded, so nothing of a scope shows up.
         assert!(!prompt.contains("- dev_grep_search("), "{prompt}");
     }
@@ -8323,6 +8333,50 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("/srv/app"), "{prompt}");
+    }
+
+    #[test]
+    fn a_mapping_pass_calls_tools_directly_in_a_script_mode_chat() {
+        const CHAT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        const MODELS: &str = "{\"data\":[{\"id\":\"test-model\"}]}";
+        let (base_url, _requests) = provider(CHAT, MODELS);
+        let mut settings: serde_json::Map<String, Value> = [(
+            PROVIDERS_KEY.to_owned(),
+            json!([{ "id": "local", "name": "Local", "protocol": "openai",
+                     "baseUrl": base_url, "models": ["test-model"] }]),
+        )]
+        .into_iter()
+        .collect();
+        let mut plugin = AiAgent::default();
+        plugin.agent.script_mode = true;
+        let ctx = egui::Context::default();
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        plugin.agent.map = super::super::map::EnvMap::parse(
+            "/srv/app",
+            1,
+            "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
+        );
+        plugin.map_deep_wanted = true;
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+
+        let run = plugin
+            .map_deep
+            .as_ref()
+            .unwrap_or_else(|| panic!("the mapping pass did not start: {:?}", plugin.error));
+        // The task is a numbered procedure — look at the map, read the files, answer with
+        // one object — so the pass keeps the tools of its scopes rather than one script tool.
+        assert!(
+            !plugin.agent.subagents[run.subagent].agent.script_mode,
+            "the mapping agent was left in script mode"
+        );
+        assert!(
+            plugin.agent.subagents[run.subagent]
+                .prompt
+                .contains("Call env_overview with no arguments"),
+            "{:?}",
+            plugin.agent.subagents[run.subagent].prompt
+        );
     }
 
     #[test]

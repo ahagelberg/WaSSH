@@ -10,6 +10,12 @@
 
 ### Fixed
 
+- Map the project in a chat that calls its tools from scripts: the pass ran its sub-agent in
+  script mode too, so the steps it is given — look at the map, read the chosen files, answer with
+  one object — were tools the sub-agent did not have, and the pass came back with nothing. The
+  pass now runs with the tools of its scopes.
+- Say in the script-mode prompt that the tools the guidelines name are called from a script, so
+  the agent stops trying them as tools of the turn and being refused.
 - Keep a chat answering after the agent looks at a picture: the picture travelled to the model
   before the answer to the call that read it, so the next request was refused with "an assistant
   message with 'tool_calls' must be followed by tool messages". A picture now arrives after every
