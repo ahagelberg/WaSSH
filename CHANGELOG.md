@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.0.19] - 2026-11-23
+
+### Changed
+
+- Queue several messages to the AI agent instead of one: press Alt+Enter to hold a message behind
+  the answer that is still running. The composer lists each held message on a row of its own, every
+  row has its own **Edit** and close button, and the messages go out one at a time in the order they
+  were written. The queue belongs to the conversation it was written in and is dropped when another
+  chat opens.
+
+### Fixed
+
+- Send the sudo password with Enter: the password card takes the keyboard as soon as it appears, so
+  the key no longer disappears into the shell behind it and **Continue** does not have to be clicked.
+- Map the project by itself: when the agent asks what it knows about the project and nothing is
+  mapped yet, the scan and the description pass start on their own instead of waiting to be asked
+  again. A pass left over from a chat that was closed no longer blocks the next one, and a scan that
+  finds no files says so instead of leaving the pass waiting.
+
 ## [2.0.18] - 2026-11-23
 
 ### Added
@@ -109,22 +128,12 @@
 - Name an AI chat by the model's digest of its first prompt instead of the first line of that
   prompt. A chat filed before its digest arrives keeps the request and takes the name when it
   lands, and a title the pane had taken from the prompt is asked for again.
-- Queue several messages instead of one: Alt+Enter holds each behind the run in flight, the composer
-  lists them as their own rows, each with its own Edit and ✕, and they go out one at a time in the
-  order they were written. The queue belongs to the conversation it was written in and is dropped
-  when another chat opens.
 - Lead the agent's guidance with the Graph scope once the development tools are loaded but the map
   is not, and name the scope to load when the host's file tools are still out of reach instead of
   letting it reach for `cat`, `grep` and `sed`.
 
 ### Fixed
 
-- Start the map on its own when a graph tool is asked for: an answer from a tree that is not
-  walked starts the scan and follows it with the mapping pass, a pass left over from a chat that is
-  gone no longer blocks the next one, and a scan that finds nothing says so instead of leaving the
-  pass waiting behind it.
-- Send the sudo password on Enter: the card takes the keyboard when it appears, so the shell behind
-  it no longer gets the key, and the field's own Enter handling is read before the field takes it.
 - Read the age a scan prints. `find -printf %T@` writes the timestamp with a fraction too, so
   every file line was thrown away and the map came out empty: the Graph popup said nothing was
   mapped, `env_search` and `env_outline` answered nothing, and a mapping pass had nothing to
