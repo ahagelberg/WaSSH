@@ -8318,7 +8318,10 @@ mod tests {
             .as_ref()
             .unwrap_or_else(|| panic!("the mapping pass did not start: {:?}", plugin.error));
         let prompt = &plugin.agent.subagents[run.subagent].prompt;
-        assert!(prompt.contains("at most 100 of them"), "{prompt}");
+        assert!(
+            prompt.contains(&format!("at most {} of them", super::super::map::MAX_MAPPED_FILES)),
+            "{prompt}"
+        );
         assert!(prompt.contains("/srv/app"), "{prompt}");
     }
 

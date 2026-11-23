@@ -44,14 +44,14 @@ pub const OVERVIEW_DEPTH: usize = 2;
 pub const TOP_LEVEL: &str = "(top level)";
 /// Files the overview names as recently changed.
 pub const OVERVIEW_RECENT: usize = 12;
-/// Files one mapping pass may describe. Past this the pass costs more than it saves.
-pub const MAX_MAPPED_FILES: usize = 100;
+/// Files one mapping pass may describe.
+pub const MAX_MAPPED_FILES: usize = 1_000;
 /// Characters of one file's summary kept.
 pub const MAX_MAP_SUMMARY_CHARS: usize = 600;
 /// Connections kept per file.
 pub const MAX_MAP_LINKS: usize = 16;
-/// Characters of a mapping answer read back at most.
-pub const MAX_MAP_ANSWER_CHARS: usize = 200_000;
+/// Characters of a mapping answer kept: room for a summary and its links for every file.
+pub const MAX_MAP_ANSWER_CHARS: usize = 800_000;
 
 /// Line the scan command prints between its two sections.
 pub const SECTION_MARKER: &str = "__wassh_symbols__";

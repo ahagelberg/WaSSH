@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Let a mapping pass describe up to 1000 files instead of 100, so a big project is mapped in one
+  pass instead of leaving most of the tree without summaries. The pass reads more of the host, so
+  it takes longer and spends more of the model's budget than before.
+
 ### Fixed
 
 - Keep a chat answering after the agent looks at a picture: the picture travelled to the model
