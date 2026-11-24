@@ -19,8 +19,9 @@
   description, in the guidelines and in the script-mode paragraph, so it stops putting the same
   `cd` in front of every command.
 - Make the chat's Plan/Agent control in the AI footer a segmented **Agent | Plan** control — one
-  track, both options named, the active side filled with the accent — instead of a button that
-  changed its own label with the mode. The tooltip still says what each side means.
+  track shaped and padded like a compact button, both options named, the active side filled with
+  the accent — instead of a button that changed its own label with the mode. The tooltip still
+  says what each side means.
 - Let a mapping pass describe up to 1000 files instead of 100, so a big project is mapped in one
   pass instead of leaving most of the tree without summaries. The pass reads more of the host, so
   it takes longer and spends more of the model's budget than before.

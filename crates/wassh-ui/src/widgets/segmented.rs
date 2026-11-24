@@ -1,21 +1,21 @@
 //! A segmented control: the options in one track, the active one filled.
 //!
 //! One control for a choice between a few named states, where a row of buttons would read as
-//! separate actions. The options share one width so the track never changes size as the choice
-//! moves.
+//! separate actions. The track takes a button's shape and padding so it sits beside one, and the
+//! options share one width so it never changes size as the choice moves.
 
 use egui::{Align2, Color32, FontId, Rect, Response, Sense, Stroke, Ui, Vec2};
-use wassh_core::Palette;
+use wassh_core::{Palette, RADIUS};
 
 use crate::terminal_view::to_color32;
 
-/// Height of the track, and the radius that makes it a pill.
+/// Height of the track: the height of a compact button.
 const HEIGHT: f32 = 20.0;
-/// Padding either side of an option's text.
-const PADDING_X: f32 = 8.0;
+/// Padding either side of an option's text, as a compact button has.
+const PADDING_X: f32 = 10.0;
 /// How far the highlight sits inside the track, clear of its border.
-const INSET: f32 = 2.0;
-/// Type size of the options.
+const INSET: f32 = 1.0;
+/// Type size of the options, as a compact button's label.
 const TEXT_SIZE: f32 = 12.0;
 
 /// Draw the options in one track and move `active` to the one clicked, reporting it as changed.
@@ -26,12 +26,11 @@ pub fn segmented(ui: &mut Ui, palette: &Palette, labels: &[&str], active: &mut u
     }
 
     let painter = ui.painter();
-    let radius = rect.height() / 2.0;
     let accent = to_color32(palette.accent);
-    painter.rect_filled(rect, radius, to_color32(palette.bg_input));
+    painter.rect_filled(rect, RADIUS, to_color32(palette.bg_input));
     painter.rect_stroke(
         rect,
-        radius,
+        RADIUS,
         Stroke::new(1.0, to_color32(palette.border)),
         egui::StrokeKind::Inside,
     );
@@ -59,7 +58,7 @@ pub fn segmented(ui: &mut Ui, palette: &Palette, labels: &[&str], active: &mut u
         if on || (under_pointer == Some(index) && response.hovered()) {
             painter.rect_filled(
                 segment.shrink(INSET),
-                radius - INSET,
+                RADIUS - INSET,
                 if on {
                     accent
                 } else {
@@ -111,6 +110,7 @@ mod tests {
         active: usize,
         size: Vec2,
         fills: Vec<Color32>,
+        track_radius: Option<egui::CornerRadius>,
     }
 
     /// Run a few frames of the control starting at `active`, optionally clicking at a
@@ -121,6 +121,7 @@ mod tests {
         let mut chosen = active;
         let mut size = Vec2::ZERO;
         let mut fills = Vec::new();
+        let mut track_radius = None;
         for frame in 0..3 {
             let mut input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -155,11 +156,14 @@ mod tests {
                 size = response.rect.size();
             });
             fills.clear();
+            track_radius = None;
             for clipped in &output.shapes {
                 if let egui::Shape::Rect(rect) = &clipped.shape
                     && rect.fill != Color32::TRANSPARENT
                 {
                     fills.push(rect.fill);
+                    // The track is the first surface painted: the highlight comes after it.
+                    track_radius.get_or_insert(rect.corner_radius);
                 }
             }
             output.drop_without_applying_deltas();
@@ -168,6 +172,7 @@ mod tests {
             active: chosen,
             size,
             fills,
+            track_radius,
         }
     }
 
@@ -197,6 +202,16 @@ mod tests {
             agent.fills.contains(&accent) && plan.fills.contains(&accent),
             "the active option is not filled with the accent: {:?}",
             plan.fills
+        );
+    }
+
+    #[test]
+    fn the_track_is_squared_to_the_button_radius() {
+        let drawn = draw(0, None);
+        assert_eq!(
+            drawn.track_radius,
+            Some(egui::CornerRadius::same(RADIUS as u8)),
+            "the track does not share a button's corners"
         );
     }
 }
