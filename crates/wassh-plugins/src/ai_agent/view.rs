@@ -1108,27 +1108,41 @@ and keep the cd out of the commands. Callable now:",
                  they cannot hang on a pager, and they show the user what changed.",
                 host_files.join(", ")
             ));
-            if !agent.offers_tool(super::protocol::TOOL_ENV_FIND)
-                && scopes::visible(&agent.scopes, &agent.permissions)
-                    .iter()
-                    .any(|scope| scope.id == ENV_SCOPE)
-            {
-                lines.push(
-                    "- Development work has a separate Graph scope ('env'). Load it when you need \
-                     to locate files or declarations across the host; env_search, env_find and \
-                     env_outline query the graph instead of re-discovering the tree with shell \
-                     commands."
-                        .to_owned(),
-                );
-            }
         } else if let Some((scope, names)) = Self::host_file_scope(agent) {
             lines.push(format!(
                 "- Files on the connected host are read, searched and changed with {names}, \
                  which the '{scope}' scope holds. Load that scope before touching a file there; \
                  do not use cat, head, tail, ls, find, grep/rg, sed, awk or shell redirection \
-                 in its place. For development, also load 'env' (Graph) separately when you need \
-                 its file/declaration index."
+                 in its place."
             ));
+        }
+        // The map answers project questions without touching the host, so it leads: loaded it
+        // is the rule, visible it is the scope to load before searching the tree by hand.
+        let env_available = scopes::visible(&agent.scopes, &agent.permissions)
+            .iter()
+            .any(|scope| scope.id == ENV_SCOPE);
+        if agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
+            lines.push(
+                "- Start project questions in the environment map: where something lives, what \
+                 calls it, which files make up an area, how the tree fits together. env_search \
+                 ranks files by how well their path and declarations answer a phrase, env_find \
+                 answers \"where is X\", env_outline describes a file and env_overview shows \
+                 what is mapped — none of them touches the host. Call env_scan for a directory \
+                 the map does not hold yet, and env_system for ports and services. Search the \
+                 tree with dev_grep_search or dev_find_files only when the map cannot answer: \
+                 the file is outside it, the thing sought is not a declaration, or the map is \
+                 empty and the tree has never been walked."
+                    .to_owned(),
+            );
+        } else if env_available {
+            lines.push(
+                "- Project questions — where something lives, what calls it, which files make up \
+                 an area — are answered from the Graph scope ('env'), which is not loaded: load \
+                 it first and use its env_search, env_find and env_outline instead of searching \
+                 the tree by hand. Load it together with the host's file tools when the work is \
+                 development."
+                    .to_owned(),
+            );
         }
         let local_files = offered(is_local_file_tool);
         if !local_files.is_empty() {
@@ -1136,17 +1150,6 @@ and keep the cd out of the commands. Callable now:",
                 "- Files on this computer: {}.",
                 local_files.join(", ")
             ));
-        }
-        if agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
-            lines.push(
-                "- Look in the environment map before searching the tree: env_search ranks \
-                 files by how well their path and declarations answer a phrase, env_find \
-                 answers \"where is X\", and env_outline describes a file, all without touching \
-                 the host. Call env_scan for a directory the map does not hold yet. env_system \
-                 says what listens on a port and which services run. The dev_* search and read \
-                 tools are for what the map cannot answer."
-                    .to_owned(),
-            );
         }
         let shells: Vec<&str> = [
             super::protocol::TOOL_RUN_COMMAND,
@@ -7913,6 +7916,38 @@ mod tests {
         assert!(!plugin.poll_models());
         assert_eq!(plugin.providers[0].models, ["kept"]);
         assert!(plugin.take_app_settings().is_empty());
+    }
+
+    #[test]
+    fn the_prompt_sends_project_questions_to_the_graph_scope() {
+        let mut plugin = AiAgent::default();
+        // The host scope is what makes the Graph one reachable, and its summary names the map.
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("host").unwrap());
+        // Not loaded but available: the rule is to load it before searching the tree.
+        let prompt =
+            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+        assert!(
+            prompt.contains("are answered from the Graph scope ('env'), which is not loaded"),
+            "{prompt}"
+        );
+        // Loaded: the map tools themselves are the first stop, and grepping is the fallback.
+        plugin
+            .agent
+            .scopes
+            .load(super::super::scopes::find("env").unwrap());
+        let prompt =
+            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+        assert!(
+            prompt.contains("Start project questions in the environment map"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Search the tree with dev_grep_search or dev_find_files only when"),
+            "{prompt}"
+        );
     }
 
     #[test]

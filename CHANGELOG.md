@@ -11,6 +11,9 @@
 
 ### Changed
 
+- Send the agent to the environment map first for project questions — where something lives,
+  what calls it, which files make up an area — instead of leaving grepping the tree as the
+  obvious first move, and say when a file search ran on a tree the map has never walked.
 - Tell the agent when a command has moved the working directory — the result now carries
   "Working directory is now …" — and name `set_working_directory` in the command tool's own
   description, in the guidelines and in the script-mode paragraph, so it stops putting the same

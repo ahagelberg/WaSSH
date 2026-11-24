@@ -75,6 +75,10 @@ pub const SUDO_REFUSED: &str = "sudo refused the password.";
 /// Said to the model when a command needed root it did not have.
 pub const SUDO_HINT: &str =
     "[This command needs root: call run_sudo with it so the user can type their password.]";
+/// Said to the model when a file search ran on a tree the map has never walked.
+pub const NO_MAP_HINT: &str = "[The Graph holds no map of this tree yet: env_scan walks it \
+once, and env_search and env_outline then answer questions about it without touching the \
+host.]";
 /// Lines a shell prints when `sudo` cannot ask for its password.
 const SUDO_DEMAND_MARKERS: [&str; 4] = [
     "sudo: a password is required",
@@ -1288,6 +1292,17 @@ impl Agent {
                                 visible.push('\n');
                             }
                             visible.push_str(&format!("Working directory is now {moved}."));
+                        }
+                        // A search the map could have answered is the moment to say it exists:
+                        // the tree is walked once, and every later question costs no host call.
+                        let searched_by_hand = matches!(
+                            self.turns.get(turn),
+                            Some(Turn::Tool { name, .. })
+                                if name == TOOL_DEV_GREP || name == TOOL_DEV_FIND
+                        );
+                        if searched_by_hand && self.map.is_empty() {
+                            visible.push('\n');
+                            visible.push_str(NO_MAP_HINT);
                         }
                         Ready::Settle(
                             self.turn_label(turn, &call),
@@ -6119,6 +6134,34 @@ Working directory is now /srv/app.
         assert!(sent.starts_with("cd '/' "), "{sent}");
         assert_eq!(agent.cwd, "/srv/app");
         assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn a_file_search_on_an_unmapped_tree_points_at_the_graph() {
+        let mut agent = Agent::new();
+        when_offered(&mut agent, TOOL_DEV_GREP);
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            PROBE_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "main.rs:1:fn main\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let output = run_tool(&mut agent, &mut fake, TOOL_DEV_GREP, r#"{"pattern":"main"}"#);
+        assert!(
+            output.contains(NO_MAP_HINT),
+            "the search did not point at the map: {output}"
+        );
+        // Once the tree is mapped the search stands on its own.
+        agent.map = super::super::map::EnvMap::parse(
+            "/srv/app",
+            1,
+            "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
+        );
+        let output = run_tool(&mut agent, &mut fake, TOOL_DEV_GREP, r#"{"pattern":"main"}"#);
+        assert!(!output.contains(NO_MAP_HINT), "{output}");
     }
 
     #[test]
