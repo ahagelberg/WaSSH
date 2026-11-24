@@ -4,6 +4,16 @@
 
 ### Added
 
+- Let the agent work on another saved host than the tab it runs in. Ask it something about a host
+  and it can call `hosts_list` for the machines you have saved, then pass one as `host` to
+  `run_command`, `set_working_directory`, `remote_fs_read_file`, `remote_fs_write_file`,
+  `remote_fs_list_dir` or `remote_fs_stat` to run commands there, read and write files, and move
+  data between machines. Each connection is confirmed first on a card naming the host and its
+  address, with **Allow**, **Deny** and **Always allow this host** / **Always deny this host**; a
+  host whose password is not in the vault asks for one on the same card. The settings list the
+  hosts the agent may reach and the ones it may never reach, both editable by hand, so an answer
+  given once can be taken back; connections close after a spell of not being used, and one only
+  opens to a host key already trusted.
 - Give the agent a way to say where the work happens: `set_working_directory` sets the directory
   that later commands and relative paths use, and answers with the directory the host ended up in.
   The current directory is still written into the prompt, so the agent stops putting a `cd` in
