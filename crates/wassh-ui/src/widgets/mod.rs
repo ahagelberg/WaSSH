@@ -18,7 +18,7 @@ pub mod select;
 pub mod slider;
 pub mod splitter;
 pub mod surface;
-pub mod switch;
+pub mod segmented;
 pub mod table;
 pub mod tag_input;
 pub mod text;
@@ -44,7 +44,7 @@ pub use surface::{
     BannerKind, INSET_RADIUS, Tone, badge, banner, banner_with, card, click_card, empty_state,
     fixed_inset_card, inset_card, inset_card_with, list_header, progress, section, stat_row,
 };
-pub use switch::{switch, switch_size};
+pub use segmented::{segmented, segmented_size};
 pub use table::{TableColumn, column_widths, table_header, table_row};
 pub use tag_input::{
     TagInputResponse, commit_all, commit_draft, commit_tag, remove_last, tag_input,
