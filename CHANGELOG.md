@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Say what the agent is doing while a tool runs. The transcript now shows a line where
+  "Thinking…" was, naming the step — running the command, reading a file, listing a directory,
+  transferring a file, running a script, waiting for a sub-agent or the terminal, or opening a
+  connection to another host — with the same animated dots, so a long build or search no longer
+  looks like a stall with only a Stop button for company.
+
 ## [2.0.20] - 2026-11-24
 
 ### Added

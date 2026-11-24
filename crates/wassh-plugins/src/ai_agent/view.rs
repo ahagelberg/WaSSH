@@ -1657,6 +1657,31 @@ and keep the cd out of the commands. Callable now:",
         }
     }
 
+    /// What the run is doing, for the line that says the pane is still working.
+    ///
+    /// A tool can take a while — a build, a search, a connection — and the card alone reads
+    /// as if nothing is happening, so the transcript names the step it is on.
+    fn working_on(&self) -> Option<&'static str> {
+        match &self.agent.phase {
+            Some(Phase::Running { waiting, .. }) => Some(match waiting {
+                Waiting::Command { .. } => "Running the command",
+                Waiting::Read { .. } => "Reading the file",
+                Waiting::List { .. } => "Listing the directory",
+                Waiting::Transfer { .. } => "Transferring the file",
+                Waiting::Worker { .. } => "Working",
+                Waiting::Script => "Running the script",
+                Waiting::Subagent { .. } => "Waiting for the sub-agent",
+                Waiting::Terminal { .. } => "Waiting for the terminal",
+            }),
+            // A connection asking for a password has its own card, which is answer enough.
+            Some(Phase::Remote { .. }) => {
+                matches!(self.agent.host_card(), Some((HostCard::Connecting, _)))
+                    .then_some("Opening the connection")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a reply is under way but has painted nothing yet.
     fn waiting_for_the_first_token(&self) -> bool {
         let Some(Phase::Streaming { turn, .. }) = &self.agent.phase else {
@@ -2434,16 +2459,24 @@ and keep the cd out of the commands. Callable now:",
             }
             ui.add_space(TURN_GAP);
         }
-        // The reference shows this until the first token of the reply arrives.
-        if interactive && self.waiting_for_the_first_token() {
-            let step = (self.agent.now_ms / THINKING_DOT_MS) as usize;
-            let dots: String = ".".repeat(1 + step % THINKING_DOT_COUNT);
-            ui.label(
-                egui::RichText::new(format!("Thinking{dots}"))
-                    .size(12.0)
-                    .italics()
-                    .color(muted),
-            );
+        // The reference shows this until the first token of the reply arrives; while a tool
+        // is working the same line names the step, so the pane never looks stopped.
+        if interactive {
+            let line = if self.waiting_for_the_first_token() {
+                Some("Thinking")
+            } else {
+                self.working_on()
+            };
+            if let Some(line) = line {
+                let step = (self.agent.now_ms / THINKING_DOT_MS) as usize;
+                let dots: String = ".".repeat(1 + step % THINKING_DOT_COUNT);
+                ui.label(
+                    egui::RichText::new(format!("{line}{dots}"))
+                        .size(12.0)
+                        .italics()
+                        .color(muted),
+                );
+            }
         }
         // Clicking a message opens it for editing; the edit itself is sent by the pane.
         if interactive {
@@ -6561,6 +6594,72 @@ mod tests {
         draw(&mut plugin, &mut settings);
         assert_eq!(plugin.agent.reach_allow, ["db-1"]);
         assert_eq!(plugin.agent.reach_deny, ["web-1"]);
+    }
+
+    #[test]
+    fn a_running_tool_says_what_it_is_doing() {
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let mut plugin = AiAgent::default();
+        plugin.agent.turns.push(Turn::Tool {
+            name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+            label: "$ sleep 100".to_owned(),
+            output: String::new(),
+            failed: false,
+        });
+        // Drawn straight, so nothing polls the call away: only the line is under test.
+        let painted = |plugin: &mut AiAgent| -> Vec<String> {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(WIDE_PANE, 400.0),
+                )),
+                ..Default::default()
+            };
+            let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
+            let mut texts = Vec::new();
+            let mut output = ctx.run_ui(input, |ui| {
+                plugin.transcript(
+                    ui,
+                    &palette,
+                    to_color32(palette.text_muted),
+                    &mut session,
+                    TranscriptSource::Main,
+                );
+            });
+            for clipped in std::mem::take(&mut output.shapes) {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    texts.push(text.galley.text().to_owned());
+                }
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+        plugin.agent.phase = Some(Phase::Running {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"sleep 100"}"#.to_owned(),
+            },
+            turn: 0,
+            waiting: Waiting::Command {
+                key: "c1".to_owned(),
+                then: super::super::agent::CommandThen::Return,
+                host: None,
+            },
+        });
+        let texts = painted(&mut plugin);
+        assert!(
+            texts.iter().any(|text| text.starts_with("Running the command")),
+            "a running tool says nothing: {texts:?}"
+        );
+        // Once the call is answered the line goes, as the model's wait does.
+        plugin.agent.phase = None;
+        let texts = painted(&mut plugin);
+        assert!(
+            !texts.iter().any(|text| text.starts_with("Running the command")),
+            "the line outlived the tool: {texts:?}"
+        );
     }
 
     #[test]
