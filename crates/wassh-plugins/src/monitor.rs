@@ -3978,6 +3978,7 @@ Ubuntu 24.04.4 LTS\n6.8.0-124-generic\nx86_64\n192.168.42.7 172.17.0.1\n";
             repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
+            remote: None,
         };
         view.persist(&mut context);
         // Written under the schema keys, so the value mirrors into the dialog.

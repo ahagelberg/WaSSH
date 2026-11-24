@@ -8,10 +8,13 @@ pub mod dialogs;
 pub mod local_exec;
 pub mod local_files;
 pub mod quick_connect;
+pub mod remote;
 pub mod session;
 pub mod wsl;
 pub mod wsl_files;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +31,7 @@ use wassh_store::Config;
 use wassh_term::TerminalSize;
 use wassh_ui::widgets::{Button, MenuItem, MenuState, ToastKind, Toasts};
 
+use self::remote::RemoteSessions;
 use self::dialogs::{
     Command, DialogAction, Dialogs, FindCommand, FindState, GroupEditState, HostSave, HostState,
     HostTarget, IdentityDraft, OptionsState, PaletteState, PluginSecretDrafts, SecretEdit, tab_menu_command,
@@ -185,6 +189,8 @@ pub struct Shell {
     quick: QuickForm,
     closed: Vec<ClosedTab>,
     known_hosts: Arc<KnownHosts>,
+    /// Connections to other hosts, opened for a pane that asked for one.
+    remote: Rc<RefCell<RemoteSessions>>,
     fullscreen: bool,
     fullscreen_request: Option<bool>,
     zoom: f32,
@@ -558,10 +564,10 @@ impl Shell {
         // Provisional: `Shell::new` re-resolves this against the desktop's preference.
         let palette = Palette::for_setting(settings.theme, true);
 
-        let known_hosts = match wassh_store::data_dir() {
+        let known_hosts = Arc::new(match wassh_store::data_dir() {
             Ok(dir) if !perf => KnownHosts::load(wassh_store::known_hosts_file(dir)),
             _ => KnownHosts::in_memory(),
-        };
+        });
 
         let mut sidebar = wassh_ui::SidebarState::new();
         sidebar.collapsed = settings.sidebar_collapsed;
@@ -586,7 +592,8 @@ impl Shell {
             dialogs: Dialogs::default(),
             quick: QuickForm::default(),
             closed: Vec::new(),
-            known_hosts: Arc::new(known_hosts),
+            known_hosts: Arc::clone(&known_hosts),
+            remote: std::rc::Rc::new(std::cell::RefCell::new(RemoteSessions::new(known_hosts))),
             fullscreen: false,
             fullscreen_request: None,
             zoom: 0.0,
@@ -641,6 +648,8 @@ impl Shell {
             shell.toasts.push(ToastKind::Info, notice);
         }
         shell.migrate_plugin_secrets();
+        // The first frame that draws the agent expects the saved hosts to be there.
+        shell.sync_remote();
         shell
     }
 
@@ -1693,6 +1702,19 @@ impl Shell {
             self.toasts
                 .push(ToastKind::Error, format!("could not save host: {error}"));
         }
+        self.sync_remote();
+    }
+
+    /// Refresh what the broker knows about the saved hosts, their credentials and their keys.
+    fn sync_remote(&mut self) {
+        let identities = self
+            .config
+            .as_ref()
+            .map(|config| config.identities.get().clone())
+            .unwrap_or_default();
+        self.remote
+            .borrow_mut()
+            .sync(&self.hosts, &identities, self.secrets.as_ref());
     }
 
     fn delete_host(&mut self, id: &str) {
@@ -1712,6 +1734,7 @@ impl Shell {
             self.toasts
                 .push(ToastKind::Error, format!("could not delete host: {error}"));
         }
+        self.sync_remote();
     }
 
     fn persist_hosts(&mut self) {
@@ -2067,6 +2090,9 @@ impl Shell {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
+        // A connection opened for a pane finishes its dialling, its commands and its file
+        // requests outside any tab, so it is polled once here.
+        self.remote.borrow_mut().poll();
         // A pane that records history does it whether or not it is drawn, so every tab
         // whose status changed hands its events on here.
         for index in changed {
@@ -2841,6 +2867,7 @@ impl Shell {
                 palette,
                 store: self.config.as_ref(),
                 plugin_values: &plugin_values,
+                remote: Rc::clone(&self.remote),
                 measured,
             };
             let actions = wassh_ui::dock_layout(
@@ -3739,6 +3766,8 @@ struct SessionPanes<'a> {
     store: Option<&'a wassh_store::Config>,
     /// Plugin settings the dialogs hold for this session.
     plugin_values: &'a PluginValues,
+    /// Connections to other hosts, for a pane that asks for one.
+    remote: Rc<RefCell<RemoteSessions>>,
     /// Emulator size measured for the space the docks left for the terminal.
     measured: TerminalSize,
 }
@@ -3756,8 +3785,13 @@ impl wassh_ui::DockContent for SessionPanes<'_> {
     }
 
     fn pane(&mut self, ui: &mut egui::Ui, plugin_id: &str) {
-        self.session
-            .show_plugin(ui, plugin_id, self.store, self.plugin_values);
+        self.session.show_plugin(
+            ui,
+            plugin_id,
+            self.store,
+            self.plugin_values,
+            Some(Rc::clone(&self.remote)),
+        );
     }
 
     fn pane_title(&self, plugin_id: &str) -> String {

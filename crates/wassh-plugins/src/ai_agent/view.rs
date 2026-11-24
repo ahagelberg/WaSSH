@@ -23,14 +23,16 @@ use super::agent::{
     subagents_from_json, subagents_to_json, turns_from_json, turns_to_json,
 };
 use super::markdown::{Block, Ink};
+use super::agent::HostCard;
+use crate::plugin::RemoteHost;
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, DEFAULT_MAX_SUBAGENTS,
     ImagePart, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, MAX_IMAGE_BYTES,
     MAX_IMAGES, Protocol, ProviderConfig, SAFE_RULES, SETTING_AUTO_COMPACT,
     SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
-    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT, SETTING_HOST_RAG_FOLDER,
-    SETTING_HOST_SCRIPT_MODE, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
+    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
+    SETTING_HOST_RAG_FOLDER, SETTING_HOST_SCRIPT_MODE, SETTING_REACH_ALLOW, SETTING_REACH_DENY, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
     SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_SCRIPT_MODE, SETTING_WEB_SEARCH_KEY,
     SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS, image_media_type,
 };
@@ -68,6 +70,8 @@ const DERIVED_SETTINGS: &[&str] = &[
     SETTING_MAX_SUBAGENTS,
     SETTING_SCRIPT_MODE,
     SETTING_HOST_SCRIPT_MODE,
+    SETTING_REACH_ALLOW,
+    SETTING_REACH_DENY,
 ];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
@@ -537,6 +541,10 @@ pub struct AiAgent {
     /// The sudo command whose card took the keyboard, so a field that lost focus is not
     /// pulled back to it.
     sudo_focused: Option<String>,
+    /// Password typed for the host whose connection is being opened.
+    host_password: String,
+    /// The host whose password card took the keyboard.
+    host_focused: Option<String>,
     /// Whether the stored conversation has been read back.
     loaded: bool,
     /// Caption and health for the pane header.
@@ -652,6 +660,8 @@ impl Default for AiAgent {
             editing: None,
             sudo: String::new(),
             sudo_focused: None,
+            host_password: String::new(),
+            host_focused: None,
             loaded: false,
             caption: (String::new(), HeaderHealth::Ok),
             caption_for: None,
@@ -1175,6 +1185,21 @@ and keep the cd out of the commands. Callable now:",
                     .to_owned(),
             );
         }
+        let host_tools: Vec<&str> = tools::HOST_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| agent.offers_tool(name))
+            .collect();
+        if !host_tools.is_empty() {
+            lines.push(format!(
+                "- Another saved host is reached by naming it: pass \"host\" with a saved \
+                 host's id from hosts_list. {} take one; paths there are that host's own, and \
+                 the user is asked once before the connection opens. Use it for diagnostics \
+                 and file transfers across machines instead of asking the user to run the \
+                 same thing in another tab.",
+                host_tools.join(", ")
+            ));
+        }
         if agent.offers_tool(super::protocol::TOOL_RUN_SUDO) {
             lines.push(
                 "- When a task needs root, call run_sudo with the same command: it asks the user \
@@ -1216,6 +1241,8 @@ and keep the cd out of the commands. Callable now:",
             setting_rules(settings, SETTING_HOST_ALLOW_RULES).unwrap_or_default();
         self.agent.host_deny = setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
         self.agent.permissions = Permissions::from_settings(settings);
+        self.agent.reach_allow = setting_rules(settings, SETTING_REACH_ALLOW).unwrap_or_default();
+        self.agent.reach_deny = setting_rules(settings, SETTING_REACH_DENY).unwrap_or_default();
         self.agent.script_mode = settings
             .get(SETTING_HOST_SCRIPT_MODE)
             .and_then(Value::as_bool)
@@ -4113,6 +4140,8 @@ struct Prompts {
     asking: Option<(String, Vec<AgentQuestion>)>,
     /// Sudo card: the command and why it needs root.
     sudo: Option<(String, Option<String>)>,
+    /// Host card: what it asks, and the saved host it is about.
+    host: Option<(HostCard, RemoteHost)>,
 }
 
 impl Prompts {
@@ -4140,6 +4169,7 @@ impl Prompts {
             sudo: agent
                 .sudo_prompt()
                 .map(|(command, reason)| (command.to_owned(), reason.map(str::to_owned))),
+            host: agent.host_card().map(|(card, host)| (card, host.clone())),
         }
     }
 
@@ -4149,6 +4179,7 @@ impl Prompts {
             && self.allowing.is_none()
             && self.asking.is_none()
             && self.sudo.is_none()
+            && self.host.is_none()
     }
 }
 
@@ -4165,6 +4196,10 @@ struct PromptAnswers {
     answers: Option<Vec<String>>,
     /// The sudo card.
     sudo: Option<SudoAnswer>,
+    /// Host card: allow the connection, and remember the answer for this host.
+    host: Option<(bool, bool)>,
+    /// The password typed for the host being connected.
+    host_password: Option<String>,
     /// Stop the agent without answering the prompt.
     stop: bool,
 }
@@ -4241,6 +4276,11 @@ impl AiAgent {
         // No sudo card means the next one takes the keyboard again.
         if prompts.sudo.is_none() {
             self.sudo_focused = None;
+        }
+        // A password typed for a card that is gone is not kept for the next one.
+        if prompts.host.is_none() {
+            self.host_focused = None;
+            self.host_password.clear();
         }
 
         // A card from a sub-agent says whose it is, so the main chat stays the one place
@@ -4564,6 +4604,140 @@ impl AiAgent {
             );
         }
 
+        // The host card: another machine a call wants to reach, or the password it needs.
+        if let Some((card, host)) = &prompts.host {
+            prompt_card(
+                ui,
+                palette,
+                "host",
+                |ui| {
+                    let title = match card {
+                        HostCard::Ask => "Connect to another host?",
+                        HostCard::Password => "Password for another host",
+                        HostCard::Connecting => "Opening a connection…",
+                    };
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    prompt_command(ui, palette, &format!("{} ({})", host.name, host.address));
+                    if let Some(problem) = &host.problem {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(problem).size(11.0).color(muted))
+                                .wrap(),
+                        );
+                    }
+                },
+                |ui| match card {
+                    HostCard::Ask => {
+                        prompt_action_row(ui, "host", |ui| {
+                            if Button::new("Allow")
+                                .compact()
+                                .primary()
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                answers.host = Some((true, false));
+                            }
+                            if Button::new("Deny")
+                                .compact()
+                                .kind(ButtonKind::Danger)
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                answers.host = Some((false, false));
+                            }
+                        });
+                        prompt_action_row(ui, "host-always", |ui| {
+                            if Button::new("Always allow this host")
+                                .compact()
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                answers.host = Some((true, true));
+                            }
+                            if Button::new("Always deny this host")
+                                .compact()
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                answers.host = Some((false, true));
+                            }
+                        });
+                        if Button::new("Stop")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.stop = true;
+                        }
+                    }
+                    HostCard::Password => {
+                        let room =
+                            (ui.available_width() - PROMPT_CARD_GAP).max(MIN_ANSWER_WIDTH);
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(room, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(room);
+                                // Read the key before the field: a focused single-line field
+                                // takes Enter as its own submission.
+                                let submitted =
+                                    ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                let response = password_input(
+                                    ui,
+                                    palette,
+                                    &mut self.host_password,
+                                    "host password",
+                                );
+                                // The card just appeared: the field takes the keyboard, so
+                                // Enter sends the password instead of reaching the shell.
+                                if self.host_focused.as_deref() != Some(host.id.as_str()) {
+                                    self.host_focused = Some(host.id.clone());
+                                    response.request_focus();
+                                }
+                                if submitted && (response.has_focus() || response.lost_focus()) {
+                                    answers.host_password =
+                                        Some(self.host_password.clone());
+                                }
+                            },
+                        );
+                        ui.horizontal(|ui| {
+                            if Button::new("Continue")
+                                .compact()
+                                .primary()
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                answers.host_password = Some(self.host_password.clone());
+                            }
+                            if Button::new("Cancel")
+                                .compact()
+                                .kind(ButtonKind::Danger)
+                                .show(ui, palette)
+                                .clicked()
+                            {
+                                answers.stop = true;
+                            }
+                        });
+                    }
+                    HostCard::Connecting => {
+                        if Button::new("Stop")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.stop = true;
+                        }
+                    }
+                },
+            );
+        }
+
         answers
     }
 }
@@ -4599,6 +4773,7 @@ impl Plugin for AiAgent {
             self.view = ChatView::Chat;
         }
         self.apply_settings(context.settings, context.secret(SETTING_WEB_SEARCH_KEY));
+        self.agent.set_remote(context.remote.clone());
         self.poll_models();
         self.refresh_models(context);
         self.agent.now_ms = wassh_core::time::now_ms();
@@ -5267,6 +5442,33 @@ impl Plugin for AiAgent {
             self.prompt_agent(prompt_target)
                 .answer(&answers, &mut session);
         }
+        if let Some((allow, always)) = prompts.host {
+            if always
+                && let Some((_, host)) = &pending.host
+            {
+                let (key, other) = if allow {
+                    (SETTING_REACH_ALLOW, SETTING_REACH_DENY)
+                } else {
+                    (SETTING_REACH_DENY, SETTING_REACH_ALLOW)
+                };
+                // An answer replaces the opposite one, so a host cannot sit in both lists.
+                let mut answered = setting_rules(context.settings, key).unwrap_or_default();
+                if !answered.iter().any(|saved| saved == &host.id) {
+                    answered.push(host.id.clone());
+                }
+                let mut contradicted = setting_rules(context.settings, other).unwrap_or_default();
+                contradicted.retain(|saved| saved != &host.id);
+                context.set_value(key, serde_json::json!(answered));
+                context.set_value(other, serde_json::json!(contradicted));
+            }
+            self.prompt_agent(prompt_target)
+                .answer_connect(allow, &mut session);
+        }
+        if let Some(password) = prompts.host_password {
+            self.host_password.clear();
+            self.prompt_agent(prompt_target)
+                .supply_host_password(&password);
+        }
         match prompts.sudo {
             Some(SudoAnswer::Run) => {
                 let password = std::mem::take(&mut self.sudo);
@@ -5426,6 +5628,27 @@ mod tests {
     use wassh_core::Palette;
     use wassh_ui::widgets::{COPIED_GLYPH, COPY_GLYPH};
 
+    /// The app's connections, holding the hosts a card test needs named.
+    struct SavedHosts(Vec<RemoteHost>);
+
+    impl crate::plugin::RemoteHosts for SavedHosts {
+        fn hosts(&self) -> &[RemoteHost] {
+            &self.0
+        }
+        fn connect(&mut self, _handle: &str, _host_id: &str) {}
+        fn state(&self, _handle: &str) -> crate::plugin::RemoteState {
+            crate::plugin::RemoteState::Idle
+        }
+        fn supply_password(&mut self, _handle: &str, _password: &str) {}
+        fn session(
+            &mut self,
+            _handle: &str,
+        ) -> Option<&mut dyn crate::plugin::SessionAccess> {
+            None
+        }
+        fn close(&mut self, _handle: &str) {}
+    }
+
     /// Draw two frames and return the painted text.
     fn draw(plugin: &mut AiAgent, settings: &mut serde_json::Map<String, Value>) -> Vec<String> {
         draw_with_secrets(plugin, settings, &EMPTY_SECRETS)
@@ -5436,6 +5659,16 @@ mod tests {
         plugin: &mut AiAgent,
         settings: &mut serde_json::Map<String, Value>,
         secrets: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        draw_with(plugin, settings, secrets, None)
+    }
+
+    /// Draw the pane with a remote broker behind it, and return the painted text.
+    fn draw_with(
+        plugin: &mut AiAgent,
+        settings: &mut serde_json::Map<String, Value>,
+        secrets: &std::collections::BTreeMap<String, String>,
+        remote: Option<std::rc::Rc<std::cell::RefCell<dyn crate::plugin::RemoteHosts>>>,
     ) -> Vec<String> {
         let ctx = egui::Context::default();
         let palette = Palette::dark();
@@ -5461,6 +5694,7 @@ mod tests {
                 repaint_after: None,
                 secrets,
                 secret_writes: Vec::new(),
+                remote: remote.clone(),
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             let shapes = std::mem::take(&mut output.shapes);
@@ -5526,6 +5760,7 @@ mod tests {
             repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
+            remote: None,
         };
         let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
         let commands = std::mem::take(&mut output.platform_output.commands);
@@ -6312,6 +6547,62 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_say_which_hosts_may_be_reached() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            "agentReachAllow".to_owned(),
+            serde_json::json!(["db-1"]),
+        );
+        settings.insert(
+            "agentReachDeny".to_owned(),
+            serde_json::json!(["web-1"]),
+        );
+        draw(&mut plugin, &mut settings);
+        assert_eq!(plugin.agent.reach_allow, ["db-1"]);
+        assert_eq!(plugin.agent.reach_deny, ["web-1"]);
+    }
+
+    #[test]
+    fn the_host_card_names_the_host_and_offers_its_answers() {
+        let mut plugin = AiAgent::default();
+        let remote: std::rc::Rc<std::cell::RefCell<dyn crate::plugin::RemoteHosts>> =
+            std::rc::Rc::new(std::cell::RefCell::new(SavedHosts(vec![RemoteHost {
+                id: "db-1".to_owned(),
+                name: "db-1".to_owned(),
+                address: "deploy@10.0.0.4:22".to_owned(),
+                tags: Vec::new(),
+                problem: None,
+            }])));
+        plugin.agent.phase = Some(Phase::Connect {
+            host: "db-1".to_owned(),
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"hostname","host":"db-1"}"#.to_owned(),
+            },
+            turn: 0,
+        });
+        let mut settings = serde_json::Map::new();
+        let painted = draw_with(&mut plugin, &mut settings, &EMPTY_SECRETS, Some(remote));
+        let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
+        assert!(
+            texts.contains(&"Connect to another host?"),
+            "card missing: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"db-1 (deploy@10.0.0.4:22)"),
+            "the host is not named: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Always allow this host"),
+            "no remembered answer: {texts:?}"
+        );
+        assert!(texts.contains(&"Allow"), "allow missing: {texts:?}");
+        assert!(texts.contains(&"Deny"), "deny missing: {texts:?}");
+    }
+
+    #[test]
     fn the_approval_card_names_the_command_and_offers_scopes() {
         let mut plugin = AiAgent::default();
         plugin.agent.phase = Some(Phase::Approving {
@@ -6471,6 +6762,7 @@ mod tests {
             repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
+            remote: None,
         };
         let mut texts = Vec::new();
         let mut cards = Vec::new();
@@ -6709,6 +7001,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             title = None;
@@ -7417,7 +7710,7 @@ mod tests {
                 palette, host_label: "dev".to_owned(), environment: "test".to_owned(),
                 status: SessionStatus::Connected, settings: &mut settings, scope: "host-1".to_owned(),
                 session: None, events: &[], pending_input: Vec::new(), repaint_after: None,
-                secrets: &EMPTY_SECRETS, secret_writes: Vec::new(),
+                secrets: &EMPTY_SECRETS, secret_writes: Vec::new(), remote: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -7665,6 +7958,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
             let shapes = std::mem::take(&mut output.shapes);
@@ -8038,8 +8332,8 @@ mod tests {
         assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(
             both.contains(
-                "- core: run_command, set_working_directory, run_command_background, run_script, \
-                 run_sudo, ask_user, spawn_subagent, wait_subagent, get_current_time"
+                "- core: run_command, set_working_directory, hosts_list, run_command_background, \
+                 run_script, run_sudo, ask_user, spawn_subagent, wait_subagent, get_current_time"
             ),
             "{both}"
         );

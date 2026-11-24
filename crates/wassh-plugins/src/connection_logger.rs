@@ -1774,6 +1774,7 @@ mod tests {
                     repaint_after: None,
                     secrets: &secrets,
                     secret_writes: Vec::new(),
+                    remote: None,
                 };
                 logger.show(ui, &mut context);
             });

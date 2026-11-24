@@ -583,6 +583,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             painted = output.shapes.len();
@@ -620,6 +621,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             texts.clear();

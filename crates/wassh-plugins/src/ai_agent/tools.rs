@@ -23,6 +23,7 @@ use super::protocol::{
     TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT,
     TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
+    TOOL_HOSTS_LIST,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
     TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
     TOOL_LOAD_SCOPE,
@@ -132,6 +133,12 @@ ls, find or sed.",
         description: "Set the directory that later commands and relative paths work in, and \
 answer with the directory the host ended up in. Call it once when the work moves elsewhere \
 instead of putting a cd in front of every command.",
+    },
+    ToolSpec {
+        name: TOOL_HOSTS_LIST,
+        description: "List the saved hosts this conversation may reach, with the address each \
+one connects to and why one cannot be opened. Commands and file tools take a host argument \
+naming one of them; a connection to another host asks the user first.",
     },
     ToolSpec {
         name: TOOL_RUN_COMMAND_BACKGROUND,
@@ -454,11 +461,31 @@ pub fn is_subagent_tool(name: &str) -> bool {
     SUBAGENT_TOOLS.contains(&name)
 }
 
+/// The tools whose schema takes a `host`, and that may therefore run on another host.
+pub const HOST_TOOLS: &[&str] = &[
+    TOOL_RUN_COMMAND,
+    TOOL_CHANGE_DIR,
+    TOOL_REMOTE_READ,
+    TOOL_REMOTE_WRITE,
+    TOOL_REMOTE_LIST,
+    TOOL_REMOTE_STAT,
+];
+
+/// Whether `name` may be aimed at another saved host.
+pub fn takes_host(name: &str) -> bool {
+    HOST_TOOLS.contains(&name)
+}
+
 /// Parameter schemas per tool, mirroring the reference's argument names.
 fn parameters(name: &str) -> (Value, Value) {
     let string = |description: &str| json!({ "type": "string", "description": description });
     let number = |description: &str| json!({ "type": "number", "description": description });
     let boolean = |description: &str| json!({ "type": "boolean", "description": description });
+    let host = || {
+        string(
+            "Saved host to run this on, from hosts_list; leave it out for this tab's own host.",
+        )
+    };
     match name {
         TOOL_RUN_SCRIPT => (
             json!({
@@ -468,13 +495,20 @@ and resolves to its JSON result; a failed call throws. Return the compact result
             json!(["code"]),
         ),
         TOOL_RUN_COMMAND => (
-            json!({ "command": string("The command line to run, exactly as it would be typed.") }),
+            json!({
+                "command": string("The command line to run, exactly as it would be typed."),
+                "host": host()
+            }),
             json!(["command"]),
         ),
         TOOL_CHANGE_DIR => (
-            json!({ "path": string("The directory to work in from now on.") }),
+            json!({
+                "path": string("The directory to work in from now on."),
+                "host": host()
+            }),
             json!(["path"]),
         ),
+        TOOL_HOSTS_LIST => (json!({}), json!([])),
         TOOL_RUN_COMMAND_BACKGROUND => (
             json!({ "command": string("The command line to start in the background.") }),
             json!(["command"]),
@@ -538,7 +572,8 @@ and resolves to its JSON result; a failed call throws. Return the compact result
             json!({
                 "path": string("File to read."),
                 "maxChars": number("How much text to return (default 32000, cap 256000)."),
-                "encoding": string("text (default) or base64 for binary files.")
+                "encoding": string("text (default) or base64 for binary files."),
+                "host": host()
             }),
             json!(["path"]),
         ),
@@ -549,7 +584,16 @@ and resolves to its JSON result; a failed call throws. Return the compact result
             }),
             json!(["path"]),
         ),
-        TOOL_REMOTE_WRITE | TOOL_LOCAL_WRITE => (
+        TOOL_REMOTE_WRITE => (
+            json!({
+                "path": string("File to write."),
+                "content": string("The whole new contents."),
+                "overwrite": boolean("Refuse when the file already exists (default false)."),
+                "host": host()
+            }),
+            json!(["path", "content"]),
+        ),
+        TOOL_LOCAL_WRITE => (
             json!({
                 "path": string("File to write."),
                 "content": string("The whole new contents."),
@@ -557,7 +601,14 @@ and resolves to its JSON result; a failed call throws. Return the compact result
             }),
             json!(["path", "content"]),
         ),
-        TOOL_REMOTE_LIST | TOOL_LOCAL_LIST => (
+        TOOL_REMOTE_LIST => (
+            json!({
+                "path": string("Directory to list."),
+                "host": host()
+            }),
+            json!(["path"]),
+        ),
+        TOOL_LOCAL_LIST => (
             json!({ "path": string("Directory to list.") }),
             json!(["path"]),
         ),
@@ -566,7 +617,10 @@ and resolves to its JSON result; a failed call throws. Return the compact result
             json!(["path"]),
         ),
         TOOL_REMOTE_STAT => (
-            json!({ "path": string("File or directory to describe.") }),
+            json!({
+                "path": string("File or directory to describe."),
+                "host": host()
+            }),
             json!(["path"]),
         ),
         TOOL_REMOTE_MOVE => (
@@ -1118,6 +1172,7 @@ pub fn is_read_only(name: &str) -> bool {
             | TOOL_LOAD_SCOPE
             | TOOL_UNLOAD_SCOPE
             | TOOL_CHANGE_DIR
+            | TOOL_HOSTS_LIST
             | TOOL_SPAWN_SUBAGENT
             | TOOL_WAIT_SUBAGENT
     ) || plugin_tool(name).is_some_and(|tool| tool.read_only)
@@ -2382,6 +2437,7 @@ mod tests {
                 TOOL_RUN_SCRIPT,
                 TOOL_RUN_COMMAND,
                 TOOL_CHANGE_DIR,
+                TOOL_HOSTS_LIST,
                 TOOL_RUN_COMMAND_BACKGROUND,
                 TOOL_RUN_SUDO,
                 TOOL_ASK_USER,
@@ -2414,7 +2470,7 @@ mod tests {
     fn the_catalog_carries_one_line_per_tool_a_script_may_call() {
         let listed = catalog(&everything_allowed(), &everything_loaded(), true, false);
         assert!(
-            listed.contains("- run_command(command: string)"),
+            listed.contains("- run_command(command: string, host?: string)"),
             "{listed}"
         );
         assert!(listed.contains("- dev_grep_search("), "{listed}");

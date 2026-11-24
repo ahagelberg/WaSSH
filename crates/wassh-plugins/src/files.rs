@@ -3529,6 +3529,7 @@ mod tests {
                         repaint_after: None,
                         secrets: &EMPTY_SECRETS,
                         secret_writes: Vec::new(),
+                        remote: None,
                     };
                     plugin.show(ui, &mut context);
                 });
@@ -3592,6 +3593,7 @@ mod tests {
                         repaint_after: None,
                         secrets: &EMPTY_SECRETS,
                         secret_writes: Vec::new(),
+                        remote: None,
                     };
                     plugin.show(ui, &mut context);
                 });
@@ -3667,6 +3669,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             let shapes = std::mem::take(&mut output.shapes);

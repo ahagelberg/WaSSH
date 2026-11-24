@@ -12,7 +12,8 @@
 
 use super::permissions::Permissions;
 use super::protocol::{
-    TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT,
+    TOOL_HOSTS_LIST, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
     TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
@@ -53,11 +54,13 @@ pub const SCOPES: &[Scope] = &[
     Scope {
         id: ROOT,
         summary: "Run shell commands on the connected host (also as root) and set the directory \
-they work in, run a JavaScript program that calls the other tools itself, ask the user a \
-question, read the clock, and delegate work to a background sub-agent.",
+they work in, reach another saved host the same way, run a JavaScript program that calls the \
+other tools itself, ask the user a question, read the clock, and delegate work to a background \
+sub-agent.",
         tools: &[
             TOOL_RUN_COMMAND,
             TOOL_CHANGE_DIR,
+            TOOL_HOSTS_LIST,
             TOOL_RUN_COMMAND_BACKGROUND,
             TOOL_RUN_SCRIPT,
             TOOL_RUN_SUDO,

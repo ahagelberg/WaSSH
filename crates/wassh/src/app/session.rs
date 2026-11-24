@@ -4,7 +4,9 @@
 //! [`TerminalView`] for drawing and a [`Backend`] that is either a local PTY or an SSH
 //! channel. The shell polls [`SessionEntry::pump`] every frame; nothing here blocks.
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
@@ -1631,6 +1633,7 @@ impl SessionEntry {
         plugin_id: &str,
         store: Option<&wassh_store::Config>,
         values: &PluginValues,
+        remote: Option<Rc<RefCell<super::remote::RemoteSessions>>>,
     ) {
         let Some(id) = PluginId::parse(plugin_id) else {
             return;
@@ -1650,6 +1653,8 @@ impl SessionEntry {
         let mut pane = self.panes.swap_remove(slot);
         let events = std::sync::Arc::clone(&self.status_history);
         let secrets = values.secrets.get(id.as_str()).unwrap_or(&NO_SECRETS);
+        let remote: Option<Rc<RefCell<dyn wassh_plugins::RemoteHosts>>> =
+            remote.map(|remote| remote as Rc<RefCell<dyn wassh_plugins::RemoteHosts>>);
         let typed;
         let repaint_after;
         {
@@ -1666,6 +1671,7 @@ impl SessionEntry {
                 repaint_after: None,
                 secrets,
                 secret_writes: Vec::new(),
+                remote: remote.clone(),
             };
             pane.plugin.show(ui, &mut context);
             typed = std::mem::take(&mut context.pending_input);
@@ -1777,6 +1783,7 @@ impl SessionEntry {
                 repaint_after: None,
                 secrets,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             pane.plugin.poll(&mut context);
             let writes = std::mem::take(&mut context.secret_writes);

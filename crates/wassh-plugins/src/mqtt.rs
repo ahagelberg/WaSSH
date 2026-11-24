@@ -2996,6 +2996,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             let shapes = std::mem::take(&mut output.shapes);
@@ -3044,6 +3045,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
             for clipped in std::mem::take(&mut output.shapes) {
@@ -3229,6 +3231,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             output.drop_without_applying_deltas();
@@ -3337,6 +3340,7 @@ mod tests {
                 repaint_after: None,
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
+                remote: None,
             };
             let output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             output.drop_without_applying_deltas();

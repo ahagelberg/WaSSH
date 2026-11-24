@@ -26,7 +26,10 @@ pub use macro_pad::MacroPad;
 pub use monitor::{MonitorAccess, ServerMonitor, Snapshot};
 pub use mqtt::MqttAnalyser;
 pub use command::TcpAccess;
-pub use plugin::{HeaderButton, Plugin, PluginContext, SessionAccess, TerminalAccess, create};
+pub use plugin::{
+    HeaderButton, Plugin, PluginContext, RemoteHost, RemoteHosts, RemoteState, SessionAccess,
+    TerminalAccess, create,
+};
 pub use settings::{FieldKind, SettingsField};
 
 use serde::{Deserialize, Serialize};

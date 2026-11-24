@@ -4,6 +4,9 @@
 //! [`PluginContext`] and a `Ui` once per frame, and keeps it until the tab closes. Nothing
 //! is loaded dynamically, so a plugin cannot outlive the build it shipped with.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use egui::Ui;
 use wassh_core::{HeaderHealth, Palette, SessionStatus};
 
@@ -42,6 +45,12 @@ pub struct PluginContext<'a> {
     /// Secret edits the pane asked for while drawing; the host writes them to
     /// the vault as `(field, Some(new value))` or `(field, None)` to forget it.
     pub secret_writes: Vec<(String, Option<String>)>,
+    /// Connections to other hosts than this tab's, when the host offers them.
+    ///
+    /// The app owns the connections: a pane asks for one by saved host id, and the app
+    /// resolves credentials, host keys and jump hosts the same way a tab does. It is
+    /// shared so a pane can keep it past the frame it was handed in.
+    pub remote: Option<Rc<RefCell<dyn RemoteHosts>>>,
 }
 
 impl PluginContext<'_> {
@@ -195,6 +204,75 @@ pub fn tools_of(id: PluginId) -> &'static [PluginTool] {
         PluginId::DockerManager => crate::docker::TOOLS.as_slice(),
         _ => &[],
     }
+}
+
+/// A saved host a pane may ask the app to open.
+///
+/// Nothing here is a secret: it is what the pane shows the user and the model so they can
+/// choose a machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteHost {
+    /// Saved host id, the one the pane names in [`RemoteHosts::connect`].
+    pub id: String,
+    /// Display name the host list shows.
+    pub name: String,
+    /// Where it connects, as `user@host:port`.
+    pub address: String,
+    /// Tags the user filed it under.
+    pub tags: Vec<String>,
+    /// Why the host cannot be opened right now, if it cannot.
+    pub problem: Option<String>,
+}
+
+/// State of one connection a pane asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RemoteState {
+    /// Never asked for.
+    #[default]
+    Idle,
+    /// The app is dialling.
+    Connecting,
+    /// The host needs a password no vault holds; answer with
+    /// [`RemoteHosts::supply_password`].
+    NeedsPassword,
+    /// Connected and answering.
+    Open {
+        /// One line describing what is on the other end.
+        environment: String,
+    },
+    /// The connection failed; the string is why.
+    Failed(String),
+}
+
+impl RemoteState {
+    /// Whether the connection is open and usable.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open { .. })
+    }
+}
+
+/// Other hosts a pane may reach, and the connections the app keeps for it.
+///
+/// A pane names each connection with a handle of its own choosing (`"host:db-1"`), the way
+/// the agent names its command keys, and polls [`RemoteHosts::state`] for the answer.
+pub trait RemoteHosts {
+    /// Every saved host, in the order the host list shows them, without secrets.
+    fn hosts(&self) -> &[RemoteHost];
+
+    /// Open a connection to `host_id` under `handle`, or reuse the one already open.
+    fn connect(&mut self, handle: &str, host_id: &str);
+
+    /// Where the connection under `handle` stands.
+    fn state(&self, handle: &str) -> RemoteState;
+
+    /// Hand over a password the user typed for a host that has none in the vault.
+    fn supply_password(&mut self, handle: &str, password: &str);
+
+    /// The connection's own tools surface, once it is open.
+    fn session(&mut self, handle: &str) -> Option<&mut dyn SessionAccess>;
+
+    /// Drop the connection under `handle`.
+    fn close(&mut self, handle: &str);
 }
 
 /// A built-in plugin view.
@@ -399,6 +477,7 @@ mod tests {
             repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
+            remote: None,
         };
         assert!(context.is_connected());
         context.set_text("text", "hello");
@@ -419,6 +498,7 @@ mod tests {
             repaint_after: None,
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
+            remote: None,
         };
         assert!(!context.is_connected());
         assert_eq!(context.text("text"), Some("hello"));

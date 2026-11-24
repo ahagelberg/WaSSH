@@ -584,6 +584,18 @@ most of the prompt tokens the tool schemas take and cuts the rounds a task needs
         AI_AGENT_KNOWLEDGE_CHILDREN,
     ),
     string_list(
+        "agentReachAllow",
+        "Hosts the agent may reach",
+        &[],
+        "Saved host ids the agent may connect to without asking. Every other host asks first; \u{201c}Always allow this host\u{201d} on the ask card adds it here.",
+    ),
+    string_list(
+        "agentReachDeny",
+        "Hosts the agent may never reach",
+        &[],
+        "Saved host ids the agent is never allowed to connect to. A denial is final: neither a session-wide allow nor an ask card gets around it.",
+    ),
+    string_list(
         "defaultAllowRules",
         "Default allow rules",
         AI_AGENT_SAFE_RULES,
@@ -1376,6 +1388,8 @@ mod tests {
                 "Sub-agents at a time",
                 "Script mode",
                 "Global knowledge",
+                "Hosts the agent may reach",
+                "Hosts the agent may never reach",
                 "Default allow rules",
                 "Default deny rules",
                 "Live terminal",

@@ -44,6 +44,10 @@ pub const SETTING_MAX_SUBAGENTS: &str = "maxSubagents";
 pub const SETTING_SCRIPT_MODE: &str = "scriptMode";
 /// Setting key: this host's script mode, which wins over the app-wide one.
 pub const SETTING_HOST_SCRIPT_MODE: &str = "hostScriptMode";
+/// Setting key: saved hosts this conversation may reach without asking.
+pub const SETTING_REACH_ALLOW: &str = "agentReachAllow";
+/// Setting key: saved hosts this conversation may never reach.
+pub const SETTING_REACH_DENY: &str = "agentReachDeny";
 /// Sub-agents allowed at once when nothing is stored.
 pub const DEFAULT_MAX_SUBAGENTS: usize = 5;
 /// Longest sub-agent answer handed back to the model.
@@ -53,6 +57,8 @@ pub const MAX_SUBAGENT_RESULT_CHARS: usize = 8_000;
 pub const TOOL_RUN_COMMAND: &str = "run_command";
 /// Tool: set the directory later commands and relative paths are resolved against.
 pub const TOOL_CHANGE_DIR: &str = "set_working_directory";
+/// Tool: list the saved hosts this conversation may reach.
+pub const TOOL_HOSTS_LIST: &str = "hosts_list";
 /// Tool: run a short JavaScript program that calls the other tools and returns one result.
 pub const TOOL_RUN_SCRIPT: &str = "run_script";
 /// Tool: start a shell command in the background without waiting for it.

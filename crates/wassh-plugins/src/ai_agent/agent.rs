@@ -4,7 +4,9 @@
 //! the answer, then run whatever tools the model asked for — asking first when
 //! the rules say so — and feed the results back until it answers in prose.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, VecDeque};
+use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
 use base64::Engine as _;
@@ -12,6 +14,7 @@ use serde_json::Value;
 
 use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
+use crate::plugin::{RemoteHost, RemoteHosts, RemoteState};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, ImagePart,
     MAX_SUBAGENT_RESULT_CHARS, TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
@@ -24,7 +27,8 @@ use super::protocol::{
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
     TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
     TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
-    TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT,
+    TOOL_HOSTS_LIST, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO,
+    TOOL_SPAWN_SUBAGENT,
     TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
     TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
     TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
@@ -64,6 +68,9 @@ pub const PROBE_KEY: &str = "ai.probe";
 pub const MAP_KEY: &str = "ai.env_scan";
 /// Prefix of the ids sub-agents are handed out.
 pub const SUBAGENT_ID_PREFIX: &str = "sub";
+
+/// Prefix of the names this pane gives the connections it opens to other hosts.
+const HOST_HANDLE_PREFIX: &str = "agent:";
 /// Longest sub-agent name taken from its prompt.
 const SUBAGENT_TITLE_CHARS: usize = 48;
 /// Said to a model that asks a sub-agent to spawn one of its own.
@@ -242,6 +249,24 @@ pub enum Phase {
         /// What it wants to do, shown on the card.
         label: String,
     },
+    /// Another host is about to be opened, and the user is being asked about it.
+    Connect {
+        /// Saved host the call named.
+        host: String,
+        /// The call waiting on the answer.
+        call: ApiToolCall,
+        /// Where its transcript line is.
+        turn: usize,
+    },
+    /// A connection to another host is opening; the call runs once it has.
+    Remote {
+        /// Saved host the call named.
+        host: String,
+        /// The call waiting on the connection.
+        call: ApiToolCall,
+        /// Where its transcript line is.
+        turn: usize,
+    },
     /// A tool is running.
     Running {
         /// The call being answered.
@@ -277,6 +302,8 @@ pub enum Waiting {
         key: String,
         /// What to do with the output.
         then: CommandThen,
+        /// Saved host it ran on, when it is not this tab's own.
+        host: Option<String>,
     },
     /// A sub-agent, until it answers.
     Subagent {
@@ -318,6 +345,22 @@ pub enum Waiting {
     },
     /// A script in its sandbox, until it returns or asks for another tool.
     Script,
+}
+
+/// What the pane shows while another host is being reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCard {
+    /// The user is being asked whether this chat may reach the host.
+    Ask,
+    /// The host needs a password the vault does not hold.
+    Password,
+    /// The connection is opening.
+    Connecting,
+}
+
+/// The name this pane gives the connection it opens to a saved host.
+fn host_handle(host: &str) -> String {
+    format!("{HOST_HANDLE_PREFIX}{host}")
 }
 
 /// What follows a probe command.
@@ -727,6 +770,22 @@ pub struct Agent {
     script: Option<ScriptRun>,
     /// Whether the tools are offered as a script API instead of one schema per tool.
     pub script_mode: bool,
+    /// The app's connections to other hosts, handed in by the pane every frame.
+    remote: Option<Rc<RefCell<dyn RemoteHosts>>>,
+    /// Saved hosts as the app last listed them, for the model and the cards.
+    pub hosts: Vec<RemoteHost>,
+    /// Saved hosts this conversation may reach without asking.
+    pub reach_allow: Vec<String>,
+    /// Saved hosts this conversation may never reach.
+    pub reach_deny: Vec<String>,
+    /// Working directory of each other host, by host id.
+    host_cwds: BTreeMap<String, String>,
+    /// The host the call being dispatched runs on, when it is not this tab's own.
+    active_host: Option<String>,
+    /// Whether the app's connections are lent out for the call in flight.
+    on_host: bool,
+    /// Whether a queued call was left for the moment those connections come back.
+    resume_after_host: bool,
 }
 
 impl Agent {
@@ -739,12 +798,17 @@ impl Agent {
         }
     }
 
-    /// Whether a reply or tool is in flight.
+    /// Whether a reply or tool is in flight, or another host is being reached.
     pub fn busy(&self) -> bool {
         matches!(
             self.phase,
-            Some(Phase::Streaming { .. } | Phase::Running { .. })
+            Some(Phase::Streaming { .. } | Phase::Running { .. } | Phase::Remote { .. })
         )
+    }
+
+    /// Whether the pane is asking whether another host may be reached.
+    pub fn connecting(&self) -> bool {
+        matches!(self.phase, Some(Phase::Connect { .. }))
     }
 
     /// Whether the user has to answer an approval.
@@ -774,7 +838,11 @@ impl Agent {
 
     /// Whether the run is parked on the user rather than on a tool.
     pub fn needs_user(&self) -> bool {
-        self.approving() || self.allowing() || self.asking() || self.sudo_prompt().is_some()
+        self.approving()
+            || self.allowing()
+            || self.asking()
+            || self.sudo_prompt().is_some()
+            || self.connecting()
     }
 
     /// Whether anything at all blocks a new message.
@@ -784,6 +852,7 @@ impl Agent {
             || self.allowing()
             || self.asking()
             || self.sudo_prompt().is_some()
+            || self.connecting()
             || self.spawning()
     }
 
@@ -977,6 +1046,10 @@ impl Agent {
     /// every sub-agent: the pane answers on the parent, and the next frame carries it in.
     fn sync_subagents(&mut self) {
         let max_subagents = self.max_subagents;
+        let remote = self.remote.clone();
+        let hosts = self.hosts.clone();
+        let reach_allow = self.reach_allow.clone();
+        let reach_deny = self.reach_deny.clone();
         for sub in self.subagents.iter_mut().filter(|sub| sub.running()) {
             let agent = &mut sub.agent;
             agent.max_subagents = max_subagents;
@@ -986,6 +1059,16 @@ impl Agent {
             }
             if agent.permissions != self.permissions {
                 agent.permissions = self.permissions.clone();
+            }
+            agent.remote = remote.clone();
+            if agent.hosts != hosts {
+                agent.hosts = hosts.clone();
+            }
+            if agent.reach_allow != reach_allow {
+                agent.reach_allow = reach_allow.clone();
+            }
+            if agent.reach_deny != reach_deny {
+                agent.reach_deny = reach_deny.clone();
             }
             if agent.app_allow != self.app_allow {
                 agent.app_allow = self.app_allow.clone();
@@ -1072,12 +1155,33 @@ impl Agent {
                 waiting: Waiting::Script,
                 ..
             }) => progressed = self.poll_script(session),
-            Some(Phase::Running { .. }) => {
-                progressed = if self.script_call_timed_out(session) {
-                    true
-                } else {
-                    self.poll_tool(session)
-                };
+            Some(Phase::Running { call, .. }) => {
+                let call = call.clone();
+                let host = self.running_host(&call);
+                self.with_host(host, session, |agent, session| {
+                    progressed = if agent.script_call_timed_out(session) {
+                        true
+                    } else {
+                        agent.poll_tool(session)
+                    };
+                });
+            }
+            Some(Phase::Remote { host, call, turn }) => {
+                let (host, call, turn) = (host.clone(), call.clone(), *turn);
+                match self.host_state(&host) {
+                    Some(RemoteState::Open { .. }) => {
+                        self.phase = None;
+                        self.reach_host(host, call, turn, session);
+                        progressed = true;
+                    }
+                    Some(RemoteState::Failed(reason)) => {
+                        self.phase = None;
+                        let label = call_label(&call);
+                        self.settle(call, turn, label, reason, true, session);
+                        progressed = true;
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -1228,8 +1332,8 @@ impl Agent {
         let (call, turn) = (call.clone(), *turn);
         let ready = match waiting {
             Waiting::Script => return false,
-            Waiting::Command { key, then } => {
-                let (key, then) = (key.clone(), then.clone());
+            Waiting::Command { key, then, host } => {
+                let (key, then, host) = (key.clone(), then.clone(), host.clone());
                 let (output, failure) = match session.as_ref() {
                     Some(access) => (
                         access.output(&key).cloned(),
@@ -1257,12 +1361,10 @@ impl Agent {
                             (None, Some(failure)) => (failure, None, None, false),
                             (None, None) => (String::new(), None, None, false),
                         };
-                        if let Some(directory) = directory
-                            && !directory.is_empty()
-                            && directory != self.cwd
+                        if let Some(directory) = &directory
+                            && self.remember_dir(host.as_deref(), directory.clone())
                         {
                             moved = Some(directory.clone());
-                            self.cwd = directory;
                         }
                         // The wrapper prints a marker when `sudo` refused the password; say so.
                         let refused_sudo = visible.contains(SUDO_AUTH_FAILED_MARKER);
@@ -1795,7 +1897,7 @@ impl Agent {
         if path.is_empty() {
             return;
         }
-        self.map.forget(&relative_remote(&self.cwd, path));
+        self.map.forget(&relative_remote(self.cwd(), path));
         self.map.forget_suffix(path);
     }
 
@@ -1913,6 +2015,12 @@ impl Agent {
 
     /// Run the next queued call, or ask the model again.
     fn advance(&mut self, session: Session<'_, '_>) {
+        // While a call holds the app's connections, the call behind it waits: the one that
+        // borrowed them starts it again as soon as it lets go.
+        if self.on_host {
+            self.resume_after_host = true;
+            return;
+        }
         if let Some(next) = self.queue.pop_front() {
             self.begin_tool(next, session);
         } else {
@@ -2177,8 +2285,79 @@ impl Agent {
         }
     }
 
-    /// Run one call the permissions already allowed.
+    /// Run one call the permissions already allowed, on the host it names.
+    ///
+    /// A call naming another saved host is confirmed with the user once — the answer can be
+    /// remembered per host — and the connection is opened before the call runs there.
     fn run_tool(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
+        let host = match self.call_host(&call) {
+            Ok(host) => host,
+            Err(problem) => {
+                let label = call_label(&call);
+                self.settle(call, turn, label, problem, true, session);
+                return;
+            }
+        };
+        let Some(host) = host else {
+            self.with_host(None, session, |agent, session| agent.perform(call, turn, session));
+            return;
+        };
+        match self.host_permission(&host) {
+            Permission::Allow => self.reach_host(host, call, turn, session),
+            Permission::Ask => {
+                self.phase = Some(Phase::Connect { host, call, turn });
+            }
+            Permission::Deny => {
+                let label = call_label(&call);
+                let output = format!(
+                    "The settings do not let this chat connect to {}.",
+                    self.host_name(&host)
+                );
+                self.settle(call, turn, label, output, true, session);
+            }
+        }
+    }
+
+    /// The host a call runs on, for one that was already let through.
+    fn running_host(&self, call: &ApiToolCall) -> Option<String> {
+        self.call_host(call).ok().flatten()
+    }
+
+    /// The saved host the call names in its `host` argument, if it names one.
+    fn call_host(&self, call: &ApiToolCall) -> Result<Option<String>, String> {
+        let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        let asked = arguments["host"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or_default();
+        if asked.is_empty() {
+            return Ok(None);
+        }
+        if !tools::takes_host(&call.name) {
+            return Err(format!(
+                "{} runs on this tab's host only. Pass `host` to {}.",
+                call.name,
+                tools::HOST_TOOLS.join(", ")
+            ));
+        }
+        match self.saved_host(asked) {
+            Some(id) => Ok(Some(id)),
+            None => Err(format!(
+                "There is no saved host `{asked}`. Call {TOOL_HOSTS_LIST} to see the ones there are."
+            )),
+        }
+    }
+
+    /// The id of the saved host `asked` names, by id or by display name.
+    fn saved_host(&self, asked: &str) -> Option<String> {
+        self.hosts
+            .iter()
+            .find(|host| host.id == asked || host.name.eq_ignore_ascii_case(asked))
+            .map(|host| host.id.clone())
+    }
+
+    /// Run one call, assuming whatever it needs is already open.
+    fn perform(&mut self, call: ApiToolCall, turn: usize, session: Session<'_, '_>) {
         let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
         let name = call.name.clone();
         if !tools::is_tool(&name) {
@@ -2232,6 +2411,7 @@ impl Agent {
 
         // A write, an edit or a delete leaves the map stale for that one path.
         if is_writing_tool(&name)
+            && self.active_host.is_none()
             && let Some(path) = arguments["path"].as_str()
         {
             self.forget_map_path(path);
@@ -2280,11 +2460,15 @@ impl Agent {
             }
             TOOL_CHANGE_DIR => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 // The wrapper reports the directory it ended in, so a path that is not there
                 // fails the call and leaves the working directory where it was.
                 let command = format!("cd {} && pwd", shell_quote(&path));
                 self.exec_command(call, command, None, turn, session);
+            }
+            TOOL_HOSTS_LIST => {
+                let output = self.host_listing();
+                self.settle(call, turn, TOOL_HOSTS_LIST.to_owned(), output, false, session);
             }
             TOOL_RUN_COMMAND => {
                 let Some(command) = arguments["command"]
@@ -2524,7 +2708,7 @@ impl Agent {
         match name {
             TOOL_REMOTE_READ => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 if arguments["encoding"].as_str() == Some("base64") {
                     self.start_read(call, turn, path, tools::MAX_BASE64_BYTES, ReadThen::Base64, session);
                     return;
@@ -2537,7 +2721,7 @@ impl Agent {
             }
             TOOL_REMOTE_EDIT | TOOL_DEV_EDIT => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let old = arguments["oldText"].as_str().unwrap_or_default().to_owned();
                 let new = arguments["newText"].as_str().unwrap_or_default().to_owned();
                 if old.is_empty() {
@@ -2562,7 +2746,7 @@ impl Agent {
             }
             TOOL_DEV_VIEW => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let start = arguments["startLine"].as_u64().unwrap_or(1).max(1) as usize;
                 let max_lines = arguments["maxLines"]
                     .as_u64()
@@ -2581,7 +2765,7 @@ impl Agent {
             }
             TOOL_DEV_IMAGE => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 // One byte over the cap is enough to know the file is too big.
                 self.start_read(
                     call,
@@ -2622,7 +2806,7 @@ impl Agent {
                     }
                     None => {
                         let path = relative_remote(
-                            &self.cwd,
+                            self.cwd(),
                             arguments["path"].as_str().unwrap_or_default(),
                         );
                         self.start_read(
@@ -2638,19 +2822,19 @@ impl Agent {
             }
             TOOL_DEV_GREP => {
                 let root =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let command = tools::dev_grep_command(arguments, &root);
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
             TOOL_DEV_FIND => {
                 let root =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let command = tools::dev_find_command(arguments, &root);
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
             TOOL_REMOTE_WRITE | TOOL_DEV_CREATE => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let content = arguments["content"].as_str().unwrap_or_default().to_owned();
                 let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
                 let probe = format!("test -e {} && echo yes || echo no", shell_quote(&path));
@@ -2668,7 +2852,7 @@ impl Agent {
             }
             TOOL_REMOTE_LIST | TOOL_DEV_LIST => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 // Only the developer listing walks sub-directories, and it does that
                 // with the host's own `find`.
                 if arguments["recursive"].as_bool().unwrap_or(false) {
@@ -2698,21 +2882,21 @@ impl Agent {
             }
             TOOL_REMOTE_DELETE => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let command = format!("rm -rf -- {} && echo removed", shell_quote(&path));
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
             TOOL_REMOTE_STAT => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let command = tools::stat_command(&path);
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
             TOOL_REMOTE_MOVE => {
                 let from =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let to = relative_remote(
-                    &self.cwd,
+                    self.cwd(),
                     arguments["destination"].as_str().unwrap_or_default(),
                 );
                 let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
@@ -2721,7 +2905,7 @@ impl Agent {
             }
             TOOL_REMOTE_PATCH => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let patch = arguments["patch"].as_str().unwrap_or_default().trim().to_owned();
                 let patch_file = arguments["patchFile"].as_str().unwrap_or_default().trim();
                 if !patch.is_empty() {
@@ -2734,7 +2918,7 @@ impl Agent {
                         session,
                     );
                 } else if !patch_file.is_empty() {
-                    let patch_path = relative_remote(&self.cwd, patch_file);
+                    let patch_path = relative_remote(self.cwd(), patch_file);
                     let command = format!("cat {}", shell_quote(&patch_path));
                     self.run_probe(
                         call,
@@ -2757,22 +2941,22 @@ impl Agent {
             }
             TOOL_REMOTE_ZIP_LIST => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let command = tools::zip_list_command(&path);
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
             TOOL_REMOTE_ZIP_READ => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let entry = arguments["entry"].as_str().unwrap_or_default();
                 let command = tools::zip_read_command(&path, entry);
                 self.run_probe(call, turn, CommandThen::Return, command, session);
             }
             TOOL_REMOTE_ZIP_EXTRACT => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let destination = relative_remote(
-                    &self.cwd,
+                    self.cwd(),
                     arguments["destination"].as_str().unwrap_or_default(),
                 );
                 let overwrite = arguments["overwrite"].as_bool().unwrap_or(false);
@@ -2786,7 +2970,7 @@ impl Agent {
             | TOOL_GIT_COMMIT
             | TOOL_GIT_CHECKOUT => {
                 let dir =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 match tools::git_command(name, arguments, &dir) {
                     Some(command) => {
                         self.run_probe(call, turn, CommandThen::Return, command, session)
@@ -2933,7 +3117,7 @@ impl Agent {
                     .as_str()
                     .map(str::trim)
                     .filter(|path| !path.is_empty())
-                    .map(|path| relative_remote(&self.cwd, path))
+                    .map(|path| relative_remote(self.cwd(), path))
                     .or_else(|| (!self.map.root.is_empty()).then(|| self.map.root.clone()))
                     .unwrap_or_default();
                 // The scan is the one map tool that touches the host: one walk, no reads.
@@ -2963,7 +3147,7 @@ impl Agent {
             }
             TOOL_ENV_OUTLINE => {
                 let path =
-                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                    relative_remote(self.cwd(), arguments["path"].as_str().unwrap_or_default());
                 let (output, failed) = match self.map.outline(&path) {
                     Some(outline) => (outline, false),
                     None => (
@@ -3133,6 +3317,10 @@ impl Agent {
         agent.map = self.map.clone();
         agent.system = self.system.clone();
         agent.permissions = self.permissions.clone();
+        agent.remote = self.remote.clone();
+        agent.hosts = self.hosts.clone();
+        agent.reach_allow = self.reach_allow.clone();
+        agent.reach_deny = self.reach_deny.clone();
         agent.app_allow = self.app_allow.clone();
         agent.app_deny = self.app_deny.clone();
         agent.host_allow = self.host_allow.clone();
@@ -3251,6 +3439,231 @@ impl Agent {
     }
 
     /// Run a shell command for `run_command`.
+    /// The directory the call being dispatched resolves paths against.
+    ///
+    /// A call aimed at another host works in that host's own directory, which is wherever
+    /// the last command there left the shell.
+    fn cwd(&self) -> &str {
+        match &self.active_host {
+            Some(host) => self.host_cwds.get(host).map_or("", String::as_str),
+            None => &self.cwd,
+        }
+    }
+
+    /// Remember where a command left the shell, on the host it ran on.
+    ///
+    /// Returns whether it moved, which is what tells the model its directory changed.
+    fn remember_dir(&mut self, host: Option<&str>, directory: String) -> bool {
+        let current = match host {
+            Some(host) => self.host_cwds.get(host).map_or("", String::as_str),
+            None => self.cwd.as_str(),
+        };
+        if directory.is_empty() || directory == current {
+            return false;
+        }
+        match host {
+            Some(host) => {
+                self.host_cwds.insert(host.to_owned(), directory);
+            }
+            None => self.cwd = directory,
+        }
+        true
+    }
+
+    /// Take the app's connections to other hosts, as the pane hands them in every frame.
+    pub fn set_remote(&mut self, remote: Option<Rc<RefCell<dyn RemoteHosts>>>) {
+        self.hosts = remote
+            .as_ref()
+            .map(|remote| remote.borrow().hosts().to_vec())
+            .unwrap_or_default();
+        self.remote = remote;
+    }
+
+    /// What the pane should show for a connection on its way, and which host it is for.
+    pub fn host_card(&self) -> Option<(HostCard, &RemoteHost)> {
+        let (host, card) = match &self.phase {
+            Some(Phase::Connect { host, .. }) => (host, HostCard::Ask),
+            Some(Phase::Remote { host, .. }) => {
+                let card = match self.host_state(host)? {
+                    RemoteState::NeedsPassword => HostCard::Password,
+                    RemoteState::Failed(_) => return None,
+                    _ => HostCard::Connecting,
+                };
+                (host, card)
+            }
+            _ => return None,
+        };
+        self.hosts
+            .iter()
+            .find(|saved| &saved.id == host)
+            .map(|saved| (card, saved))
+    }
+
+    /// Where the connection to `host` stands, as the app reports it.
+    fn host_state(&self, host: &str) -> Option<RemoteState> {
+        let remote = self.remote.as_ref()?;
+        Some(remote.borrow().state(&host_handle(host)))
+    }
+
+    /// Hand the app the password the user typed for a host that has none in the vault.
+    pub fn supply_host_password(&mut self, password: &str) {
+        let Some(Phase::Remote { host, .. }) = &self.phase else {
+            return;
+        };
+        let handle = host_handle(host);
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        remote.borrow_mut().supply_password(&handle, password);
+    }
+
+    /// Answer the card that asks whether this chat may reach another host.
+    pub fn answer_connect(&mut self, allow: bool, session: Session<'_, '_>) {
+        let Some(Phase::Connect { host, call, turn }) = self.phase.take() else {
+            return;
+        };
+        if allow {
+            self.reach_host(host, call, turn, session);
+            return;
+        }
+        let label = call_label(&call);
+        let output = format!(
+            "The user did not allow this chat to connect to {}.",
+            self.host_name(&host)
+        );
+        self.settle(call, turn, label, output, true, session);
+    }
+
+    /// The decision for reaching `host`, with this session's blanket answer applied.
+    ///
+    /// Every saved host is asked about unless the user answered about it, and a denial is
+    /// final: a connection is the one thing a session-wide "allow" cannot open by itself.
+    fn host_permission(&self, host: &str) -> Permission {
+        if self.reach_deny.iter().any(|saved| saved == host) {
+            return Permission::Deny;
+        }
+        if self.reach_allow.iter().any(|saved| saved == host) || self.allow_all {
+            return Permission::Allow;
+        }
+        Permission::Ask
+    }
+
+    /// How a saved host reads in a message.
+    fn host_name(&self, host: &str) -> String {
+        self.hosts
+            .iter()
+            .find(|saved| saved.id == host)
+            .map(|saved| saved.name.clone())
+            .unwrap_or_else(|| host.to_owned())
+    }
+
+    /// Run a call on a saved host, opening the connection first when it is not open.
+    fn reach_host(
+        &mut self,
+        host: String,
+        call: ApiToolCall,
+        turn: usize,
+        session: Session<'_, '_>,
+    ) {
+        let Some(remote) = self.remote.clone() else {
+            let label = call_label(&call);
+            let output = format!(
+                "This pane has no connection to {}, so the call did not run.",
+                self.host_name(&host)
+            );
+            self.settle(call, turn, label, output, true, session);
+            return;
+        };
+        let handle = host_handle(&host);
+        let state = remote.borrow().state(&handle);
+        match state {
+            RemoteState::Open { .. } => {
+                // Waiting for a connection is not the call's own time to answer, so a
+                // script's clock starts when the call actually runs.
+                if self.waiting_on(&call)
+                    && let Some(run) = self.script.as_mut()
+                {
+                    run.since = Some(std::time::Instant::now());
+                }
+                self.with_host(Some(host), session, |agent, session| {
+                    agent.perform(call, turn, session)
+                });
+            }
+            RemoteState::Failed(reason) => {
+                let label = call_label(&call);
+                self.settle(call, turn, label, reason, true, session);
+            }
+            RemoteState::Idle => {
+                remote.borrow_mut().connect(&handle, &host);
+                self.phase = Some(Phase::Remote { host, call, turn });
+            }
+            RemoteState::Connecting | RemoteState::NeedsPassword => {
+                self.phase = Some(Phase::Remote { host, call, turn });
+            }
+        }
+    }
+
+    /// Run `job` with the session of the host a call names, or with this tab's own.
+    ///
+    /// The app's connections are lent out for the length of the call, so a call queued
+    /// behind it starts once they are back.
+    fn with_host(
+        &mut self,
+        host: Option<String>,
+        session: Session<'_, '_>,
+        job: impl FnOnce(&mut Self, Session<'_, '_>),
+    ) {
+        let Some(host) = host else {
+            self.active_host = None;
+            job(self, session);
+            return;
+        };
+        let Some(remote) = self.remote.clone() else {
+            self.active_host = Some(host);
+            job(self, session);
+            return;
+        };
+        self.active_host = Some(host.clone());
+        let held = std::mem::replace(&mut self.on_host, true);
+        {
+            let mut borrowed = remote.borrow_mut();
+            let mut side = borrowed.session(&host_handle(&host));
+            job(self, &mut side);
+        }
+        self.on_host = held;
+        if std::mem::take(&mut self.resume_after_host) {
+            self.advance(session);
+        }
+    }
+
+    /// Every saved host and how to work on one, as the model reads it.
+    fn host_listing(&self) -> String {
+        if self.hosts.is_empty() {
+            return "No other hosts are saved, so everything runs on this tab's host.".to_owned();
+        }
+        let mut lines = vec!["Saved hosts:".to_owned()];
+        for host in &self.hosts {
+            let mut line = format!("- {} — {} ({})", host.id, host.name, host.address);
+            if !host.tags.is_empty() {
+                line.push_str(&format!(", tags: {}", host.tags.join(", ")));
+            }
+            match self.host_permission(&host.id) {
+                Permission::Deny => line.push_str(", not allowed from here"),
+                Permission::Allow => line.push_str(", allowed"),
+                Permission::Ask => {}
+            }
+            if let Some(problem) = &host.problem {
+                line.push_str(&format!(", cannot be opened: {problem}"));
+            }
+            lines.push(line);
+        }
+        lines.push(
+            "Pass a host's id as `host` to run_command, set_working_directory,              remote_fs_read_file, remote_fs_write_file, remote_fs_list_dir or remote_fs_stat              to work there; the first call to a host asks the user to allow the connection."
+                .to_owned(),
+        );
+        lines.join("\n")
+    }
+
     fn exec_command(
         &mut self,
         call: ApiToolCall,
@@ -3282,11 +3695,11 @@ impl Agent {
         };
         match &sudo_stdin {
             Some(password) => {
-                let wrapped = wrap_command_with_sudo(&self.cwd, &command);
+                let wrapped = wrap_command_with_sudo(self.cwd(), &command);
                 access.exec_input(&self.keys.exec, &wrapped, password);
             }
             None => {
-                let wrapped = wrap_command(&self.cwd, &command);
+                let wrapped = wrap_command(self.cwd(), &command);
                 access.exec(&self.keys.exec, &wrapped);
             }
         }
@@ -3296,6 +3709,7 @@ impl Agent {
             waiting: Waiting::Command {
                 key: self.keys.exec.clone(),
                 then: CommandThen::Return,
+                host: self.active_host.clone(),
             },
         });
     }
@@ -3322,7 +3736,7 @@ impl Agent {
             "(nohup sh -c {} >/dev/null 2>&1 </dev/null & echo \"Background PID: $!\")",
             shell_quote(&command)
         );
-        let wrapped = wrap_command(&self.cwd, &launched);
+        let wrapped = wrap_command(self.cwd(), &launched);
         access.exec(&self.keys.exec, &wrapped);
         self.phase = Some(Phase::Running {
             call,
@@ -3330,6 +3744,7 @@ impl Agent {
             waiting: Waiting::Command {
                 key: self.keys.exec.clone(),
                 then: CommandThen::Return,
+                host: self.active_host.clone(),
             },
         });
     }
@@ -3362,6 +3777,7 @@ impl Agent {
             waiting: Waiting::Command {
                 key: self.keys.probe.clone(),
                 then,
+                host: self.active_host.clone(),
             },
         });
     }
@@ -3430,7 +3846,10 @@ impl Agent {
             {
                 self.session_allow.push(scope.pattern.clone());
             }
-            self.exec_command(call, command, None, turn, session);
+            let host = self.running_host(&call);
+            self.with_host(host, session, |agent, session| {
+                agent.exec_command(call, command, None, turn, session)
+            });
         } else {
             if let Some(index) = remember
                 && let Some(scope) = scopes.get(index)
@@ -3456,7 +3875,10 @@ impl Agent {
         };
         let turn = self.turn_for(&call);
         let password = password.trim().to_owned();
-        self.exec_command(call, command, Some(password), turn, session);
+        let host = self.running_host(&call);
+        self.with_host(host, session, |agent, session| {
+            agent.exec_command(call, command, Some(password), turn, session)
+        });
     }
 
     /// Refuse the sudo prompt; the model is told the command did not run.
@@ -3482,7 +3904,10 @@ impl Agent {
         };
         self.allow_all = true;
         let turn = self.turn_for(&call);
-        self.exec_command(call, command, None, turn, session);
+        let host = self.running_host(&call);
+        self.with_host(host, session, |agent, session| {
+            agent.exec_command(call, command, None, turn, session)
+        });
     }
 
     /// The transcript line belonging to a call with no answer yet.
@@ -3560,9 +3985,10 @@ impl Agent {
                     *stopped = true;
                 }
             }
-            Phase::Running { call, turn, .. } | Phase::Allowing { call, turn, .. } => {
-                self.abandon_tool(call, turn)
-            }
+            Phase::Running { call, turn, .. }
+            | Phase::Allowing { call, turn, .. }
+            | Phase::Connect { call, turn, .. }
+            | Phase::Remote { call, turn, .. } => self.abandon_tool(call, turn),
             Phase::Approving { call, .. } | Phase::Asking { call, .. } | Phase::Sudo { call, .. } => {
                 let turn = self.turn_for(&call);
                 self.abandon_tool(call, turn);
@@ -3589,16 +4015,18 @@ impl Agent {
     /// instead of waiting for output that will never come.
     pub fn stop_command(&mut self, session: Session<'_, '_>) {
         let Some(Phase::Running {
-            waiting: Waiting::Command { key, .. },
+            waiting: Waiting::Command { key, host, .. },
             ..
         }) = &self.phase
         else {
             return;
         };
-        let key = key.clone();
-        if let Some(access) = session.as_mut() {
-            access.cancel(&key);
-        }
+        let (key, host) = (key.clone(), host.clone());
+        self.with_host(host, session, |_, session| {
+            if let Some(access) = session.as_mut() {
+                access.cancel(&key);
+            }
+        });
     }
 
     /// Answer a tool call that will never run, so the model sees why it stopped.
@@ -4022,8 +4450,10 @@ fn is_writing_tool(name: &str) -> bool {
 pub fn wrap_command(cwd: &str, command: &str) -> String {
     let status = "__WASSH_STATUS";
     let pwd = "__WASSH_PWD";
+    // A host the conversation has not moved in yet has no directory to go to.
+    let enter = (!cwd.is_empty()).then(|| format!("cd {} >/dev/null 2>&1 || true", shell_quote(cwd)));
     [
-        format!("cd {} >/dev/null 2>&1 || true", shell_quote(cwd)),
+        enter.unwrap_or_default(),
         command.to_owned(),
         "__wassh_status=$?".to_owned(),
         format!(r#"printf '\n{status}:%s__\n' "$__wassh_status""#),
@@ -7045,5 +7475,364 @@ Working directory is now /srv/app.
         assert!(text.contains("User: restart nginx"));
         assert!(text.contains("Assistant: done"));
         assert!(SUMMARY_SYSTEM_PROMPT.contains("Goal"));
+    }
+
+    /// The app's connections, with one saved host and a session per handle.
+    #[derive(Default)]
+    struct FakeRemote {
+        hosts: Vec<RemoteHost>,
+        states: std::collections::HashMap<String, RemoteState>,
+        sessions: std::collections::HashMap<String, FakeSession>,
+        opened: Vec<String>,
+        passwords: Vec<String>,
+    }
+
+    impl FakeRemote {
+        /// A broker holding one host, in `state`, with its session ready to answer.
+        fn with_host(id: &str, name: &str, state: RemoteState) -> Rc<RefCell<Self>> {
+            let mut remote = Self::default();
+            remote.hosts.push(RemoteHost {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                address: "deploy@10.0.0.4:22".to_owned(),
+                tags: vec!["prod".to_owned()],
+                problem: None,
+            });
+            remote.states.insert(host_handle(id), state);
+            remote.sessions.insert(host_handle(id), FakeSession::default());
+            Rc::new(RefCell::new(remote))
+        }
+
+        /// Hand the conversation the broker, as the pane does every frame.
+        fn attach(agent: &mut Agent, remote: &Rc<RefCell<Self>>) {
+            let broker: Rc<RefCell<dyn RemoteHosts>> = remote.clone();
+            agent.set_remote(Some(broker));
+        }
+
+        /// Let the connection finish opening.
+        fn open(&mut self, id: &str) {
+            self.states
+                .insert(host_handle(id), RemoteState::Open { environment: "a test box".to_owned() });
+        }
+
+        /// The session commands on `id` run through.
+        fn session_mut(&mut self, id: &str) -> &mut FakeSession {
+            self.sessions.get_mut(&host_handle(id)).expect("a session")
+        }
+    }
+
+    impl RemoteHosts for FakeRemote {
+        fn hosts(&self) -> &[RemoteHost] {
+            &self.hosts
+        }
+        fn connect(&mut self, handle: &str, host_id: &str) {
+            self.opened.push(host_id.to_owned());
+            self.states.insert(handle.to_owned(), RemoteState::Connecting);
+        }
+        fn state(&self, handle: &str) -> RemoteState {
+            self.states.get(handle).cloned().unwrap_or_default()
+        }
+        fn supply_password(&mut self, handle: &str, password: &str) {
+            self.passwords.push(password.to_owned());
+            self.states.insert(
+                handle.to_owned(),
+                RemoteState::Open { environment: "a test box".to_owned() },
+            );
+        }
+        fn session(&mut self, handle: &str) -> Option<&mut dyn SessionAccess> {
+            self.sessions
+                .get_mut(handle)
+                .map(|session| session as &mut dyn SessionAccess)
+        }
+        fn close(&mut self, handle: &str) {
+            self.states.remove(handle);
+        }
+    }
+
+    /// A conversation with one saved host, ready to be asked to work on it.
+    fn with_saved_host(state: RemoteState) -> (Agent, Rc<RefCell<FakeRemote>>) {
+        let remote = FakeRemote::with_host("db-1", "db-1", state);
+        let mut agent = Agent::new();
+        agent.allow_all = true;
+        FakeRemote::attach(&mut agent, &remote);
+        (agent, remote)
+    }
+
+    #[test]
+    fn hosts_list_names_the_saved_hosts_and_how_to_use_them() {
+        let (mut agent, _remote) = with_saved_host(RemoteState::Idle);
+        let mut tab = FakeSession::default();
+        let output = run_tool(&mut agent, &mut tab, TOOL_HOSTS_LIST, "{}");
+        assert!(output.contains("- db-1 — db-1 (deploy@10.0.0.4:22)"), "{output}");
+        assert!(output.contains("tags: prod"), "{output}");
+        assert!(output.contains("Pass a host's id as `host`"), "{output}");
+        assert!(!output.contains("password"), "{output}");
+    }
+
+    #[test]
+    fn a_call_on_another_host_asks_before_it_connects() {
+        let (mut agent, remote) = with_saved_host(RemoteState::Idle);
+        // The command itself is allowed; the connection to another machine is what asks.
+        agent.allow_all = false;
+        agent.app_allow = vec!["uname*".to_owned()];
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_RUN_COMMAND);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut tab);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"uname -a","host":"db-1"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        let Some((HostCard::Ask, host)) = agent.host_card() else {
+            panic!("the card does not ask: {}", agent.host_card().is_some());
+        };
+        assert_eq!(host.name, "db-1");
+        assert!(remote.borrow().opened.is_empty(), "it connected before asking");
+
+        agent.answer_connect(true, &mut session);
+        assert_eq!(remote.borrow().opened, ["db-1"]);
+        assert!(!agent.host_card().is_some_and(|(card, _)| card == HostCard::Ask));
+
+        // While the connection is opening the call waits.
+        let handle = host_handle("db-1");
+        agent.poll(&mut session);
+        assert!(matches!(agent.phase, Some(Phase::Remote { .. })));
+        remote.borrow_mut().open("db-1");
+        remote.borrow_mut().session_mut("db-1").answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "Linux db-1\n__WASSH_STATUS:0__\n__WASSH_PWD:/root__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        // The call runs once the other host answers, and its output comes back through
+        // that host's own session a frame later.
+        agent.poll(&mut session);
+        agent.poll(&mut session);
+        assert!(tab.commands.is_empty(), "the command ran on this tab's host");
+        let sent = remote.borrow().sessions[&handle].commands.clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].1.contains("uname -a"), "{sent:?}");
+        assert!(
+            matches!(
+                agent.turns.last(),
+                Some(Turn::Tool { output, .. }) if output.contains("Linux db-1")
+            ),
+            "{:?}",
+            agent.turns.last()
+        );
+    }
+
+    #[test]
+    fn a_denied_connection_is_reported_without_connecting() {
+        let (mut agent, remote) = with_saved_host(RemoteState::Idle);
+        agent.allow_all = false;
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_RUN_COMMAND);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut tab);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"hostname","host":"db-1"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        agent.answer_connect(false, &mut session);
+        assert!(remote.borrow().opened.is_empty());
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. })
+                if content.contains("did not allow this chat to connect to db-1")
+        ));
+    }
+
+    #[test]
+    fn an_unknown_host_is_refused_with_the_list_to_call() {
+        let (mut agent, _remote) = with_saved_host(RemoteState::Idle);
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_RUN_COMMAND);
+        let output = run_tool(
+            &mut agent,
+            &mut tab,
+            TOOL_RUN_COMMAND,
+            r#"{"command":"hostname","host":"web-9"}"#,
+        );
+        assert!(output.contains("no saved host `web-9`"), "{output}");
+        assert!(output.contains(TOOL_HOSTS_LIST), "{output}");
+        assert!(tab.commands.is_empty());
+    }
+
+    #[test]
+    fn a_tool_that_cannot_run_elsewhere_says_which_ones_can() {
+        let (mut agent, _remote) = with_saved_host(RemoteState::Idle);
+        when_offered(&mut agent, TOOL_REMOTE_EDIT);
+        let mut tab = FakeSession::default();
+        tab.contents.insert("/srv/app/main.rs".to_owned(), "fn main() {}\n".to_owned());
+        let output = run_tool(
+            &mut agent,
+            &mut tab,
+            TOOL_REMOTE_EDIT,
+            r#"{"path":"/srv/app/main.rs","oldText":"main","newText":"start","host":"db-1"}"#,
+        );
+        assert!(output.contains("runs on this tab's host only"), "{output}");
+        assert!(output.contains(TOOL_RUN_COMMAND), "{output}");
+    }
+
+    #[test]
+    fn a_remembered_denial_refuses_the_connection_without_a_card() {
+        let (mut agent, remote) = with_saved_host(RemoteState::Idle);
+        agent.allow_all = false;
+        agent.reach_deny = vec!["db-1".to_owned()];
+        let mut tab = FakeSession::default();
+        let output = run_tool(
+            &mut agent,
+            &mut tab,
+            TOOL_RUN_COMMAND,
+            r#"{"command":"hostname","host":"db-1"}"#,
+        );
+        assert!(output.contains("do not let this chat connect to db-1"), "{output}");
+        assert!(agent.host_card().is_none(), "the card asked anyway");
+        assert!(remote.borrow().opened.is_empty());
+    }
+
+    #[test]
+    fn a_remembered_allow_connects_without_a_card() {
+        let (mut agent, remote) = with_saved_host(RemoteState::Idle);
+        agent.allow_all = false;
+        agent.reach_allow = vec!["db-1".to_owned()];
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_RUN_COMMAND);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut tab);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"hostname","host":"db-1"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert_eq!(
+            agent.host_card().map(|(card, _)| card),
+            Some(HostCard::Connecting),
+            "the card asked anyway"
+        );
+        assert_eq!(remote.borrow().opened, ["db-1"]);
+    }
+
+    #[test]
+    fn a_host_without_a_stored_password_asks_for_one() {
+        let (mut agent, remote) = with_saved_host(RemoteState::NeedsPassword);
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_RUN_COMMAND);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut tab);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"hostname","host":"db-1"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        let Some((HostCard::Password, host)) = agent.host_card() else {
+            panic!("the card does not ask for a password: {}", agent.host_card().is_some());
+        };
+        assert_eq!(host.id, "db-1");
+
+        remote.borrow_mut().session_mut("db-1").answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "db-1\n__WASSH_STATUS:0__\n__WASSH_PWD:/home/deploy__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        agent.supply_host_password("hunter2");
+        assert_eq!(remote.borrow().passwords, ["hunter2"]);
+        agent.poll(&mut session);
+        agent.poll(&mut session);
+        assert!(tab.commands.is_empty(), "the command ran on this tab's host");
+        let sent = remote.borrow().sessions[&host_handle("db-1")].commands.clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+    }
+
+    #[test]
+    fn a_file_written_on_another_host_lands_there() {
+        let (mut agent, remote) =
+            with_saved_host(RemoteState::Open { environment: "a test box".to_owned() });
+        agent.allow_all = true;
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_REMOTE_WRITE);
+        remote.borrow_mut().session_mut("db-1").answers.insert(
+            PROBE_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "no\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut tab);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_REMOTE_WRITE.to_owned(),
+                arguments: r#"{"path":"/srv/app/main.rs","content":"fn main() {}\n","host":"db-1"}"#
+                    .to_owned(),
+            },
+            &mut session,
+        );
+        // The probe answers on the host, then the upload finishes there.
+        agent.poll(&mut session);
+        agent.poll(&mut session);
+        assert!(tab.writes.is_empty(), "the file was written on this tab's host");
+        let written = remote.borrow().sessions[&host_handle("db-1")].writes.clone();
+        assert_eq!(
+            written,
+            [(
+                "/srv/app/main.rs".to_owned(),
+                b"fn main() {}\n".to_vec()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_working_directory_is_kept_per_host() {
+        let (mut agent, remote) = with_saved_host(RemoteState::Open { environment: "a test box".to_owned() });
+        agent.allow_all = true;
+        let mut tab = FakeSession::default();
+        when_offered(&mut agent, TOOL_RUN_COMMAND);
+        remote.borrow_mut().session_mut("db-1").answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "/srv/app\n__WASSH_STATUS:0__\n__WASSH_PWD:/srv/app__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let output = run_tool(
+            &mut agent,
+            &mut tab,
+            TOOL_RUN_COMMAND,
+            r#"{"command":"cd /srv/app","host":"db-1"}"#,
+        );
+        assert!(output.contains("Working directory is now /srv/app"), "{output}");
+        assert_eq!(agent.cwd, "/", "another host moved this tab's directory");
+
+        // A relative path on that host resolves against its directory, not this tab's.
+        remote.borrow_mut().session_mut("db-1").contents.insert(
+            "/srv/app/main.rs".to_owned(),
+            "fn main() {}\n".to_owned(),
+        );
+        let read = run_tool(
+            &mut agent,
+            &mut tab,
+            TOOL_REMOTE_READ,
+            r#"{"path":"main.rs","host":"db-1"}"#,
+        );
+        assert!(read.contains("fn main() {}"), "{read}");
     }
 }
