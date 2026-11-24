@@ -11,6 +11,10 @@
 
 ### Changed
 
+- Tell the agent when a command has moved the working directory — the result now carries
+  "Working directory is now …" — and name `set_working_directory` in the command tool's own
+  description, in the guidelines and in the script-mode paragraph, so it stops putting the same
+  `cd` in front of every command.
 - Make the chat's Plan/Agent control in the AI footer a real switch — a track with a knob that
   slides across, captioned **Plan** — instead of a button that changed its label with the mode.
   The knob's position shows the mode, and the tooltip still says what each side means.

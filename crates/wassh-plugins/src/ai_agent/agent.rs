@@ -1238,6 +1238,7 @@ impl Agent {
                 }
                 match then {
                     CommandThen::Return => {
+                        let mut moved = None;
                         let (visible, exit_code, directory, truncated) = match (output, failure) {
                             (Some(output), _) => {
                                 let raw = tail_of(&format!("{}{}", output.stdout, output.stderr));
@@ -1254,7 +1255,9 @@ impl Agent {
                         };
                         if let Some(directory) = directory
                             && !directory.is_empty()
+                            && directory != self.cwd
                         {
+                            moved = Some(directory.clone());
                             self.cwd = directory;
                         }
                         // The wrapper prints a marker when `sudo` refused the password; say so.
@@ -1276,6 +1279,15 @@ impl Agent {
                         if plain_command && needs_sudo_help(&visible) {
                             visible.push('\n');
                             visible.push_str(SUDO_HINT);
+                        }
+                        // A command that left the shell in another directory has moved the
+                        // conversation's: say so where the model reads, not only in the next
+                        // request's prompt.
+                        if let Some(moved) = &moved {
+                            if !visible.is_empty() {
+                                visible.push('\n');
+                            }
+                            visible.push_str(&format!("Working directory is now {moved}."));
                         }
                         Ready::Settle(
                             self.turn_label(turn, &call),
@@ -6050,6 +6062,33 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_cd_answers_where_the_shell_ended_up() {
+        let mut agent = Agent::new();
+        agent.allow_all = true;
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "\n__WASSH_STATUS:0__\n__WASSH_PWD:/srv/app__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_RUN_COMMAND,
+            r#"{"command":"cd /srv/app"}"#,
+        );
+        assert_eq!(
+            output,
+            "Working directory is now /srv/app.
+[exit code: 0]"
+        );
+        assert_eq!(agent.cwd, "/srv/app");
+    }
+
+    #[test]
     fn a_command_runs_through_the_session_and_moves_the_directory() {
         let mut agent = Agent::new();
         agent.app_allow = vec!["pwd".to_owned()];
@@ -6071,9 +6110,11 @@ mod tests {
         assert_eq!(
             output,
             "/srv/app
+Working directory is now /srv/app.
 [exit code: 0]"
         );
-        // The wrapper ran in the cwd and reported it back.
+        // The wrapper ran in the cwd and reported it back; the move is said out loud, so a
+        // model that cd-ed keeps the directory instead of repeating it in every command.
         let sent = &fake.commands[0].1;
         assert!(sent.starts_with("cd '/' "), "{sent}");
         assert_eq!(agent.cwd, "/srv/app");

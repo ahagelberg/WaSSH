@@ -987,7 +987,9 @@ results there. Spend real effort on shrinking what you return: filter down to th
 that answer the question, sort and de-duplicate them, and compact, count or summarise the \
 rest instead of dumping raw output — that result is all the model sees, so keep it as \
 small as the answer allows. Every tool the guidance below names is called the same way: from \
-a script, never as a tool of the turn. Callable now:",
+a script, never as a tool of the turn. The working directory is shared by every call a script \
+makes and stays after it, so move it once with `await tools.set_working_directory({{ path }})` \
+and keep the cd out of the commands. Callable now:",
                     super::script::MAX_EXEC_MS / 1_000,
                     super::script::MAX_CALLS,
                     super::script::MAX_CALL_MS / 1_000
@@ -1087,6 +1089,14 @@ a script, never as a tool of the turn. Callable now:",
              If it belongs to a scope listed above, load that scope with load_scope first."
                 .to_owned(),
         ];
+        if agent.offers_tool(super::protocol::TOOL_RUN_COMMAND) {
+            lines.push(
+                "- Work relative to the current working directory written above. When the work \
+                 moves, move it once with set_working_directory and keep the cd out of the \
+                 commands that follow."
+                    .to_owned(),
+            );
+        }
         let host_files = offered(is_host_file_tool);
         if !host_files.is_empty() {
             lines.push(format!(

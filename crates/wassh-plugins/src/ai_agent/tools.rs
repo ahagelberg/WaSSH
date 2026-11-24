@@ -121,9 +121,11 @@ turn and hand back only what the answer needs.",
     ToolSpec {
         name: TOOL_RUN_COMMAND,
         description: "Run a shell command on the connected SSH host and return its output and exit \
-code. Meant for work no tool covers, such as builds, tests, services, package managers and \
-version control; files are read, searched and edited with the file tools of the \"host-files\" \
-scope, not with cat, grep, ls, find or sed.",
+code. It runs in the conversation's working directory, which set_working_directory moves; a cd at \
+the start of a command moves that directory too, so one change covers every later call. Meant for \
+work no tool covers, such as builds, tests, services, package managers and version control; files \
+are read, searched and edited with the file tools of the \"host-files\" scope, not with cat, grep, \
+ls, find or sed.",
     },
     ToolSpec {
         name: TOOL_CHANGE_DIR,
