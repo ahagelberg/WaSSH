@@ -14,7 +14,7 @@ use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, ImagePart,
-    MAX_SUBAGENT_RESULT_CHARS, TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    MAX_SUBAGENT_RESULT_CHARS, TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
     TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
@@ -2251,6 +2251,14 @@ impl Agent {
                 let questions = asked_questions(&arguments);
                 self.phase = Some(Phase::Asking { call, questions });
             }
+            TOOL_CHANGE_DIR => {
+                let path =
+                    relative_remote(&self.cwd, arguments["path"].as_str().unwrap_or_default());
+                // The wrapper reports the directory it ended in, so a path that is not there
+                // fails the call and leaves the working directory where it was.
+                let command = format!("cd {} && pwd", shell_quote(&path));
+                self.exec_command(call, command, None, turn, session);
+            }
             TOOL_RUN_COMMAND => {
                 let Some(command) = arguments["command"]
                     .as_str()
@@ -3822,6 +3830,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
     let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     match call.name.as_str() {
         TOOL_RUN_COMMAND => format!("$ {}", arguments["command"].as_str().unwrap_or_default()),
+        TOOL_CHANGE_DIR => format!(
+            "cd {}",
+            arguments["path"].as_str().unwrap_or_default().trim()
+        ),
         TOOL_RUN_COMMAND_BACKGROUND => format!(
             "$ {} (background)",
             arguments["command"].as_str().unwrap_or_default()
@@ -6066,6 +6078,53 @@ mod tests {
         assert!(sent.starts_with("cd '/' "), "{sent}");
         assert_eq!(agent.cwd, "/srv/app");
         assert!(agent.needs_reply);
+    }
+
+    #[test]
+    fn a_working_directory_change_moves_the_calls_after_it() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "/srv/app\n__WASSH_STATUS:0__\n__WASSH_PWD:/srv/app__\n".to_owned(),
+                stderr: String::new(),
+                code: Some(0),
+            },
+        );
+        let output = run_tool(
+            &mut agent,
+            &mut fake,
+            TOOL_CHANGE_DIR,
+            r#"{"path":"/srv/app"}"#,
+        );
+        assert_eq!(agent.cwd, "/srv/app", "{output}");
+        // A relative path of a later call lands in the new directory.
+        assert_eq!(relative_remote(&agent.cwd, "src"), "/srv/app/src");
+        assert!(output.contains("/srv/app"), "{output}");
+        assert!(
+            fake.commands[0].1.contains("cd '/srv/app' && pwd"),
+            "the change did not run as a cd: {:?}",
+            fake.commands[0].1
+        );
+    }
+
+    #[test]
+    fn a_change_to_a_directory_that_is_not_there_leaves_the_cwd_alone() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        fake.answers.insert(
+            EXEC_KEY.to_owned(),
+            crate::command::CommandOutput {
+                stdout: "\n__WASSH_STATUS:2__\n__WASSH_PWD:/__\n".to_owned(),
+                stderr: "cd: can't cd to /nope\n".to_owned(),
+                code: Some(2),
+            },
+        );
+        let output = run_tool(&mut agent, &mut fake, TOOL_CHANGE_DIR, r#"{"path":"/nope"}"#);
+        assert_eq!(agent.cwd, "/", "the working directory followed a failed cd");
+        assert!(output.contains("can't cd to /nope"), "{output}");
+        assert!(output.contains("[exit code: 2]"), "{output}");
     }
 
     #[test]

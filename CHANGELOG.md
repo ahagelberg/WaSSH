@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Give the agent a way to say where the work happens: `set_working_directory` sets the directory
+  that later commands and relative paths use, and answers with the directory the host ended up in.
+  The current directory is still written into the prompt, so the agent stops putting a `cd` in
+  front of every command.
+
 ### Changed
 
 - Make the chat's Plan/Agent control in the AI footer a real switch — a track with a knob that

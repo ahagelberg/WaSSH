@@ -20,7 +20,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::protocol::{
-    TOOL_ASK_USER, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT,
+    TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
     TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
@@ -123,6 +124,12 @@ turn and hand back only what the answer needs.",
 code. Meant for work no tool covers, such as builds, tests, services, package managers and \
 version control; files are read, searched and edited with the file tools of the \"host-files\" \
 scope, not with cat, grep, ls, find or sed.",
+    },
+    ToolSpec {
+        name: TOOL_CHANGE_DIR,
+        description: "Set the directory that later commands and relative paths work in, and \
+answer with the directory the host ended up in. Call it once when the work moves elsewhere \
+instead of putting a cd in front of every command.",
     },
     ToolSpec {
         name: TOOL_RUN_COMMAND_BACKGROUND,
@@ -461,6 +468,10 @@ and resolves to its JSON result; a failed call throws. Return the compact result
         TOOL_RUN_COMMAND => (
             json!({ "command": string("The command line to run, exactly as it would be typed.") }),
             json!(["command"]),
+        ),
+        TOOL_CHANGE_DIR => (
+            json!({ "path": string("The directory to work in from now on.") }),
+            json!(["path"]),
         ),
         TOOL_RUN_COMMAND_BACKGROUND => (
             json!({ "command": string("The command line to start in the background.") }),
@@ -1021,6 +1032,7 @@ pub fn needs_session(name: &str) -> bool {
         TOOL_ENV_SCAN
             | TOOL_ENV_SYSTEM
             | TOOL_RUN_COMMAND
+            | TOOL_CHANGE_DIR
             | TOOL_RUN_COMMAND_BACKGROUND
             | TOOL_RUN_SUDO
             | TOOL_REMOTE_READ
@@ -1103,6 +1115,7 @@ pub fn is_read_only(name: &str) -> bool {
             | TOOL_ASK_USER
             | TOOL_LOAD_SCOPE
             | TOOL_UNLOAD_SCOPE
+            | TOOL_CHANGE_DIR
             | TOOL_SPAWN_SUBAGENT
             | TOOL_WAIT_SUBAGENT
     ) || plugin_tool(name).is_some_and(|tool| tool.read_only)
@@ -2366,6 +2379,7 @@ mod tests {
                 TOOL_UNLOAD_SCOPE,
                 TOOL_RUN_SCRIPT,
                 TOOL_RUN_COMMAND,
+                TOOL_CHANGE_DIR,
                 TOOL_RUN_COMMAND_BACKGROUND,
                 TOOL_RUN_SUDO,
                 TOOL_ASK_USER,
@@ -2450,6 +2464,7 @@ mod tests {
             TOOL_ENV_FIND,
             TOOL_ASK_USER,
             TOOL_LOAD_SCOPE,
+            TOOL_CHANGE_DIR,
             "docker_containers",
         ] {
             assert!(names.contains(&kept), "{kept} should survive Plan mode: {names:?}");

@@ -51,6 +51,8 @@ pub const MAX_SUBAGENT_RESULT_CHARS: usize = 8_000;
 
 /// Tool: run a shell command with output captured.
 pub const TOOL_RUN_COMMAND: &str = "run_command";
+/// Tool: set the directory later commands and relative paths are resolved against.
+pub const TOOL_CHANGE_DIR: &str = "set_working_directory";
 /// Tool: run a short JavaScript program that calls the other tools and returns one result.
 pub const TOOL_RUN_SCRIPT: &str = "run_script";
 /// Tool: start a shell command in the background without waiting for it.

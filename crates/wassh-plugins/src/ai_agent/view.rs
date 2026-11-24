@@ -7984,8 +7984,8 @@ mod tests {
         assert!(both.contains("Environment: a test shell."), "{both}");
         assert!(
             both.contains(
-                "- core: run_command, run_command_background, run_script, run_sudo, ask_user, \
-                 spawn_subagent, wait_subagent, get_current_time"
+                "- core: run_command, set_working_directory, run_command_background, run_script, \
+                 run_sudo, ask_user, spawn_subagent, wait_subagent, get_current_time"
             ),
             "{both}"
         );
