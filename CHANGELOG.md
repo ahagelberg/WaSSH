@@ -1,14 +1,26 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.21] - 2026-11-24
 
 ### Added
 
+- Let the agent ask for a longer script. When a script needs more than the 20 seconds it gets
+  by default, a card asks you first, with **Allow once** and **Deny**; an allowed run gets up to
+  ten minutes.
+- Let the agent start scripts in the background: it sets a script running beside the chat, keeps
+  working, and collects the result when the script is done — up to four at a time. The transcript
+  says when one finishes or fails, a script's own permission cards appear in the composer under
+  its name, and Stop stops only that script.
 - Say what the agent is doing while a tool runs. The transcript now shows a line where
   "Thinking…" was, naming the step — running the command, reading a file, listing a directory,
   transferring a file, running a script, waiting for a sub-agent or the terminal, or opening a
   connection to another host — with the same animated dots, so a long build or search no longer
   looks like a stall with only a Stop button for company.
+
+### Changed
+
+- A tool the agent calls from a script may now take up to ten minutes to answer instead of one,
+  so a build, download or search started inside a script is no longer cut off partway.
 
 ## [2.0.20] - 2026-11-24
 
