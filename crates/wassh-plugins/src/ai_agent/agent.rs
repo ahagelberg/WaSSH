@@ -28,7 +28,7 @@ use super::protocol::{
     TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
     TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
     TOOL_HOSTS_LIST, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO,
-    TOOL_SPAWN_SUBAGENT,
+    TOOL_SCRIPT_RESULT, TOOL_SPAWN_SUBAGENT,
     TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
     TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
     TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
@@ -54,6 +54,10 @@ type Session<'a, 'b> = &'a mut Option<&'b mut dyn SessionAccess>;
 pub const MAX_OUTPUT_CHARS: usize = 64_000;
 /// Prefix of the call ids a script's tool calls carry; they never reach the provider.
 const SCRIPT_CALL_PREFIX: &str = "script-";
+/// Background scripts one conversation may run at once.
+const MAX_BACKGROUND_SCRIPTS: usize = 4;
+/// Longest `script_result` waits for a background script.
+const MAX_SCRIPT_WAIT_SECONDS: u64 = 300;
 /// Hits `env_find` returns when the call does not say.
 const ENV_FIND_HITS_DEFAULT: usize = 30;
 /// Files `env_search` ranks when the call does not say.
@@ -211,6 +215,18 @@ struct ScriptRun {
     job: script::ScriptJob,
 }
 
+/// One script running beside the conversation.
+pub struct BackgroundScript {
+    /// Id the model uses: `s1`, `s2`…
+    pub id: String,
+    /// The script's own conversation state: its calls, rules and prompts.
+    pub agent: Agent,
+    /// What it produced, once it finished.
+    result: Option<(String, bool)>,
+    /// Whether the finish line was already written to the transcript.
+    announced: bool,
+}
+
 /// A question the agent asks, with optional selectable answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentQuestion {
@@ -257,6 +273,8 @@ pub enum Phase {
         turn: usize,
         /// Seconds it wants to run for.
         seconds: u64,
+        /// Whether it was asked to run beside the conversation.
+        background: bool,
     },
     /// Another host is about to be opened, and the user is being asked about it.
     Connect {
@@ -354,6 +372,13 @@ pub enum Waiting {
     },
     /// A script in its sandbox, until it returns or asks for another tool.
     Script,
+    /// A background script, until it answers or the wait ends.
+    BackgroundScript {
+        /// Id the model asked for.
+        id: String,
+        /// When the wait gives up, in milliseconds since the epoch.
+        until_ms: u64,
+    },
 }
 
 /// What the pane shows while another host is being reached.
@@ -777,6 +802,10 @@ pub struct Agent {
     shown_images: Vec<(String, ImagePart)>,
     /// The script this conversation is running, if any.
     script: Option<ScriptRun>,
+    /// Scripts running beside the conversation, in the order they were started.
+    pub background: Vec<BackgroundScript>,
+    /// Counter behind the background script ids.
+    next_background: usize,
     /// Whether the tools are offered as a script API instead of one schema per tool.
     pub script_mode: bool,
     /// The app's connections to other hosts, handed in by the pane every frame.
@@ -894,6 +923,11 @@ impl Agent {
             }
         }
         self.subagents.clear();
+        for bg in &mut self.background {
+            bg.agent.stop();
+        }
+        self.background.clear();
+        self.next_background = 0;
         self.next_subagent = 0;
     }
 
@@ -1016,6 +1050,7 @@ impl Agent {
         self.flush_reports();
         let mut progressed = self.poll_own(session);
         progressed |= self.poll_subagents(session);
+        progressed |= self.poll_background(session);
         progressed
     }
 
@@ -1125,6 +1160,89 @@ impl Agent {
         let (turn, report) = end_subagent(sub);
         self.turns.push(turn);
         self.pending_reports.push(report);
+    }
+
+    /// Poll the background scripts, and note the ones that finished.
+    fn poll_background(&mut self, session: Session<'_, '_>) -> bool {
+        if self.background.is_empty() {
+            return false;
+        }
+        let permissions = self.permissions.clone();
+        let remote = self.remote.clone();
+        let hosts = self.hosts.clone();
+        let reach_allow = self.reach_allow.clone();
+        let reach_deny = self.reach_deny.clone();
+        let app_allow = self.app_allow.clone();
+        let app_deny = self.app_deny.clone();
+        let host_allow = self.host_allow.clone();
+        let host_deny = self.host_deny.clone();
+        let session_allow = self.session_allow.clone();
+        let session_deny = self.session_deny.clone();
+        let allow_all = self.allow_all;
+        let now = self.now_ms;
+        let mut progressed = false;
+        let mut finished = Vec::new();
+        for bg in &mut self.background {
+            let agent = &mut bg.agent;
+            agent.now_ms = now;
+            if agent.permissions != permissions {
+                agent.permissions = permissions.clone();
+            }
+            agent.remote = remote.clone();
+            if agent.hosts != hosts {
+                agent.hosts = hosts.clone();
+            }
+            if agent.reach_allow != reach_allow {
+                agent.reach_allow = reach_allow.clone();
+            }
+            if agent.reach_deny != reach_deny {
+                agent.reach_deny = reach_deny.clone();
+            }
+            if agent.app_allow != app_allow {
+                agent.app_allow = app_allow.clone();
+            }
+            if agent.app_deny != app_deny {
+                agent.app_deny = app_deny.clone();
+            }
+            if agent.host_allow != host_allow {
+                agent.host_allow = host_allow.clone();
+            }
+            if agent.host_deny != host_deny {
+                agent.host_deny = host_deny.clone();
+            }
+            if agent.session_allow != session_allow {
+                agent.session_allow = session_allow.clone();
+            }
+            if agent.session_deny != session_deny {
+                agent.session_deny = session_deny.clone();
+            }
+            if agent.allow_all != allow_all {
+                agent.allow_all = allow_all;
+            }
+            if bg.result.is_some() {
+                continue;
+            }
+            progressed |= agent.poll(&mut *session);
+            let call_id = format!("bg-{}", bg.id);
+            if let Some(result) = tool_result(agent, &call_id) {
+                bg.result = Some(result);
+                progressed = true;
+            }
+            if bg.result.is_some() && !bg.announced {
+                bg.announced = true;
+                let failed = bg.result.as_ref().is_some_and(|(_, failed)| *failed);
+                finished.push((bg.id.clone(), failed));
+            }
+        }
+        for (id, failed) in finished {
+            let line = if failed {
+                format!("Background script {id} failed.")
+            } else {
+                format!("Background script {id} finished. Call script_result with \"{id}\" to collect it.")
+            };
+            self.turns.push(Turn::Notice(line));
+        }
+        progressed
     }
 
     /// Take in whatever this conversation's own worker thread or tool produced.
@@ -1739,6 +1857,20 @@ impl Agent {
                     }
                 }
             }
+            Waiting::BackgroundScript { id, until_ms } => {
+                let (id, until_ms) = (id.clone(), *until_ms);
+                if let Some((text, failed)) = self.collect_background(&id) {
+                    Ready::Settle(format!("script {id}"), text, failed)
+                } else if self.now_ms < until_ms {
+                    return false;
+                } else {
+                    Ready::Settle(
+                        format!("script {id}"),
+                        format!("Script {id} is still running; collect it again later."),
+                        false,
+                    )
+                }
+            }
             Waiting::Terminal { before, until_ms } => {
                 let (before, until_ms) = (before.clone(), *until_ms);
                 let screen = session
@@ -2187,13 +2319,33 @@ impl Agent {
             call,
             turn,
             seconds,
+            background,
         }) = self.phase.take()
         else {
             return;
         };
         if allow {
             let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-            self.start_task_script(call, turn, &arguments, session);
+            if background {
+                let code = arguments["code"].as_str().unwrap_or_default().to_owned();
+                let label = call_label(&call);
+                match self.begin_background_script(&code, seconds, session) {
+                    Ok(id) => self.settle(
+                        call,
+                        turn,
+                        label,
+                        format!(
+                            "Started background script {id}. Collect it with script_result and \
+                             \"{id}\", and keep working in the meantime."
+                        ),
+                        false,
+                        session,
+                    ),
+                    Err(problem) => self.settle(call, turn, label, problem, true, session),
+                }
+            } else {
+                self.start_task_script(call, turn, &arguments, session);
+            }
         } else {
             let limit = script::MAX_EXEC_MS / 1_000;
             let label = call_label(&call);
@@ -2434,7 +2586,11 @@ at most."
         }
         // Script mode offers one tool: everything else is called from inside the program.
         // The calls a script makes are let through — they are what the sandbox asked for.
-        if self.script_mode && name != TOOL_RUN_SCRIPT && !self.waiting_on(&call) {
+        if self.script_mode
+            && name != TOOL_RUN_SCRIPT
+            && name != TOOL_SCRIPT_RESULT
+            && !self.waiting_on(&call)
+        {
             let label = call_label(&call);
             self.settle(
                 call,
@@ -2464,6 +2620,7 @@ at most."
                     call,
                     turn,
                     seconds,
+                    background: arguments["background"].as_bool().unwrap_or(false),
                 });
                 return;
             }
@@ -2495,7 +2652,82 @@ at most."
         }
 
         match name.as_str() {
-            TOOL_RUN_SCRIPT => self.start_task_script(call, turn, &arguments, session),
+            TOOL_RUN_SCRIPT => {
+                if arguments["background"].as_bool().unwrap_or(false) {
+                    let code = arguments["code"].as_str().unwrap_or_default().to_owned();
+                    let seconds = tools::script_seconds(&arguments);
+                    let label = call_label(&call);
+                    match self.begin_background_script(&code, seconds, session) {
+                        Ok(id) => self.settle(
+                            call,
+                            turn,
+                            label,
+                            format!(
+                                "Started background script {id}. Collect it with script_result and \
+                                 \"{id}\", and keep working in the meantime."
+                            ),
+                            false,
+                            session,
+                        ),
+                        Err(problem) => self.settle(call, turn, label, problem, true, session),
+                    }
+                } else {
+                    self.start_task_script(call, turn, &arguments, session);
+                }
+            }
+            TOOL_SCRIPT_RESULT => {
+                let id = arguments["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let label = call_label(&call);
+                if !self.background.iter().any(|bg| bg.id == id) {
+                    let running: Vec<&str> = self
+                        .background
+                        .iter()
+                        .filter(|bg| bg.result.is_none())
+                        .map(|bg| bg.id.as_str())
+                        .collect();
+                    let message = if running.is_empty() {
+                        "There is no background script; none are running.".to_owned()
+                    } else {
+                        format!(
+                            "There is no background script '{id}'. Running: {}.",
+                            running.join(", ")
+                        )
+                    };
+                    self.settle(call, turn, label, message, true, session);
+                    return;
+                }
+                if let Some((text, failed)) = self.collect_background(&id) {
+                    self.settle(call, turn, label, text, failed, session);
+                } else {
+                    let wait = arguments["waitSeconds"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .min(MAX_SCRIPT_WAIT_SECONDS);
+                    if wait == 0 {
+                        self.settle(
+                            call,
+                            turn,
+                            label,
+                            format!("Script {id} is still running."),
+                            false,
+                            session,
+                        );
+                    } else {
+                        self.phase = Some(Phase::Running {
+                            call,
+                            turn,
+                            waiting: Waiting::BackgroundScript {
+                                id,
+                                until_ms: self.now_ms + wait * 1_000,
+                            },
+                        });
+                    }
+                }
+            }
             TOOL_LOAD_SCOPE => {
                 let asked = arguments["scope"].as_str().unwrap_or_default().to_owned();
                 let (output, failed) = match self.load_scope(&asked) {
@@ -3362,17 +3594,10 @@ at most."
         self.spawn_request.take()
     }
 
-    /// Create the sub-agent `request` describes, returning its index in [`Agent::subagents`].
-    ///
-    /// It starts with this conversation's working directory, scopes, permissions and rules;
-    /// the rules are re-read every frame, so later answers here reach it too.
-    pub fn begin_subagent(&mut self, title: &str, prompt: &str) -> usize {
-        self.next_subagent += 1;
-        let id = format!("{SUBAGENT_ID_PREFIX}-{}", self.next_subagent);
+    /// A child conversation carrying this one's directory, scopes and rules.
+    fn child_agent(&self) -> Agent {
         let mut agent = Agent::new();
         agent.cwd = self.cwd.clone();
-        agent.subagent = true;
-        agent.keys = CommandKeys::subagent(&id);
         agent.scopes = self.scopes.clone();
         agent.map = self.map.clone();
         agent.system = self.system.clone();
@@ -3392,6 +3617,19 @@ at most."
         agent.script_mode = self.script_mode;
         agent.tools = self.tools.clone();
         agent.max_subagents = self.max_subagents;
+        agent
+    }
+
+    /// Create the sub-agent `request` describes, returning its index in [`Agent::subagents`].
+    ///
+    /// It starts with this conversation's working directory, scopes, permissions and rules;
+    /// the rules are re-read every frame, so later answers here reach it too.
+    pub fn begin_subagent(&mut self, title: &str, prompt: &str) -> usize {
+        self.next_subagent += 1;
+        let id = format!("{SUBAGENT_ID_PREFIX}-{}", self.next_subagent);
+        let mut agent = self.child_agent();
+        agent.subagent = true;
+        agent.keys = CommandKeys::subagent(&id);
         agent.push_user(prompt, UserMeta::default());
         self.subagents.push(Subagent {
             id: id.clone(),
@@ -3468,15 +3706,25 @@ at most."
 
     /// Fold the answers a sub-agent was given into this conversation's rules.
     pub fn adopt_subagent_rules(&mut self, index: usize) {
-        let Some(sub) = self.subagents.get_mut(index) else {
+        let Some(sub) = self.subagents.get(index) else {
             return;
         };
-        self.allow_all |= sub.agent.allow_all;
-        if self.session_allow != sub.agent.session_allow {
-            self.session_allow = sub.agent.session_allow.clone();
+        let (allow_all, allow, deny) = (
+            sub.agent.allow_all,
+            sub.agent.session_allow.clone(),
+            sub.agent.session_deny.clone(),
+        );
+        self.adopt_rules(allow_all, allow, deny);
+    }
+
+    /// Take the blanket and session answers into this conversation.
+    fn adopt_rules(&mut self, allow_all: bool, allow: Vec<String>, deny: Vec<String>) {
+        self.allow_all |= allow_all;
+        if self.session_allow != allow {
+            self.session_allow = allow;
         }
-        if self.session_deny != sub.agent.session_deny {
-            self.session_deny = sub.agent.session_deny.clone();
+        if self.session_deny != deny {
+            self.session_deny = deny;
         }
     }
 
@@ -3498,7 +3746,89 @@ at most."
         stopped
     }
 
-    /// Run a shell command for `run_command`.
+    /// Start a script that runs beside the conversation, and answer with its id.
+    fn begin_background_script(
+        &mut self,
+        code: &str,
+        seconds: u64,
+        session: Session<'_, '_>,
+    ) -> Result<String, String> {
+        if self.subagent {
+            return Err(NO_NESTED_SUBAGENTS.to_owned());
+        }
+        if self.background.len() >= MAX_BACKGROUND_SCRIPTS {
+            return Err(format!(
+                "{MAX_BACKGROUND_SCRIPTS} background scripts are already running. Collect one \
+                 with script_result before starting another."
+            ));
+        }
+        let code = code.trim();
+        if code.is_empty() {
+            return Err("The code argument was missing or empty.".to_owned());
+        }
+        self.next_background += 1;
+        let id = format!("s{}", self.next_background);
+        let mut agent = self.child_agent();
+        // A script gets no model of its own and starts no sub-agents of its own.
+        agent.subagent = true;
+        agent.script_mode = false;
+        agent.keys = CommandKeys::subagent(&format!("bg-{id}"));
+        let call = ApiToolCall {
+            id: format!("bg-{id}"),
+            name: TOOL_RUN_SCRIPT.to_owned(),
+            arguments: serde_json::json!({ "code": code, "timeoutSeconds": seconds }).to_string(),
+        };
+        let arguments = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        agent.start_task_script(call, 0, &arguments, session);
+        self.background.push(BackgroundScript {
+            id: id.clone(),
+            agent,
+            result: None,
+            announced: false,
+        });
+        Ok(id)
+    }
+
+    /// Take a finished background script's result, dropping it so its slot frees up.
+    fn collect_background(&mut self, id: &str) -> Option<(String, bool)> {
+        let index = self.background.iter().position(|bg| bg.id == id)?;
+        let result = self.background[index].result.clone()?;
+        self.background.remove(index);
+        Some(result)
+    }
+
+    /// The first background script waiting for the user.
+    pub fn waiting_background(&self) -> Option<usize> {
+        self.background
+            .iter()
+            .position(|bg| bg.result.is_none() && bg.agent.needs_user())
+    }
+
+    /// Stop a background script whose prompt is on screen.
+    pub fn stop_background(&mut self, index: usize) {
+        let Some(bg) = self.background.get_mut(index) else {
+            return;
+        };
+        bg.agent.stop();
+        if bg.result.is_none() {
+            bg.result = Some(("The script was stopped by the user.".to_owned(), true));
+            bg.announced = true;
+        }
+    }
+
+    /// Fold the answers a background script was given into this conversation's rules.
+    pub fn adopt_background_rules(&mut self, index: usize) {
+        let Some(bg) = self.background.get(index) else {
+            return;
+        };
+        let (allow_all, allow, deny) = (
+            bg.agent.allow_all,
+            bg.agent.session_allow.clone(),
+            bg.agent.session_deny.clone(),
+        );
+        self.adopt_rules(allow_all, allow, deny);
+    }
+
     /// The directory the call being dispatched resolves paths against.
     ///
     /// A call aimed at another host works in that host's own directory, which is wherever
@@ -4428,6 +4758,10 @@ pub fn call_label(call: &ApiToolCall) -> String {
             arguments["namePattern"].as_str().unwrap_or_default()
         ),
         TOOL_DEV_DIFF => format!("diff {}", arguments["path"].as_str().unwrap_or_default()),
+        TOOL_SCRIPT_RESULT => format!(
+            "script {}",
+            arguments["id"].as_str().unwrap_or_default()
+        ),
         TOOL_DEV_IMAGE => format!(
             "image {}",
             arguments["path"].as_str().unwrap_or_default()
@@ -4485,6 +4819,19 @@ pub fn relative_remote(cwd: &str, name: &str) -> String {
     } else {
         tools::join_path(cwd, name)
     }
+}
+
+/// The tool result a background script's run left in its own history.
+fn tool_result(agent: &Agent, call_id: &str) -> Option<(String, bool)> {
+    agent.history.iter().find_map(|message| match message {
+        ApiMessage::Tool {
+            tool_call_id,
+            content,
+        } if tool_call_id == call_id => {
+            Some((content.clone(), content.starts_with("The script failed")))
+        }
+        _ => None,
+    })
 }
 
 /// Whether a tool changes a file, which makes the map stale for that path.
@@ -5352,6 +5699,20 @@ mod tests {
         panic!("the script never finished");
     }
 
+    /// Poll until every background script has a result.
+    fn drive_background(agent: &mut Agent, fake: &mut FakeSession) {
+        let mut session: Option<&mut dyn SessionAccess> = Some(fake);
+        for _ in 0..SCRIPT_POLL_STEPS {
+            if agent.background.iter().all(|bg| bg.result.is_some()) {
+                return;
+            }
+            if !agent.poll(&mut session) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        panic!("the background script never finished");
+    }
+
     /// Start a script the way the model does.
     fn start_script(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
         {
@@ -5546,6 +5907,179 @@ mod tests {
                 assert!(content.contains("120"), "{content}");
             }
             other => panic!("expected the refusal in the history, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_background_script_runs_beside_the_chat() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_background(&mut agent, &mut fake, "return 7;");
+        assert!(agent.phase.is_none(), "the conversation is free");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. })
+                if content.contains("Started background script s1")
+        ));
+        drive_background(&mut agent, &mut fake);
+        let Some((text, failed)) = &agent.background[0].result else {
+            panic!("the script has a result");
+        };
+        assert!(!failed);
+        assert_eq!(text.as_str(), "7");
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Notice(line)) if line.contains("Background script s1 finished")
+        ));
+    }
+
+    #[test]
+    fn script_result_collects_a_finished_background_script() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_background(&mut agent, &mut fake, "return 7;");
+        drive_background(&mut agent, &mut fake);
+        collect(&mut agent, &mut fake, r#"{"id":"s1"}"#);
+        assert_eq!(agent.history.last(), Some(&tool_answer("7")));
+        assert!(agent.background.is_empty(), "the collected script is gone");
+    }
+
+    #[test]
+    fn a_collected_background_script_frees_its_slot() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        for _ in 0..MAX_BACKGROUND_SCRIPTS {
+            start_background(&mut agent, &mut fake, "return 1;");
+            drive_background(&mut agent, &mut fake);
+        }
+        assert_eq!(agent.background.len(), MAX_BACKGROUND_SCRIPTS);
+        collect(&mut agent, &mut fake, r#"{"id":"s1"}"#);
+        assert_eq!(agent.background.len(), MAX_BACKGROUND_SCRIPTS - 1);
+        start_background(&mut agent, &mut fake, "return 1;");
+        assert_eq!(agent.background.last().map(|bg| bg.id.as_str()), Some("s5"));
+        drive_background(&mut agent, &mut fake);
+    }
+
+    #[test]
+    fn script_result_says_the_script_is_still_running() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_background(&mut agent, &mut fake, "return 7;");
+        collect(&mut agent, &mut fake, r#"{"id":"s1"}"#);
+        match agent.history.last() {
+            Some(ApiMessage::Tool { content, .. }) => {
+                assert!(content.contains("still running"), "{content}");
+            }
+            other => panic!("expected the answer in the history, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_result_with_a_wait_parks_the_call() {
+        let mut agent = Agent::new();
+        agent.now_ms = 1_700_000_000_000;
+        let mut fake = FakeSession::default();
+        start_background(&mut agent, &mut fake, "return 7;");
+        collect(&mut agent, &mut fake, r#"{"id":"s1","waitSeconds":5}"#);
+        assert!(matches!(
+            agent.phase,
+            Some(Phase::Running {
+                waiting: Waiting::BackgroundScript { .. },
+                ..
+            })
+        ));
+        // The script lands inside the wait, which answers the call without timing out.
+        drive_background(&mut agent, &mut fake);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.poll(&mut session);
+        assert!(agent.phase.is_none(), "the wait is over");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. }) if content == "7"
+        ));
+    }
+
+    #[test]
+    fn script_result_names_nothing_when_no_script_matches() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        collect(&mut agent, &mut fake, r#"{"id":"s9"}"#);
+        match agent.history.last() {
+            Some(ApiMessage::Tool { content, .. }) => {
+                assert!(content.contains("no background script"), "{content}");
+            }
+            other => panic!("expected the answer in the history, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_background_script_asking_for_more_time_waits_for_the_user() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: r#"{"code":"return 1;","timeoutSeconds":120,"background":true}"#
+                        .to_owned(),
+                },
+                &mut session,
+            );
+        }
+        assert!(matches!(
+            agent.phase,
+            Some(Phase::Extending {
+                seconds: 120,
+                background: true,
+                ..
+            })
+        ));
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.answer_extension(true, &mut session);
+        }
+        assert!(agent.phase.is_none(), "the conversation is free");
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::Tool { content, .. })
+                if content.contains("Started background script s1")
+        ));
+        agent.stop_background(0);
+    }
+
+    /// Start a background script the way the model does.
+    fn start_background(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
+        let mut session: Option<&mut dyn SessionAccess> = Some(fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_SCRIPT.to_owned(),
+                arguments: serde_json::json!({ "code": code, "background": true }).to_string(),
+            },
+            &mut session,
+        );
+    }
+
+    /// Ask for a background script's result the way the model does.
+    fn collect(agent: &mut Agent, fake: &mut FakeSession, arguments: &str) {
+        let mut session: Option<&mut dyn SessionAccess> = Some(fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c2".to_owned(),
+                name: TOOL_SCRIPT_RESULT.to_owned(),
+                arguments: arguments.to_owned(),
+            },
+            &mut session,
+        );
+    }
+
+    /// The provider history entry a tool answers with.
+    fn tool_answer(content: &str) -> ApiMessage {
+        ApiMessage::Tool {
+            tool_call_id: "c2".to_owned(),
+            content: content.to_owned(),
         }
     }
 

@@ -61,6 +61,8 @@ pub const TOOL_CHANGE_DIR: &str = "set_working_directory";
 pub const TOOL_HOSTS_LIST: &str = "hosts_list";
 /// Tool: run a short JavaScript program that calls the other tools and returns one result.
 pub const TOOL_RUN_SCRIPT: &str = "run_script";
+/// Tool: collect a background script's result.
+pub const TOOL_SCRIPT_RESULT: &str = "script_result";
 /// Tool: start a shell command in the background without waiting for it.
 pub const TOOL_RUN_COMMAND_BACKGROUND: &str = "run_command_background";
 /// Tool: run a shell command as root, asking the user for the password first.

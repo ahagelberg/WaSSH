@@ -991,7 +991,8 @@ sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result 
 (`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
 — time spent waiting on a tool does not count — and up to {} tool calls; one call that has \
 not answered within {} seconds fails with a timeout. Pass `timeoutSeconds` to ask for a \
-longer run than {} seconds, up to {}; the user is asked to approve it. Run \
+longer run than {} seconds, up to {}; the user is asked to approve it. Pass `background: true` \
+to run it beside the conversation and collect it later with `script_result {{ id }}`. Run \
 multiple tool calls in one go when it makes sense: put every call a step needs in a single \
 script, batch independent calls together and chain the ones that depend on each other, instead \
 of spending a round per call, because each round re-sends the whole prompt. Do the processing \
@@ -1478,11 +1479,18 @@ and keep the cd out of the commands. Callable now:",
         }
     }
 
-    /// What the pane has to show: the main conversation's request, else a sub-agent's.
+    /// What the pane has to show: the main conversation's request, else a background
+    /// script's, else a sub-agent's.
     fn pending_prompts(&self) -> (Prompts, PromptTarget) {
         let own = Prompts::of(&self.agent);
         if !own.is_empty() {
             return (own, PromptTarget::Main);
+        }
+        if let Some(index) = self.agent.waiting_background() {
+            return (
+                Prompts::of(&self.agent.background[index].agent),
+                PromptTarget::Background(index),
+            );
         }
         match self.agent.waiting_subagent() {
             Some(index) => (
@@ -1498,6 +1506,7 @@ and keep the cd out of the commands. Callable now:",
         match target {
             PromptTarget::Main => &mut self.agent,
             PromptTarget::Subagent(index) => &mut self.agent.subagents[index].agent,
+            PromptTarget::Background(index) => &mut self.agent.background[index].agent,
         }
     }
 
@@ -1512,6 +1521,7 @@ and keep the cd out of the commands. Callable now:",
                 sub.agent.stop();
                 sub.end = Some(SubagentEnd::Stopped);
             }
+            PromptTarget::Background(index) => self.agent.stop_background(index),
         }
     }
 
@@ -1675,6 +1685,7 @@ and keep the cd out of the commands. Callable now:",
                 Waiting::Worker { .. } => "Working",
                 Waiting::Script => "Running the script",
                 Waiting::Subagent { .. } => "Waiting for the sub-agent",
+                Waiting::BackgroundScript { .. } => "Waiting for the script",
                 Waiting::Terminal { .. } => "Waiting for the terminal",
             }),
             // A connection asking for a password has its own card, which is answer enough.
@@ -4163,6 +4174,8 @@ enum PromptTarget {
     Main,
     /// One of its sub-agents.
     Subagent(usize),
+    /// One of its background scripts.
+    Background(usize),
 }
 
 /// What one agent is waiting for, taken out of it so the cards can be drawn while the pane
@@ -5076,6 +5089,10 @@ impl Plugin for AiAgent {
         let prompt_source = match prompt_target {
             PromptTarget::Main => None,
             PromptTarget::Subagent(index) => Some(self.agent.subagents[index].title.clone()),
+            PromptTarget::Background(index) => Some(format!(
+                "background script {}",
+                self.agent.background[index].id
+            )),
         };
         let slash = parse_slash_input(&self.draft);
         egui::Panel::bottom("ai-composer")
@@ -5579,8 +5596,10 @@ impl Plugin for AiAgent {
         }
         // A sub-agent's "always" answers join the main conversation, so every other
         // sub-agent and the next run inherit them.
-        if let PromptTarget::Subagent(index) = prompt_target {
-            self.agent.adopt_subagent_rules(index);
+        match prompt_target {
+            PromptTarget::Subagent(index) => self.agent.adopt_subagent_rules(index),
+            PromptTarget::Background(index) => self.agent.adopt_background_rules(index),
+            PromptTarget::Main => {}
         }
 
         if submit
@@ -6263,6 +6282,7 @@ mod tests {
             },
             turn: 0,
             seconds: 120,
+            background: false,
         });
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
@@ -8532,7 +8552,8 @@ mod tests {
         assert!(
             both.contains(
                 "- core: run_command, set_working_directory, hosts_list, run_command_background, \
-                 run_script, run_sudo, ask_user, spawn_subagent, wait_subagent, get_current_time"
+                 run_script, script_result, run_sudo, ask_user, spawn_subagent, wait_subagent, \
+                 get_current_time"
             ),
             "{both}"
         );

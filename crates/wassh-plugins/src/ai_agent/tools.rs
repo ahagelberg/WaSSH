@@ -32,7 +32,8 @@ use super::protocol::{
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
     TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
     TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
-    TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SPAWN_SUBAGENT,
+    TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO, TOOL_SCRIPT_RESULT,
+    TOOL_SPAWN_SUBAGENT,
     TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
     TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
     TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
@@ -125,56 +126,61 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         name: TOOL_RUN_SCRIPT,
         description: "Run a short JavaScript program that calls the other tools itself: \
 `await tools.<name>(args)` resolves to the tool's JSON result (`{ok, text}`), a failed call \
-throws, and the value you return is the result. Batch, filter or join several calls in one \
-turn and hand back only what the answer needs. timeoutSeconds asks for a longer run than the \
-default; the user approves it.",
+throws, and the value you return is the result. Batch several calls in one turn and return \
+only the lines that answer the question. timeoutSeconds asks for a longer run than the \
+default; the user approves it. background runs it beside the chat, collected with \
+script_result.",
+    },
+    ToolSpec {
+        name: TOOL_SCRIPT_RESULT,
+        description: "Collect the result of a background script, waiting up to waitSeconds for \
+it to finish.",
     },
     ToolSpec {
         name: TOOL_RUN_COMMAND,
         description: "Run a shell command on the connected SSH host and return its output and exit \
-code. It runs in the conversation's working directory, which set_working_directory moves; a cd at \
-the start of a command moves that directory too, so one change covers every later call. Meant for \
-work no tool covers, such as builds, tests, services, package managers and version control; files \
-are read, searched and edited with the file tools of the \"host-files\" scope, not with cat, grep, \
-ls, find or sed.",
+code, in the conversation's working directory. Meant for work no tool covers: builds, tests, \
+services, package managers. Files are read, searched and edited with the file tools of the \
+\"host-files\" scope, not with cat, grep, ls, find or sed.",
     },
     ToolSpec {
         name: TOOL_CHANGE_DIR,
-        description: "Set the directory that later commands and relative paths work in, and \
-answer with the directory the host ended up in. Call it once when the work moves elsewhere \
-instead of putting a cd in front of every command.",
+        description: "Set the directory later commands and relative paths work in, and answer with \
+the directory the host ended up in. Call it once instead of putting a cd in front of every \
+command.",
     },
     ToolSpec {
         name: TOOL_HOSTS_LIST,
-        description: "List the saved hosts this conversation may reach, with the address each \
-one connects to and why one cannot be opened. Commands and file tools take a host argument \
-naming one of them; a connection to another host asks the user first.",
+        description: "List the saved hosts this conversation may reach, with each one's address \
+and why one cannot be opened. Commands and file tools take a host argument naming one of \
+them.",
     },
     ToolSpec {
         name: TOOL_RUN_COMMAND_BACKGROUND,
-        description: "Start a shell command on the connected SSH host in the background and return \
-immediately. Use this for long-running servers or jobs whose output does not need to be returned \
-now. The command does not keep the live terminal busy.",
+        description: "Start a shell command on the connected host in the background and return at \
+once, for long-running servers or jobs whose output is not needed now. The live terminal \
+stays free.",
     },
     ToolSpec {
         name: TOOL_RUN_SUDO,
-        description: "Run a shell command with root rights. The user is asked for their sudo password \
-first, so use this only when run_command failed for lack of permissions.",
+        description: "Run a shell command with root rights. The user is asked for their sudo \
+password first, so use it only when run_command failed for lack of permissions.",
     },
     ToolSpec {
         name: TOOL_ASK_USER,
-        description: "Ask the user one or more questions and wait for every answer. Questions may offer choices; the user can also choose to write a free-text answer.",
+        description: "Ask the user questions and wait for every answer. Questions may offer \
+choices, and the user can always write a free-text answer.",
     },
     ToolSpec {
         name: TOOL_SPAWN_SUBAGENT,
-        description: "Start a sub-agent on a self-contained task and return at once. The sub-agent \
-runs in the background with this conversation's tools, model and permissions, and its progress is \
-listed with the chats. Collect its answer with wait_subagent.",
+        description: "Start a sub-agent on a self-contained task and return at once. It runs in \
+the background with this conversation's tools, model and permissions; collect its answer with \
+wait_subagent.",
     },
     ToolSpec {
         name: TOOL_WAIT_SUBAGENT,
-        description: "Wait for a sub-agent started with spawn_subagent and return its answer. \
-Returns as soon as it is done; a sub-agent still working keeps the call waiting.",
+        description: "Wait for a sub-agent started with spawn_subagent and return its answer; one \
+still working keeps the call waiting.",
     },
     ToolSpec {
         name: TOOL_WEB_FETCH,
@@ -502,9 +508,17 @@ fn parameters(name: &str) -> (Value, Value) {
                 "code": string("The JavaScript program. `await tools.<name>(args)` calls a tool \
 and resolves to its JSON result; a failed call throws. Return the compact result you need."),
                 "timeoutSeconds": number("Seconds the program may run (default 20, cap 600; \
-more needs approval).")
+more needs approval)."),
+                "background": boolean("Run it beside the chat; collect it with script_result.")
             }),
             json!(["code"]),
+        ),
+        TOOL_SCRIPT_RESULT => (
+            json!({
+                "id": string("Id run_script returned."),
+                "waitSeconds": number("How long to wait (default 0, cap 300).")
+            }),
+            json!(["id"]),
         ),
         TOOL_RUN_COMMAND => (
             json!({
@@ -1187,6 +1201,7 @@ pub fn is_read_only(name: &str) -> bool {
             | TOOL_HOSTS_LIST
             | TOOL_SPAWN_SUBAGENT
             | TOOL_WAIT_SUBAGENT
+            | TOOL_SCRIPT_RESULT
     ) || plugin_tool(name).is_some_and(|tool| tool.read_only)
 }
 
@@ -2447,6 +2462,7 @@ mod tests {
                 TOOL_LOAD_SCOPE,
                 TOOL_UNLOAD_SCOPE,
                 TOOL_RUN_SCRIPT,
+                TOOL_SCRIPT_RESULT,
                 TOOL_RUN_COMMAND,
                 TOOL_CHANGE_DIR,
                 TOOL_HOSTS_LIST,
