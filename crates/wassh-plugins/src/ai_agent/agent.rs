@@ -249,6 +249,15 @@ pub enum Phase {
         /// What it wants to do, shown on the card.
         label: String,
     },
+    /// A script asked to run longer than the default, and waits for the user.
+    Extending {
+        /// The `run_script` call waiting on the answer.
+        call: ApiToolCall,
+        /// Where its transcript line is.
+        turn: usize,
+        /// Seconds it wants to run for.
+        seconds: u64,
+    },
     /// Another host is about to be opened, and the user is being asked about it.
     Connect {
         /// Saved host the call named.
@@ -821,6 +830,11 @@ impl Agent {
         matches!(self.phase, Some(Phase::Allowing { .. }))
     }
 
+    /// Whether a script's request for more run time waits for the user.
+    pub fn extending(&self) -> bool {
+        matches!(self.phase, Some(Phase::Extending { .. }))
+    }
+
     /// Whether the agent is waiting on the user.
     pub fn asking(&self) -> bool {
         matches!(self.phase, Some(Phase::Asking { .. }))
@@ -840,6 +854,7 @@ impl Agent {
     pub fn needs_user(&self) -> bool {
         self.approving()
             || self.allowing()
+            || self.extending()
             || self.asking()
             || self.sudo_prompt().is_some()
             || self.connecting()
@@ -850,6 +865,7 @@ impl Agent {
         self.busy()
             || self.approving()
             || self.allowing()
+            || self.extending()
             || self.asking()
             || self.sudo_prompt().is_some()
             || self.connecting()
@@ -2165,6 +2181,36 @@ impl Agent {
         self.answer_permission(true, session);
     }
 
+    /// Answer a script's request for more run time. A yes starts it with that budget.
+    pub fn answer_extension(&mut self, allow: bool, session: Session<'_, '_>) {
+        let Some(Phase::Extending {
+            call,
+            turn,
+            seconds,
+        }) = self.phase.take()
+        else {
+            return;
+        };
+        if allow {
+            let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+            self.start_task_script(call, turn, &arguments, session);
+        } else {
+            let limit = script::MAX_EXEC_MS / 1_000;
+            let label = call_label(&call);
+            self.settle(
+                call,
+                turn,
+                label,
+                format!(
+                    "The user refused a {seconds}-second script; it may run for {limit} seconds \
+at most."
+                ),
+                true,
+                session,
+            );
+        }
+    }
+
     /// The decision for `tool`, with this session's blanket answer applied.
     fn permission(&self, tool: &str) -> Permission {
         if self.allow_all && self.permissions.decision(tool) == Permission::Ask {
@@ -2409,6 +2455,20 @@ impl Agent {
             return;
         }
 
+        // A script that wants to run past the default asks the user first; a smaller
+        // budget needs no answer.
+        if name == TOOL_RUN_SCRIPT {
+            let seconds = tools::script_seconds(&arguments);
+            if seconds > script::MAX_EXEC_MS / 1_000 {
+                self.phase = Some(Phase::Extending {
+                    call,
+                    turn,
+                    seconds,
+                });
+                return;
+            }
+        }
+
         // A write, an edit or a delete leaves the map stale for that one path.
         if is_writing_tool(&name)
             && self.active_host.is_none()
@@ -2650,7 +2710,7 @@ impl Agent {
             inner: None,
             calls: Vec::new(),
             since: None,
-            job: script::spawn(&code),
+            job: script::spawn_with_budget(&code, tools::script_seconds(arguments) * 1_000),
         });
         self.phase = Some(Phase::Running {
             call,
@@ -3987,6 +4047,7 @@ impl Agent {
             }
             Phase::Running { call, turn, .. }
             | Phase::Allowing { call, turn, .. }
+            | Phase::Extending { call, turn, .. }
             | Phase::Connect { call, turn, .. }
             | Phase::Remote { call, turn, .. } => self.abandon_tool(call, turn),
             Phase::Approving { call, .. } | Phase::Asking { call, .. } | Phase::Sudo { call, .. } => {
@@ -5423,6 +5484,84 @@ mod tests {
         assert!(failed, "{result:?}");
         let result = result.clone().expect("the failure is recorded");
         assert!(result.contains("did not answer within"), "{result}");
+    }
+
+    #[test]
+    fn a_script_asking_for_more_time_waits_for_the_user() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: r#"{"code":"return 1;","timeoutSeconds":120}"#.to_owned(),
+                },
+                &mut session,
+            );
+        }
+        assert!(
+            matches!(agent.phase, Some(Phase::Extending { seconds: 120, .. })),
+            "the user is asked before the script runs"
+        );
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.answer_extension(true, &mut session);
+        }
+        assert!(matches!(
+            agent.phase,
+            Some(Phase::Running {
+                waiting: Waiting::Script,
+                ..
+            })
+        ));
+        assert!(agent.script.is_some(), "the granted script started");
+        agent.stop();
+    }
+
+    #[test]
+    fn a_refused_longer_script_timeout_is_reported() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: r#"{"code":"return 1;","timeoutSeconds":120}"#.to_owned(),
+                },
+                &mut session,
+            );
+        }
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.answer_extension(false, &mut session);
+        }
+        assert!(!agent.extending(), "the card is gone");
+        match agent.history.last() {
+            Some(ApiMessage::Tool { content, .. }) => {
+                assert!(content.contains("refused"), "{content}");
+                assert!(content.contains("120"), "{content}");
+            }
+            other => panic!("expected the refusal in the history, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_script_within_the_default_needs_no_approval() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        start_script(
+            &mut agent,
+            &mut fake,
+            "const r = await tools.get_current_time({}); return r.text;",
+        );
+        assert!(matches!(
+            agent.turns.last(),
+            Some(Turn::Script { result, failed: false, .. }) if result.is_some()
+        ));
     }
 
     #[test]

@@ -990,13 +990,15 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
 sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
 (`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
 — time spent waiting on a tool does not count — and up to {} tool calls; one call that has \
-not answered within {} seconds fails with a timeout. Run multiple tool calls in one go when \
-it makes sense: put every call a step needs in a single script, batch independent calls \
-together and chain the ones that depend on each other, instead of spending a round per \
-call, because each round re-sends the whole prompt. Do the processing and the decisions in \
-the script rather than back through the conversation: filter, join, compare and branch on \
-results there. Spend real effort on shrinking what you return: filter down to the lines \
-that answer the question, sort and de-duplicate them, and compact, count or summarise the \
+not answered within {} seconds fails with a timeout. Pass `timeoutSeconds` to ask for a \
+longer run than {} seconds, up to {}; the user is asked to approve it. Run \
+multiple tool calls in one go when it makes sense: put every call a step needs in a single \
+script, batch independent calls together and chain the ones that depend on each other, instead \
+of spending a round per call, because each round re-sends the whole prompt. Do the processing \
+and the decisions in the script rather than back through the conversation: filter, join, \
+compare and branch on results there. Spend real effort on shrinking what you return: filter \
+down to the lines that answer the question, sort and de-duplicate them, and compact, count or \
+summarise the \
 rest instead of dumping raw output — that result is all the model sees, so keep it as \
 small as the answer allows. Every tool the guidance below names is called the same way: from \
 a script, never as a tool of the turn. The working directory is shared by every call a script \
@@ -1004,7 +1006,9 @@ makes and stays after it, so move it once with `await tools.set_working_director
 and keep the cd out of the commands. Callable now:",
                     super::script::MAX_EXEC_MS / 1_000,
                     super::script::MAX_CALLS,
-                    super::script::MAX_CALL_MS / 1_000
+                    super::script::MAX_CALL_MS / 1_000,
+                    super::script::MAX_EXEC_MS / 1_000,
+                    super::script::MAX_TIMEOUT_MS / 1_000
                 ));
                 lines.push(catalog);
             }
@@ -4169,6 +4173,8 @@ struct Prompts {
     approval: Option<(String, Vec<ApprovalScope>)>,
     /// Capability card: the label, and the tool it belongs to when it has a setting.
     allowing: Option<(String, Option<String>)>,
+    /// Extension card: the seconds a script asked to run for.
+    extending: Option<u64>,
     /// Question card: the call id and the questions.
     asking: Option<(String, Vec<AgentQuestion>)>,
     /// Sudo card: the command and why it needs root.
@@ -4193,6 +4199,10 @@ impl Prompts {
                 }
                 _ => None,
             },
+            extending: match &agent.phase {
+                Some(Phase::Extending { seconds, .. }) => Some(*seconds),
+                _ => None,
+            },
             asking: match &agent.phase {
                 Some(Phase::Asking { call, questions }) => {
                     Some((call.id.clone(), questions.clone()))
@@ -4210,6 +4220,7 @@ impl Prompts {
     fn is_empty(&self) -> bool {
         self.approval.is_none()
             && self.allowing.is_none()
+            && self.extending.is_none()
             && self.asking.is_none()
             && self.sudo.is_none()
             && self.host.is_none()
@@ -4223,6 +4234,8 @@ struct PromptAnswers {
     approval: Option<(bool, Option<usize>, bool)>,
     /// Capability card: (allow, remember the answer).
     permission: Option<(bool, bool)>,
+    /// Extension card: whether the longer run was allowed.
+    extension: Option<bool>,
     /// Capability card: allow every prompt for the rest of the session.
     allow_session: bool,
     /// The question card's answers, one per question.
@@ -4397,6 +4410,55 @@ impl AiAgent {
                     } else if everything {
                         answers.approval = Some((true, None, true));
                     }
+                },
+            );
+        }
+
+        // The extension card: a script asked for more run time than the default.
+        if let Some(seconds) = prompts.extending {
+            prompt_card(
+                ui,
+                palette,
+                "extension",
+                |ui| {
+                    ui.label(
+                        egui::RichText::new("Allow a longer script?")
+                            .size(12.0)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "The agent wants a script to run for up to {seconds} seconds. A \
+script normally stops after {} seconds of JavaScript.",
+                                super::script::MAX_EXEC_MS / 1_000
+                            ))
+                            .size(11.0)
+                            .color(muted),
+                        )
+                        .wrap(),
+                    );
+                },
+                |ui| {
+                    prompt_action_row(ui, "extension-now", |ui| {
+                        if Button::new("Allow once")
+                            .compact()
+                            .primary()
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.extension = Some(true);
+                        }
+                        if Button::new("Deny")
+                            .compact()
+                            .kind(ButtonKind::Danger)
+                            .show(ui, palette)
+                            .clicked()
+                        {
+                            answers.extension = Some(false);
+                        }
+                    });
                 },
             );
         }
@@ -5475,6 +5537,10 @@ impl Plugin for AiAgent {
             self.prompt_agent(prompt_target)
                 .answer(&answers, &mut session);
         }
+        if let Some(allow) = prompts.extension {
+            self.prompt_agent(prompt_target)
+                .answer_extension(allow, &mut session);
+        }
         if let Some((allow, always)) = prompts.host {
             if always
                 && let Some((_, host)) = &pending.host
@@ -6183,6 +6249,31 @@ mod tests {
         assert!(
             !request.contains("question 4"),
             "only what is being folded goes to the summariser: {request}"
+        );
+    }
+
+    #[test]
+    fn a_longer_script_timeout_asks_the_user_first() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Extending {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_SCRIPT.to_owned(),
+                arguments: r#"{"code":"return 1;","timeoutSeconds":120}"#.to_owned(),
+            },
+            turn: 0,
+            seconds: 120,
+        });
+        let mut settings = serde_json::Map::new();
+        let painted = draw(&mut plugin, &mut settings);
+        let texts: Vec<&str> = painted.iter().map(String::as_str).collect();
+        assert!(
+            texts.contains(&"Allow a longer script?"),
+            "the permission card is missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("120 seconds")),
+            "the card says what it wants: {texts:?}"
         );
     }
 
@@ -8384,6 +8475,15 @@ mod tests {
                 "not answered within {} seconds fails with a timeout",
                 super::super::script::MAX_CALL_MS / 1_000
             )),
+            "{prompt}"
+        );
+        // A longer run is offered, but only with the user's approval.
+        assert!(
+            prompt.contains("Pass `timeoutSeconds`"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("the user is asked to approve it"),
             "{prompt}"
         );
         assert!(

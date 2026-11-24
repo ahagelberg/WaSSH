@@ -41,6 +41,7 @@ use super::protocol::{
 use super::agent::shell_quote;
 use super::permissions::Permissions;
 use super::scopes::{Loaded, scope_of};
+use super::script;
 use crate::plugin::PluginTool;
 
 /// Longest body a fetch may return.
@@ -101,6 +102,14 @@ const DEV_COMMAND_POLL_MS: u64 = 50;
 /// What a tool produced.
 pub type ToolResult = Result<String, String>;
 
+/// Seconds a `run_script` call asked to run for, within what may be granted.
+pub fn script_seconds(args: &Value) -> u64 {
+    args["timeoutSeconds"]
+        .as_u64()
+        .unwrap_or(script::MAX_EXEC_MS / 1_000)
+        .clamp(1, script::MAX_TIMEOUT_MS / 1_000)
+}
+
 /// A tool the model may call.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolSpec {
@@ -117,7 +126,8 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         description: "Run a short JavaScript program that calls the other tools itself: \
 `await tools.<name>(args)` resolves to the tool's JSON result (`{ok, text}`), a failed call \
 throws, and the value you return is the result. Batch, filter or join several calls in one \
-turn and hand back only what the answer needs.",
+turn and hand back only what the answer needs. timeoutSeconds asks for a longer run than the \
+default; the user approves it.",
     },
     ToolSpec {
         name: TOOL_RUN_COMMAND,
@@ -490,7 +500,9 @@ fn parameters(name: &str) -> (Value, Value) {
         TOOL_RUN_SCRIPT => (
             json!({
                 "code": string("The JavaScript program. `await tools.<name>(args)` calls a tool \
-and resolves to its JSON result; a failed call throws. Return the compact result you need.")
+and resolves to its JSON result; a failed call throws. Return the compact result you need."),
+                "timeoutSeconds": number("Seconds the program may run (default 20, cap 600; \
+more needs approval).")
             }),
             json!(["code"]),
         ),
@@ -2893,6 +2905,18 @@ mod tests {
         let failed = run_local_command(&json!({ "command": "exit 3" })).unwrap();
         assert!(failed.contains("[exit code 3]"), "{failed}");
         assert!(run_local_command(&json!({ "command": "  " })).is_err());
+    }
+
+    #[test]
+    fn run_script_takes_a_grantable_timeout() {
+        let (properties, _) = parameters(TOOL_RUN_SCRIPT);
+        assert!(properties.get("timeoutSeconds").is_some(), "{properties}");
+        assert_eq!(script_seconds(&json!({})), script::MAX_EXEC_MS / 1_000);
+        assert_eq!(script_seconds(&json!({ "timeoutSeconds": 120 })), 120);
+        assert_eq!(
+            script_seconds(&json!({ "timeoutSeconds": 99_999 })),
+            script::MAX_TIMEOUT_MS / 1_000
+        );
     }
 
     #[test]

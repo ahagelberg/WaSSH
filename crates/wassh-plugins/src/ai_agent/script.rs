@@ -23,6 +23,8 @@ use rquickjs::{Context, Function, Runtime};
 pub const MAX_EXEC_MS: u64 = 20_000;
 /// Longest a script waits on one tool call before it is failed with a timeout.
 pub const MAX_CALL_MS: u64 = 60_000;
+/// Longest a script may execute when the user grants it more time.
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
 /// Memory the runtime may use.
 pub const MAX_HEAP_BYTES: usize = 64 * 1024 * 1024;
 /// Tool calls one run may make.
@@ -253,7 +255,7 @@ pub fn spawn(code: &str) -> ScriptJob {
     spawn_with_budget(code, MAX_EXEC_MS)
 }
 
-fn spawn_with_budget(code: &str, budget_ms: u64) -> ScriptJob {
+pub fn spawn_with_budget(code: &str, budget_ms: u64) -> ScriptJob {
     let (event_tx, event_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
