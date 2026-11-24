@@ -247,11 +247,12 @@ const PRELUDE: &str = r#"
 })();
 "#;
 
-/// Start a script in its own sandbox.
+/// Start a script in its own sandbox with the default budget.
 ///
 /// The returned job is driven by the caller: every [`ScriptEvent::Call`] must be answered
 /// with [`ScriptJob::reply`], or the script stays suspended until the job is dropped.
-pub fn spawn(code: &str) -> ScriptJob {
+#[cfg(test)]
+fn spawn(code: &str) -> ScriptJob {
     spawn_with_budget(code, MAX_EXEC_MS)
 }
 
