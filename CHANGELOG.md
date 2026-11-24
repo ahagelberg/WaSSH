@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Make the chat's Plan/Agent control in the AI footer a real switch — a track with a knob that
+  slides across, captioned **Plan** — instead of a button that changed its label with the mode.
+  The knob's position shows the mode, and the tooltip still says what each side means.
 - Let a mapping pass describe up to 1000 files instead of 100, so a big project is mapped in one
   pass instead of leaving most of the tree without summaries. The pass reads more of the host, so
   it takes longer and spends more of the model's budget than before.

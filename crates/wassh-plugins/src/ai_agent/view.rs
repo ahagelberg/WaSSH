@@ -13,7 +13,8 @@ use wassh_core::{Palette, RADIUS, SessionStatus};
 use wassh_core::HeaderHealth;
 use wassh_ui::widgets::{
     Button, ButtonKind, COPY_BUTTON_SIZE, COPY_FEEDBACK_MS, copy_button, password_input,
-    select_width, small_button, small_button_enabled, text_area_with_id, ToastKind,
+    select_width, small_button, small_button_enabled, switch, switch_size, text_area_with_id,
+    ToastKind,
 };
 
 use super::agent::{
@@ -135,14 +136,12 @@ const COMPACTED_NOTICE: &str = "Earlier messages were compacted into a summary:"
 /// Gap between the provider and model dropdowns under the composer.
 const FOOTER_GAP: f32 = 6.0;/// Type size of the two dropdowns.
 const FOOTER_TEXT_SIZE: f32 = 11.0;
-/// Labels of the two modes the footer switches between.
+/// Caption of the switch that turns Plan mode on; the knob carries the state.
 const MODE_PLAN_LABEL: &str = "Plan";
-/// The other mode's label.
-const MODE_AGENT_LABEL: &str = "Agent";
-/// What Plan mode means, on the mode button.
+/// What Plan mode means, on the mode switch.
 const MODE_TO_AGENT_HINT: &str = "Plan mode: every tool only reads. Click for Agent mode, where \
 the agent may change files, run commands and act on the host.";
-/// What Agent mode means, on the mode button.
+/// What Agent mode means, on the mode switch.
 const MODE_TO_PLAN_HINT: &str = "Agent mode: the agent may change files, run commands and act \
 on the host. Click for Plan mode, where it only reads.";
 /// Room two dropdowns need before the mode and Compact buttons are drawn at all.
@@ -5072,19 +5071,12 @@ impl Plugin for AiAgent {
                         // The mode says most about what this chat may do, so it leads; the
                         // Compact button sits where the model dropdown starts. A pane too
                         // narrow for both keeps the action and drops them.
-                        let mode_button = Button::new(if plan_mode {
-                            MODE_PLAN_LABEL
-                        } else {
-                            MODE_AGENT_LABEL
-                        })
-                        .compact()
-                        .active(plan_mode);
+                        let mode_switch = switch_size(ui, MODE_PLAN_LABEL);
                         let compact_button = Button::new(COMPACT_LABEL)
                             .compact()
                             .enabled(self.summary.is_none() && !self.agent.turns.is_empty());
-                        let controls = mode_button.size(ui).x
-                            + compact_button.size(ui).x
-                            + FOOTER_GAP;
+                        let controls =
+                            mode_switch.x + compact_button.size(ui).x + FOOTER_GAP;
                         let room = (ui.available_width() - action.size(ui).x - FOOTER_GAP * 2.0)
                             .max(0.0);
                         if room >= controls + MIN_SELECT_ROOM * 2.0 {
@@ -5093,9 +5085,8 @@ impl Plugin for AiAgent {
                             } else {
                                 MODE_TO_PLAN_HINT
                             };
-                            if mode_button.show(ui, palette).on_hover_text(hint).clicked() {
-                                plan_mode = !plan_mode;
-                            }
+                            switch(ui, palette, &mut plan_mode, MODE_PLAN_LABEL)
+                                .on_hover_text(hint);
                             compact_clicked = compact_button
                                 .show(ui, palette)
                                 .on_hover_text(COMPACT_HINT)
@@ -7033,19 +7024,24 @@ mod tests {
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let mode = rows
             .iter()
-            .find(|(_, _, text)| text == MODE_AGENT_LABEL)
+            .find(|(_, _, text)| text == MODE_PLAN_LABEL)
             .cloned()
-            .unwrap_or_else(|| panic!("the footer offers the mode: {rows:?}"));
+            .unwrap_or_else(|| panic!("the footer offers the mode switch: {rows:?}"));
         assert!(!plugin.agent.plan, "a chat starts in Agent mode");
         frame(&mut plugin, &mut settings, &ctx, click(mode));
-        assert!(plugin.agent.plan, "the mode button did not switch to Plan");
-        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        assert!(
-            rows.iter().any(|(_, _, text)| text == MODE_PLAN_LABEL),
-            "the button names the mode the chat is in: {rows:?}"
-        );
+        assert!(plugin.agent.plan, "the switch did not turn Plan mode on");
         // And the pane keeps it with the conversation.
         assert_eq!(settings[CONVERSATION_KEY]["planMode"], json!(true));
+        // The switch throws back: the caption stays, the knob carries the state.
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let mode = rows
+            .iter()
+            .find(|(_, _, text)| text == MODE_PLAN_LABEL)
+            .cloned()
+            .expect("the mode switch keeps its caption");
+        frame(&mut plugin, &mut settings, &ctx, click(mode));
+        assert!(!plugin.agent.plan, "the switch did not turn Plan mode off");
+        assert_eq!(settings[CONVERSATION_KEY]["planMode"], json!(false));
     }
 
     #[test]
