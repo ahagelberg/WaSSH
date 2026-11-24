@@ -124,6 +124,9 @@ pub enum HostKeyPolicy {
     AcceptNew(Arc<KnownHosts>),
     /// Ask the user for unknown or changed keys, then remember accepted ones.
     Ask(Arc<KnownHosts>),
+    /// Trust only a key that is already recorded; an unknown or changed one refuses the
+    /// connection. This is what a connection opened without a user watching asks for.
+    Known(Arc<KnownHosts>),
 }
 
 impl std::fmt::Debug for HostKeyPolicy {
@@ -132,6 +135,7 @@ impl std::fmt::Debug for HostKeyPolicy {
             Self::AcceptAny => f.write_str("AcceptAny"),
             Self::AcceptNew(_) => f.write_str("AcceptNew"),
             Self::Ask(_) => f.write_str("Ask"),
+            Self::Known(_) => f.write_str("Known"),
         }
     }
 }
@@ -554,6 +558,21 @@ impl client::Handler for ClientHandler {
                     eprintln!("could not record the host key: {error}");
                 }
                 Ok(accepted)
+            }
+            HostKeyPolicy::Known(known_hosts) => {
+                let recorded = known_hosts.get(&self.host, self.port);
+                if recorded.as_deref() == Some(fingerprint.as_str()) {
+                    return Ok(true);
+                }
+                // Nothing here can accept a key: no prompt is answered without a user, and
+                // trust on first use is not something an unattended connection may do.
+                let _ = self.events.send(SshEvent::HostKeyPrompt {
+                    host: self.host.clone(),
+                    port: self.port,
+                    fingerprint,
+                    mismatch: recorded.is_some(),
+                });
+                Ok(false)
             }
         }
     }
