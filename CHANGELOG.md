@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Name the tools a script used, not just how many calls it made: a script card now carries the same
+  coloured tags a direct call gets (SSH, Remote filesystem, Search and so on), one per kind of tool
+  in the order they were first used, and any past the first three are counted (“+2”). A card too
+  narrow for the tags keeps its call count and drops them.
+
 ## [2.0.21] - 2026-11-24
 
 ### Added

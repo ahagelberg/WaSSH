@@ -192,6 +192,10 @@ const BADGE_TINT: f32 = 0.25;
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// Badge on a `run_script` card.
 const SCRIPT_BADGE: &str = "Script";
+/// How many tool tags a script card names before it counts the rest.
+const SCRIPT_TAGS_MAX: usize = 3;
+/// Narrowest card that has room for the tags beside the count and the outcome.
+const SCRIPT_TAGS_MIN_WIDTH: f32 = 320.0;
 /// Header of the program in a script card.
 const SCRIPT_CODE_LABEL: &str = "JavaScript";
 /// Header of what the script returned.
@@ -3719,6 +3723,9 @@ fn script_card(ui: &mut Ui, palette: &Palette, state: ScriptCardState<'_>) -> bo
     } else {
         ("ok", to_color32(palette.ok))
     };
+    // The tags the calls earned, so the card reads the way a direct call's does.
+    let tags = script_tags(calls, palette);
+    let shown = tags.len().min(SCRIPT_TAGS_MAX);
     let mut stop = false;
     egui::Frame::new()
         .fill(to_color32(palette.bg_input))
@@ -3739,6 +3746,19 @@ fn script_card(ui: &mut Ui, palette: &Palette, state: ScriptCardState<'_>) -> bo
                         .size(10.0)
                         .color(muted),
                 );
+                // A card too narrow for them keeps its count and outcome and drops the tags.
+                if ui.available_width() >= SCRIPT_TAGS_MIN_WIDTH {
+                    for (tag, colour) in &tags[..shown] {
+                        badge_pill(ui, palette, tag, *colour);
+                    }
+                    if let Some(rest) = tags.len().checked_sub(shown).filter(|rest| *rest > 0) {
+                        ui.label(
+                            egui::RichText::new(format!("+{rest}"))
+                                .size(10.0)
+                                .color(muted),
+                        );
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(outcome)
@@ -4026,6 +4046,21 @@ fn badge_pill(ui: &mut Ui, palette: &Palette, label: &str, colour: wassh_core::R
                     .color(to_color32(colour)),
             );
         });
+}
+
+/// The tags a script's calls earned, one per badge, in the order they first appear.
+fn script_tags(
+    calls: &[super::agent::ScriptRow],
+    palette: &Palette,
+) -> Vec<(&'static str, wassh_core::Rgba)> {
+    let mut tags: Vec<(&'static str, wassh_core::Rgba)> = Vec::new();
+    for row in calls {
+        let tag = tool_badge(&row.name, palette);
+        if !tags.iter().any(|(seen, _)| *seen == tag.0) {
+            tags.push(tag);
+        }
+    }
+    tags
 }
 
 /// The badge a tool call gets, named after the reference's `toolBadge`.
@@ -6705,6 +6740,99 @@ mod tests {
         draw(&mut plugin, &mut settings);
         assert_eq!(plugin.agent.reach_allow, ["db-1"]);
         assert_eq!(plugin.agent.reach_deny, ["web-1"]);
+    }
+
+    #[test]
+    fn a_script_card_names_the_tools_its_calls_used() {
+        use super::super::protocol::{TOOL_RUN_COMMAND, TOOL_RUN_SUDO};
+        let ctx = egui::Context::default();
+        let palette = Palette::dark();
+        let call = |name: &str| super::super::agent::ScriptRow {
+            name: name.to_owned(),
+            label: name.to_owned(),
+            output: "ok".to_owned(),
+            failed: false,
+        };
+        // Each painted text with how far right it reaches, so a pill cannot be cropped.
+        let painted = |calls: Vec<super::super::agent::ScriptRow>, width: f32| -> Vec<(String, f32)> {
+            let mut plugin = AiAgent::default();
+            plugin.agent.turns.push(Turn::Script {
+                code: "return 1;".to_owned(),
+                calls,
+                result: Some("1".to_owned()),
+                failed: false,
+                console: String::new(),
+            });
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(width, 400.0),
+                )),
+                ..Default::default()
+            };
+            let mut session: Option<&mut dyn crate::plugin::SessionAccess> = None;
+            let mut texts = Vec::new();
+            let mut output = ctx.run_ui(input, |ui| {
+                plugin.transcript(
+                    ui,
+                    &palette,
+                    to_color32(palette.text_muted),
+                    &mut session,
+                    TranscriptSource::Main,
+                );
+            });
+            for clipped in std::mem::take(&mut output.shapes) {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    let right = text.pos.x + text.galley.size().x;
+                    texts.push((text.galley.text().to_owned(), right));
+                }
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+        let texts = painted(
+            vec![
+                call(TOOL_RUN_COMMAND),
+                call("remote_fs_read_file"),
+                call("dev_view_file"),
+                call(TOOL_RUN_SUDO),
+            ],
+            WIDE_PANE,
+        );
+        assert!(texts.iter().any(|(text, _)| text == "SCRIPT"), "{texts:?}");
+        assert!(texts.iter().any(|(text, _)| text == "4 calls"), "{texts:?}");
+        // One tag per badge, in the order the calls first earned them: the two file tools
+        // share one, so the card does not repeat it.
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|(text, _)| ["SSH", "REMOTE FILESYSTEM", "ROOT"].contains(&text.as_str()))
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["SSH", "REMOTE FILESYSTEM", "ROOT"],
+            "{texts:?}"
+        );
+        // More tags than the header holds are counted rather than dropped, and the ones left
+        // stay inside the card.
+        let wider = vec![
+            call(TOOL_RUN_COMMAND),
+            call("remote_fs_read_file"),
+            call(TOOL_RUN_SUDO),
+            call("web_search"),
+            call("get_current_time"),
+        ];
+        let texts = painted(wider.clone(), WIDE_PANE);
+        assert!(texts.iter().any(|(text, _)| text == "+2"), "{texts:?}");
+        assert!(!texts.iter().any(|(text, _)| text == "SEARCH"), "{texts:?}");
+        let last = texts
+            .iter()
+            .find(|(text, _)| text == "ROOT")
+            .expect("the last tag is missing");
+        assert!(last.1 <= WIDE_PANE, "the last tag is cropped: {last:?}");
+        // A card with no room for them keeps its count rather than cropping a pill.
+        let texts = painted(wider, NARROW_PANE);
+        assert!(texts.iter().any(|(text, _)| text == "5 calls"), "{texts:?}");
+        assert!(!texts.iter().any(|(text, _)| text == "SSH"), "{texts:?}");
     }
 
     #[test]
