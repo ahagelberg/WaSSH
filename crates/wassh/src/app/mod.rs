@@ -2080,7 +2080,7 @@ impl Shell {
         let mut changed = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             results.push((index, session.pump(&term_type)));
-            if session.take_plugin_dirty() {
+            if session.take_plugin_dirty() || session.plugins_ticking() {
                 changed.push(index);
             }
             // Collect any finished remote-file or monitoring requests.
@@ -2093,10 +2093,14 @@ impl Shell {
         // A connection opened for a pane finishes its dialling, its commands and its file
         // requests outside any tab, so it is polled once here.
         self.remote.borrow_mut().poll();
-        // A pane that records history does it whether or not it is drawn, so every tab
-        // whose status changed hands its events on here.
+        // A pane works whether or not it is drawn: a tab whose status changed hands its
+        // events on here, and a tab with a run in flight keeps moving.
         for index in changed {
-            self.poll_session_plugins(index);
+            // A pane that asked for a frame gets one: a run in a tab nobody is looking at
+            // finishes on its own pace, not the idle one.
+            if let Some(after) = self.poll_session_plugins(index) {
+                ctx.request_repaint_after(after);
+            }
         }
         let mut exited = Vec::new();
         for (index, pumped) in results {
@@ -2420,19 +2424,28 @@ impl Shell {
 
     // --- drawing -----------------------------------------------------------
 
-    /// Let the panes of session `index` fold in what happened while they were not drawn.
+    /// Let the panes of session `index` work a frame without being drawn.
     ///
     /// The values come through the same cache the drawn tab uses, and whatever the panes
     /// wrote is saved straight away, because an undrawn tab never reaches
-    /// [`Self::persist_plugin_data`].
-    fn poll_session_plugins(&mut self, index: usize) {
+    /// [`Self::persist_plugin_data`]. A pane that is working gets a frame in return, so a
+    /// run in a tab nobody is looking at goes on at its own pace.
+    fn poll_session_plugins(&mut self, index: usize) -> Option<Duration> {
         let values = self.take_plugin_values(index);
-        let enabled = self.settings.enabled_plugins.clone();
+        let store = self.config.as_ref();
+        let remote: Rc<RefCell<dyn wassh_plugins::RemoteHosts>> = self.remote.clone();
+        let mut after = None;
         if let Some(session) = self.sessions.get_mut(index) {
-            session.poll_plugins(self.config.as_ref(), &values, &enabled);
+            after = session.poll_plugins(
+                store,
+                &values,
+                &self.settings.enabled_plugins,
+                Some(remote),
+            );
         }
         self.plugin_values = Some(values);
         self.persist_plugin_data(index);
+        after
     }
 
     /// Write any plugin data that changed while the tab was drawn.

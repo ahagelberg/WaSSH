@@ -285,11 +285,21 @@ pub trait Plugin {
 
     /// Do the pane's background work for one frame, whether or not it is drawn.
     ///
-    /// The host calls this after the session's status changed, for every enabled plugin of
-    /// every tab: a pane that records history (the connection log) keeps up while it is
+    /// The host calls this for every enabled plugin of every tab whose session changed, and
+    /// on every frame for a pane that reports [`Plugin::ticking`]: a pane that records
+    /// history (the connection log) or runs a model (the AI agent) keeps up while it is
     /// closed or its tab sits in the background. Drawing is not involved, so a pane that
     /// only works when drawn leaves this alone.
     fn poll(&mut self, _context: &mut PluginContext<'_>) {}
+
+    /// Whether the pane has work that has to keep moving while its tab is not drawn.
+    ///
+    /// A pane that says yes is polled on every frame, on every tab, so a run in one tab
+    /// carries on while the user works in another. A pane with nothing in flight says no
+    /// and costs nothing until its session changes.
+    fn ticking(&self) -> bool {
+        false
+    }
 
     /// Short state line for the pane header: the text and how it reads.
     ///

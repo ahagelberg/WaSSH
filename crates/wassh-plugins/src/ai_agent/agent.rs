@@ -836,6 +836,20 @@ impl Agent {
         }
     }
 
+    /// Whether a frame has work to do: a reply streaming in, a tool running, a connection
+    /// opening, a reply owed, a spawn the pane has not launched, or text and answers waiting
+    /// to join the history.
+    ///
+    /// A card the user has to answer is not work here: nothing moves until it is answered,
+    /// and answering it wakes the pane without the clock.
+    pub fn pending(&self) -> bool {
+        self.busy()
+            || self.needs_reply
+            || self.spawn_request.is_some()
+            || !self.injected.is_empty()
+            || !self.pending_reports.is_empty()
+    }
+
     /// Whether a reply or tool is in flight, or another host is being reached.
     pub fn busy(&self) -> bool {
         matches!(

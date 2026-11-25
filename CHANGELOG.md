@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Keep every tab's AI chat running while you are somewhere else. A run only advanced while its
+  pane was on screen, so a chat left in a background tab waited at its next tool call until you
+  came back to it — and only one tab could be working at a time. Each chat now moves on by
+  itself, tools and all, on its own host, so several tabs can run agents at once.
 - Name the tools a script used, not just how many calls it made: a script card now carries the same
   coloured tags a direct call gets (SSH, Remote filesystem, Search and so on), one per kind of tool
   in the order they were first used, and any past the first three are counted (“+2”). A card too

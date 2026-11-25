@@ -4883,28 +4883,14 @@ script normally stops after {} seconds of JavaScript.",
 
         answers
     }
-}
 
-impl Plugin for AiAgent {
-    fn manifest(&self) -> PluginManifest {
-        PluginId::AiAgent.manifest()
-    }
-
-    fn take_toasts(&mut self) -> Vec<(ToastKind, String)> {
-        std::mem::take(&mut self.toasts)
-    }
-
-    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
-        (!self.caption.0.is_empty()).then_some((self.caption.0.as_str(), self.caption.1))
-    }
-
-    fn take_app_settings(&mut self) -> Vec<(String, Value)> {
-        std::mem::take(&mut self.app_writes)
-    }
-
-    fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
-        let palette = &context.palette;
-        let muted = to_color32(palette.text_muted);
+    /// Move the run on by one frame without drawing: the model's replies, the tools it
+    /// asks for, the sub-agents, the map and the messages queued behind it.
+    ///
+    /// The host calls this for a pane whose tab is not on screen too, so every tab's chat
+    /// keeps working at once instead of only the one being looked at. `show` calls it
+    /// before it paints.
+    fn tick(&mut self, context: &mut PluginContext<'_>) {
         // Taken out so the borrow of one field does not block the rest.
         let mut session = context.session.take();
         self.sync_providers(context.settings, context.secrets);
@@ -5026,6 +5012,127 @@ impl Plugin for AiAgent {
             };
         }
 
+        context.session = session;
+
+        // A run in flight, a summary or an attachment being read all finish outside a frame,
+        // so the pane asks for the next one whether or not its tab is drawn.
+        if self.working() {
+            context.request_repaint_after(std::time::Duration::ZERO);
+        }
+    }
+
+    /// Whether the pane has work that has to keep moving while its tab is not drawn.
+    fn working(&self) -> bool {
+        // A card waiting for the user is not work: the answer wakes the pane, and asking
+        // for frames until then would spin the window for as long as the card is up.
+        let answering = self.agent.needs_user()
+            || matches!(self.agent.host_card(), Some((HostCard::Password, _)));
+        (!answering && self.agent.pending())
+            || self.agent.subagents_running() > 0
+            || self.summary.is_some()
+            || self.title_job.is_some()
+            || self.picking.is_some()
+            || self.fetch.is_some()
+            || self.map_deep.is_some()
+            || self.agent.map_scan.is_some()
+            || self.map_rebuild
+            || self.map_deep_wanted
+            || !self.queued.is_empty()
+    }
+
+    /// Write the conversation, the map and the system facts into the pane's data.
+    ///
+    /// Done once a frame rather than on every change: the host compares the values with
+    /// what it last wrote, so an unchanged pane costs nothing to save.
+    fn save_state(&mut self, context: &mut PluginContext<'_>) {
+        // Keep the conversation.
+        let chats: Vec<Value> = self
+            .chats
+            .iter()
+            .map(|chat| {
+                json!({
+                    "title": chat.title,
+                    "created": chat.created,
+                    "cwd": chat.cwd,
+                    "model": chat.model,
+                    "provider": chat.provider,
+                    "turns": turns_to_json(&chat.turns),
+                    "history": history_to_json(&chat.history),
+                    "subagents": subagents_to_json(&chat.subagents),
+                    "compacted": chat.compacted,
+                    "scopes": chat.scopes.to_json(),
+                    "planMode": chat.plan
+                })
+            })
+            .collect();
+        context.set_value(
+            CONVERSATION_KEY,
+            json!({
+                "version": DATA_VERSION,
+                "title": self.title(),
+                "created": self.created,
+                "model": self.model,
+                "provider": self.active().map(|provider| provider.id.clone()),
+                "cwd": self.agent.cwd,
+                "turns": turns_to_json(&self.agent.turns),
+                "history": history_to_json(&self.agent.history),
+                "subagents": subagents_to_json(&self.agent.subagents),
+                "compacted": self.agent.compacted,
+                "scopes": self.agent.scopes.to_json(),
+                "planMode": self.agent.plan,
+                "chats": chats
+            }),
+        );
+        // The map is host state: written once per change, not once per frame.
+        if self.agent.map.revision != self.map_saved {
+            self.map_saved = self.agent.map.revision;
+            context.set_value(MAP_KEY, self.agent.map.to_json());
+        }
+        if self.agent.system.revision != self.system_saved {
+            self.system_saved = self.agent.system.revision;
+            context.set_value(SYSTEM_KEY, self.agent.system.to_json());
+        }
+    }
+
+}
+
+impl Plugin for AiAgent {
+    fn manifest(&self) -> PluginManifest {
+        PluginId::AiAgent.manifest()
+    }
+
+    fn take_toasts(&mut self) -> Vec<(ToastKind, String)> {
+        std::mem::take(&mut self.toasts)
+    }
+
+    fn header_status(&self) -> Option<(&str, HeaderHealth)> {
+        (!self.caption.0.is_empty()).then_some((self.caption.0.as_str(), self.caption.1))
+    }
+
+    fn take_app_settings(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.app_writes)
+    }
+
+    /// Do the pane's work for a frame, whether or not it is drawn.
+    ///
+    /// A chat keeps running while its tab sits in the background: the model's reply arrives
+    /// on its own thread, and this is where its tools, sub-agents and queue are moved on.
+    fn poll(&mut self, context: &mut PluginContext<'_>) {
+        self.tick(context);
+        self.save_state(context);
+    }
+
+    /// Whether a chat is in flight, so the host keeps polling this pane every frame.
+    fn ticking(&self) -> bool {
+        self.working()
+    }
+
+    fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
+        self.tick(context);
+        let palette = &context.palette;
+        let muted = to_color32(palette.text_muted);
+        // Taken out so the borrow of one field does not block the rest.
+        let mut session = context.session.take();
         let busy = self.agent.busy();
 
         // A chat leads with a way back to the list and the chat's own title; the list leads
@@ -5701,64 +5808,8 @@ impl Plugin for AiAgent {
             }
         }
 
-        // Keep the conversation.
-        let chats: Vec<Value> = self
-            .chats
-            .iter()
-            .map(|chat| {
-                json!({
-                    "title": chat.title,
-                    "created": chat.created,
-                    "cwd": chat.cwd,
-                    "model": chat.model,
-                    "provider": chat.provider,
-                    "turns": turns_to_json(&chat.turns),
-                    "history": history_to_json(&chat.history),
-                    "subagents": subagents_to_json(&chat.subagents),
-                    "compacted": chat.compacted,
-                    "scopes": chat.scopes.to_json(),
-                    "planMode": chat.plan
-                })
-            })
-            .collect();
-        context.set_value(
-            CONVERSATION_KEY,
-            json!({
-                "version": DATA_VERSION,
-                "title": self.title(),
-                "created": self.created,
-                "model": self.model,
-                "provider": self.active().map(|provider| provider.id.clone()),
-                "cwd": self.agent.cwd,
-                "turns": turns_to_json(&self.agent.turns),
-                "history": history_to_json(&self.agent.history),
-                "subagents": subagents_to_json(&self.agent.subagents),
-                "compacted": self.agent.compacted,
-                "scopes": self.agent.scopes.to_json(),
-                "planMode": self.agent.plan,
-                "chats": chats
-            }),
-        );
         context.session = session;
-        // The map is host state: written once per change, not once per frame.
-        if self.agent.map.revision != self.map_saved {
-            self.map_saved = self.agent.map.revision;
-            context.set_value(MAP_KEY, self.agent.map.to_json());
-        }
-        if self.agent.system.revision != self.system_saved {
-            self.system_saved = self.agent.system.revision;
-            context.set_value(SYSTEM_KEY, self.agent.system.to_json());
-        }
-        // A run in flight, a summary or an attachment being read all finish outside a frame.
-        if self.agent.busy()
-            || self.summary.is_some()
-            || self.picking.is_some()
-            || self.fetch.is_some()
-            || self.map_deep.is_some()
-            || self.agent.map_scan.is_some()
-        {
-            context.request_repaint_after(std::time::Duration::ZERO);
-        }
+        self.save_state(context);
     }
 }
 
@@ -6740,6 +6791,101 @@ mod tests {
         draw(&mut plugin, &mut settings);
         assert_eq!(plugin.agent.reach_allow, ["db-1"]);
         assert_eq!(plugin.agent.reach_deny, ["web-1"]);
+    }
+
+    /// A frame's context for a pane that is not drawn: no Ui, no session.
+    fn undrawn<'a>(
+        settings: &'a mut serde_json::Map<String, Value>,
+    ) -> PluginContext<'a> {
+        PluginContext {
+            palette: Palette::dark(),
+            host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
+            status: SessionStatus::Connected,
+            settings,
+            scope: "host-1".to_owned(),
+            session: None,
+            events: &[],
+            pending_input: Vec::new(),
+            repaint_after: None,
+            secrets: &EMPTY_SECRETS,
+            secret_writes: Vec::new(),
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn a_chat_in_a_background_tab_keeps_working() {
+        let (mut plugin, worker) = busy_pane();
+        let mut settings = serde_json::Map::new();
+        assert!(plugin.ticking(), "a run in flight asks for no frames");
+        let mut context = undrawn(&mut settings);
+        plugin.poll(&mut context);
+        assert!(
+            context.repaint_after.is_some(),
+            "the host is not asked to draw the pane again"
+        );
+
+        // The model answers while the tab is in the background, and the next poll takes it
+        // in without a frame ever being drawn.
+        worker
+            .send(crate::ai_agent::StreamEvent::Done(
+                super::super::protocol::Completion {
+                    text: "all done".to_owned(),
+                    ..super::super::protocol::Completion::default()
+                },
+            ))
+            .expect("send");
+        plugin.poll(&mut context);
+        assert!(
+            matches!(
+                plugin.agent.turns.last(),
+                Some(Turn::Assistant { text, .. }) if text == "all done"
+            ),
+            "{:?}",
+            plugin.agent.turns.last()
+        );
+        // The run is over and nothing is waiting, so the pane stops asking for frames.
+        assert!(!plugin.ticking());
+        assert!(plugin.agent.phase.is_none(), "the run did not settle");
+    }
+
+    #[test]
+    fn a_chat_waiting_for_an_answer_does_not_spin() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Approving {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"systemctl restart nginx"}"#.to_owned(),
+            },
+            command: "systemctl restart nginx".to_owned(),
+            scopes: super::super::rules::approval_scopes("systemctl restart nginx"),
+        });
+        assert!(
+            !plugin.ticking(),
+            "a card waiting for the user keeps the window repainting"
+        );
+        let mut settings = serde_json::Map::new();
+        let mut context = undrawn(&mut settings);
+        plugin.poll(&mut context);
+        assert!(
+            context.repaint_after.is_none(),
+            "an unanswered card asks for frames every frame"
+        );
+    }
+
+    #[test]
+    fn an_idle_chat_does_not_ask_to_be_polled() {
+        let mut plugin = AiAgent::default();
+        let mut settings = serde_json::Map::new();
+        assert!(!plugin.ticking());
+        let mut context = undrawn(&mut settings);
+        plugin.poll(&mut context);
+        assert!(
+            context.repaint_after.is_none(),
+            "an idle pane asks for frames every frame"
+        );
     }
 
     #[test]

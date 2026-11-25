@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 use super::{local_exec, local_files, wsl_files};
 use wassh_core::{
@@ -1748,47 +1749,69 @@ impl SessionEntry {
         std::mem::take(&mut self.plugins_dirty)
     }
 
-    /// Let every enabled pane do its background work for one frame.
+    /// Let every enabled pane do its background work for one frame, with this session's
+    /// tools in reach.
     ///
     /// Called after the session's status changed, so a pane that records history — the
-    /// connection log — keeps going while it is closed or its tab is in the background.
+    /// connection log — keeps going while it is closed or its tab is in the background, and
+    /// on every frame while a pane reports work in flight, so a chat in a background tab
+    /// runs its commands on its own host rather than waiting to be looked at.
     pub fn poll_plugins(
         &mut self,
         store: Option<&wassh_store::Config>,
         values: &PluginValues,
         enabled: &[String],
-    ) {
+        remote: Option<Rc<RefCell<dyn wassh_plugins::RemoteHosts>>>,
+    ) -> Option<Duration> {
         let scope = self.plugin_scope();
         let events = std::sync::Arc::clone(&self.status_history);
+        let palette = self.palette;
+        let host_label = self.title.clone();
+        let environment = self.connection.environment();
+        let status = self.status;
+        let mut after: Option<Duration> = None;
         for id in PluginId::ALL {
             if !enabled.iter().any(|name| name == id.as_str()) {
                 continue;
             }
             let slot = self.ensure_pane(id);
             self.load_pane_data(slot, store, values);
+            // Lent out so a pane is served this session's tools while it works: a chat in a
+            // tab nobody is looking at still runs its commands on its own host.
+            let mut pane = self.panes.swap_remove(slot);
             let secrets = values.secrets.get(id.as_str()).unwrap_or(&NO_SECRETS);
-            let Some(pane) = self.panes.get_mut(slot) else {
-                continue;
-            };
             let mut context = PluginContext {
-                palette: self.palette,
-                host_label: self.title.clone(),
-                environment: self.connection.environment(),
-                status: self.status,
+                palette,
+                host_label: host_label.clone(),
+                environment: environment.clone(),
+                status,
                 settings: &mut pane.data.values,
                 scope: scope.clone(),
-                session: None,
+                session: Some(self),
                 events: &events,
                 pending_input: Vec::new(),
                 repaint_after: None,
                 secrets,
                 secret_writes: Vec::new(),
-                remote: None,
+                remote: remote.clone(),
             };
             pane.plugin.poll(&mut context);
             let writes = std::mem::take(&mut context.secret_writes);
+            if let Some(asked) = context.repaint_after {
+                after = Some(after.map_or(asked, |best| best.min(asked)));
+            }
             pane.secret_writes.extend(writes);
+            self.panes.push(pane);
         }
+        after
+    }
+
+    /// Whether any pane has work in flight that has to keep moving between frames.
+    ///
+    /// The host polls those panes on every frame, whatever tab is on screen, so a run in a
+    /// background tab is not left waiting for the user to come back to it.
+    pub fn plugins_ticking(&self) -> bool {
+        self.panes.iter().any(|pane| pane.plugin.ticking())
     }
 
     /// Panes whose data changed since the last save, ready to be written.
@@ -3887,6 +3910,73 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A pane that works between frames, to prove the host polls what is in flight.
+    struct BusyPane {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        had_session: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Plugin for BusyPane {
+        fn manifest(&self) -> wassh_plugins::PluginManifest {
+            PluginId::ConnectionLogger.manifest()
+        }
+
+        fn show(&mut self, _ui: &mut egui::Ui, _context: &mut PluginContext<'_>) {}
+
+        fn poll(&mut self, context: &mut PluginContext<'_>) {
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            self.polls.fetch_add(1, relaxed);
+            self.had_session.store(context.session.is_some(), relaxed);
+            context.request_repaint_after(Duration::ZERO);
+        }
+
+        fn ticking(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_pane_with_work_in_flight_is_polled_with_its_session() {
+        let mut entry = SessionEntry::new_local(
+            "t-busy-pane",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            "xterm-256color",
+            TerminalSize::new(80, 24),
+            local_params(),
+        );
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let had_session = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        entry.panes.push(PluginPane {
+            id: PluginId::ConnectionLogger,
+            plugin: Box::new(BusyPane {
+                polls: Arc::clone(&polls),
+                had_session: Arc::clone(&had_session),
+            }),
+            data: PluginData::default(),
+            secret_writes: Vec::new(),
+            app_writes: Vec::new(),
+        });
+        assert!(
+            entry.plugins_ticking(),
+            "the host will not poll a pane that has work in flight"
+        );
+
+        let enabled = vec![PluginId::ConnectionLogger.as_str().to_owned()];
+        let after = entry.poll_plugins(None, &PluginValues::default(), &enabled, None);
+        assert_eq!(polls.load(relaxed), 1, "the pane was not polled");
+        assert!(
+            had_session.load(relaxed),
+            "a pane that works is not lent its session"
+        );
+        assert_eq!(
+            after,
+            Some(Duration::ZERO),
+            "the pane's request for a frame was dropped"
+        );
+    }
+
     #[test]
     fn a_closed_connection_log_still_records_the_session() {
         let mut entry = SessionEntry::new_local(
@@ -3907,7 +3997,7 @@ mod tests {
         let enabled = vec![wassh_plugins::PluginId::ConnectionLogger
             .as_str()
             .to_owned()];
-        entry.poll_plugins(None, &PluginValues::default(), &enabled);
+        entry.poll_plugins(None, &PluginValues::default(), &enabled, None);
         let log = connection_log(&entry);
         assert_eq!(log.len(), 1, "the connect is in the log: {log:?}");
         assert_eq!(log[0]["kind"], serde_json::json!("connected"));
@@ -3920,7 +4010,7 @@ mod tests {
         );
 
         // The same history, offered again, writes nothing.
-        entry.poll_plugins(None, &PluginValues::default(), &enabled);
+        entry.poll_plugins(None, &PluginValues::default(), &enabled, None);
         assert!(entry.take_dirty_plugins().is_empty());
         assert_eq!(connection_log(&entry).len(), 1);
     }
