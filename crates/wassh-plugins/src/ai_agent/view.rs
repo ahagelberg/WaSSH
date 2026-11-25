@@ -194,6 +194,8 @@ const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 const SCRIPT_BADGE: &str = "Script";
 /// How many tool tags a script card names before it counts the rest.
 const SCRIPT_TAGS_MAX: usize = 3;
+/// Button that lets every later script in the session run past its default budget.
+const EXTENSION_ALWAYS_LABEL: &str = "Always allow this session";
 /// Narrowest card that has room for the tags beside the count and the outcome.
 const SCRIPT_TAGS_MIN_WIDTH: f32 = 320.0;
 /// Header of the program in a script card.
@@ -4282,8 +4284,8 @@ struct PromptAnswers {
     approval: Option<(bool, Option<usize>, bool)>,
     /// Capability card: (allow, remember the answer).
     permission: Option<(bool, bool)>,
-    /// Extension card: whether the longer run was allowed.
-    extension: Option<bool>,
+    /// Extension card: whether the longer run was allowed, and for the rest of the session.
+    extension: Option<(bool, bool)>,
     /// Capability card: allow every prompt for the rest of the session.
     allow_session: bool,
     /// The question card's answers, one per question.
@@ -4496,7 +4498,7 @@ script normally stops after {} seconds of JavaScript.",
                             .show(ui, palette)
                             .clicked()
                         {
-                            answers.extension = Some(true);
+                            answers.extension = Some((true, false));
                         }
                         if Button::new("Deny")
                             .compact()
@@ -4504,9 +4506,17 @@ script normally stops after {} seconds of JavaScript.",
                             .show(ui, palette)
                             .clicked()
                         {
-                            answers.extension = Some(false);
+                            answers.extension = Some((false, false));
                         }
                     });
+                    // Session-wide, so it gets its own line: the row never scrolls.
+                    if Button::new(EXTENSION_ALWAYS_LABEL)
+                        .compact()
+                        .show(ui, palette)
+                        .clicked()
+                    {
+                        answers.extension = Some((true, true));
+                    }
                 },
             );
         }
@@ -5696,9 +5706,9 @@ impl Plugin for AiAgent {
             self.prompt_agent(prompt_target)
                 .answer(&answers, &mut session);
         }
-        if let Some(allow) = prompts.extension {
+        if let Some((allow, always)) = prompts.extension {
             self.prompt_agent(prompt_target)
-                .answer_extension(allow, &mut session);
+                .answer_extension(allow, always, &mut session);
         }
         if let Some((allow, always)) = prompts.host {
             if always
@@ -6381,6 +6391,52 @@ mod tests {
             texts.iter().any(|text| text.contains("120 seconds")),
             "the card says what it wants: {texts:?}"
         );
+        assert!(
+            texts.contains(&EXTENSION_ALWAYS_LABEL),
+            "the card offers no session-wide answer: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_session_wide_extension_answers_the_card() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Extending {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_RUN_SCRIPT.to_owned(),
+                arguments: r#"{"code":"return 1;","timeoutSeconds":120}"#.to_owned(),
+            },
+            turn: 0,
+            seconds: 120,
+            background: false,
+        });
+        let mut settings = serde_json::Map::new();
+        let ctx = egui::Context::default();
+        // The card grows the composer panel, so it takes a frame to find its place.
+        frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        let always = rows
+            .iter()
+            .find(|(_, _, text)| text == EXTENSION_ALWAYS_LABEL)
+            .cloned()
+            .unwrap_or_else(|| panic!("the session-wide answer is missing: {rows:?}"));
+        // It sits under the pair, so neither row has to scroll sideways.
+        let once = rows
+            .iter()
+            .find(|(_, _, text)| text == "Allow once")
+            .cloned()
+            .expect("the card offers a once-off answer");
+        assert!(
+            always.0 > once.0,
+            "the session-wide answer is not on its own line: {rows:?}"
+        );
+        frame(&mut plugin, &mut settings, &ctx, click(always));
+        assert!(
+            plugin.agent.allow_long_scripts,
+            "the session-wide answer was not taken"
+        );
+        assert!(!plugin.agent.extending(), "the card is still up");
+        plugin.agent.stop();
     }
 
     #[test]

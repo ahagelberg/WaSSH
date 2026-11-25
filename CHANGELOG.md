@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Ask once or for the whole session: the card that asks about a script running past its default
+  20 seconds now offers **Always allow this session** beside **Allow once** and **Deny**, so a chat
+  that keeps running long builds stops asking. The answer lasts until the session ends, and the
+  chat's sub-agents follow it.
+
 ### Changed
 
 - Keep every tab's AI chat running while you are somewhere else. A run only advanced while its

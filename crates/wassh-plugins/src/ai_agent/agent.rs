@@ -740,6 +740,9 @@ pub struct Agent {
     pub session_deny: Vec<String>,
     /// Set once the user allowed every prompt for the rest of this session.
     pub allow_all: bool,
+    /// Set once the user let scripts run past their default budget for the rest of the
+    /// session, so a longer run is not asked about again.
+    pub allow_long_scripts: bool,
     /// Tool settings from the plugin data.
     pub tools: ToolSettings,
     /// What this host may do, read from the plugin settings.
@@ -1121,6 +1124,9 @@ impl Agent {
             agent.now_ms = self.now_ms;
             if agent.allow_all != self.allow_all {
                 agent.allow_all = self.allow_all;
+            }
+            if agent.allow_long_scripts != self.allow_long_scripts {
+                agent.allow_long_scripts = self.allow_long_scripts;
             }
             if agent.permissions != self.permissions {
                 agent.permissions = self.permissions.clone();
@@ -2327,8 +2333,14 @@ impl Agent {
         self.answer_permission(true, session);
     }
 
-    /// Answer a script's request for more run time. A yes starts it with that budget.
-    pub fn answer_extension(&mut self, allow: bool, session: Session<'_, '_>) {
+    /// Answer a script's request for more run time. A yes starts it with that budget;
+    /// `always` lets every later script in this session run long without asking again.
+    pub fn answer_extension(
+        &mut self,
+        allow: bool,
+        always: bool,
+        session: Session<'_, '_>,
+    ) {
         let Some(Phase::Extending {
             call,
             turn,
@@ -2339,6 +2351,7 @@ impl Agent {
             return;
         };
         if allow {
+            self.allow_long_scripts |= always;
             let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
             if background {
                 let code = arguments["code"].as_str().unwrap_or_default().to_owned();
@@ -2627,7 +2640,7 @@ at most."
 
         // A script that wants to run past the default asks the user first; a smaller
         // budget needs no answer.
-        if name == TOOL_RUN_SCRIPT {
+        if name == TOOL_RUN_SCRIPT && !self.allow_long_scripts {
             let seconds = tools::script_seconds(&arguments);
             if seconds > script::MAX_EXEC_MS / 1_000 {
                 self.phase = Some(Phase::Extending {
@@ -3627,6 +3640,7 @@ at most."
         agent.session_allow = self.session_allow.clone();
         agent.session_deny = self.session_deny.clone();
         agent.allow_all = self.allow_all;
+        agent.allow_long_scripts = self.allow_long_scripts;
         agent.plan = self.plan;
         agent.script_mode = self.script_mode;
         agent.tools = self.tools.clone();
@@ -5882,7 +5896,7 @@ mod tests {
         );
         {
             let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
-            agent.answer_extension(true, &mut session);
+            agent.answer_extension(true, false, &mut session);
         }
         assert!(matches!(
             agent.phase,
@@ -5912,9 +5926,13 @@ mod tests {
         }
         {
             let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
-            agent.answer_extension(false, &mut session);
+            agent.answer_extension(false, false, &mut session);
         }
         assert!(!agent.extending(), "the card is gone");
+        assert!(
+            !agent.allow_long_scripts,
+            "a refusal lets the rest of the session through"
+        );
         match agent.history.last() {
             Some(ApiMessage::Tool { content, .. }) => {
                 assert!(content.contains("refused"), "{content}");
@@ -6027,6 +6045,51 @@ mod tests {
     }
 
     #[test]
+    fn a_session_wide_extension_is_not_asked_again() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        let long_script = |id: &str| ApiToolCall {
+            id: id.to_owned(),
+            name: TOOL_RUN_SCRIPT.to_owned(),
+            arguments: r#"{"code":"return 1;","timeoutSeconds":120}"#.to_owned(),
+        };
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(long_script("c1"), &mut session);
+        }
+        assert!(agent.extending(), "the first longer run is asked about");
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.answer_extension(true, true, &mut session);
+        }
+        assert!(agent.allow_long_scripts, "the session-wide answer was lost");
+        agent.stop();
+
+        // The next one runs straight away, and so does a sub-agent's.
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(long_script("c2"), &mut session);
+        }
+        assert!(
+            !agent.extending(),
+            "a second longer run asks again after the session-wide answer"
+        );
+        assert!(matches!(
+            agent.phase,
+            Some(Phase::Running {
+                waiting: Waiting::Script,
+                ..
+            })
+        ));
+        let index = agent.begin_subagent("fetch logs", "read the logs");
+        assert!(
+            agent.subagents[index].agent.allow_long_scripts,
+            "a sub-agent of this session asks again"
+        );
+        agent.stop();
+    }
+
+    #[test]
     fn a_background_script_asking_for_more_time_waits_for_the_user() {
         let mut agent = Agent::new();
         let mut fake = FakeSession::default();
@@ -6052,7 +6115,7 @@ mod tests {
         ));
         {
             let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
-            agent.answer_extension(true, &mut session);
+            agent.answer_extension(true, false, &mut session);
         }
         assert!(agent.phase.is_none(), "the conversation is free");
         assert!(matches!(
