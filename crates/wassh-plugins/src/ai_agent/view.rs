@@ -4921,6 +4921,12 @@ script normally stops after {} seconds of JavaScript.",
         self.poll_picker();
         self.compact_if_needed(context.settings, &context.host_label);
 
+        // A tool waiting on this tab's shell cannot be answered once the transport that
+        // carried it is gone, so it is answered here rather than left running for ever.
+        if context.status != SessionStatus::Connected {
+            self.agent.session_lost();
+        }
+
         // Drain workers, then answer any tool result it produced. Sub-agents are drained
         // with it, so they keep working while the user reads another chat.
         self.agent.poll(&mut session);
@@ -6852,12 +6858,13 @@ mod tests {
     /// A frame's context for a pane that is not drawn: no Ui, no session.
     fn undrawn<'a>(
         settings: &'a mut serde_json::Map<String, Value>,
+        status: SessionStatus,
     ) -> PluginContext<'a> {
         PluginContext {
             palette: Palette::dark(),
             host_label: "dev".to_owned(),
             environment: "a test shell".to_owned(),
-            status: SessionStatus::Connected,
+            status,
             settings,
             scope: "host-1".to_owned(),
             session: None,
@@ -6875,7 +6882,7 @@ mod tests {
         let (mut plugin, worker) = busy_pane();
         let mut settings = serde_json::Map::new();
         assert!(plugin.ticking(), "a run in flight asks for no frames");
-        let mut context = undrawn(&mut settings);
+        let mut context = undrawn(&mut settings, SessionStatus::Connected);
         plugin.poll(&mut context);
         assert!(
             context.repaint_after.is_some(),
@@ -6923,7 +6930,7 @@ mod tests {
             "a card waiting for the user keeps the window repainting"
         );
         let mut settings = serde_json::Map::new();
-        let mut context = undrawn(&mut settings);
+        let mut context = undrawn(&mut settings, SessionStatus::Connected);
         plugin.poll(&mut context);
         assert!(
             context.repaint_after.is_none(),
@@ -6932,11 +6939,49 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_waiting_on_a_lost_session_is_answered() {
+        let mut plugin = AiAgent::default();
+        plugin.agent.phase = Some(Phase::Running {
+            call: super::super::protocol::ApiToolCall {
+                id: "c1".to_owned(),
+                name: super::super::protocol::TOOL_REMOTE_READ.to_owned(),
+                arguments: r#"{"path":"/etc/hosts"}"#.to_owned(),
+            },
+            turn: 0,
+            waiting: Waiting::Read {
+                path: "/etc/hosts".to_owned(),
+                max: 4_000,
+                then: super::super::agent::ReadThen::Return,
+            },
+        });
+        plugin.agent.turns.push(Turn::Tool {
+            name: super::super::protocol::TOOL_REMOTE_READ.to_owned(),
+            label: "read /etc/hosts".to_owned(),
+            output: String::new(),
+            failed: false,
+        });
+        let mut settings = serde_json::Map::new();
+        // The tab drops while the pane sits in the background: the read can never answer.
+        let mut context = undrawn(&mut settings, SessionStatus::Disconnected);
+        plugin.poll(&mut context);
+        assert!(plugin.agent.phase.is_none(), "the lost read is still running");
+        assert!(
+            matches!(
+                plugin.agent.turns.last(),
+                Some(Turn::Tool { output, failed: true, .. })
+                    if output == super::super::agent::SESSION_CLOSED
+            ),
+            "{:?}",
+            plugin.agent.turns.last()
+        );
+    }
+
+    #[test]
     fn an_idle_chat_does_not_ask_to_be_polled() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
         assert!(!plugin.ticking());
-        let mut context = undrawn(&mut settings);
+        let mut context = undrawn(&mut settings, SessionStatus::Connected);
         plugin.poll(&mut context);
         assert!(
             context.repaint_after.is_none(),

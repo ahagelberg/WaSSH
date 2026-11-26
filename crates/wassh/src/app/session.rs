@@ -669,9 +669,7 @@ impl SessionEntry {
         self.exit_reported = false;
         self.login = None;
         self.suppress_close = false;
-        // The listeners and requests belonged to the transport that just went away, so a
-        // pane asking again gets a fresh address instead of the dead one it was given.
-        self.forwards = RemoteForwards::default();
+        self.forget_transport_requests();
         if !secrets.password.is_empty() {
             self.secrets = secrets.clone();
         }
@@ -1179,14 +1177,25 @@ impl SessionEntry {
         self.auth_prompt = None;
         self.login = None;
         self.suppress_close = false;
-        // Nothing can reach a forward once the transport is gone.
-        self.forwards = RemoteForwards::default();
+        self.forget_transport_requests();
         if !matches!(
             self.status,
             SessionStatus::Failed | SessionStatus::Disconnected
         ) {
             self.status = SessionStatus::Closed;
         }
+    }
+
+    /// Drop what belonged to the transport that is going away.
+    ///
+    /// Forwards, commands and file requests are all keyed by what a pane asked for, and none
+    /// of them can be answered once the transport carrying them is gone: a pane asking again
+    /// gets a fresh handle instead of a dead one, and one that was waiting is told the
+    /// request failed rather than waiting for an answer that can never come.
+    fn forget_transport_requests(&mut self) {
+        self.forwards = RemoteForwards::default();
+        self.commands.forget(COMMAND_CLOSED);
+        self.files.forget(LISTING_CLOSED);
     }
 
     /// True while the session can accept keyboard input.
@@ -2143,6 +2152,9 @@ const FORWARD_CLOSED: &str = "The forward closed before it opened.";
 /// Why a command never ran: the thread that owned it went away.
 const COMMAND_CLOSED: &str = "the session closed before the command finished";
 
+/// Why a file request never answered: the transport that carried it went away.
+const LISTING_CLOSED: &str = "the session closed before the file request finished";
+
 /// Take every answer that has arrived, leaving the rest pending.
 ///
 /// Every pane request follows the same shape: a receiver per request, keyed by what the
@@ -2223,6 +2235,21 @@ impl RemoteCommands {
             };
             results.insert(key.to_owned(), result);
         });
+    }
+
+    /// Fail every command still running, reporting the reason a command whose thread died
+    /// reports, so a pane waiting on one stops waiting.
+    fn forget(&mut self, reason: &str) {
+        self.stops.clear();
+        for (key, _) in std::mem::take(&mut self.pending) {
+            self.results.insert(
+                key,
+                CommandResult {
+                    output: None,
+                    failure: Some(reason.to_owned()),
+                },
+            );
+        }
     }
 
     /// Whether a command for `key` is still running.
@@ -2559,6 +2586,28 @@ impl RemoteFiles {
     /// Forget the file that was read: a write, a change or a reload may have replaced it.
     fn forget_content(&mut self) {
         self.content = None;
+    }
+
+    /// Fail the request in flight and let go of what described the old transport.
+    ///
+    /// The listing, the transfer and the login directory all belonged to the session that
+    /// went away, so the next ask starts from the new one.
+    fn forget(&mut self, reason: &str) {
+        if self.listing_pending.take().is_some() {
+            self.listing_error = Some(reason.to_owned());
+        }
+        self.listing_stop = None;
+        if self.pending.take().is_some() {
+            self.error = Some(reason.to_owned());
+        }
+        self.job = None;
+        self.pack = None;
+        self.progress = None;
+        self.moved = None;
+        self.stop = None;
+        self.requested = None;
+        self.resolved = None;
+        self.forget_content();
     }
 
     fn poll_listing(&mut self) {
@@ -5285,6 +5334,49 @@ mod tests {
             .insert(forward.to_owned(), "127.0.0.1:41000".to_owned());
         entry.disconnect();
         assert_eq!(entry.forward_address(forward), None);
+    }
+
+    #[test]
+    fn a_new_transport_fails_the_requests_the_old_one_carried() {
+        use wassh_plugins::{CommandAccess as _, SftpAccess as _};
+        let mut entry = password_entry();
+        // A command a pane is waiting on, and a file request in flight.
+        let (_answers, pending) = std::sync::mpsc::channel();
+        entry
+            .commands
+            .pending
+            .push(("ai.run_command".to_owned(), pending));
+        let (_listing, requested) = std::sync::mpsc::channel();
+        entry
+            .files
+            .listing_pending
+            .replace((".".to_owned(), requested));
+        entry.files.resolved = Some("/home/alice".to_owned());
+
+        entry.restart(
+            "xterm-256color",
+            &Secrets::default(),
+            Arc::new(KnownHosts::in_memory()),
+        );
+
+        // The pane waiting on the command is told, instead of waiting for ever.
+        assert!(!entry.is_running("ai.run_command"));
+        assert_eq!(entry.output("ai.run_command"), None);
+        assert!(
+            entry
+                .failure("ai.run_command")
+                .is_some_and(|why| why.contains("session closed")),
+            "the lost command is not reported: {:?}",
+            entry.failure("ai.run_command")
+        );
+        // And the file request says the same, with the login directory forgotten.
+        assert!(
+            entry.error().is_some_and(|why| why.contains("session closed")),
+            "the lost file request is not reported: {:?}",
+            entry.error()
+        );
+        assert_eq!(entry.files.resolved, None);
+        assert!(!entry.is_loading());
     }
 
     #[test]

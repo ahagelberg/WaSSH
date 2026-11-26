@@ -115,6 +115,10 @@ inside `run_script`: call run_script with a program that awaits `tools.<name>({ 
 const QUESTION_FALLBACK: &str = "The agent needs your input.";
 /// Answer given to a tool call the user stopped before it ran.
 pub const STOPPED_BY_USER: &str = "Stopped by the user before this ran.";
+/// Answer given to a tool call whose session went away before it could answer.
+pub const SESSION_CLOSED: &str =
+    "The session closed before this finished, so its result was lost. Run it again once the \
+     tab is connected.";
 /// System prompt used when summarising a chat for a new one.
 pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarise the conversation above for a fresh agent session that must \
 continue the work. Reply with terse bullet points, at most 150 words, covering: Goal (what the user wants), \
@@ -4448,6 +4452,47 @@ at most."
         });
     }
 
+    /// Answer a call that was waiting on this tab's shell when it went away.
+    ///
+    /// A command, a read, a listing, a transfer or the terminal cannot answer once the
+    /// transport that carried it is gone, so the call is answered here instead of leaving
+    /// the chat looking busy for ever. A call running on another host, or a connection
+    /// being opened, is not this tab's to end.
+    ///
+    /// Returns whether anything was answered.
+    pub fn session_lost(&mut self) -> bool {
+        let Some(Phase::Running { call, turn, waiting }) = &self.phase else {
+            return false;
+        };
+        let lost = match waiting {
+            Waiting::Command { host, .. } => host.is_none(),
+            Waiting::Read { .. }
+            | Waiting::List { .. }
+            | Waiting::Transfer { .. }
+            | Waiting::Terminal { .. } => true,
+            Waiting::Subagent { .. }
+            | Waiting::Worker { .. }
+            | Waiting::Script
+            | Waiting::BackgroundScript { .. } => false,
+        };
+        if !lost {
+            return false;
+        }
+        let (call, turn) = (call.clone(), *turn);
+        self.phase = None;
+        let label = self.turn_label(turn, &call);
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        self.settle(
+            call,
+            turn,
+            label,
+            SESSION_CLOSED.to_owned(),
+            true,
+            &mut session,
+        );
+        true
+    }
+
     /// Answer a tool call that will never run, so the model sees why it stopped.
     fn abandon_tool(&mut self, call: ApiToolCall, turn: usize) {
         if let Some(Turn::Tool { output, .. }) = self.turns.get_mut(turn) {
@@ -6087,6 +6132,66 @@ mod tests {
             "a sub-agent of this session asks again"
         );
         agent.stop();
+    }
+
+    #[test]
+    fn a_tool_waiting_on_the_shell_ends_when_the_session_closes() {
+        let mut agent = Agent::new();
+        when_offered(&mut agent, TOOL_REMOTE_READ);
+        let mut fake = FakeSession::default();
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_REMOTE_READ.to_owned(),
+                    arguments: r#"{"path":"/etc/hosts"}"#.to_owned(),
+                },
+                &mut session,
+            );
+        }
+        assert!(
+            matches!(
+                agent.phase,
+                Some(Phase::Running {
+                    waiting: Waiting::Read { .. },
+                    ..
+                })
+            ),
+            "the read is under way"
+        );
+        assert!(agent.session_lost(), "the lost read was left waiting");
+        assert!(agent.phase.is_none(), "the run is over");
+        assert!(
+            matches!(
+                agent.history.last(),
+                Some(ApiMessage::Tool { content, .. }) if content == SESSION_CLOSED
+            ),
+            "{:?}",
+            agent.history.last()
+        );
+        assert!(agent.needs_reply, "the model is not told to carry on");
+    }
+
+    #[test]
+    fn a_run_elsewhere_is_not_ended_by_this_tab_closing() {
+        let mut agent = Agent::new();
+        agent.phase = Some(Phase::Running {
+            call: ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"uptime","host":"db-1"}"#.to_owned(),
+            },
+            turn: 0,
+            waiting: Waiting::Command {
+                key: "ai.run_command".to_owned(),
+                then: CommandThen::Return,
+                host: Some("db-1".to_owned()),
+            },
+        });
+        // A connection to another host, and everything that is not the shell, carries on.
+        assert!(!agent.session_lost(), "another host's command was ended here");
+        assert!(agent.phase.is_some());
     }
 
     #[test]

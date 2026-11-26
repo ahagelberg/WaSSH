@@ -11,6 +11,13 @@
 
 ### Fixed
 
+- Keep every pane working when a session comes back. Whatever a pane had asked the old connection
+  for belonged to a channel that went away with it: the app now fails the commands and file
+  requests it was still carrying and forgets its forwards and the login directory, so a pane
+  asking again gets a fresh one and a pane that was waiting is told the request failed. An AI chat
+  answers a call that was waiting on the shell — a command, a file read, a listing, a transfer or
+  the terminal — with "The session closed before this finished…" and carries on, instead of
+  looking busy for ever.
 - Reconnect the MQTT analyser when its tab comes back. The broker connection runs through the SSH
   session, so a dropped session left the pane holding a listener and a client that no longer
   existed: it showed "Disconnected" and stayed there, and even the header's Reconnect kept dialling
