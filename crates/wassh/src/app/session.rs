@@ -30,6 +30,8 @@ const MAX_STATUS_HISTORY: usize = 200;
 
 /// Prompt shown when the host has no user name to log in as.
 const USERNAME_PROMPT: &str = "login as: ";
+/// What erases the character last typed at a prompt that echoes: back, space, back.
+const ERASE_TYPED: &str = "\u{8} \u{8}";
 
 /// What a retried password attempt is told after the server rejected the last one.
 const PASSWORD_DENIED: &str = "\r\nPermission denied, please try again.\r\n";
@@ -1904,8 +1906,8 @@ impl SessionEntry {
 
     /// Print the user-name or password prompt into the terminal and wait for typing.
     ///
-    /// Nothing is echoed while the user types, and a retry prints the same
-    /// "Permission denied" line OpenSSH and PuTTY use.
+    /// The user name is echoed as it is typed, the way a shell shows it; the password is
+    /// not. A retry prints the same "Permission denied" line OpenSSH and PuTTY use.
     pub fn prompt_login(&mut self, open: SshOpen) {
         let attempts = self.login.as_ref().map_or(0, |login| login.attempts);
         let stage = if open.resolved_params().username.trim().is_empty() {
@@ -1938,10 +1940,11 @@ impl SessionEntry {
         self.terminal.feed(text.as_bytes());
     }
 
-    /// Feed keystrokes to the password prompt.
+    /// Feed keystrokes to the login prompt.
     ///
-    /// Returns [`LoginOutcome::Submitted`] once the password has been handed to a new
-    /// connection attempt.
+    /// What the user types is echoed while the prompt asks for the user name and kept off
+    /// the screen while it asks for the password. Returns [`LoginOutcome::Submitted`] once
+    /// the answer has been handed to the next step or to a new connection attempt.
     pub fn login_input(
         &mut self,
         inputs: &[wassh_ui::TerminalInput],
@@ -1955,6 +1958,9 @@ impl SessionEntry {
         }
         let mut submit = false;
         let mut cancel = false;
+        // A user name is shown as it is typed; a password never is.
+        let secret = login.stage == LoginStage::Password;
+        let mut echo = String::new();
         for input in inputs {
             match input {
                 wassh_ui::TerminalInput::Text(text) => {
@@ -1962,28 +1968,52 @@ impl SessionEntry {
                         match ch {
                             '\r' | '\n' => submit = true,
                             '\u{7f}' => {
-                                login.buffer.pop();
+                                if login.buffer.pop().is_some() && !secret {
+                                    echo.push_str(ERASE_TYPED);
+                                }
                             }
                             '\u{3}' => cancel = true,
-                            ch if !ch.is_control() => login.buffer.push(ch),
+                            ch if !ch.is_control() => {
+                                login.buffer.push(ch);
+                                if !secret {
+                                    echo.push(ch);
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 wassh_ui::TerminalInput::Paste(text) => {
-                    login.buffer.extend(text.chars().filter(|ch| !ch.is_control()));
+                    let typed: String =
+                        text.chars().filter(|ch| !ch.is_control()).collect();
+                    login.buffer.push_str(&typed);
+                    if !secret {
+                        echo.push_str(&typed);
+                    }
                 }
                 wassh_ui::TerminalInput::Key(stroke) => match stroke.key {
                     Key::Enter => submit = true,
                     Key::Backspace => {
-                        login.buffer.pop();
+                        if login.buffer.pop().is_some() && !secret {
+                            echo.push_str(ERASE_TYPED);
+                        }
                     }
                     Key::Escape => cancel = true,
                     Key::Char('c') if stroke.ctrl => cancel = true,
-                    Key::Char('u') if stroke.ctrl => login.buffer.clear(),
+                    Key::Char('u') if stroke.ctrl => {
+                        if !secret {
+                            for _ in 0..login.buffer.chars().count() {
+                                echo.push_str(ERASE_TYPED);
+                            }
+                        }
+                        login.buffer.clear();
+                    }
                     _ => {}
                 },
             }
+        }
+        if !echo.is_empty() {
+            self.terminal.feed(echo.as_bytes());
         }
         if cancel {
             self.cancel_login();
@@ -3739,6 +3769,98 @@ mod tests {
                 jump_error: None,
             },
         )
+    }
+
+    /// A session whose host names no user, so the prompt asks for one first.
+    fn username_entry() -> SessionEntry {
+        let params = ConnectionParams {
+            kind: ConnectionType::Ssh,
+            host: "127.0.0.1".to_owned(),
+            port: 1,
+            username: String::new(),
+            auth: AuthMethod::Password,
+            ..ConnectionParams::default()
+        };
+        SessionEntry::new_ssh_prompt(
+            "t-username",
+            &Palette::dark(),
+            &SessionStyleDefaults::default(),
+            TerminalSize::new(80, 24),
+            SshOpen {
+                params,
+                resolved: None,
+                host_id: None,
+                secrets: Secrets::default(),
+                known_hosts: Arc::new(KnownHosts::in_memory()),
+                jumps: Vec::new(),
+                jump_error: None,
+            },
+        )
+    }
+
+    /// One keystroke, as the terminal reports it.
+    fn key(key: Key) -> wassh_ui::TerminalInput {
+        wassh_ui::TerminalInput::Key(wassh_term::KeyStroke {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        })
+    }
+
+    #[test]
+    fn typing_a_username_shows_it_and_the_password_does_not() {
+        let mut entry = username_entry();
+        assert!(entry.awaiting_login());
+        assert!(entry.visible_text().contains("login as:"), "{:?}", entry.visible_text());
+
+        entry.login_input(
+            &[wassh_ui::TerminalInput::Text("bob".to_owned())],
+            "xterm-256color",
+        );
+        let screen = entry.visible_text();
+        assert!(screen.contains("login as: bob"), "the typed name is hidden: {screen:?}");
+
+        // Backspace takes the last character off the screen as well as the buffer.
+        entry.login_input(&[key(Key::Backspace)], "xterm-256color");
+        let screen = entry.visible_text();
+        assert!(screen.contains("login as: bo"), "{screen:?}");
+        assert!(!screen.contains("bob"), "the erased character stays on screen: {screen:?}");
+
+        // Enter moves on to the password, which stays off the screen.
+        entry.login_input(&[key(Key::Enter)], "xterm-256color");
+        let screen = entry.visible_text();
+        assert!(
+            screen.contains("bo@127.0.0.1's password:"),
+            "the prompt does not name the user just typed: {screen:?}"
+        );
+        entry.login_input(
+            &[wassh_ui::TerminalInput::Text("hunter2".to_owned())],
+            "xterm-256color",
+        );
+        let screen = entry.visible_text();
+        assert!(!screen.contains("hunter2"), "the password is echoed: {screen:?}");
+    }
+
+    #[test]
+    fn ctrl_u_clears_a_typed_username_from_the_screen() {
+        let mut entry = username_entry();
+        entry.login_input(
+            &[wassh_ui::TerminalInput::Text("wrong-name".to_owned())],
+            "xterm-256color",
+        );
+        entry.login_input(
+            &[wassh_ui::TerminalInput::Key(wassh_term::KeyStroke {
+                key: Key::Char('u'),
+                ctrl: true,
+                alt: false,
+                shift: false,
+            })],
+            "xterm-256color",
+        );
+        let screen = entry.visible_text();
+        assert!(screen.contains("login as:"), "{screen:?}");
+        assert!(!screen.contains("wrong-name"), "{screen:?}");
     }
 
     #[test]

@@ -9,6 +9,13 @@
   that keeps running long builds stops asking. The answer lasts until the session ends, and the
   chat's sub-agents follow it.
 
+### Fixed
+
+- Show the user name while it is typed at the login prompt. A host with no user name set asks
+  for one in the terminal, and the answer was kept off the screen the way a password is, so it
+  looked as if nothing was being typed. The name now appears as you type and backspace erases it;
+  the password is still hidden.
+
 ### Changed
 
 - Keep every tab's AI chat running while you are somewhere else. A run only advanced while its
