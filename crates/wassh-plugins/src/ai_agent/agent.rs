@@ -747,6 +747,10 @@ pub struct Agent {
     /// Set once the user let scripts run past their default budget for the rest of the
     /// session, so a longer run is not asked about again.
     pub allow_long_scripts: bool,
+    /// Directory on the host this conversation's commands put their temporary files in.
+    pub scratch: String,
+    /// Whether that directory is to be emptied before the next command runs.
+    scratch_dirty: bool,
     /// Tool settings from the plugin data.
     pub tools: ToolSettings,
     /// What this host may do, read from the plugin settings.
@@ -839,6 +843,7 @@ impl Agent {
         Self {
             cwd: "/".to_owned(),
             max_subagents: DEFAULT_MAX_SUBAGENTS,
+            scratch: super::tools::scratch_dir(),
             ..Self::default()
         }
     }
@@ -3629,6 +3634,10 @@ at most."
     fn child_agent(&self) -> Agent {
         let mut agent = Agent::new();
         agent.cwd = self.cwd.clone();
+        // A sub-agent's commands share this conversation's scratch directory, and the reset
+        // stays with the conversation: emptying it under a run that is still using it would
+        // take files that run still needs.
+        agent.scratch = self.scratch.clone();
         agent.scopes = self.scopes.clone();
         agent.map = self.map.clone();
         agent.system = self.system.clone();
@@ -3859,6 +3868,25 @@ at most."
             bg.agent.session_deny.clone(),
         );
         self.adopt_rules(allow_all, allow, deny);
+    }
+
+    /// Point a command's temporary files at this conversation's scratch directory.
+    ///
+    /// The model reaches for `mktemp` and `/tmp` for scratch work; with `TMPDIR` set those
+    /// files land in one directory that is emptied before the next step runs, so nothing it
+    /// makes is left on the host. The step after a connection is a reset too, which clears
+    /// out whatever a session that went away left behind.
+    fn scratch_prefix(&mut self) -> String {
+        if self.scratch.is_empty() {
+            return String::new();
+        }
+        let reset = std::mem::take(&mut self.scratch_dirty);
+        super::tools::scratch_preamble(&self.scratch, reset)
+    }
+
+    /// Empty the scratch directory before the next command runs.
+    pub fn forget_scratch(&mut self) {
+        self.scratch_dirty = true;
     }
 
     /// The directory the call being dispatched resolves paths against.
@@ -4115,13 +4143,14 @@ at most."
             );
             return;
         };
+        let prefix = self.scratch_prefix();
         match &sudo_stdin {
             Some(password) => {
-                let wrapped = wrap_command_with_sudo(self.cwd(), &command);
+                let wrapped = wrap_command_with_sudo_in(self.cwd(), &prefix, &command);
                 access.exec_input(&self.keys.exec, &wrapped, password);
             }
             None => {
-                let wrapped = wrap_command(self.cwd(), &command);
+                let wrapped = wrap_command_in(self.cwd(), &prefix, &command);
                 access.exec(&self.keys.exec, &wrapped);
             }
         }
@@ -4158,7 +4187,8 @@ at most."
             "(nohup sh -c {} >/dev/null 2>&1 </dev/null & echo \"Background PID: $!\")",
             shell_quote(&command)
         );
-        let wrapped = wrap_command(self.cwd(), &launched);
+        let prefix = self.scratch_prefix();
+        let wrapped = wrap_command_in(self.cwd(), &prefix, &launched);
         access.exec(&self.keys.exec, &wrapped);
         self.phase = Some(Phase::Running {
             call,
@@ -4927,20 +4957,20 @@ fn is_writing_tool(name: &str) -> bool {
     )
 }
 
-/// Wrap a command so its exit status and working directory come back too.
-pub fn wrap_command(cwd: &str, command: &str) -> String {
+/// Wrap a command so its exit status and working directory come back too, behind `prefix`,
+/// which sets up the shell before the command runs.
+pub fn wrap_command_in(cwd: &str, prefix: &str, command: &str) -> String {
     let status = "__WASSH_STATUS";
     let pwd = "__WASSH_PWD";
     // A host the conversation has not moved in yet has no directory to go to.
     let enter = (!cwd.is_empty()).then(|| format!("cd {} >/dev/null 2>&1 || true", shell_quote(cwd)));
-    [
-        enter.unwrap_or_default(),
-        command.to_owned(),
-        "__wassh_status=$?".to_owned(),
-        format!(r#"printf '\n{status}:%s__\n' "$__wassh_status""#),
-        format!(r#"printf '{pwd}:%s__\n' "$(pwd 2>/dev/null)""#),
-    ]
-    .join("\n")
+    let mut lines: Vec<String> = enter.into_iter().collect();
+    lines.extend((!prefix.is_empty()).then(|| prefix.to_owned()));
+    lines.push(command.to_owned());
+    lines.push("__wassh_status=$?".to_owned());
+    lines.push(format!(r#"printf '\n{status}:%s__\n' "$__wassh_status""#));
+    lines.push(format!(r#"printf '{pwd}:%s__\n' "$(pwd 2>/dev/null)""#));
+    lines.join("\n")
 }
 
 /// Whether a command's output says it needed root.
@@ -4961,12 +4991,12 @@ fn command_needs_sudo(command: &str) -> bool {
         .any(|word| word.rsplit('/').next() == Some("sudo"))
 }
 
-/// Wrap a command that needs `sudo`, reading the password from stdin.
+/// Wrap a command that needs `sudo` behind `prefix`, reading the password from stdin.
 ///
 /// Port of the reference's sudo preamble: the password is written to the channel
 /// and read with `IFS= read -r`, so it never reaches the command line. The command
 /// itself is run as root unless it already calls `sudo`.
-pub fn wrap_command_with_sudo(cwd: &str, command: &str) -> String {
+pub fn wrap_command_with_sudo_in(cwd: &str, prefix: &str, command: &str) -> String {
     let status = "__WASSH_STATUS";
     let pwd = "__WASSH_PWD";
     let line = if command_needs_sudo(command) {
@@ -4974,7 +5004,7 @@ pub fn wrap_command_with_sudo(cwd: &str, command: &str) -> String {
     } else {
         format!("sudo -n {command}")
     };
-    [
+    let mut lines: Vec<String> = vec![
         format!("cd {} >/dev/null 2>&1 || true", shell_quote(cwd)),
         "IFS= read -r __wassh_sudo_pw || true".to_owned(),
         "if [ -n \"${__wassh_sudo_pw}\" ]; then".to_owned(),
@@ -4994,11 +5024,14 @@ pub fn wrap_command_with_sudo(cwd: &str, command: &str) -> String {
         "fi".to_owned(),
         format!(r#"printf '\n{status}:%s__\n' "$__wassh_status""#),
         format!(r#"printf '{pwd}:%s__\n' "$(pwd 2>/dev/null)""#),
-    ]
-    .join("\n")
+    ];
+    if !prefix.is_empty() {
+        lines.insert(1, prefix.to_owned());
+    }
+    lines.join("\n")
 }
 
-/// Undo [`wrap_command`]: the visible output, exit status and directory.
+/// Undo [`wrap_command_in`]: the visible output, exit status and directory.
 pub fn unwrap_output(raw: &str) -> (String, Option<i32>, Option<String>) {
     let mut exit_code = None;
     let mut directory = None;
@@ -5363,8 +5396,53 @@ mod tests {
     const SCRIPT_POLL_STEPS: usize = 10_000;
 
     #[test]
+    fn a_command_points_its_temporary_files_at_the_scratch_directory() {
+        let mut agent = Agent::new();
+        let scratch = agent.scratch.clone();
+        assert!(scratch.starts_with(tools::SCRATCH_ROOT));
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"uptime"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        agent.approve(true, None, &mut session);
+        agent.poll(&mut session);
+        let (_, command) = fake.commands.first().expect("the command ran");
+        assert!(
+            command.contains(&format!("export TMPDIR='{scratch}'")),
+            "{command}"
+        );
+        assert!(command.contains("uptime"), "{command}");
+    }
+
+    #[test]
+    fn the_step_after_the_scratch_directory_was_used_empties_it_once() {
+        let mut agent = Agent::new();
+        let scratch = agent.scratch.clone();
+        assert!(!agent.scratch_prefix().contains("rm -rf"), "a fresh step");
+        agent.forget_scratch();
+        let reset = agent.scratch_prefix();
+        assert!(reset.starts_with(&format!("rm -rf '{scratch}'")), "{reset}");
+        assert!(reset.contains(&format!("export TMPDIR='{scratch}'")), "{reset}");
+        assert!(!agent.scratch_prefix().contains("rm -rf"), "the rest of the step");
+    }
+
+    #[test]
+    fn a_subagent_writes_its_temporary_files_beside_its_parent() {
+        let mut agent = Agent::new();
+        let index = agent.begin_subagent("check the log", "look at it");
+        let child = &agent.subagents[index].agent;
+        assert_eq!(child.scratch, agent.scratch);
+    }
+
+    #[test]
     fn a_wrapped_command_reports_status_and_directory() {
-        let wrapped = wrap_command("/srv/app", "ls -la");
+        let wrapped = wrap_command_in("/srv/app", "", "ls -la");
         assert!(wrapped.starts_with("cd '/srv/app' >/dev/null 2>&1 || true\nls -la\n"));
         assert!(wrapped.contains("__WASSH_STATUS:%s__"));
         assert!(wrapped.contains("__WASSH_PWD:%s__"));
@@ -8092,14 +8170,14 @@ Working directory is now /srv/app.
 
     #[test]
     fn a_sudo_command_reads_its_password_from_stdin() {
-        let wrapped = wrap_command_with_sudo("/srv", "apt-get update");
+        let wrapped = wrap_command_with_sudo_in("/srv", "", "apt-get update");
         assert!(wrapped.contains("IFS= read -r __wassh_sudo_pw"));
         assert!(wrapped.contains("sudo -S -p '' -v"));
         // A bare command is run as root; one that already calls sudo is left alone.
         assert!(wrapped.contains("sudo -n apt-get update"), "{wrapped}");
         assert!(!wrapped.contains("sudo -n sudo"));
         assert!(
-            wrap_command_with_sudo("/srv", "sudo du -sh /root").contains("\n  sudo du -sh /root\n")
+            wrap_command_with_sudo_in("/srv", "", "sudo du -sh /root").contains("\n  sudo du -sh /root\n")
         );
         assert!(wrapped.contains(SUDO_AUTH_FAILED_MARKER));
         // The password itself is never part of the command line.

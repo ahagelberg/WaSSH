@@ -27,6 +27,13 @@
   for one in the terminal, and the answer was kept off the screen the way a password is, so it
   looked as if nothing was being typed. The name now appears as you type and backspace erases it;
   the password is still hidden.
+- Clean up the temporary files the agent's commands leave on the host. Scratch work a chat asked
+  for — a `mktemp` directory, a tree it unpacked and never removed — was written straight into
+  `/tmp` and stayed there, filling the host's disk, and a run that was cut short never got to
+  remove it. Every command now has `TMPDIR`, `TMP` and `TEMP` pointing at one directory of the
+  chat's own, `/tmp/wassh-ai/<id>`, which is emptied before the chat's next step runs, and
+  directories a killed run left behind are swept once they have gone a day untouched. The agent
+  is told to keep scratch files there and to leave nothing behind in `/tmp` or the project tree.
 
 ### Changed
 

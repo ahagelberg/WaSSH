@@ -14,6 +14,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -1585,6 +1586,48 @@ pub fn dev_find_command(args: &Value, root: &str) -> String {
     )
 }
 
+/// Directory on the host the agent's commands put their temporary files in.
+///
+/// One directory per conversation, so whatever a command leaves behind is ours to delete: the
+/// model reaches for `mktemp` and `/tmp` for scratch work, and those files used to pile up on
+/// the host with nothing to remove them.
+pub const SCRATCH_ROOT: &str = "/tmp/wassh-ai";
+
+/// Hours a scratch directory no command has touched is kept before it is swept.
+///
+/// A run that was killed never gets to clean up after itself, so the next connection does it:
+/// a day is longer than any run, and short enough that a host does not fill up.
+const SCRATCH_KEEP_HOURS: u64 = 24;
+
+/// A scratch directory of its own for one conversation.
+///
+/// Named after the process and a counter, so two windows or two chats on the same host never
+/// write into each other's directory.
+pub fn scratch_dir() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{SCRATCH_ROOT}/{:x}-{id:x}", std::process::id())
+}
+
+/// The shell prefix that points a command's temporary files at `dir`.
+///
+/// `reset` also deletes what an earlier step left there and sweeps the directories of runs
+/// that never got to clean up, so the host keeps one step's worth of scratch at most.
+pub fn scratch_preamble(dir: &str, reset: bool) -> String {
+    let dir = shell_quote(dir);
+    let reset = if reset {
+        format!(
+            "rm -rf {dir} 2>/dev/null; find {root} -mindepth 1 -maxdepth 1 -mmin +{minutes} \
+             -exec rm -rf {{}} + 2>/dev/null; ",
+            root = shell_quote(SCRATCH_ROOT),
+            minutes = SCRATCH_KEEP_HOURS * 60,
+        )
+    } else {
+        String::new()
+    };
+    format!("{reset}mkdir -p {dir} >/dev/null 2>&1; export TMPDIR={dir} TMP={dir} TEMP={dir}; ")
+}
+
 /// The shell command a recursive `dev_list_directory` runs on the connected host.
 pub fn dev_tree_command(args: &Value, root: &str) -> String {
     let depth = args["maxDepth"]
@@ -2382,6 +2425,33 @@ mod tests {
         GROUP_KNOWLEDGE_BASE, GROUP_LOCAL_FS, GROUP_REMOTE_FS, GROUP_TERMINAL, GROUP_WEB_ACCESS,
         Permission, group_key, method_key,
     };
+
+    #[test]
+    fn each_conversation_gets_a_scratch_directory_of_its_own() {
+        let first = scratch_dir();
+        let second = scratch_dir();
+        assert!(first.starts_with(&format!("{SCRATCH_ROOT}/")));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_reset_empties_the_scratch_directory_and_sweeps_the_old_ones() {
+        let dir = "/tmp/wassh-ai/1a-2";
+        let reset = scratch_preamble(dir, true);
+        assert!(
+            reset.starts_with(&format!("rm -rf '{dir}' 2>/dev/null; find '{SCRATCH_ROOT}'")),
+            "{reset}"
+        );
+        assert!(
+            reset.contains(&format!("-mmin +{}", SCRATCH_KEEP_HOURS * 60)),
+            "{reset}"
+        );
+        assert!(reset.contains(&format!("export TMPDIR='{dir}' TMP='{dir}' TEMP='{dir}'")));
+        let kept = scratch_preamble(dir, false);
+        assert!(!kept.contains("rm -rf"), "{kept}");
+        assert!(kept.contains(&format!("mkdir -p '{dir}'")), "{kept}");
+        assert!(kept.contains(&format!("export TMPDIR='{dir}'")), "{kept}");
+    }
 
     /// Every scope loaded, so every tool is in the payload.
     fn everything_loaded() -> Loaded {

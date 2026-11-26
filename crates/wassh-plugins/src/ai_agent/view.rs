@@ -594,6 +594,8 @@ pub struct AiAgent {
     map_more: bool,
     /// Which of the pane's two views is drawn.
     view: ChatView,
+    /// Set while a run owns the scratch directory its commands write to.
+    scratch_used: bool,
 }
 
 /// A mapping pass running on a sub-agent.
@@ -688,6 +690,7 @@ impl Default for AiAgent {
             map_pass_after_scan: false,
             map_more: false,
             view: ChatView::List,
+            scratch_used: false,
         }
     }
 }
@@ -1187,6 +1190,15 @@ and keep the cd out of the commands. Callable now:",
                  version control. Never for reading, listing, searching or editing files.",
                 shells.join(", "),
                 if shells.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        if !shells.is_empty() && !agent.scratch.is_empty() {
+            lines.push(format!(
+                "- Scratch files go in $TMPDIR, which every command is given as {}, a directory \
+                 of this conversation's own: TMPDIR is already set, so make nothing yourself. It \
+                 is emptied between steps, so nothing kept there outlives the one that made it, \
+                 and nothing is left behind in /tmp or in the project's tree.",
+                agent.scratch
             ));
         }
         if agent.offers_tool(super::protocol::TOOL_TERMINAL_READ) {
@@ -4925,6 +4937,9 @@ script normally stops after {} seconds of JavaScript.",
         // carried it is gone, so it is answered here rather than left running for ever.
         if context.status != SessionStatus::Connected {
             self.agent.session_lost();
+            // The scratch directory went down with the connection, so the next one starts
+            // from an empty directory instead of inheriting whatever is left on the host.
+            self.agent.forget_scratch();
         }
 
         // Drain workers, then answer any tool result it produced. Sub-agents are drained
@@ -4997,6 +5012,14 @@ script normally stops after {} seconds of JavaScript.",
                 }
             }
         }
+        // A run that has settled leaves its scratch files behind: the next command empties
+        // the directory before it starts, so a long conversation cannot fill the host's disk.
+        if self.agent.busy() {
+            self.scratch_used = true;
+        } else if std::mem::take(&mut self.scratch_used) {
+            self.agent.forget_scratch();
+        }
+
         // The caption only changes when the run state or the session does, so its text is
         // built then rather than every frame. The chat's own title sits in the body beside
         // the back button, so an idle pane says nothing here.
