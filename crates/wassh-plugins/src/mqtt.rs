@@ -844,12 +844,51 @@ impl MqttAnalyser {
         &self.topics
     }
 
-    /// Drop the client, keeping the messages.
-    fn disconnect(&mut self) {
+    /// Let go of the client and of the forward behind it, keeping the messages.
+    ///
+    /// The forward lives inside the SSH session, so it goes with it: keeping either would
+    /// leave the pane talking through a channel that no longer exists.
+    fn release(&mut self) {
         if let Some(session) = self.session.take() {
             session.disconnect();
         }
+        self.forward_requested = false;
+    }
+
+    /// Drop the client, keeping the messages.
+    fn disconnect(&mut self) {
+        self.release();
         self.status = Status::Idle;
+    }
+
+    /// Keep the client in step with the shell, without drawing anything.
+    ///
+    /// Called on every drawn frame and, through [`Plugin::poll`], on frames where the tab
+    /// is in the background, so the analyser follows the session both ways: it lets go of
+    /// the client and the forward when the shell goes away, and asks for a fresh forward
+    /// when it comes back.
+    fn maintain(&mut self, context: &mut PluginContext<'_>) {
+        self.load(context.settings);
+        self.broker =
+            broker_from_settings(context.settings, context.secret(PASSWORD_SETTING));
+        if context.status != SessionStatus::Connected || context.session.is_none() {
+            self.release();
+            self.status = Status::Unavailable("MQTT Analyser requires an SSH session".to_owned());
+            self.caption = (self.status.label(), self.status.health());
+            return;
+        }
+        // A pane that was never drawn stays idle until its tab is opened; one that was
+        // waiting for the shell, or whose client dropped with it, starts again here.
+        let retry = matches!(
+            self.status,
+            Status::Idle | Status::Connecting | Status::Unavailable(_)
+        );
+        if self.session.is_none() && retry {
+            self.connect(context);
+        }
+        self.drain_events();
+        self.tick(context);
+        self.caption = (self.status.label(), self.status.health());
     }
 
     /// Ask for the broker forward and connect once it is up.
@@ -935,9 +974,12 @@ impl MqttAnalyser {
             context.request_repaint_after(BLINK_POLL);
         }
         // Messages are pushed by the broker thread, which cannot wake the window, so a
-        // connected pane keeps its own frames coming.
+        // connected pane keeps its own frames coming; one waiting for its forward needs
+        // them too, or a background tab would sit on the request until something else drew.
         if self.session.is_some() {
             context.request_repaint_after(BROKER_POLL);
+        } else if self.forward_requested {
+            context.request_repaint_after(BLINK_POLL);
         }
         self.poll_pick();
         if self.picking.is_some() {
@@ -1247,31 +1289,29 @@ impl Plugin for MqttAnalyser {
         self.reconnect();
     }
 
+    /// Keep the client in step with the shell, without drawing.
+    ///
+    /// A pane whose tab is not drawn still has to follow the session: a shell that comes
+    /// back has to get a fresh forward and a fresh client, or the pane stays on the dead
+    /// channel it was left on.
+    fn poll(&mut self, context: &mut PluginContext<'_>) {
+        // A pane that has never been drawn starts when its tab is opened, not before.
+        if self.status == Status::Idle {
+            return;
+        }
+        self.maintain(context);
+    }
+
+    /// Whether the pane has a broker connection to keep up with, or one being opened.
+    fn ticking(&self) -> bool {
+        matches!(self.status, Status::Connecting | Status::Connected)
+    }
+
     fn show(&mut self, ui: &mut Ui, context: &mut PluginContext<'_>) {
         let palette = context.palette;
-        self.load(context.settings);
-        self.broker =
-            broker_from_settings(context.settings, context.secret(PASSWORD_SETTING));
-
-        // Connect as soon as the session is up, like the reference: no fields —
-        // the broker comes from the host settings.
-        if context.status == SessionStatus::Connected {
-            // "Unavailable" only ever comes from the session not being up yet, so
-            // it is retried once the tab connects. A failure or a closed broker
-            // is the user's call to retry, from the header button.
-            let retry = matches!(
-                self.status,
-                Status::Idle | Status::Connecting | Status::Unavailable(_)
-            );
-            if self.session.is_none() && retry {
-                self.connect(context);
-            }
-        } else if self.session.is_none() {
-            self.status = Status::Unavailable("MQTT Analyser requires an SSH session".to_owned());
-        }
-        self.drain_events();
-        self.tick(context);
-        self.caption = (self.status.label(), self.status.health());
+        // Connect as soon as the session is up, like the reference: no fields — the broker
+        // comes from the host settings.
+        self.maintain(context);
 
         // --- topics | splitter | details ---------------------------------
         //
@@ -2966,6 +3006,31 @@ mod tests {
     }
 
     /// Draw two frames and return the painted text.
+    /// One frame of the pane's background work, with no window in front of it.
+    fn poll(
+        plugin: &mut MqttAnalyser,
+        access: &mut FakeBroker,
+        settings: &mut serde_json::Map<String, Value>,
+        status: SessionStatus,
+    ) {
+        let mut context = PluginContext {
+            palette: wassh_core::Palette::dark(),
+            host_label: "dev".to_owned(),
+            environment: "a test shell".to_owned(),
+            status,
+            settings,
+            scope: "host-1".to_owned(),
+            session: Some(access),
+            events: &[],
+            pending_input: Vec::new(),
+            repaint_after: None,
+            secrets: &EMPTY_SECRETS,
+            secret_writes: Vec::new(),
+            remote: None,
+        };
+        Plugin::poll(plugin, &mut context);
+    }
+
     fn draw(
         plugin: &mut MqttAnalyser,
         access: &mut FakeBroker,
@@ -3546,6 +3611,70 @@ mod tests {
         draw(&mut plugin, &mut access, &mut settings, SessionStatus::Connected);
         assert_eq!(access.asked, [("127.0.0.1".to_owned(), DEFAULT_PORT)]);
         assert_eq!(plugin.status(), &Status::Connecting);
+    }
+
+    #[test]
+    fn a_dropped_session_hands_the_forward_back_and_asks_again() {
+        let mut plugin = MqttAnalyser::default();
+        let mut settings = serde_json::Map::new();
+        let mut access = FakeBroker::default();
+        // The forward is asked for, and the client waits for its address.
+        draw(&mut plugin, &mut access, &mut settings, SessionStatus::Connected);
+        assert_eq!(access.asked.len(), 1);
+        assert_eq!(plugin.status(), &Status::Connecting);
+        assert!(plugin.ticking(), "a broker being dialled is not kept up with");
+
+        // The tab drops: the forward went with the SSH session, so the pane lets go of it
+        // and stops claiming to be connected.
+        draw(&mut plugin, &mut access, &mut settings, SessionStatus::Disconnected);
+        assert!(matches!(plugin.status(), Status::Unavailable(_)));
+        assert!(plugin.session.is_none());
+        assert!(!plugin.forward_requested, "the dead forward is still remembered");
+        assert!(
+            !plugin.ticking(),
+            "a pane with no shell keeps the host polling it"
+        );
+
+        // The tab comes back: a fresh forward, and a fresh client on the way.
+        draw(&mut plugin, &mut access, &mut settings, SessionStatus::Connected);
+        assert_eq!(access.asked.len(), 2, "the pane kept the dead forward");
+        assert_eq!(plugin.status(), &Status::Connecting);
+        assert!(
+            plugin.ticking(),
+            "the pane stops being kept up with while its forward opens"
+        );
+    }
+
+    #[test]
+    fn a_pane_in_a_background_tab_reconnects_when_the_session_returns() {
+        let mut plugin = MqttAnalyser::default();
+        let mut settings = serde_json::Map::new();
+        let mut access = FakeBroker::default();
+        // Drawn once so the broker is being dialled, then left in the background.
+        draw(&mut plugin, &mut access, &mut settings, SessionStatus::Connected);
+        assert_eq!(access.asked.len(), 1);
+
+        // The session goes down and comes back while the tab is not drawn.
+        poll(&mut plugin, &mut access, &mut settings, SessionStatus::Disconnected);
+        assert!(matches!(plugin.status(), Status::Unavailable(_)));
+        poll(&mut plugin, &mut access, &mut settings, SessionStatus::Connected);
+        assert_eq!(
+            access.asked.len(),
+            2,
+            "the pane did not ask for a new forward in the background"
+        );
+        assert_eq!(plugin.status(), &Status::Connecting);
+    }
+
+    #[test]
+    fn a_background_poll_does_not_start_a_pane_that_was_never_drawn() {
+        let mut plugin = MqttAnalyser::default();
+        let mut settings = serde_json::Map::new();
+        let mut access = FakeBroker::default();
+        poll(&mut plugin, &mut access, &mut settings, SessionStatus::Connected);
+        assert!(access.asked.is_empty(), "an unopened pane dials on its own");
+        assert_eq!(plugin.status(), &Status::Idle);
+        assert!(!plugin.ticking());
     }
 
     #[test]

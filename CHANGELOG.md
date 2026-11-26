@@ -11,6 +11,11 @@
 
 ### Fixed
 
+- Reconnect the MQTT analyser when its tab comes back. The broker connection runs through the SSH
+  session, so a dropped session left the pane holding a listener and a client that no longer
+  existed: it showed "Disconnected" and stayed there, and even the header's Reconnect kept dialling
+  the dead channel. The pane now lets go of both when the session goes away and asks for a fresh
+  one when it returns, whether or not its tab is on screen.
 - Show the user name while it is typed at the login prompt. A host with no user name set asks
   for one in the terminal, and the answer was kept off the screen the way a password is, so it
   looked as if nothing was being typed. The name now appears as you type and backspace erases it;

@@ -669,6 +669,9 @@ impl SessionEntry {
         self.exit_reported = false;
         self.login = None;
         self.suppress_close = false;
+        // The listeners and requests belonged to the transport that just went away, so a
+        // pane asking again gets a fresh address instead of the dead one it was given.
+        self.forwards = RemoteForwards::default();
         if !secrets.password.is_empty() {
             self.secrets = secrets.clone();
         }
@@ -1176,6 +1179,8 @@ impl SessionEntry {
         self.auth_prompt = None;
         self.login = None;
         self.suppress_close = false;
+        // Nothing can reach a forward once the transport is gone.
+        self.forwards = RemoteForwards::default();
         if !matches!(
             self.status,
             SessionStatus::Failed | SessionStatus::Disconnected
@@ -5245,6 +5250,41 @@ mod tests {
         entry.reload_pane_settings();
         entry.load_pane_data(slot, None, &values);
         assert_eq!(entry.panes[slot].data.values["maxEntries"], serde_json::json!(10));
+    }
+
+    #[test]
+    fn a_new_transport_forgets_the_forwards_of_the_old_one() {
+        use wassh_plugins::TcpAccess as _;
+        let forward = "mqtt.broker";
+        let mut entry = password_entry();
+        entry
+            .forwards
+            .addresses
+            .insert(forward.to_owned(), "127.0.0.1:41000".to_owned());
+        entry
+            .forwards
+            .errors
+            .insert("other.pane".to_owned(), "gone".to_owned());
+        // Reconnecting starts a new transport, so the listeners it held are gone with it.
+        entry.restart(
+            "xterm-256color",
+            &Secrets::default(),
+            Arc::new(KnownHosts::in_memory()),
+        );
+        assert_eq!(
+            entry.forward_address(forward),
+            None,
+            "a pane is still handed the address of the old transport's listener"
+        );
+        assert_eq!(entry.forward_error("other.pane"), None);
+
+        // And a plain disconnect lets go of them just the same.
+        entry
+            .forwards
+            .addresses
+            .insert(forward.to_owned(), "127.0.0.1:41000".to_owned());
+        entry.disconnect();
+        assert_eq!(entry.forward_address(forward), None);
     }
 
     #[test]
