@@ -774,6 +774,8 @@ pub struct CallUsage {
     pub calls: u32,
     /// Whether the numbers were counted by the provider or read from characters.
     pub estimated: bool,
+    /// Part of `input` the provider served from its own cache.
+    pub cached: u32,
 }
 
 /// Tokens one request spent, by what they carried.
@@ -831,6 +833,7 @@ impl UsageLog {
             totals.parts.tool_results += call.parts.tool_results;
             totals.text += call.text;
             totals.calls_args += call.calls;
+            totals.cached += call.cached;
             totals.estimated += u32::from(call.estimated);
         }
         totals.requests = self.calls.len() as u32;
@@ -853,6 +856,7 @@ impl UsageLog {
                     "toolResults": call.parts.tool_results,
                     "text": call.text,
                     "calls": call.calls,
+                    "cached": call.cached,
                     "estimated": call.estimated
                 })
             })
@@ -880,6 +884,7 @@ impl UsageLog {
                     },
                     text: count("text"),
                     calls: count("calls"),
+                    cached: count("cached"),
                     estimated: row["estimated"].as_bool().unwrap_or(false),
                 }
             })
@@ -903,6 +908,8 @@ pub struct UsageTotals {
     pub text: u32,
     /// Tokens of tool-call arguments.
     pub calls_args: u32,
+    /// Part of `input` the provider served from its cache.
+    pub cached: u32,
     /// How many of the entries were estimated rather than counted.
     pub estimated: u32,
 }
@@ -918,6 +925,19 @@ impl UsageTotals {
 pub const CHARS_PER_TOKEN: usize = 4;
 /// Requests a usage log keeps; the oldest is dropped past this.
 pub const USAGE_CALLS_KEPT: usize = 1_000;
+/// Assistant turns whose tool results the history keeps in full.
+const KEPT_TOOL_TURNS: usize = 2;
+/// A result shorter than this is left whole: its stub would be as long as the result.
+const STUB_MIN_CHARS: usize = 400;
+/// Characters of an old result that are kept, so the model still sees what it said.
+const STUB_KEEP_CHARS: usize = 200;
+/// History size below which nothing is cut down.
+///
+/// Cutting rewrites messages the provider has already cached, so it is done once the saving
+/// is worth more than the cache it costs.
+const STUB_TRIGGER_CHARS: usize = 24_000;
+/// User turns a loaded scope may go unused before it is released.
+const SCOPE_IDLE_TURNS: u64 = 4;
 
 /// One conversation's state.
 #[derive(Default)]
@@ -1025,6 +1045,10 @@ pub struct Agent {
     request_parts: Option<UsageParts>,
     /// Every request this conversation was billed for.
     pub usage: UsageLog,
+    /// User messages this conversation has taken, the clock scope release reads.
+    user_turns: u64,
+    /// The user turn in which each loaded scope was last used.
+    scope_use: std::collections::BTreeMap<&'static str, u64>,
     /// The app's connections to other hosts, handed in by the pane every frame.
     remote: Option<Rc<RefCell<dyn RemoteHosts>>>,
     /// Saved hosts as the app last listed them, for the model and the cards.
@@ -1161,6 +1185,8 @@ impl Agent {
         self.background.clear();
         self.next_background = 0;
         self.next_subagent = 0;
+        self.user_turns = 0;
+        self.scope_use.clear();
     }
 
     /// Add the user's turn, if the conversation is idle.
@@ -1180,6 +1206,9 @@ impl Agent {
             return false;
         }
         self.error = None;
+        // A new task step is the moment to let go of what the last ones stopped using.
+        self.user_turns += 1;
+        self.release_idle_scopes();
         self.turns.push(Turn::User {
             text: text.to_owned(),
             meta,
@@ -2517,6 +2546,8 @@ impl Agent {
         failed: bool,
         session: Session<'_, '_>,
     ) {
+        // The scope a call came from is the one this conversation is working in.
+        self.note_scope_use(&call.name);
         // A call a script made is not part of the provider history: its result goes back to
         // the sandbox, which decides what the model ever sees.
         if self.waiting_on(&call) {
@@ -2845,12 +2876,53 @@ at most."
             return Err(self.scope_problem(id));
         }
         self.scopes.load(scope);
+        self.scope_use.insert(scope.id, self.user_turns);
         Ok(format!(
             "Loaded {} ({} tools): {}.",
             scope.id,
             self.scope_tool_count(scope),
             self.scope_names(scope)
         ))
+    }
+
+    /// Note that a call from `tool`'s scope ran, so that scope is not idle.
+    fn note_scope_use(&mut self, tool: &str) {
+        if let Some(scope) = scopes::scope_of(tool) {
+            self.scope_use.insert(scope.id, self.user_turns);
+        }
+    }
+
+    /// Let go of loaded scopes nothing has called for a while.
+    ///
+    /// A loaded scope is prompt weight on every round it sits there, so once the conversation
+    /// has moved past one it goes back to the list it can be loaded from. The user is told,
+    /// and the model still sees it among the scopes it can load again.
+    fn release_idle_scopes(&mut self) {
+        let now = self.user_turns;
+        let idle: Vec<&'static str> = self
+            .scopes
+            .ids()
+            .iter()
+            .copied()
+            .filter(|id| *id != scopes::ROOT)
+            .filter(|id| {
+                now.saturating_sub(*self.scope_use.get(id).unwrap_or(&0)) >= SCOPE_IDLE_TURNS
+            })
+            .collect();
+        for id in idle {
+            let removed = self.scopes.unload(id);
+            if removed.is_empty() {
+                continue;
+            }
+            for gone in &removed {
+                self.scope_use.remove(gone);
+            }
+            let again = if removed.len() == 1 { "it" } else { "them" };
+            self.turns.push(Turn::Notice(format!(
+                "Released {} — unused for {SCOPE_IDLE_TURNS} turns. Load {again} again when needed.",
+                removed.join(", ")
+            )));
+        }
     }
 
     /// Take a loaded scope, and everything it nests, back out.
@@ -4982,6 +5054,71 @@ at most."
             }
             _ => true,
         });
+        self.trim_used_results();
+    }
+
+    /// Cut down results the conversation has already worked through.
+    ///
+    /// A tool result is needed while the model is acting on it; an answer two turns old is
+    /// usually just prompt weight. The head of each old result stays, so what the model saw
+    /// is still readable, and the transcript keeps every character for the reader. Only
+    /// turns already behind the newest [`KEPT_TOOL_TURNS`] are cut, and only once the
+    /// history is big enough that the saving beats the cache the rewrite costs.
+    fn trim_used_results(&mut self) {
+        if self.history.iter().map(message_chars).sum::<usize>() <= STUB_TRIGGER_CHARS {
+            return;
+        }
+        let mut assistant_seen = 0;
+        let mut keep_from = self.history.len();
+        for (index, message) in self.history.iter().enumerate().rev() {
+            if matches!(message, ApiMessage::Assistant { .. }) {
+                assistant_seen += 1;
+                if assistant_seen > KEPT_TOOL_TURNS {
+                    keep_from = index;
+                    break;
+                }
+            }
+        }
+        if keep_from == 0 {
+            return;
+        }
+        // A call's name lives on the assistant turn that asked for it.
+        let names: std::collections::HashMap<String, String> = self
+            .history
+            .iter()
+            .flat_map(|message| match message {
+                ApiMessage::Assistant { tool_calls, .. } => tool_calls
+                    .iter()
+                    .map(|call| (call.id.clone(), call.name.clone()))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let mut cut = false;
+        for message in &mut self.history[..keep_from] {
+            let ApiMessage::Tool {
+                tool_call_id,
+                content,
+            } = message
+            else {
+                continue;
+            };
+            let chars = content.chars().count();
+            if chars <= STUB_MIN_CHARS {
+                continue;
+            }
+            let name = names.get(tool_call_id).map_or("The tool", String::as_str);
+            let head: String = content.chars().take(STUB_KEEP_CHARS).collect();
+            *content = format!(
+                "{head}\n…[{name} answered {chars} characters; the rest is kept in the \
+                 transcript]"
+            );
+            cut = true;
+        }
+        if cut {
+            // The size cache described messages that no longer say what they said.
+            self.history_count = None;
+        }
     }
 
     /// The transcript as plain text, for summarising.
@@ -5103,14 +5240,15 @@ at most."
             Some(Usage {
                 input,
                 output,
-                cached_input: _,
-            }) => (input, output, false),
+                cached_input,
+            }) => (input, output, cached_input),
             None => (
                 (chars / CHARS_PER_TOKEN) as u32,
                 (written / CHARS_PER_TOKEN) as u32,
-                true,
+                0,
             ),
         };
+        let estimated = completion.usage.is_none();
         let share = |part: usize| -> u32 {
             if chars == 0 {
                 return 0;
@@ -5136,7 +5274,8 @@ at most."
             },
             text,
             calls: output - text,
-            estimated: estimate,
+            cached: estimate,
+            estimated,
         });
     }
 
@@ -6912,6 +7051,134 @@ mod tests {
         assert!(failed);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].output.contains(PLAN_READ_ONLY), "{}", calls[0].output);
+    }
+
+    #[test]
+    fn a_scope_nothing_calls_is_released_and_said_so() {
+        let mut agent = Agent::new();
+        agent.load_scope("host").expect("the host scope loads");
+        agent.load_scope("host-files").expect("the file scope loads");
+        assert!(agent.scopes.contains("host-files"));
+        // A scope is prompt weight only while the conversation works in it.
+        for step in 0..SCOPE_IDLE_TURNS {
+            assert!(agent.push_user(&format!("step {step}"), UserMeta::default()));
+        }
+        assert!(
+            !agent.scopes.contains("host-files"),
+            "the scope stayed loaded"
+        );
+        assert!(
+            agent
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::Notice(text) if text.contains("Released") && text.contains("host-files"))),
+            "{:?}",
+            agent.turns
+        );
+    }
+
+    #[test]
+    fn a_scope_a_call_used_recently_stays_loaded() {
+        let mut agent = Agent::new();
+        agent.load_scope("host").expect("the host scope loads");
+        agent.load_scope("host-files").expect("the file scope loads");
+        for step in 0..SCOPE_IDLE_TURNS - 1 {
+            assert!(agent.push_user(&format!("step {step}"), UserMeta::default()));
+        }
+        assert!(
+            agent.scopes.contains("host-files"),
+            "a scope used a few turns ago stays"
+        );
+        // Loading it again starts the clock again, so the next step does not release it.
+        agent.unload_scope("host").expect("the pair unloads");
+        agent.load_scope("host").expect("it loads again");
+        agent.load_scope("host-files").expect("it loads again");
+        assert!(agent.push_user("one more", UserMeta::default()));
+        assert!(
+            agent.scopes.contains("host-files"),
+            "a scope used last turn stays"
+        );
+    }
+
+    #[test]
+    fn a_used_tool_result_is_cut_down_but_stays_in_the_transcript() {
+        let mut agent = Agent::new();
+        let big = "x".repeat(10_000);
+        for step in 0..4 {
+            agent.history.push(ApiMessage::User {
+                content: format!("ask {step}"),
+                images: Vec::new(),
+            });
+            agent.history.push(ApiMessage::Assistant {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![ApiToolCall {
+                    id: format!("c{step}"),
+                    name: TOOL_RUN_COMMAND.to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            });
+            agent.history.push(ApiMessage::Tool {
+                tool_call_id: format!("c{step}"),
+                content: big.clone(),
+            });
+        }
+        // The transcript is what the reader looks at, and it keeps every character.
+        agent.turns.push(Turn::Tool {
+            name: TOOL_RUN_COMMAND.to_owned(),
+            label: "run_command".to_owned(),
+            output: big.clone(),
+            failed: false,
+        });
+        agent.repair_history();
+        let result = |index: usize| match &agent.history[index] {
+            ApiMessage::Tool { content, .. } => content.clone(),
+            other => panic!("expected a tool result, got {other:?}"),
+        };
+        // Two turns back is still what the model is working from; older ones are cut down.
+        assert_eq!(result(11), big, "the newest result is untouched");
+        assert_eq!(result(8), big, "the turn before it keeps its result");
+        let old = result(2);
+        assert!(old.chars().count() < 400, "the old result is {old:?}");
+        assert!(old.contains("kept in the transcript"), "{old}");
+        assert_eq!(
+            agent.turns[0].clone(),
+            Turn::Tool {
+                name: TOOL_RUN_COMMAND.to_owned(),
+                label: "run_command".to_owned(),
+                output: big,
+                failed: false,
+            },
+            "the transcript keeps the whole result"
+        );
+    }
+
+    #[test]
+    fn a_short_history_keeps_its_results_whole() {
+        let mut agent = Agent::new();
+        for step in 0..4 {
+            agent.history.push(ApiMessage::Assistant {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![ApiToolCall {
+                    id: format!("c{step}"),
+                    name: TOOL_RUN_COMMAND.to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            });
+            agent.history.push(ApiMessage::Tool {
+                tool_call_id: format!("c{step}"),
+                content: "y".repeat(600),
+            });
+        }
+        agent.repair_history();
+        // Rewriting a message the provider already cached costs more than the stub saves.
+        assert!(
+            agent
+                .history
+                .iter()
+                .all(|message| !matches!(message, ApiMessage::Tool { content, .. } if content.len() < 600))
+        );
     }
 
     #[test]

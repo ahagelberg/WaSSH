@@ -241,24 +241,56 @@ pub fn anthropic_body(request: &CompletionRequest) -> Value {
     let mut body = json!({
         "model": request.model,
         "max_tokens": request.max_tokens,
-        "system": request.system,
+        // The system prompt and the toolset are the same every round of a run, so they are
+        // marked cacheable: a round pays for them once, not once per round.
+        "system": [{
+            "type": "text",
+            "text": request.system,
+            "cache_control": { "type": "ephemeral" }
+        }],
         "messages": messages,
         "stream": true
     });
     if !request.tools.is_empty() {
-        body["tools"] = Value::Array(
-            request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool["name"],
-                        "description": tool["description"],
-                        "input_schema": tool["parameters"]
-                    })
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "input_schema": tool["parameters"]
                 })
-                .collect(),
-        );
+            })
+            .collect();
+        // A breakpoint covers everything before it, so one on the last tool caches the lot.
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
+        body["tools"] = Value::Array(tools);
+    }
+    // One more breakpoint on the newest message lets the next round of the run read the
+    // conversation it already paid for.
+    if let Some(Value::Object(last)) = body["messages"].as_array_mut().and_then(|m| m.last_mut()) {
+        match last.get_mut("content") {
+            Some(Value::Array(blocks)) => {
+                if let Some(Value::Object(block)) = blocks.last_mut() {
+                    block.insert("cache_control".to_owned(), json!({ "type": "ephemeral" }));
+                }
+            }
+            Some(Value::String(text)) => {
+                let text = std::mem::take(text);
+                last.insert(
+                    "content".to_owned(),
+                    json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": { "type": "ephemeral" }
+                    }]),
+                );
+            }
+            _ => {}
+        }
     }
     body
 }
@@ -851,6 +883,31 @@ mod tests {
     }
 
     #[test]
+    fn the_anthropic_body_marks_what_the_cache_can_keep() {
+        let mut request = request(Protocol::Anthropic);
+        request.tools = vec![json!({
+            "name": "run_command",
+            "description": "run",
+            "parameters": { "type": "object", "properties": {} }
+        })];
+        let body = anthropic_body(&request);
+        // The system prompt and the toolset are the same on every round of a run.
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["tools"][0]["cache_control"]["type"],
+            "ephemeral",
+            "the last tool carries the breakpoint for the set"
+        );
+        // And the newest message lets the next round read the conversation it paid for.
+        let last = body["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .expect("a last message");
+        let blocks = last["content"].as_array().expect("blocks");
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
     fn the_openai_body_uses_function_tools() {
         let body = openai_body(&request(Protocol::Openai));
         assert_eq!(body["model"], "m");
@@ -883,7 +940,8 @@ mod tests {
     #[test]
     fn the_anthropic_body_folds_tool_results_into_user_turns() {
         let body = anthropic_body(&request(Protocol::Anthropic));
-        assert_eq!(body["system"], "be brief");
+        // The prompt is a cacheable text block, so a run pays for it once.
+        assert_eq!(body["system"][0]["text"], "be brief");
         assert_eq!(body["max_tokens"], 1024);
         let messages = body["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 3);

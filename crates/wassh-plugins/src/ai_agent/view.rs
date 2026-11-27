@@ -171,6 +171,8 @@ they keep counting as the chat goes on.";
 /// Note under the usage totals when some numbers were read from characters.
 const USAGE_ESTIMATED: &str = "Some entries were estimated from text: the provider did not report \
 what the request cost.";
+/// Note under the totals when the provider served part of the prompt from its cache.
+const USAGE_CACHED: &str = "{n} of the input came from the provider's prompt cache.";
 /// Lines of the usage view that name one call.
 const USAGE_CALLS_LISTED: usize = 24;
 /// Height of the per-call chart.
@@ -548,6 +550,8 @@ struct UsageCall {
     text: u32,
     /// Part of `output` tool-call arguments took.
     calls_args: u32,
+    /// Part of `input` the provider served from its cache.
+    cached: u32,
     /// Entries that were estimated rather than counted.
     estimated: u32,
 }
@@ -566,6 +570,7 @@ impl UsageCall {
             tool_results: call.parts.tool_results,
             text: call.text,
             calls_args: call.calls,
+            cached: call.cached,
             estimated: u32::from(call.estimated),
         }
     }
@@ -582,8 +587,24 @@ impl UsageCall {
         self.tool_results += other.tool_results;
         self.text += other.text;
         self.calls_args += other.calls_args;
+        self.cached += other.cached;
         self.estimated += other.estimated;
     }
+}
+
+/// Every request one chat was billed for, its sub-agents' included, oldest first.
+fn usage_calls(usage: &UsageLog, subagents: &[Subagent]) -> Vec<(u64, UsageCall, Option<String>)> {
+    let mut calls: Vec<(u64, UsageCall, Option<String>)> = Vec::new();
+    for call in &usage.calls {
+        calls.push((call.at, UsageCall::of(call), None));
+    }
+    for sub in subagents {
+        for call in &sub.agent.usage.calls {
+            calls.push((call.at, UsageCall::of(call), Some(sub.title.clone())));
+        }
+    }
+    calls.sort_by_key(|(at, _, _)| *at);
+    calls
 }
 
 /// One series of the usage chart: a value from every call, oldest first.
@@ -784,8 +805,8 @@ enum ChatView {
     Chat,
     /// One sub-agent's transcript, read-only.
     Subagent(usize),
-    /// What the chat's requests cost, read-only.
-    Stats,
+    /// What a chat's requests cost, read-only: the open chat's, or a chat from the list.
+    Stats(Option<usize>),
 }
 
 /// Which conversation the transcript draws.
@@ -3181,6 +3202,7 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
         }
         let mut open = None;
         let mut open_subagent = None;
+        let mut open_stats = None;
         let mut toggled = None;
         egui::ScrollArea::vertical()
             .id_salt("ai-chats")
@@ -3200,6 +3222,9 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
                     if let Some(position) = row.subagent {
                         open_subagent = Some((index, position));
                     }
+                    if row.stats {
+                        open_stats = Some(index);
+                    }
                 }
             });
         if let Some(created) = toggled
@@ -3207,7 +3232,9 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
         {
             self.expanded_chats.insert(created);
         }
-        if let Some((index, subagent)) = open_subagent {
+        if let Some(index) = open_stats {
+            self.view = ChatView::Stats(Some(index));
+        } else if let Some((index, subagent)) = open_subagent {
             // Opening the parent puts its sub-agents back in the pane, in the same order.
             self.open_chat(index);
             if subagent < self.agent.subagents.len() {
@@ -3389,6 +3416,8 @@ fn subagent_row(ui: &mut Ui, palette: &Palette, sub: &Subagent) -> egui::Rect {
 struct ChatRowReply {
     /// The card itself was clicked: open the chat.
     open: bool,
+    /// The usage note was clicked: show what this chat cost.
+    stats: bool,
     /// The sub-agent note was clicked: show or hide the sub-agent cards.
     toggle: bool,
     /// One of the expanded sub-agent cards was clicked.
@@ -3402,6 +3431,7 @@ struct ChatRowReply {
 fn chat_row(ui: &mut Ui, palette: &Palette, chat: &StoredChat, expanded: bool) -> ChatRowReply {
     let mut reply = ChatRowReply::default();
     let mut note_rect = None;
+    let mut stats_rect = None;
     let mut sub_rects: Vec<(usize, egui::Rect)> = Vec::new();
     let response = egui::Frame::NONE
         .fill(to_color32(palette.bg_panel_2))
@@ -3411,12 +3441,31 @@ fn chat_row(ui: &mut Ui, palette: &Palette, chat: &StoredChat, expanded: bool) -
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(&chat.title)
-                        .size(CHAT_TITLE_TEXT_SIZE)
-                        .strong()
-                        .color(to_color32(palette.text)),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&chat.title)
+                            .size(CHAT_TITLE_TEXT_SIZE)
+                            .strong()
+                            .color(to_color32(palette.text)),
+                    );
+                    // A chat's numbers are one click away, on every chat that has any: a
+                    // card is a place to look from, not only one to open.
+                    let spent = !chat.usage.calls.is_empty()
+                        || chat.subagents.iter().any(|sub| !sub.agent.usage.calls.is_empty());
+                    if !spent {
+                        return;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        stats_rect = Some(
+                            ui.label(
+                                egui::RichText::new(USAGE_LABEL)
+                                    .size(10.0)
+                                    .color(to_color32(palette.accent)),
+                            )
+                            .rect,
+                        );
+                    });
+                });
                 ui.add_space(4.0);
                 let turns = chat.turns.len();
                 let model = if chat.model.trim().is_empty() {
@@ -3477,14 +3526,16 @@ fn chat_row(ui: &mut Ui, palette: &Palette, chat: &StoredChat, expanded: bool) -
     let pointer = ui.ctx().input(|input| input.pointer.interact_pos());
     if let Some(pos) = pointer {
         let over_note = note_rect.is_some_and(|rect| rect.contains(pos));
+        let over_stats = stats_rect.is_some_and(|rect| rect.contains(pos));
         let over_sub = sub_rects.iter().find(|(_, rect)| rect.contains(pos));
-        if over_note || over_sub.is_some() {
+        if over_note || over_stats || over_sub.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if clicked {
-            match (over_note, over_sub) {
-                (true, _) => reply.toggle = true,
-                (false, Some((position, _))) => reply.subagent = Some(*position),
+            match (over_stats, over_note, over_sub) {
+                (true, _, _) => reply.stats = true,
+                (false, true, _) => reply.toggle = true,
+                (false, false, Some((position, _))) => reply.subagent = Some(*position),
                 _ => reply.open = true,
             }
         }
@@ -5241,18 +5292,19 @@ script normally stops after {} seconds of JavaScript.",
     ///
     /// Counted from the log the conversation kept as it ran, not from the transcript: a
     /// compacted chat would otherwise forget what it spent before the summary.
-    fn usage_page(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
-        // Sub-agents are part of what the chat costs, so their calls are gathered here.
-        let mut calls: Vec<(u64, UsageCall, Option<String>)> = Vec::new();
-        for call in &self.agent.usage.calls {
-            calls.push((call.at, UsageCall::of(call), None));
-        }
-        for sub in &self.agent.subagents {
-            for call in &sub.agent.usage.calls {
-                calls.push((call.at, UsageCall::of(call), Some(sub.title.clone())));
-            }
-        }
-        calls.sort_by_key(|(at, _, _)| *at);
+    fn usage_page(
+        &self,
+        ui: &mut Ui,
+        palette: &wassh_core::Palette,
+        muted: egui::Color32,
+        chat: Option<usize>,
+    ) {
+        // A chat the list lent its numbers to is read back from what was stored with it.
+        let (usage, subagents) = match chat.and_then(|index| self.chats.get(index)) {
+            Some(chat) => (&chat.usage, chat.subagents.as_slice()),
+            None => (&self.agent.usage, self.agent.subagents.as_slice()),
+        };
+        let calls = usage_calls(usage, subagents);
         egui::ScrollArea::vertical()
             .id_salt("ai-usage")
             .auto_shrink([false, false])
@@ -5373,6 +5425,13 @@ script normally stops after {} seconds of JavaScript.",
                         egui::RichText::new(USAGE_ESTIMATED)
                             .size(FOOTER_TEXT_SIZE)
                             .italics()
+                            .color(muted),
+                    );
+                }
+                if totals.cached > 0 {
+                    ui.label(
+                        egui::RichText::new(USAGE_CACHED.replace("{n}", &compact_tokens(totals.cached)))
+                            .size(FOOTER_TEXT_SIZE)
                             .color(muted),
                     );
                 }
@@ -5542,11 +5601,19 @@ impl Plugin for AiAgent {
                                 .color(muted),
                         );
                     }
-                    ChatView::Stats => {
+                    ChatView::Stats(chat) => {
                         back = back_button(ui, palette);
+                        let title = match chat {
+                            Some(index) => self
+                                .chats
+                                .get(index)
+                                .map(|chat| format!("{} \u{00b7} {}", USAGE_TITLE, chat.title))
+                                .unwrap_or_else(|| USAGE_TITLE.to_owned()),
+                            None => USAGE_TITLE.to_owned(),
+                        };
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(USAGE_TITLE).size(CHAT_TITLE_TEXT_SIZE),
+                                egui::RichText::new(title).size(CHAT_TITLE_TEXT_SIZE),
                             )
                             .truncate(),
                         );
@@ -5576,13 +5643,14 @@ impl Plugin for AiAgent {
             self.begin_new_chat();
         }
         if usage {
-            self.view = ChatView::Stats;
+            self.view = ChatView::Stats(None);
         }
         if back {
             match self.view {
-                // Back returns to the chat that owns the sub-agent, or to the chat itself
-                // from its usage.
-                ChatView::Subagent(_) | ChatView::Stats => self.view = ChatView::Chat,
+                // Back returns to the chat that owns the sub-agent, to the open chat from its
+                // own usage, and to the list from a chat the list lent its numbers.
+                ChatView::Stats(Some(_)) => self.view = ChatView::List,
+                ChatView::Subagent(_) | ChatView::Stats(None) => self.view = ChatView::Chat,
                 _ => {
                     // Leaving a settled chat files it, so the list holds everything the pane
                     // has. A run still going stays open: clearing it would end the run.
@@ -5624,7 +5692,7 @@ impl Plugin for AiAgent {
             .show(ui, |ui| {
                 // The usage view is a page of numbers, not a conversation: nothing is typed
                 // into it.
-                if matches!(self.view, ChatView::Stats) {
+                if matches!(self.view, ChatView::Stats(_)) {
                     return;
                 }
                 // A request the agent is blocked on comes first: it is the one thing the
@@ -6012,10 +6080,10 @@ impl Plugin for AiAgent {
             ChatView::List => None,
             ChatView::Chat => Some(TranscriptSource::Main),
             ChatView::Subagent(index) => Some(TranscriptSource::Subagent(index)),
-            ChatView::Stats => None,
+            ChatView::Stats(_) => None,
         };
-        if matches!(self.view, ChatView::Stats) {
-            self.usage_page(ui, palette, muted);
+        if let ChatView::Stats(chat) = self.view {
+            self.usage_page(ui, palette, muted, chat);
         } else if source.is_none() {
             self.chat_list(ui, palette, muted);
         } else if let Some(source) = source {
@@ -10248,6 +10316,57 @@ mod tests {
         assert!(
             plugin.agent.scopes.contains(ENV_SCOPE),
             "clearing is not unloading"
+        );
+    }
+
+    #[test]
+    fn a_chat_card_opens_that_chats_usage() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            CONVERSATION_KEY.to_owned(),
+            json!({
+                "model": "llama3.1",
+                "turns": [],
+                "history": [],
+                "chats": [{
+                    "title": "old chat",
+                    "cwd": "/srv",
+                    "model": "llama3.1",
+                    "provider": "ollama",
+                    "turns": [{ "role": "user", "text": "old chat" }],
+                    "history": [],
+                    "usage": [{
+                        "at": 1, "input": 1200, "output": 300,
+                        "system": 200, "tools": 600, "user": 100,
+                        "assistant": 150, "toolResults": 150,
+                        "text": 250, "calls": 50, "estimated": false
+                    }]
+                }]
+            }),
+        );
+        let mut plugin = AiAgent::default();
+        let ctx = egui::Context::default();
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        // The card offers the way in…
+        assert!(
+            rows.iter().any(|(_, _, text)| text == USAGE_LABEL),
+            "the card offers its numbers: {rows:?}"
+        );
+        // …and the view it opens draws that chat's numbers, not the open chat's.
+        plugin.view = ChatView::Stats(Some(0));
+        let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
+        assert!(plugin.agent.turns.is_empty(), "the chat was not opened");
+        assert!(
+            rows.iter().any(|(_, _, text)| text.contains("Token usage")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, _, text)| text == "Requests"),
+            "the totals are drawn: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, _, text)| text.contains("1200")),
+            "the chat's own count is drawn: {rows:?}"
         );
     }
 

@@ -4,6 +4,10 @@
 
 ### Added
 
+- Prompt caching on Anthropic-compatible providers: the system prompt and the toolset carry a
+  cache breakpoint, and the newest message carries one more, so every round of a run reads the
+  prefix the round before it already paid for. OpenAI-compatible endpoints cache on their own.
+  The Usage view now says how much of the input came from the provider's cache.
 - Token usage for every AI chat, counted as the requests are answered rather than read back from
   the transcript, so compacting a chat keeps its cost. **Usage** on the chat header opens the
   totals, what the input carried (system prompt, tool definitions, your prompts, earlier answers,
@@ -28,6 +32,15 @@
 
 ### Fixed
 
+- Loaded scopes are released again once the conversation stops using them. After four user
+  turns with no call from a scope, it and anything it nests go back to the loadable list and a
+  note says so; the model sees it among the scopes it can load. Before this, a scope loaded
+  once stayed in every request for the rest of the chat.
+- Results the chat has already worked through no longer weigh on every later request. Once the
+  provider history grows past a budget, results older than the last two answered turns are cut
+  down to their head plus a note saying what they were and how long they were; the transcript
+  keeps them whole, so nothing the user reads is lost. A short chat keeps its results as they
+  came, because rewriting a cached message costs more than the cut saves.
 - Keep every pane working when a session comes back. Whatever a pane had asked the old connection
   for belonged to a channel that went away with it: the app now fails the commands and file
   requests it was still carrying and forgets its forwards and the login directory, so a pane
