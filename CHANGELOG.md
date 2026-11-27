@@ -64,6 +64,16 @@
 
 ### Fixed
 
+- The usage view keeps every number on screen. All seven breakdown bars take one length now —
+  they used to end wherever each row's own text happened to stop, and the longest label pushed
+  the last rows out of line. The number column is measured from the longest number it has to
+  hold, the rows are laid out inside the pane's width less room for the scroll bar, and a name
+  too long for its column is cut with an ellipsis instead of stretching the row.
+- The usage chart is one stack, not six graphs. It shows tokens accumulated over the chat, so
+  each band is what its part has spent so far, the top of the chart is the running total of
+  input and output, and the line never falls. A chat of thousands of requests is summed into
+  the columns it is drawn in, so every request still counts and the last column is the true
+  total.
 - What a command may do is decided from what it does, not from how it is spelled. A saved
   pattern like `git status*` used to cover `git status && rm -rf /`, because the whole line was
   compared as text; each command of a line is now read on its own and matched on its own, its

@@ -192,9 +192,12 @@ const USAGE_ESTIMATED: &str = "Some entries were estimated from text: the provid
 what the request cost.";
 /// Note under the totals when the provider served part of the prompt from its cache.
 const USAGE_CACHED: &str = "{n} of the input came from the provider's prompt cache.";
+/// What the accumulated chart is, said once under its heading.
+const USAGE_CHART_NOTE: &str = "Each band is what one part of the conversation has spent so far; \
+the top of the chart is the whole chat's running total.";
 /// Lines of the usage view that name one call.
 const USAGE_CALLS_LISTED: usize = 24;
-/// Height of the per-call chart.
+/// Height of the accumulated-tokens chart.
 const USAGE_CHART_HEIGHT: f32 = 90.0;
 /// Gap between two blocks of the usage view.
 const USAGE_ROW_GAP: f32 = 6.0;
@@ -203,9 +206,17 @@ const USAGE_CARD_GAP: f32 = 14.0;
 /// Type size of a usage total.
 const USAGE_TOTAL_TEXT_SIZE: f32 = 18.0;
 /// Width of a breakdown row's label.
-const USAGE_LABEL_WIDTH: f32 = 130.0;
-/// Width of the number beside a breakdown bar.
-const USAGE_VALUE_WIDTH: f32 = 96.0;
+const USAGE_LABEL_WIDTH: f32 = 150.0;
+/// Room between a number and the end of its column.
+const USAGE_VALUE_PAD: f32 = 8.0;
+/// Shortest a breakdown bar may get before the pane is too narrow to read.
+const USAGE_TRACK_MIN: f32 = 40.0;
+/// Narrowest the usage view draws its rows at.
+const USAGE_MIN_WIDTH: f32 = 220.0;
+/// Room kept for the scroll bar, so no number is drawn under it or past the edge.
+const USAGE_SCROLL_GUTTER: f32 = 14.0;
+/// Breakdown rows that make up the input; the rest make up the output.
+const USAGE_INPUT_ROWS: usize = 5;
 /// Diameter of a legend dot and height of a breakdown bar.
 const LEGEND_DOT_SIZE: f32 = 8.0;
 /// Said when Compact is pressed while a run is in flight.
@@ -634,49 +645,94 @@ fn series_values(
     calls.iter().map(|(_, call, _)| pick(call) as f32).collect()
 }
 
-/// One part of the input, with the share of the total it took.
-fn share_row(
-    ui: &mut Ui,
-    palette: &wassh_core::Palette,
-    muted: egui::Color32,
-    label: &str,
+/// One part of a total, and the share of it the part took.
+struct Share<'a> {
+    /// What the part is called.
+    label: &'a str,
+    /// What it took.
     value: u32,
+    /// What it is a part of: the input for input parts, the output for output parts.
     total: u32,
+    /// Colour its bar takes.
     colour: wassh_core::Rgba,
-) {
-    let share = if total == 0 {
-        0.0
-    } else {
-        value as f32 / total as f32
-    };
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            egui::Vec2::new(USAGE_LABEL_WIDTH, ui.spacing().interact_size.y),
-            egui::Label::new(egui::RichText::new(label).size(FOOTER_TEXT_SIZE).color(muted)),
-        );
-        let width = (ui.available_width() - USAGE_VALUE_WIDTH).max(0.0);
-        let (bar, _) = ui.allocate_exact_size(
-            egui::Vec2::new(width, LEGEND_DOT_SIZE),
-            egui::Sense::hover(),
-        );
-        ui.painter()
-            .rect_filled(bar, 2.0, to_color32(palette.bg_input));
-        let mut filled = bar;
-        filled.set_width(bar.width() * share);
-        ui.painter().rect_filled(filled, 2.0, to_color32(colour));
-        ui.add_sized(
-            egui::Vec2::new(USAGE_VALUE_WIDTH, ui.spacing().interact_size.y),
-            egui::Label::new(
-                egui::RichText::new(format!(
-                    "{}  {:.0}%",
-                    compact_tokens(value),
-                    share * 100.0
-                ))
-                .size(FOOTER_TEXT_SIZE)
-                .color(muted),
-            ),
-        );
-    });
+}
+
+/// The geometry every share row takes, so all the bars are one length and no number is drawn
+/// past the edge of the pane.
+struct ShareLayout {
+    /// Width of the bar track, identical on every row.
+    track: f32,
+    /// Width of the number column, sized to the widest number drawn.
+    value: f32,
+}
+
+impl ShareLayout {
+    /// The layout of rows drawn `available` points wide, from the widest number among them.
+    fn of(ui: &Ui, available: f32, widest: f32) -> Self {
+        let value = widest + USAGE_VALUE_PAD;
+        let gaps = 2.0 * ui.spacing().item_spacing.x;
+        let track = (available - USAGE_LABEL_WIDTH - value - gaps).max(USAGE_TRACK_MIN);
+        Self { track, value }
+    }
+}
+
+impl Share<'_> {
+    /// The part of `total` the part took, from 0 to 1.
+    fn share(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.value as f32 / self.total as f32
+        }
+    }
+
+    /// What the number column says: the count and the share.
+    fn text(&self) -> String {
+        format!(
+            "{}  {:.0}%",
+            compact_tokens(self.value),
+            self.share() * 100.0
+        )
+    }
+
+    /// Draw the row: its name, its bar on the shared track, and its number in its column.
+    fn show(
+        &self,
+        ui: &mut Ui,
+        palette: &wassh_core::Palette,
+        muted: egui::Color32,
+        layout: &ShareLayout,
+    ) {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                egui::Vec2::new(USAGE_LABEL_WIDTH, ui.spacing().interact_size.y),
+                egui::Label::new(
+                    egui::RichText::new(self.label)
+                        .size(FOOTER_TEXT_SIZE)
+                        .color(muted),
+                )
+                .truncate(),
+            );
+            let (bar, _) = ui.allocate_exact_size(
+                egui::Vec2::new(layout.track, LEGEND_DOT_SIZE),
+                egui::Sense::hover(),
+            );
+            ui.painter()
+                .rect_filled(bar, 2.0, to_color32(palette.bg_input));
+            let mut filled = bar;
+            filled.set_width(bar.width() * self.share());
+            ui.painter().rect_filled(filled, 2.0, to_color32(self.colour));
+            ui.add_sized(
+                egui::Vec2::new(layout.value, ui.spacing().interact_size.y),
+                egui::Label::new(
+                    egui::RichText::new(self.text())
+                        .size(FOOTER_TEXT_SIZE)
+                        .color(muted),
+                )
+                .truncate(),
+            );
+        });
+    }
 }
 
 /// A token count with thousands shortened, for the stats cards.
@@ -5291,6 +5347,10 @@ script normally stops after {} seconds of JavaScript.",
                     ui.label(egui::RichText::new(USAGE_EMPTY).color(muted));
                     return;
                 }
+                // The pane's own width, less room for the scroll bar: everything below is
+                // laid out inside it, so no number is drawn past the edge.
+                let width = (ui.available_width() - USAGE_SCROLL_GUTTER).max(USAGE_MIN_WIDTH);
+                ui.set_max_width(width);
                 let mut totals = UsageCall::default();
                 for (_, call, _) in &calls {
                     totals.add(call);
@@ -5319,17 +5379,69 @@ script normally stops after {} seconds of JavaScript.",
                 });
                 ui.add_space(USAGE_ROW_GAP);
                 ui.label(egui::RichText::new("What the input carried").size(FOOTER_TEXT_SIZE));
-                let parts = [
-                    ("System prompt", totals.system, palette.text_muted),
-                    ("Tool definitions", totals.tools, palette.accent),
-                    ("Your prompts", totals.user, palette.ok),
-                    ("Earlier answers", totals.assistant, palette.warn),
-                    ("Tool results", totals.tool_results, palette.danger),
+                let shares = [
+                    Share {
+                        label: "System prompt",
+                        value: totals.system,
+                        total: totals.input,
+                        colour: palette.text_muted,
+                    },
+                    Share {
+                        label: "Tool definitions",
+                        value: totals.tools,
+                        total: totals.input,
+                        colour: palette.accent,
+                    },
+                    Share {
+                        label: "Your prompts",
+                        value: totals.user,
+                        total: totals.input,
+                        colour: palette.ok,
+                    },
+                    Share {
+                        label: "Earlier answers",
+                        value: totals.assistant,
+                        total: totals.input,
+                        colour: palette.warn,
+                    },
+                    Share {
+                        label: "Tool results",
+                        value: totals.tool_results,
+                        total: totals.input,
+                        colour: palette.danger,
+                    },
+                    Share {
+                        label: "Answer text",
+                        value: totals.text,
+                        total: totals.output,
+                        colour: palette.text,
+                    },
+                    Share {
+                        label: "Tool-call arguments",
+                        value: totals.calls_args,
+                        total: totals.output,
+                        colour: palette.accent_hover,
+                    },
                 ];
-                for (label, value, colour) in parts {
-                    share_row(ui, palette, muted, label, value, totals.input, colour);
+                // Measured over every row, so the number column fits the longest of them and
+                // all seven bars come out one length.
+                let widest = shares
+                    .iter()
+                    .map(|share| {
+                        ui.painter()
+                            .layout_no_wrap(
+                                share.text(),
+                                egui::FontId::proportional(FOOTER_TEXT_SIZE),
+                                muted,
+                            )
+                            .size()
+                            .x
+                    })
+                    .fold(0.0f32, f32::max);
+                let layout = ShareLayout::of(ui, width, widest);
+                for share in &shares[..USAGE_INPUT_ROWS] {
+                    share.show(ui, palette, muted, &layout);
                 }
-                share_row(ui, palette, muted, "Answer text", totals.text, totals.output, palette.text);
                 if chat.is_none() && !self.agent.offered_tools.is_empty() {
                     ui.add_space(USAGE_ROW_GAP);
                     ui.label(egui::RichText::new("Tools on the turn").size(FOOTER_TEXT_SIZE));
@@ -5366,61 +5478,56 @@ tools.",
                         });
                     }
                 }
-                share_row(
-                    ui,
-                    palette,
-                    muted,
-                    "Tool-call arguments",
-                    totals.calls_args,
-                    totals.output,
-                    palette.accent_hover,
-                );
+                for share in &shares[USAGE_INPUT_ROWS..] {
+                    share.show(ui, palette, muted, &layout);
+                }
                 ui.add_space(USAGE_ROW_GAP);
-                ui.label(egui::RichText::new("Per request").size(FOOTER_TEXT_SIZE));
-                let series = [
+                ui.label(egui::RichText::new("Accumulated tokens").size(FOOTER_TEXT_SIZE));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(USAGE_CHART_NOTE)
+                            .size(FOOTER_TEXT_SIZE)
+                            .color(muted),
+                    )
+                    .wrap(),
+                );
+                // One stack, not six graphs: every band is what its part has spent so far, so
+                // the top of the chart is the chat's running total and it never falls.
+                let parts = [
                     (
+                        "system",
                         series_values(&calls, |call| call.system),
                         palette.text_muted,
                     ),
-                    (series_values(&calls, |call| call.tools), palette.accent),
-                    (series_values(&calls, |call| call.user), palette.ok),
+                    ("tools", series_values(&calls, |call| call.tools), palette.accent),
+                    ("you", series_values(&calls, |call| call.user), palette.ok),
                     (
+                        "answers",
                         series_values(&calls, |call| call.assistant),
                         palette.warn,
                     ),
                     (
+                        "results",
                         series_values(&calls, |call| call.tool_results),
                         palette.danger,
                     ),
-                    (
-                        series_values(&calls, |call| call.output),
-                        palette.text,
-                    ),
+                    ("output", series_values(&calls, |call| call.output), palette.text),
                 ];
-                let lines: Vec<wassh_ui::widgets::chart::Series<'_>> = series
+                let layers: Vec<wassh_ui::widgets::chart::Layer<'_>> = parts
                     .iter()
-                    .map(|(values, colour)| wassh_ui::widgets::chart::Series {
+                    .map(|(_, values, colour)| wassh_ui::widgets::chart::Layer {
                         values,
                         colour: to_color32(*colour),
                     })
                     .collect();
-                wassh_ui::widgets::chart::series_chart(
+                wassh_ui::widgets::chart::stacked_chart(
                     ui,
                     palette,
-                    &lines,
-                    0.0,
+                    &layers,
                     USAGE_CHART_HEIGHT,
                 );
                 ui.horizontal_wrapped(|ui| {
-                    let legend = [
-                        ("system", palette.text_muted),
-                        ("tools", palette.accent),
-                        ("you", palette.ok),
-                        ("answers", palette.warn),
-                        ("results", palette.danger),
-                        ("output", palette.text),
-                    ];
-                    for (label, colour) in legend {
+                    for (label, _, colour) in &parts {
                         let (dot, _) = ui.allocate_exact_size(
                             egui::Vec2::splat(LEGEND_DOT_SIZE),
                             egui::Sense::hover(),
@@ -5428,9 +5535,9 @@ tools.",
                         ui.painter().circle_filled(
                             dot.center(),
                             LEGEND_DOT_SIZE / 2.0,
-                            to_color32(colour),
+                            to_color32(*colour),
                         );
-                        ui.label(egui::RichText::new(label).size(FOOTER_TEXT_SIZE).color(muted));
+                        ui.label(egui::RichText::new(*label).size(FOOTER_TEXT_SIZE).color(muted));
                         ui.add_space(USAGE_CARD_GAP);
                     }
                 });
@@ -6395,6 +6502,28 @@ mod tests {
         events: Vec<egui::Event>,
         width: f32,
     ) -> (Vec<(i32, i32, String)>, Vec<egui::OutputCommand>) {
+        let (texts, _, commands) = frame_bodies(plugin, settings, ctx, events, width);
+        let mut rows: Vec<_> = texts
+            .into_iter()
+            .map(|(rect, text)| (rect.min.y as i32, rect.min.x as i32, text))
+            .collect();
+        rows.sort();
+        (rows, commands)
+    }
+
+    /// One frame drawn `width` points wide: the box of every painted text, the box of every
+    /// painted rectangle, and what it asked the platform to do.
+    fn frame_bodies(
+        plugin: &mut AiAgent,
+        settings: &mut serde_json::Map<String, Value>,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> (
+        Vec<(egui::Rect, String)>,
+        Vec<egui::Rect>,
+        Vec<egui::OutputCommand>,
+    ) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -6423,19 +6552,17 @@ mod tests {
         let commands = std::mem::take(&mut output.platform_output.commands);
         let shapes = std::mem::take(&mut output.shapes);
         output.drop_without_applying_deltas();
-        let mut rows: Vec<_> = shapes
-            .into_iter()
-            .filter_map(|clipped| match clipped.shape {
-                egui::Shape::Text(text) => Some((
-                    text.pos.y as i32,
-                    text.pos.x as i32,
-                    text.galley.text().to_owned(),
-                )),
-                _ => None,
-            })
-            .collect();
-        rows.sort();
-        (rows, commands)
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for clipped in shapes {
+            let bounds = clipped.shape.visual_bounding_rect();
+            match clipped.shape {
+                egui::Shape::Text(text) => texts.push((bounds, text.galley.text().to_owned())),
+                egui::Shape::Rect(_) => rects.push(bounds),
+                _ => {}
+            }
+        }
+        (texts, rects, commands)
     }
 
     /// The events that click once at `pos`.
@@ -10242,6 +10369,81 @@ mod tests {
         assert!(
             plugin.agent.loaded.holds(super::super::protocol::TOOL_ENV_SCAN),
             "clearing is not unloading"
+        );
+    }
+
+    #[test]
+    fn the_usage_bars_are_one_length_and_stay_inside_the_pane() {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            CONVERSATION_KEY.to_owned(),
+            json!({
+                "model": "llama3.1",
+                "turns": [],
+                "history": [],
+                "chats": [{
+                    "title": "a long chat",
+                    "cwd": "/srv",
+                    "model": "llama3.1",
+                    "provider": "ollama",
+                    "turns": [],
+                    "history": [],
+                    // Numbers as long as a chat that has been going for days.
+                    "usage": [
+                        { "at": 1, "input": 94421, "output": 300,
+                          "system": 24701, "tools": 32491, "user": 5413,
+                          "assistant": 80000, "toolResults": 24057,
+                          "text": 250, "calls": 50, "estimated": false },
+                        { "at": 2, "input": 90000, "output": 310,
+                          "system": 24000, "tools": 32000, "user": 5000,
+                          "assistant": 70000, "toolResults": 24000,
+                          "text": 260, "calls": 50, "estimated": false }
+                    ]
+                }]
+            }),
+        );
+        let mut plugin = AiAgent::default();
+        plugin.view = ChatView::Stats(Some(0));
+        let ctx = egui::Context::default();
+        let width = 420.0;
+        // The first frame sizes the pane; the second is the one that paints.
+        frame_bodies(&mut plugin, &mut settings, &ctx, Vec::new(), width);
+        let (texts, rects, _) = frame_bodies(&mut plugin, &mut settings, &ctx, Vec::new(), width);
+        for (rect, text) in &texts {
+            assert!(
+                rect.right() <= width,
+                "{text} runs past the pane: {rect:?}"
+            );
+        }
+        for rect in &rects {
+            assert!(rect.right() <= width + 0.5, "a box runs past the pane: {rect:?}");
+        }
+        // The seven bars share one track: they are the widest boxes as tall as a bar.
+        let bars: Vec<egui::Rect> = rects
+            .iter()
+            .copied()
+            .filter(|rect| (rect.height() - LEGEND_DOT_SIZE).abs() < 0.5)
+            .collect();
+        let widest = bars.iter().map(|rect| rect.width()).fold(0.0f32, f32::max);
+        let tracks: Vec<egui::Rect> = bars
+            .iter()
+            .copied()
+            .filter(|rect| (rect.width() - widest).abs() < 0.5)
+            .collect();
+        assert_eq!(tracks.len(), 7, "one track per breakdown row: {bars:?}");
+        for track in &tracks {
+            assert!(
+                (track.left() - tracks[0].left()).abs() < 0.5
+                    && (track.right() - tracks[0].right()).abs() < 0.5,
+                "the bars are not one length: {tracks:?}"
+            );
+        }
+        // And the chart is one stacked block, drawn where it was asked for.
+        assert!(
+            rects
+                .iter()
+                .any(|rect| (rect.height() - USAGE_CHART_HEIGHT).abs() < 0.5),
+            "the chart is missing: {rects:?}"
         );
     }
 
