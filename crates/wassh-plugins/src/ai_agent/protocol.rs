@@ -40,9 +40,15 @@ pub const SETTING_MODEL_CONTEXTS: &str = "modelContexts";
 pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
 /// Setting key: how many sub-agents may run at the same time.
 pub const SETTING_MAX_SUBAGENTS: &str = "maxSubagents";
-/// Setting key: send the tools as a script API instead of one schema per tool.
+/// Setting key: how a tool is called when the chat has no explicit choice for it.
+pub const SETTING_TOOL_CALLER_DEFAULT: &str = "toolCallerDefault";
+/// Setting key: this host's default caller, which wins over the app-wide one.
+pub const SETTING_HOST_TOOL_CALLER_DEFAULT: &str = "hostToolCallerDefault";
+/// Setting key: the caller chosen per tool, as `{ tool: "direct" | "script" | "both" }`.
+pub const SETTING_TOOL_CALLERS: &str = "toolCallers";
+/// Setting key: the retired switch, read only to migrate an existing install.
 pub const SETTING_SCRIPT_MODE: &str = "scriptMode";
-/// Setting key: this host's script mode, which wins over the app-wide one.
+/// Setting key: the retired per-host switch, read only to migrate.
 pub const SETTING_HOST_SCRIPT_MODE: &str = "hostScriptMode";
 /// Setting key: saved hosts this conversation may reach without asking.
 pub const SETTING_REACH_ALLOW: &str = "agentReachAllow";
@@ -207,7 +213,7 @@ pub const OPENAI_MODELS_PATH: &str = "/models";
 pub const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 
 /// Version of the plugin's stored data.
-pub const DATA_VERSION: u32 = 3;
+pub const DATA_VERSION: u32 = 4;
 /// Title a fresh chat gets.
 pub const DEFAULT_CHAT_TITLE: &str = "New chat";
 /// Chats kept per host.
@@ -460,6 +466,17 @@ pub enum ApiMessage {
     },
 }
 
+/// Tokens a provider said a completion took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Tokens the request carried.
+    pub input: u32,
+    /// Tokens the model wrote.
+    pub output: u32,
+    /// Part of `input` the provider served from its prompt cache.
+    pub cached_input: u32,
+}
+
 /// What a completion produced.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Completion {
@@ -471,6 +488,8 @@ pub struct Completion {
     pub tool_calls: Vec<ApiToolCall>,
     /// Provider stop reason, when it sent one.
     pub stop_reason: Option<String>,
+    /// What it cost, when the provider reported it.
+    pub usage: Option<Usage>,
 }
 
 /// Join a base URL and an operation path with exactly one slash.

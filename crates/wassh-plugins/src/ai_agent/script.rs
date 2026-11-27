@@ -29,6 +29,8 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_HEAP_BYTES: usize = 64 * 1024 * 1024;
 /// Tool calls one run may make.
 pub const MAX_CALLS: usize = 100;
+/// Tool calls one run may have in flight at the same time.
+pub const MAX_INFLIGHT: usize = 8;
 /// Characters the result keeps before it is cut with a marker.
 pub const MAX_RESULT_CHARS: usize = 32_000;
 /// Characters console output keeps for the transcript; never sent to the model.
@@ -336,6 +338,7 @@ fn run(
     }
 
     let mut calls = 0usize;
+    let mut inflight = 0usize;
     loop {
         if let Err(problem) = pump(&runtime) {
             clock.pause();
@@ -348,7 +351,31 @@ fn run(
             clock.pause();
             return (outcome, console(&bridge));
         }
-        let Some((id, name, arguments)) = slot(&bridge.calls).pop_front() else {
+        // Hand the agent every call the script is waiting on, up to the limit, so a
+        // `Promise.all` is one round of work on the host rather than a queue of them.
+        while inflight < MAX_INFLIGHT {
+            let Some((id, name, arguments)) = slot(&bridge.calls).pop_front() else {
+                break;
+            };
+            calls += 1;
+            if calls > MAX_CALLS {
+                clock.pause();
+                let problem = format!("The script made more than {MAX_CALLS} tool calls.");
+                return (Err(problem), console(&bridge));
+            }
+            if events
+                .send(ScriptEvent::Call(ScriptCall {
+                    id,
+                    name,
+                    arguments,
+                }))
+                .is_err()
+            {
+                return (Err("The script was stopped.".to_owned()), console(&bridge));
+            }
+            inflight += 1;
+        }
+        if inflight == 0 {
             clock.pause();
             let problem = if stop.load(Ordering::SeqCst) {
                 "The script was stopped.".to_owned()
@@ -356,22 +383,6 @@ fn run(
                 "The script awaited something that never happens.".to_owned()
             };
             return (Err(problem), console(&bridge));
-        };
-        calls += 1;
-        if calls > MAX_CALLS {
-            clock.pause();
-            let problem = format!("The script made more than {MAX_CALLS} tool calls.");
-            return (Err(problem), console(&bridge));
-        }
-        if events
-            .send(ScriptEvent::Call(ScriptCall {
-                id,
-                name,
-                arguments,
-            }))
-            .is_err()
-        {
-            return (Err("The script was stopped.".to_owned()), console(&bridge));
         }
         clock.pause();
         let reply = replies.recv();
@@ -379,6 +390,7 @@ fn run(
         let Ok(reply) = reply else {
             return (Err("The script was stopped.".to_owned()), console(&bridge));
         };
+        inflight -= 1;
         if let Err(problem) = settle(&context, &reply) {
             return (Err(problem), console(&bridge));
         }

@@ -1,4 +1,4 @@
-﻿//! The AI agent pane.
+//! The AI agent pane.
 //!
 //! A chat with an LLM that can act on the session: run commands, read and write
 //! files, drive the terminal, search the web or the knowledge base. Provider and
@@ -19,9 +19,11 @@ use wassh_ui::widgets::{
 
 use super::agent::{
     Agent, AgentQuestion, Phase, SUMMARY_SYSTEM_PROMPT, Subagent, SubagentEnd, SubagentState,
-    ToolSettings, Turn, UserMeta, Waiting, announce_wait, end_subagent, history_from_json, history_to_json,
-    subagents_from_json, subagents_to_json, turns_from_json, turns_to_json,
+    ToolSettings, Turn, UsageLog, UserMeta, Waiting, announce_wait, end_subagent,
+    history_from_json, history_to_json, subagents_from_json, subagents_to_json, turns_from_json,
+    turns_to_json,
 };
+use super::callers::{CallerMode, Callers};
 use super::markdown::{Block, Ink};
 use super::agent::HostCard;
 use crate::plugin::RemoteHost;
@@ -156,6 +158,35 @@ const MIN_SELECT_ROOM: f32 = 80.0;
 const COMPACT_HINT: &str = "Fold the older part of this chat into a summary now.";
 /// Caption of the Compact button.
 const COMPACT_LABEL: &str = "Compact";
+/// Caption of the button that opens the usage view.
+const USAGE_LABEL: &str = "Usage";
+/// Tooltip of the usage button.
+const USAGE_HINT: &str = "What this chat's requests have cost: totals, what they carried, and \
+one line per request.";
+/// Heading of the usage view.
+const USAGE_TITLE: &str = "Token usage";
+/// What the usage view says before the first answer arrives.
+const USAGE_EMPTY: &str = "No requests yet. The numbers appear once the first answer arrives, and \
+they keep counting as the chat goes on.";
+/// Note under the usage totals when some numbers were read from characters.
+const USAGE_ESTIMATED: &str = "Some entries were estimated from text: the provider did not report \
+what the request cost.";
+/// Lines of the usage view that name one call.
+const USAGE_CALLS_LISTED: usize = 24;
+/// Height of the per-call chart.
+const USAGE_CHART_HEIGHT: f32 = 90.0;
+/// Gap between two blocks of the usage view.
+const USAGE_ROW_GAP: f32 = 6.0;
+/// Gap between two cards or legend entries.
+const USAGE_CARD_GAP: f32 = 14.0;
+/// Type size of a usage total.
+const USAGE_TOTAL_TEXT_SIZE: f32 = 18.0;
+/// Width of a breakdown row's label.
+const USAGE_LABEL_WIDTH: f32 = 130.0;
+/// Width of the number beside a breakdown bar.
+const USAGE_VALUE_WIDTH: f32 = 96.0;
+/// Diameter of a legend dot and height of a breakdown bar.
+const LEGEND_DOT_SIZE: f32 = 8.0;
 /// Said when Compact is pressed while a run is in flight.
 const COMPACT_BUSY: &str = "Stop the run before compacting the chat.";
 /// The bar's caption while the older part of the chat is folded into a summary.
@@ -458,6 +489,8 @@ pub struct StoredChat {
     pub scopes: Loaded,
     /// Whether it was a Plan-mode chat, which only reads.
     pub plan: bool,
+    /// Every request it was billed for.
+    pub usage: super::agent::UsageLog,
 }
 
 /// A message typed while a run was in flight.
@@ -490,6 +523,129 @@ enum SudoAnswer {
     Run,
     /// Leave the command unrun.
     Cancel,
+}
+
+/// One call's numbers, summed for the usage totals and drawn as one point of its chart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UsageCall {
+    /// Requests counted.
+    requests: u32,
+    /// Tokens the requests carried.
+    input: u32,
+    /// Tokens the model wrote.
+    output: u32,
+    /// Part of `input` the system prompt took.
+    system: u32,
+    /// Part of `input` tool definitions took.
+    tools: u32,
+    /// Part of `input` the user's prompts took.
+    user: u32,
+    /// Part of `input` earlier answers took.
+    assistant: u32,
+    /// Part of `input` tool results took.
+    tool_results: u32,
+    /// Part of `output` answer text took.
+    text: u32,
+    /// Part of `output` tool-call arguments took.
+    calls_args: u32,
+    /// Entries that were estimated rather than counted.
+    estimated: u32,
+}
+
+impl UsageCall {
+    /// The numbers of one recorded call.
+    fn of(call: &super::agent::CallUsage) -> Self {
+        Self {
+            requests: 1,
+            input: call.input,
+            output: call.output,
+            system: call.parts.system,
+            tools: call.parts.tools,
+            user: call.parts.user,
+            assistant: call.parts.assistant,
+            tool_results: call.parts.tool_results,
+            text: call.text,
+            calls_args: call.calls,
+            estimated: u32::from(call.estimated),
+        }
+    }
+
+    /// Add another call's numbers to these.
+    fn add(&mut self, other: &Self) {
+        self.requests += other.requests;
+        self.input += other.input;
+        self.output += other.output;
+        self.system += other.system;
+        self.tools += other.tools;
+        self.user += other.user;
+        self.assistant += other.assistant;
+        self.tool_results += other.tool_results;
+        self.text += other.text;
+        self.calls_args += other.calls_args;
+        self.estimated += other.estimated;
+    }
+}
+
+/// One series of the usage chart: a value from every call, oldest first.
+fn series_values(
+    calls: &[(u64, UsageCall, Option<String>)],
+    pick: impl Fn(&UsageCall) -> u32,
+) -> Vec<f32> {
+    calls.iter().map(|(_, call, _)| pick(call) as f32).collect()
+}
+
+/// One part of the input, with the share of the total it took.
+fn share_row(
+    ui: &mut Ui,
+    palette: &wassh_core::Palette,
+    muted: egui::Color32,
+    label: &str,
+    value: u32,
+    total: u32,
+    colour: wassh_core::Rgba,
+) {
+    let share = if total == 0 {
+        0.0
+    } else {
+        value as f32 / total as f32
+    };
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::Vec2::new(USAGE_LABEL_WIDTH, ui.spacing().interact_size.y),
+            egui::Label::new(egui::RichText::new(label).size(FOOTER_TEXT_SIZE).color(muted)),
+        );
+        let width = (ui.available_width() - USAGE_VALUE_WIDTH).max(0.0);
+        let (bar, _) = ui.allocate_exact_size(
+            egui::Vec2::new(width, LEGEND_DOT_SIZE),
+            egui::Sense::hover(),
+        );
+        ui.painter()
+            .rect_filled(bar, 2.0, to_color32(palette.bg_input));
+        let mut filled = bar;
+        filled.set_width(bar.width() * share);
+        ui.painter().rect_filled(filled, 2.0, to_color32(colour));
+        ui.add_sized(
+            egui::Vec2::new(USAGE_VALUE_WIDTH, ui.spacing().interact_size.y),
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "{}  {:.0}%",
+                    compact_tokens(value),
+                    share * 100.0
+                ))
+                .size(FOOTER_TEXT_SIZE)
+                .color(muted),
+            ),
+        );
+    });
+}
+
+/// A token count with thousands shortened, for the stats cards.
+fn compact_tokens(count: u32) -> String {
+    if count >= 10_000 {
+        format!("{:.1}k", count as f32 / 1_000.0)
+    } else {
+        count.to_string()
+    }
 }
 
 /// The AI agent pane.
@@ -619,7 +775,7 @@ struct ScopePopup {
     anchor: egui::Rect,
 }
 
-/// Which of the pane's three views is drawn.
+/// Which of the pane's views is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChatView {
     /// The chat list, with the composer that starts a new chat.
@@ -628,6 +784,8 @@ enum ChatView {
     Chat,
     /// One sub-agent's transcript, read-only.
     Subagent(usize),
+    /// What the chat's requests cost, read-only.
+    Stats,
 }
 
 /// Which conversation the transcript draws.
@@ -777,15 +935,16 @@ fn build_request(
 ) -> CompletionRequest {
     agent.repair_history();
     let system = AiAgent::system_prompt(agent, settings, host, environment);
-    let tools = tools::specs(
+    let offered = tools::offered(
         &agent.permissions,
         &agent.scopes,
         !agent.subagent,
         agent.plan,
-        agent.script_mode,
+        &agent.callers,
     );
     // Kept so compaction measures the scopes this conversation really carries.
-    agent.prompt_chars = tools::prompt_chars(&tools, &system);
+    agent.prompt_chars = tools::prompt_chars(&offered.specs, &system);
+    agent.note_request(&system, &offered.specs);
     CompletionRequest {
         base_url: provider.base_url.clone(),
         api_key,
@@ -793,7 +952,7 @@ fn build_request(
         model: model.to_owned(),
         system,
         messages: agent.history.clone(),
-        tools,
+        tools: offered.specs,
         max_tokens: MAX_TOKENS,
     }
 }
@@ -833,6 +992,7 @@ impl AiAgent {
             compacted: self.agent.compacted.take(),
             scopes: std::mem::take(&mut self.agent.scopes),
             plan: self.agent.plan,
+            usage: std::mem::take(&mut self.agent.usage),
         }
     }
 
@@ -898,6 +1058,7 @@ impl AiAgent {
         self.agent.compacted = chat.compacted;
         self.agent.scopes = chat.scopes;
         self.agent.plan = chat.plan;
+        self.agent.usage = chat.usage;
         self.created = chat.created;
         self.generated_title = (chat.title != DEFAULT_CHAT_TITLE).then(|| chat.title.clone());
         // A digest this chat was still waiting for goes on being written here.
@@ -987,15 +1148,19 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 lines.push(format!("- {}: {}", scope.id, scope.summary));
             }
         }
-        // Script mode sends `run_script` instead of one schema per tool, so the tools it can
-        // call are spelled out here: a line each instead of a schema each.
-        if agent.script_mode {
-            let catalog =
-                tools::catalog(&agent.permissions, &agent.scopes, !agent.subagent, agent.plan);
-            if !catalog.is_empty() {
-                lines.push(String::new());
-                lines.push(format!(
-                    "Call tools from a script. `run_script` runs a JavaScript program in a \
+        // The tools called from scripts are spelled out here, a line each instead of a schema
+        // each, so a request can offer the whole toolset without carrying it.
+        let catalog = tools::catalog(
+            &agent.permissions,
+            &agent.scopes,
+            !agent.subagent,
+            agent.plan,
+            &agent.callers,
+        );
+        if !catalog.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "Call tools from a script. `run_script` runs a JavaScript program in a \
 sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
 (`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
 — time spent waiting on a tool does not count — and up to {} tool calls; one call that has \
@@ -1008,20 +1173,18 @@ of spending a round per call, because each round re-sends the whole prompt. Do t
 and the decisions in the script rather than back through the conversation: filter, join, \
 compare and branch on results there. Spend real effort on shrinking what you return: filter \
 down to the lines that answer the question, sort and de-duplicate them, and compact, count or \
-summarise the \
-rest instead of dumping raw output — that result is all the model sees, so keep it as \
-small as the answer allows. Every tool the guidance below names is called the same way: from \
-a script, never as a tool of the turn. The working directory is shared by every call a script \
-makes and stays after it, so move it once with `await tools.set_working_directory({{ path }})` \
-and keep the cd out of the commands. Callable now:",
-                    super::script::MAX_EXEC_MS / 1_000,
-                    super::script::MAX_CALLS,
-                    super::script::MAX_CALL_MS / 1_000,
-                    super::script::MAX_EXEC_MS / 1_000,
-                    super::script::MAX_TIMEOUT_MS / 1_000
-                ));
-                lines.push(catalog);
-            }
+summarise the rest instead of dumping raw output — that result is all the model sees, so keep \
+it as small as the answer allows. The tools listed below are called from a script, never as \
+tools of the turn; anything not listed there is a tool of the turn. The working directory is \
+shared by every call a script makes and stays after it, so move it once with `await \
+tools.set_working_directory({{ path }})` and keep the cd out of the commands. Callable now:",
+                super::script::MAX_EXEC_MS / 1_000,
+                super::script::MAX_CALLS,
+                super::script::MAX_CALL_MS / 1_000,
+                super::script::MAX_EXEC_MS / 1_000,
+                super::script::MAX_TIMEOUT_MS / 1_000
+            ));
+            lines.push(catalog);
         }
         // The map's digest: the tree this conversation already knows, so its turns go on
         // the work rather than on finding the files again.
@@ -1266,14 +1429,7 @@ and keep the cd out of the commands. Callable now:",
         self.agent.permissions = Permissions::from_settings(settings);
         self.agent.reach_allow = setting_rules(settings, SETTING_REACH_ALLOW).unwrap_or_default();
         self.agent.reach_deny = setting_rules(settings, SETTING_REACH_DENY).unwrap_or_default();
-        self.agent.script_mode = settings
-            .get(SETTING_HOST_SCRIPT_MODE)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || settings
-                .get(SETTING_SCRIPT_MODE)
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+        self.agent.callers = Callers::from_settings(settings, Some(settings));
         self.agent.max_subagents = settings
             .get(SETTING_MAX_SUBAGENTS)
             .and_then(Value::as_u64)
@@ -1903,6 +2059,7 @@ and keep the cd out of the commands. Callable now:",
             .map(str::to_owned);
         self.agent.scopes = Loaded::from_json(stored.get("scopes"));
         self.agent.plan = stored["planMode"].as_bool().unwrap_or(false);
+        self.agent.usage = UsageLog::from_json(stored.get("usage"));
         self.agent
             .adopt_subagents(subagents_from_json(stored.get("subagents")));
         if let Some(chats) = stored.get("chats").and_then(Value::as_array) {
@@ -1945,6 +2102,7 @@ and keep the cd out of the commands. Callable now:",
                             .map(str::to_owned),
                         scopes: Loaded::from_json(chat.get("scopes")),
                         plan: chat["planMode"].as_bool().unwrap_or(false),
+                        usage: UsageLog::from_json(chat.get("usage")),
                         subagents: subagents_from_json(chat.get("subagents")),
                     }
                 })
@@ -2852,8 +3010,8 @@ and keep the cd out of the commands. Callable now:",
             .replace("{files}", &super::map::MAX_MAPPED_FILES.to_string());
         let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt);
         // The pass is a numbered procedure of direct calls, so it runs with the tools of its
-        // scopes rather than the one script tool a script-mode chat sends.
-        self.agent.subagents[index].agent.script_mode = false;
+        // scopes rather than whatever the chat sends.
+        self.agent.subagents[index].agent.callers = Callers::every(CallerMode::Direct);
         match self.request_for(Some(index), settings, host, environment) {
             Some(request) => {
                 if let Some(sub) = self.agent.subagents.get_mut(index) {
@@ -5079,6 +5237,166 @@ script normally stops after {} seconds of JavaScript.",
             || !self.queued.is_empty()
     }
 
+    /// What this chat's requests have cost, as totals, a breakdown and one line per call.
+    ///
+    /// Counted from the log the conversation kept as it ran, not from the transcript: a
+    /// compacted chat would otherwise forget what it spent before the summary.
+    fn usage_page(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
+        // Sub-agents are part of what the chat costs, so their calls are gathered here.
+        let mut calls: Vec<(u64, UsageCall, Option<String>)> = Vec::new();
+        for call in &self.agent.usage.calls {
+            calls.push((call.at, UsageCall::of(call), None));
+        }
+        for sub in &self.agent.subagents {
+            for call in &sub.agent.usage.calls {
+                calls.push((call.at, UsageCall::of(call), Some(sub.title.clone())));
+            }
+        }
+        calls.sort_by_key(|(at, _, _)| *at);
+        egui::ScrollArea::vertical()
+            .id_salt("ai-usage")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if calls.is_empty() {
+                    ui.label(egui::RichText::new(USAGE_EMPTY).color(muted));
+                    return;
+                }
+                let mut totals = UsageCall::default();
+                for (_, call, _) in &calls {
+                    totals.add(call);
+                }
+                ui.add_space(USAGE_ROW_GAP);
+                ui.horizontal_wrapped(|ui| {
+                    for (label, value) in [
+                        ("Requests", totals.requests.to_string()),
+                        ("Input", compact_tokens(totals.input)),
+                        ("Output", compact_tokens(totals.output)),
+                        ("Total", compact_tokens(totals.input + totals.output)),
+                    ] {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .size(FOOTER_TEXT_SIZE)
+                                    .color(muted),
+                            );
+                            ui.label(
+                                egui::RichText::new(value).size(USAGE_TOTAL_TEXT_SIZE),
+                            );
+                            ui.add_space(USAGE_ROW_GAP);
+                        });
+                        ui.add_space(USAGE_CARD_GAP);
+                    }
+                });
+                ui.add_space(USAGE_ROW_GAP);
+                ui.label(egui::RichText::new("What the input carried").size(FOOTER_TEXT_SIZE));
+                let parts = [
+                    ("System prompt", totals.system, palette.text_muted),
+                    ("Tool definitions", totals.tools, palette.accent),
+                    ("Your prompts", totals.user, palette.ok),
+                    ("Earlier answers", totals.assistant, palette.warn),
+                    ("Tool results", totals.tool_results, palette.danger),
+                ];
+                for (label, value, colour) in parts {
+                    share_row(ui, palette, muted, label, value, totals.input, colour);
+                }
+                share_row(ui, palette, muted, "Answer text", totals.text, totals.output, palette.text);
+                share_row(
+                    ui,
+                    palette,
+                    muted,
+                    "Tool-call arguments",
+                    totals.calls_args,
+                    totals.output,
+                    palette.accent_hover,
+                );
+                ui.add_space(USAGE_ROW_GAP);
+                ui.label(egui::RichText::new("Per request").size(FOOTER_TEXT_SIZE));
+                let series = [
+                    (
+                        series_values(&calls, |call| call.system),
+                        palette.text_muted,
+                    ),
+                    (series_values(&calls, |call| call.tools), palette.accent),
+                    (series_values(&calls, |call| call.user), palette.ok),
+                    (
+                        series_values(&calls, |call| call.assistant),
+                        palette.warn,
+                    ),
+                    (
+                        series_values(&calls, |call| call.tool_results),
+                        palette.danger,
+                    ),
+                    (
+                        series_values(&calls, |call| call.output),
+                        palette.text,
+                    ),
+                ];
+                let lines: Vec<wassh_ui::widgets::chart::Series<'_>> = series
+                    .iter()
+                    .map(|(values, colour)| wassh_ui::widgets::chart::Series {
+                        values,
+                        colour: to_color32(*colour),
+                    })
+                    .collect();
+                wassh_ui::widgets::chart::series_chart(
+                    ui,
+                    palette,
+                    &lines,
+                    0.0,
+                    USAGE_CHART_HEIGHT,
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let legend = [
+                        ("system", palette.text_muted),
+                        ("tools", palette.accent),
+                        ("you", palette.ok),
+                        ("answers", palette.warn),
+                        ("results", palette.danger),
+                        ("output", palette.text),
+                    ];
+                    for (label, colour) in legend {
+                        let (dot, _) = ui.allocate_exact_size(
+                            egui::Vec2::splat(LEGEND_DOT_SIZE),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(
+                            dot.center(),
+                            LEGEND_DOT_SIZE / 2.0,
+                            to_color32(colour),
+                        );
+                        ui.label(egui::RichText::new(label).size(FOOTER_TEXT_SIZE).color(muted));
+                        ui.add_space(USAGE_CARD_GAP);
+                    }
+                });
+                if totals.estimated > 0 {
+                    ui.label(
+                        egui::RichText::new(USAGE_ESTIMATED)
+                            .size(FOOTER_TEXT_SIZE)
+                            .italics()
+                            .color(muted),
+                    );
+                }
+                ui.add_space(USAGE_ROW_GAP);
+                let shown = calls.len().min(USAGE_CALLS_LISTED);
+                for (index, (_, call, from)) in calls.iter().enumerate().skip(calls.len() - shown) {
+                    let mut line = format!(
+                        "#{}  in {}  out {}",
+                        index + 1,
+                        compact_tokens(call.input),
+                        compact_tokens(call.output)
+                    );
+                    if call.estimated > 0 {
+                        line.push_str("  (estimated)");
+                    }
+                    if let Some(from) = from {
+                        line.push_str("  \u{21b3} ");
+                        line.push_str(from);
+                    }
+                    ui.label(egui::RichText::new(line).size(FOOTER_TEXT_SIZE).color(muted));
+                }
+            });
+    }
+
     /// Write the conversation, the map and the system facts into the pane's data.
     ///
     /// Done once a frame rather than on every change: the host compares the values with
@@ -5100,7 +5418,8 @@ script normally stops after {} seconds of JavaScript.",
                     "subagents": subagents_to_json(&chat.subagents),
                     "compacted": chat.compacted,
                     "scopes": chat.scopes.to_json(),
-                    "planMode": chat.plan
+                    "planMode": chat.plan,
+                    "usage": chat.usage.to_json()
                 })
             })
             .collect();
@@ -5119,6 +5438,7 @@ script normally stops after {} seconds of JavaScript.",
                 "compacted": self.agent.compacted,
                 "scopes": self.agent.scopes.to_json(),
                 "planMode": self.agent.plan,
+                "usage": self.agent.usage.to_json(),
                 "chats": chats
             }),
         );
@@ -5179,6 +5499,7 @@ impl Plugin for AiAgent {
         // Provider and model live under the composer.
         let mut back = false;
         let mut new_chat = false;
+        let mut usage = false;
         egui::containers::Sides::new()
             .height(BACK_BUTTON_SIZE)
             .shrink_left()
@@ -5221,6 +5542,15 @@ impl Plugin for AiAgent {
                                 .color(muted),
                         );
                     }
+                    ChatView::Stats => {
+                        back = back_button(ui, palette);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(USAGE_TITLE).size(CHAT_TITLE_TEXT_SIZE),
+                            )
+                            .truncate(),
+                        );
+                    }
                 },
                 |ui| {
                     // A sub-agent belongs to the chat that started it, so only the chat and
@@ -5232,15 +5562,27 @@ impl Plugin for AiAgent {
                             .enabled(!busy)
                             .show(ui, palette)
                             .clicked();
+                    if matches!(self.view, ChatView::Chat) {
+                        usage = Button::new(USAGE_LABEL)
+                            .compact()
+                            .ghost()
+                            .show(ui, palette)
+                            .on_hover_text(USAGE_HINT)
+                            .clicked();
+                    }
                 },
             );
         if new_chat {
             self.begin_new_chat();
         }
+        if usage {
+            self.view = ChatView::Stats;
+        }
         if back {
             match self.view {
-                // Back returns to the chat that owns the sub-agent.
-                ChatView::Subagent(_) => self.view = ChatView::Chat,
+                // Back returns to the chat that owns the sub-agent, or to the chat itself
+                // from its usage.
+                ChatView::Subagent(_) | ChatView::Stats => self.view = ChatView::Chat,
                 _ => {
                     // Leaving a settled chat files it, so the list holds everything the pane
                     // has. A run still going stays open: clearing it would end the run.
@@ -5280,6 +5622,11 @@ impl Plugin for AiAgent {
             .frame(egui::Frame::NONE)
             .show_separator_line(false)
             .show(ui, |ui| {
+                // The usage view is a page of numbers, not a conversation: nothing is typed
+                // into it.
+                if matches!(self.view, ChatView::Stats) {
+                    return;
+                }
                 // A request the agent is blocked on comes first: it is the one thing the
                 // user has to answer before the run can go on.
                 prompts = self.prompt_cards(ui, palette, muted, &pending, prompt_source.as_deref());
@@ -5665,8 +6012,11 @@ impl Plugin for AiAgent {
             ChatView::List => None,
             ChatView::Chat => Some(TranscriptSource::Main),
             ChatView::Subagent(index) => Some(TranscriptSource::Subagent(index)),
+            ChatView::Stats => None,
         };
-        if source.is_none() {
+        if matches!(self.view, ChatView::Stats) {
+            self.usage_page(ui, palette, muted);
+        } else if source.is_none() {
             self.chat_list(ui, palette, muted);
         } else if let Some(source) = source {
             let scroll = egui::ScrollArea::vertical()
@@ -8855,7 +9205,7 @@ mod tests {
     #[test]
     fn script_mode_puts_the_tool_catalog_in_the_prompt() {
         let mut plugin = AiAgent::default();
-        plugin.agent.script_mode = true;
+        plugin.agent.callers = Callers::every(CallerMode::Script);
         let prompt =
             AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(prompt.contains("Call tools from a script."), "{prompt}");
@@ -8915,7 +9265,7 @@ mod tests {
         // The guidance names tools the way a chat without scripts does: say that a script
         // calls them, or the model calls one of them as a tool of the turn and is refused.
         assert!(
-            prompt.contains("Every tool the guidance below names is called the same way"),
+            prompt.contains("The tools listed below are called from a script"),
             "{prompt}"
         );
         // The root's tools are the only ones loaded, so nothing of a scope shows up.
@@ -9311,7 +9661,7 @@ mod tests {
         .into_iter()
         .collect();
         let mut plugin = AiAgent::default();
-        plugin.agent.script_mode = true;
+        plugin.agent.callers = Callers::every(CallerMode::Script);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         plugin.agent.map = super::super::map::EnvMap::parse(
@@ -9327,10 +9677,14 @@ mod tests {
             .as_ref()
             .unwrap_or_else(|| panic!("the mapping pass did not start: {:?}", plugin.error));
         // The task is a numbered procedure — look at the map, read the files, answer with
-        // one object — so the pass keeps the tools of its scopes rather than one script tool.
+        // one object — so the pass keeps the tools of its scopes rather than the chat's paths.
         assert!(
-            !plugin.agent.subagents[run.subagent].agent.script_mode,
-            "the mapping agent was left in script mode"
+            plugin.agent.subagents[run.subagent]
+                .agent
+                .callers
+                .caller("run_command")
+                .direct(),
+            "the mapping agent was left calling its tools from scripts"
         );
         assert!(
             plugin.agent.subagents[run.subagent]

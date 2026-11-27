@@ -10,7 +10,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::protocol::{
-    join_url, ApiMessage, ApiToolCall, Completion, ImagePart, Protocol, ProviderConfig,
+    join_url, ApiMessage, ApiToolCall, Completion, ImagePart, Protocol, ProviderConfig, Usage,
     ANTHROPIC_CHAT_PATH, ANTHROPIC_MODELS_PATH, ANTHROPIC_VERSION, OPENAI_CHAT_PATH,
     OPENAI_EMBEDDINGS_PATH, OPENAI_MODELS_PATH,
 };
@@ -95,7 +95,9 @@ pub fn openai_body(request: &CompletionRequest) -> Value {
     let mut body = json!({
         "model": request.model,
         "messages": messages,
-        "stream": true
+        "stream": true,
+        // Without this an OpenAI stream ends before it says what the call cost.
+        "stream_options": { "include_usage": true }
     });
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -301,12 +303,23 @@ pub struct OpenAiStream {
     reasoning_content: String,
     fragments: std::collections::BTreeMap<u64, (String, String, String)>,
     stop_reason: Option<String>,
+    usage: Option<Usage>,
 }
 
 impl OpenAiStream {
     /// Feed one `data:` payload and return the text it added, if any.
     pub fn push(&mut self, payload: &str) -> Option<String> {
         let json: Value = serde_json::from_str(payload).ok()?;
+        let usage = &json["usage"];
+        if usage.is_object() {
+            self.usage = Some(Usage {
+                input: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                output: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+                cached_input: usage["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0) as u32,
+            });
+        }
         if let Some(reason) = json["choices"][0]["finish_reason"].as_str()
             && !reason.is_empty()
         {
@@ -367,6 +380,7 @@ impl OpenAiStream {
                 .then_some(self.reasoning_content),
             tool_calls,
             stop_reason: self.stop_reason,
+            usage: self.usage,
         }
     }
 }
@@ -377,6 +391,7 @@ pub struct AnthropicStream {
     text: String,
     blocks: std::collections::BTreeMap<u64, (String, String, String)>,
     stop_reason: Option<String>,
+    usage: Option<Usage>,
 }
 
 impl AnthropicStream {
@@ -417,9 +432,22 @@ impl AnthropicStream {
                 }
                 None
             }
+            "message_start" => {
+                let usage = &json["message"]["usage"];
+                self.usage = Some(Usage {
+                    input: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
+                    output: 0,
+                    cached_input: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
+                });
+                None
+            }
             "message_delta" => {
                 if let Some(reason) = json["delta"]["stop_reason"].as_str() {
                     self.stop_reason = Some(reason.to_owned());
+                }
+                if let Some(output) = json["usage"]["output_tokens"].as_u64() {
+                    let usage = self.usage.get_or_insert_with(Usage::default);
+                    usage.output = output as u32;
                 }
                 None
             }
@@ -443,6 +471,7 @@ impl AnthropicStream {
                 })
                 .collect(),
             stop_reason: self.stop_reason,
+            usage: self.usage,
         }
     }
 }
@@ -699,6 +728,13 @@ pub fn complete_blocking(request: &CompletionRequest) -> Result<Completion, Stri
                 reasoning_content: message["reasoning_content"].as_str().map(str::to_owned),
                 tool_calls,
                 stop_reason: json["choices"][0]["finish_reason"].as_str().map(str::to_owned),
+                usage: Some(Usage {
+                    input: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                    output: json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
+                    cached_input: json["usage"]["prompt_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as u32,
+                }),
             })
         }
         Protocol::Anthropic => {
@@ -722,6 +758,13 @@ pub fn complete_blocking(request: &CompletionRequest) -> Result<Completion, Stri
                 reasoning_content: None,
                 tool_calls,
                 stop_reason: json["stop_reason"].as_str().map(str::to_owned),
+                usage: Some(Usage {
+                    input: json["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32,
+                    output: json["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32,
+                    cached_input: json["usage"]["cache_read_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as u32,
+                }),
             })
         }
     }

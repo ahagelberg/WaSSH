@@ -10,14 +10,15 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
 use base64::Engine as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
 use crate::plugin::{RemoteHost, RemoteHosts, RemoteState};
+use super::callers::{Caller, CallerMode, Callers};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, ImagePart,
-    MAX_SUBAGENT_RESULT_CHARS, TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
+    MAX_SUBAGENT_RESULT_CHARS, Usage, TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
     TOOL_DEV_GREP, TOOL_DEV_IMAGE, TOOL_DEV_LIST, TOOL_DEV_VIEW, TOOL_ENV_FIND, TOOL_ENV_OUTLINE,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
     TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
@@ -108,9 +109,12 @@ pub const DENIED_BY_USER: &str = "Action denied by user.";
 /// Said when a Plan-mode chat is asked to change something.
 pub const PLAN_READ_ONLY: &str = "This chat is in Plan mode, which only reads. Switch it to Agent \
 mode to change anything.";
-/// Said when a script-mode chat calls a tool directly instead of from a script.
-pub const SCRIPT_MODE_ONLY: &str = "This chat is in script mode, so the tools are called from \
-inside `run_script`: call run_script with a program that awaits `tools.<name>({ ... })`.";
+/// Said when a chat calls from the turn a tool it calls from scripts.
+pub const SCRIPT_TOOL_ONLY: &str = "This chat calls this tool from a script, so it is not a tool \
+of the turn.";
+/// Said when a script calls a tool the chat keeps on the direct path.
+pub const DIRECT_TOOL_ONLY: &str = "This tool is called as a tool of the turn, not from inside a \
+script.";
 /// Question shown when `ask_user` carried none.
 const QUESTION_FALLBACK: &str = "The agent needs your input.";
 /// Answer given to a tool call the user stopped before it ran.
@@ -211,12 +215,26 @@ struct ScriptRun {
     turn: usize,
     /// The call the script is waiting on, with the id it waits under.
     inner: Option<(ApiToolCall, u64)>,
+    /// Calls the script is running at the same time as others.
+    inflight: Vec<InFlight>,
     /// Every call the script has made so far.
     calls: Vec<ScriptRow>,
     /// When the call it is waiting on started.
     since: Option<std::time::Instant>,
     /// Where its events and answers travel.
     job: script::ScriptJob,
+}
+
+/// A script call running on a command key of its own, beside the conversation's turn.
+struct InFlight {
+    /// Id the script waits for.
+    id: u64,
+    /// Command cache key, reused by the next call to take this slot.
+    key: String,
+    /// Its row on the script's card.
+    row: usize,
+    /// When it started, for the timeout.
+    since: std::time::Instant,
 }
 
 /// One script running beside the conversation.
@@ -717,6 +735,190 @@ pub struct SpawnRequest {
     pub prompt: String,
 }
 
+/// Characters one request spends, by what carries them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageParts {
+    /// The system prompt.
+    pub system: usize,
+    /// Tool schemas, or the script API.
+    pub tools: usize,
+    /// What the user typed.
+    pub user: usize,
+    /// What the model wrote earlier.
+    pub assistant: usize,
+    /// Tool results.
+    pub tool_results: usize,
+}
+
+impl UsageParts {
+    /// Everything the request carries.
+    pub fn total(&self) -> usize {
+        self.system + self.tools + self.user + self.assistant + self.tool_results
+    }
+}
+
+/// One answered request, as it is kept for the stats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallUsage {
+    /// When it was answered, in milliseconds.
+    pub at: u64,
+    /// Tokens the request carried.
+    pub input: u32,
+    /// Tokens the model wrote.
+    pub output: u32,
+    /// How much of `input` each part carried.
+    pub parts: UsageTokens,
+    /// How much of `output` was text rather than tool calls.
+    pub text: u32,
+    /// How much of `output` was tool-call arguments.
+    pub calls: u32,
+    /// Whether the numbers were counted by the provider or read from characters.
+    pub estimated: bool,
+}
+
+/// Tokens one request spent, by what they carried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageTokens {
+    /// The system prompt.
+    pub system: u32,
+    /// Tool schemas, or the script API.
+    pub tools: u32,
+    /// What the user typed.
+    pub user: u32,
+    /// What the model wrote earlier.
+    pub assistant: u32,
+    /// Tool results.
+    pub tool_results: u32,
+}
+
+impl UsageTokens {
+    /// Everything the request carried.
+    pub fn input(&self) -> u32 {
+        self.system + self.tools + self.user + self.assistant + self.tool_results
+    }
+}
+
+/// Every request a conversation has been billed for.
+///
+/// Kept as a log rather than counted from the transcript: compaction shortens the
+/// transcript, and a cost that disappears when the history is folded up is not a cost.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageLog {
+    /// One entry per answered request, oldest first.
+    pub calls: Vec<CallUsage>,
+}
+
+impl UsageLog {
+    /// Add one answered request.
+    pub fn push(&mut self, call: CallUsage) {
+        // The graph is per call and a chat is read, not analysed: keep the newest thousand.
+        if self.calls.len() >= USAGE_CALLS_KEPT {
+            self.calls.remove(0);
+        }
+        self.calls.push(call);
+    }
+
+    /// Everything spent so far.
+    pub fn totals(&self) -> UsageTotals {
+        let mut totals = UsageTotals::default();
+        for call in &self.calls {
+            totals.input += call.input;
+            totals.output += call.output;
+            totals.parts.system += call.parts.system;
+            totals.parts.tools += call.parts.tools;
+            totals.parts.user += call.parts.user;
+            totals.parts.assistant += call.parts.assistant;
+            totals.parts.tool_results += call.parts.tool_results;
+            totals.text += call.text;
+            totals.calls_args += call.calls;
+            totals.estimated += u32::from(call.estimated);
+        }
+        totals.requests = self.calls.len() as u32;
+        totals
+    }
+
+    /// The log as stored JSON.
+    pub fn to_json(&self) -> Vec<Value> {
+        self.calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "at": call.at,
+                    "input": call.input,
+                    "output": call.output,
+                    "system": call.parts.system,
+                    "tools": call.parts.tools,
+                    "user": call.parts.user,
+                    "assistant": call.parts.assistant,
+                    "toolResults": call.parts.tool_results,
+                    "text": call.text,
+                    "calls": call.calls,
+                    "estimated": call.estimated
+                })
+            })
+            .collect()
+    }
+
+    /// Read a stored log.
+    pub fn from_json(value: Option<&Value>) -> Self {
+        let calls = value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                let count = |key: &str| row[key].as_u64().unwrap_or(0) as u32;
+                CallUsage {
+                    at: row["at"].as_u64().unwrap_or(0),
+                    input: count("input"),
+                    output: count("output"),
+                    parts: UsageTokens {
+                        system: count("system"),
+                        tools: count("tools"),
+                        user: count("user"),
+                        assistant: count("assistant"),
+                        tool_results: count("toolResults"),
+                    },
+                    text: count("text"),
+                    calls: count("calls"),
+                    estimated: row["estimated"].as_bool().unwrap_or(false),
+                }
+            })
+            .collect();
+        Self { calls }
+    }
+}
+
+/// Everything a conversation has spent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageTotals {
+    /// Requests it made.
+    pub requests: u32,
+    /// Tokens the requests carried.
+    pub input: u32,
+    /// Tokens the model wrote.
+    pub output: u32,
+    /// How much of `input` each part carried.
+    pub parts: UsageTokens,
+    /// Tokens of answer text.
+    pub text: u32,
+    /// Tokens of tool-call arguments.
+    pub calls_args: u32,
+    /// How many of the entries were estimated rather than counted.
+    pub estimated: u32,
+}
+
+impl UsageTotals {
+    /// Everything the conversation spent.
+    pub fn total(&self) -> u32 {
+        self.input + self.output
+    }
+}
+
+/// Characters one token is taken to be, for estimates and for the context budget.
+pub const CHARS_PER_TOKEN: usize = 4;
+/// Requests a usage log keeps; the oldest is dropped past this.
+pub const USAGE_CALLS_KEPT: usize = 1_000;
+
 /// One conversation's state.
 #[derive(Default)]
 pub struct Agent {
@@ -818,7 +1020,11 @@ pub struct Agent {
     /// Counter behind the background script ids.
     next_background: usize,
     /// Whether the tools are offered as a script API instead of one schema per tool.
-    pub script_mode: bool,
+    pub callers: Callers,
+    /// Characters the request being sent spends, by what carries them.
+    request_parts: Option<UsageParts>,
+    /// Every request this conversation was billed for.
+    pub usage: UsageLog,
     /// The app's connections to other hosts, handed in by the pane every frame.
     remote: Option<Rc<RefCell<dyn RemoteHosts>>>,
     /// Saved hosts as the app last listed them, for the model and the cards.
@@ -1371,18 +1577,212 @@ impl Agent {
                 }
             }
         }
+        progressed |= self.poll_flights(session);
+        progressed
+    }
+
+    /// Answer the calls a script runs beside the conversation's turn.
+    ///
+    /// A command the script started on its own key is collected here rather than through the
+    /// turn's waiting slot, which is what lets several of them run at once.
+    fn poll_flights(&mut self, session: Session<'_, '_>) -> bool {
+        let Some(run) = self.script.as_ref() else {
+            return false;
+        };
+        if run.inflight.is_empty() {
+            return false;
+        }
+        let mut finished: Vec<(usize, Result<String, String>)> = Vec::new();
+        for (index, flight) in run.inflight.iter().enumerate() {
+            let result = match session.as_ref() {
+                Some(access) => match (access.output(&flight.key), access.failure(&flight.key)) {
+                    (Some(output), _) => {
+                        let raw = tail_of(&format!("{}{}", output.stdout, output.stderr));
+                        let (visible, exit_code, _) = unwrap_output(&raw);
+                        let truncated = raw.chars().count() > MAX_OUTPUT_CHARS;
+                        let text = command_result_text(&clamp_output(visible), exit_code, truncated);
+                        if exit_code.is_some_and(|code| code != 0) {
+                            Err(text)
+                        } else {
+                            Ok(text)
+                        }
+                    }
+                    (None, Some(failure)) => Err(failure.to_owned()),
+                    (None, None) => continue,
+                },
+                None => Err("The session is not connected.".to_owned()),
+            };
+            finished.push((index, result));
+        }
+        let mut progressed = false;
+        for (index, result) in finished.into_iter().rev() {
+            progressed = true;
+            let Some(run) = self.script.as_mut() else {
+                return progressed;
+            };
+            let flight = run.inflight.remove(index);
+            if let Some(row) = run.calls.get_mut(flight.row) {
+                match &result {
+                    Ok(text) => row.output = text.clone(),
+                    Err(problem) => {
+                        row.failed = true;
+                        row.output = problem.clone();
+                    }
+                }
+            }
+            run.job.reply(script::ScriptReply {
+                id: flight.id,
+                ok: result.is_ok(),
+                text: match result {
+                    Ok(text) => text,
+                    Err(problem) => problem,
+                },
+            });
+        }
+        // A call that has hung holds its slot forever otherwise.
+        let stuck: Vec<usize> = self
+            .script
+            .as_ref()
+            .map(|run| {
+                run.inflight
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, flight)| {
+                        flight.since.elapsed()
+                            >= std::time::Duration::from_millis(script::MAX_CALL_MS)
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for index in stuck.into_iter().rev() {
+            progressed = true;
+            let Some(run) = self.script.as_mut() else {
+                return progressed;
+            };
+            let flight = run.inflight.remove(index);
+            if let Some(access) = session.as_mut() {
+                access.cancel(&flight.key);
+            }
+            let problem = format!(
+                "The tool did not answer within {} seconds.",
+                script::MAX_CALL_MS / 1_000
+            );
+            if let Some(row) = run.calls.get_mut(flight.row) {
+                row.failed = true;
+                row.output = problem.clone();
+            }
+            run.job.reply(script::ScriptReply {
+                id: flight.id,
+                ok: false,
+                text: problem,
+            });
+        }
         progressed
     }
 
     /// Run one call the script asked for, through the same gates a direct call takes.
+    ///
+    /// A plain command the user already allows is started on a key of its own, so a script
+    /// that fires several at once really does run them at once. Everything that has to stop
+    /// and ask — a permission, a sudo password, a tool with a card of its own — takes the
+    /// turn's single waiting slot instead, which keeps the prompts in one queue.
     fn start_script_call(&mut self, call: script::ScriptCall, session: Session<'_, '_>) {
-        let Some(run) = self.script.as_mut() else {
-            return;
-        };
         let inner = ApiToolCall {
             id: format!("{SCRIPT_CALL_PREFIX}{}", call.id),
             name: call.name,
             arguments: call.arguments,
+        };
+        if self.caller(&inner.name) == Caller::Direct {
+            self.park_script_call(&inner, call.id);
+            let label = self
+                .script
+                .as_ref()
+                .and_then(|run| run.calls.last())
+                .map(|row| row.label.clone())
+                .unwrap_or_default();
+            self.answer_script(&inner, label, DIRECT_TOOL_ONLY.to_owned(), true);
+            return;
+        }
+        if self.can_run_beside(&inner, session) {
+            self.start_flight(inner, call.id, session);
+            return;
+        }
+        self.park_script_call(&inner, call.id);
+        let turn = self.script.as_ref().map(|run| run.turn).unwrap_or_default();
+        self.dispatch(inner, turn, session);
+    }
+
+    /// Give the script's call a row and the waiting slot.
+    fn park_script_call(&mut self, inner: &ApiToolCall, id: u64) {
+        let Some(run) = self.script.as_mut() else {
+            return;
+        };
+        run.calls.push(ScriptRow {
+            name: inner.name.clone(),
+            label: call_label(inner),
+            output: String::new(),
+            failed: false,
+        });
+        run.inner = Some((inner.clone(), id));
+        run.since = Some(std::time::Instant::now());
+    }
+
+    /// Whether this call can run beside the conversation's turn instead of through it.
+    fn can_run_beside(&self, call: &ApiToolCall, session: Session<'_, '_>) -> bool {
+        // Only a command: it has no card, asks for nothing once it is allowed, and the
+        // session keeps its result under the key it was started with. `set_working_directory`
+        // is left out because it moves the directory the other calls read.
+        if call.name != TOOL_RUN_COMMAND || session.as_ref().is_none() {
+            return false;
+        }
+        let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        let command = arguments["command"].as_str().unwrap_or_default();
+        if command_needs_sudo(command) {
+            return false;
+        }
+        if !self.call_host(call).is_ok_and(|host| host.is_none()) {
+            return false;
+        }
+        self.permission(&call.name) == Permission::Allow
+            && self.flight_slot().is_some()
+    }
+
+    /// A free command key for a call running beside the turn, if one is free.
+    fn flight_slot(&self) -> Option<usize> {
+        let run = self.script.as_ref()?;
+        (0..script::MAX_INFLIGHT).find(|slot| {
+            !run
+                .inflight
+                .iter()
+                .any(|flight| flight.key == self.flight_key(*slot))
+        })
+    }
+
+    /// The command key one flight slot uses.
+    fn flight_key(&self, slot: usize) -> String {
+        format!("{}#s{slot}", self.keys.exec)
+    }
+
+    /// Start a script call on a key of its own.
+    fn start_flight(&mut self, inner: ApiToolCall, id: u64, session: Session<'_, '_>) {
+        let Some(slot) = self.flight_slot() else {
+            self.park_script_call(&inner, id);
+            let turn = self.script.as_ref().map(|run| run.turn).unwrap_or_default();
+            self.dispatch(inner, turn, session);
+            return;
+        };
+        let arguments: Value = serde_json::from_str(&inner.arguments).unwrap_or(Value::Null);
+        let command = arguments["command"].as_str().unwrap_or_default().to_owned();
+        let key = self.flight_key(slot);
+        let prefix = self.scratch_prefix();
+        let wrapped = wrap_command_in(self.cwd(), &prefix, &command);
+        let Some(access) = session.as_mut() else {
+            return;
+        };
+        access.exec(&key, &wrapped);
+        let Some(run) = self.script.as_mut() else {
+            return;
         };
         run.calls.push(ScriptRow {
             name: inner.name.clone(),
@@ -1390,10 +1790,13 @@ impl Agent {
             output: String::new(),
             failed: false,
         });
-        run.inner = Some((inner.clone(), call.id));
-        run.since = Some(std::time::Instant::now());
-        let turn = run.turn;
-        self.dispatch(inner, turn, session);
+        let row = run.calls.len() - 1;
+        run.inflight.push(InFlight {
+            id,
+            key,
+            row,
+            since: std::time::Instant::now(),
+        });
     }
 
     /// Fail the script's pending call when it has waited too long, so a hung command cannot
@@ -1438,7 +1841,8 @@ impl Agent {
         result: Result<String, String>,
         console: String,
         session: Session<'_, '_>,
-    ) {        let Some(run) = self.script.take() else {
+    ) {
+        let Some(run) = self.script.take() else {
             return;
         };
         self.phase = None;
@@ -2228,6 +2632,7 @@ impl Agent {
                 self.turns.push(Turn::Error(error));
             }
             Ok(completion) => {
+                self.record_usage(&completion);
                 if completion.text.is_empty() && completion.tool_calls.is_empty() {
                     // Silence here looks like the pane ignored the prompt.
                     self.error = Some(EMPTY_ANSWER.to_owned());
@@ -2620,19 +3025,19 @@ at most."
             );
             return;
         }
-        // Script mode offers one tool: everything else is called from inside the program.
-        // The calls a script makes are let through — they are what the sandbox asked for.
-        if self.script_mode
-            && name != TOOL_RUN_SCRIPT
-            && name != TOOL_SCRIPT_RESULT
+        // A tool the chat calls from scripts is not offered to the turn, so a call that
+        // arrives here is one the model recalled: name the way in. The calls a script makes
+        // are let through — they are what the sandbox asked for.
+        if name != TOOL_RUN_SCRIPT
             && !self.waiting_on(&call)
+            && self.caller(&name) == Caller::Script
         {
             let label = call_label(&call);
             self.settle(
                 call,
                 turn,
                 label,
-                SCRIPT_MODE_ONLY.to_owned(),
+                format!("{SCRIPT_TOOL_ONLY} Call run_script with a program that awaits `tools.{name}(...)`."),
                 true,
                 session,
             );
@@ -2976,6 +3381,7 @@ at most."
             outer: call.clone(),
             turn,
             inner: None,
+            inflight: Vec::new(),
             calls: Vec::new(),
             since: None,
             job: script::spawn_with_budget(&code, tools::script_seconds(arguments) * 1_000),
@@ -3655,7 +4061,7 @@ at most."
         agent.allow_all = self.allow_all;
         agent.allow_long_scripts = self.allow_long_scripts;
         agent.plan = self.plan;
-        agent.script_mode = self.script_mode;
+        agent.callers = self.callers.clone();
         agent.tools = self.tools.clone();
         agent.max_subagents = self.max_subagents;
         agent
@@ -3810,9 +4216,10 @@ at most."
         self.next_background += 1;
         let id = format!("s{}", self.next_background);
         let mut agent = self.child_agent();
-        // A script gets no model of its own and starts no sub-agents of its own.
+        // A script gets no model of its own and starts no sub-agents of its own. Its calls
+        // are made by the program it runs, so its own turn has nothing to call.
         agent.subagent = true;
-        agent.script_mode = false;
+        agent.callers = Callers::every(CallerMode::Direct);
         agent.keys = CommandKeys::subagent(&format!("bg-{id}"));
         let call = ApiToolCall {
             id: format!("bg-{id}"),
@@ -4632,6 +5039,107 @@ at most."
         chars
     }
 
+    /// How `name` is called: the request builder and the gate resolve one answer.
+    pub fn caller(&self, name: &str) -> Caller {
+        self.callers.caller(name)
+    }
+
+    /// Characters the request about to be sent spends, by what carries them.
+    ///
+    /// Kept until the answer arrives: the transcript grows while the request is out, and the
+    /// parts have to describe what was sent rather than what is there when it comes back.
+    pub fn note_request(&mut self, system: &str, tools: &[Value]) {
+        let mut parts = UsageParts {
+            system: system.chars().count(),
+            tools: tools.iter().map(|tool| tool.to_string().chars().count()).sum(),
+            ..UsageParts::default()
+        };
+        for message in &self.history {
+            match message {
+                ApiMessage::User { content, images } => {
+                    parts.user += content.chars().count();
+                    parts.user += images
+                        .iter()
+                        .map(|image| image.data.len() / CHARS_PER_TOKEN)
+                        .sum::<usize>();
+                }
+                ApiMessage::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    parts.assistant += content.chars().count();
+                    parts.assistant += reasoning_content
+                        .as_deref()
+                        .map_or(0, |reasoning| reasoning.chars().count());
+                    parts.assistant += tool_calls
+                        .iter()
+                        .map(|call| call.name.chars().count() + call.arguments.chars().count())
+                        .sum::<usize>();
+                }
+                ApiMessage::Tool { content, .. } => {
+                    parts.tool_results += content.chars().count();
+                }
+            }
+        }
+        self.request_parts = Some(parts);
+    }
+
+    /// Record what the answered request cost.
+    ///
+    /// The provider's own count is the total; each part gets its share of it by the
+    /// characters it carried. Without a count the characters are all there is, and the entry
+    /// says so.
+    fn record_usage(&mut self, completion: &Completion) {
+        let parts = self.request_parts.take().unwrap_or_default();
+        let chars = parts.total();
+        let written = completion.text.chars().count()
+            + completion
+                .tool_calls
+                .iter()
+                .map(|call| call.name.chars().count() + call.arguments.chars().count())
+                .sum::<usize>();
+        let (input, output, estimate) = match completion.usage {
+            Some(Usage {
+                input,
+                output,
+                cached_input: _,
+            }) => (input, output, false),
+            None => (
+                (chars / CHARS_PER_TOKEN) as u32,
+                (written / CHARS_PER_TOKEN) as u32,
+                true,
+            ),
+        };
+        let share = |part: usize| -> u32 {
+            if chars == 0 {
+                return 0;
+            }
+            ((input as u64 * part as u64) / chars as u64) as u32
+        };
+        let text_chars = completion.text.chars().count();
+        let text = if written == 0 {
+            0
+        } else {
+            ((output as u64 * text_chars as u64) / written as u64) as u32
+        };
+        self.usage.push(CallUsage {
+            at: self.now_ms,
+            input,
+            output,
+            parts: UsageTokens {
+                system: share(parts.system),
+                tools: share(parts.tools),
+                user: share(parts.user),
+                assistant: share(parts.assistant),
+                tool_results: share(parts.tool_results),
+            },
+            text,
+            calls: output - text,
+            estimated: estimate,
+        });
+    }
+
     /// Where the conversation splits when it is compacted: the message the tail starts at.
     ///
     /// The tail begins with a user message, so no tool result is left without the call it
@@ -5234,7 +5742,8 @@ pub fn subagents_to_json(subagents: &[Subagent]) -> Vec<Value> {
                 "history": history_to_json(&sub.agent.history),
                 "cwd": sub.agent.cwd,
                 "compacted": sub.agent.compacted,
-                "scopes": sub.agent.scopes.to_json()
+                "scopes": sub.agent.scopes.to_json(),
+                "usage": sub.agent.usage.to_json()
             })
         })
         .collect()
@@ -5257,6 +5766,7 @@ pub fn subagents_from_json(value: Option<&Value>) -> Vec<Subagent> {
             agent.cwd = row["cwd"].as_str().unwrap_or("/").to_owned();
             agent.compacted = row["compacted"].as_str().map(str::to_owned);
             agent.scopes = Loaded::from_json(row.get("scopes"));
+            agent.usage = UsageLog::from_json(row.get("usage"));
             if let Some(turns) = row["turns"].as_array() {
                 agent.turns = turns_from_json(turns);
             }
@@ -5866,6 +6376,8 @@ mod tests {
 
     /// Start a script the way the model does.
     fn start_script(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
+        // A chat that runs a script is one whose tools the script may call.
+        agent.callers = Callers::every(CallerMode::Both);
         {
             let mut session: Option<&mut dyn SessionAccess> = Some(&mut *fake);
             agent.begin_tool(
@@ -5929,6 +6441,7 @@ mod tests {
     #[test]
     fn a_script_call_that_hangs_times_out() {
         let mut agent = Agent::new();
+        agent.callers = Callers::every(CallerMode::Both);
         agent
             .scopes
             .load(scopes::find("host-files").expect("the file scope"));
@@ -6383,6 +6896,7 @@ mod tests {
     #[test]
     fn plan_mode_offers_run_script_and_refuses_what_it_would_change() {
         let mut agent = Agent::new();
+        agent.callers = Callers::every(CallerMode::Both);
         agent.plan = true;
         assert!(agent.offers_tool(TOOL_RUN_SCRIPT));
         when_offered(&mut agent, TOOL_REMOTE_WRITE);
@@ -6401,13 +6915,13 @@ mod tests {
     }
 
     #[test]
-    fn script_mode_refuses_a_tool_call_that_does_not_come_from_a_script() {
+    fn a_script_only_tool_is_refused_on_the_turn() {
         let mut agent = Agent::new();
-        agent.script_mode = true;
+        agent.callers = Callers::every(CallerMode::Script);
         agent.now_ms = 1_700_000_000_000;
         let mut fake = FakeSession::default();
         let output = run_tool(&mut agent, &mut fake, TOOL_CURRENT_TIME, "{}");
-        assert!(output.contains("script mode"), "{output}");
+        assert!(output.contains("run_script"), "{output}");
         assert!(matches!(
             agent.turns.last(),
             Some(Turn::Tool { failed: true, .. })
@@ -6415,7 +6929,7 @@ mod tests {
 
         // The same tool runs when the script asks for it.
         let mut scripted = Agent::new();
-        scripted.script_mode = true;
+        scripted.callers = Callers::every(CallerMode::Script);
         let mut fake = FakeSession::default();
         start_script(
             &mut scripted,
@@ -6829,6 +7343,7 @@ mod tests {
                     arguments: r#"{"command":"pwd"}"#.to_owned(),
                 }],
                 stop_reason: None,
+                usage: None,
             }),
             &mut session,
         );

@@ -4,6 +4,18 @@
 
 ### Added
 
+- Token usage for every AI chat, counted as the requests are answered rather than read back from
+  the transcript, so compacting a chat keeps its cost. **Usage** on the chat header opens the
+  totals, what the input carried (system prompt, tool definitions, your prompts, earlier answers,
+  tool results), what the answer spent on text and on tool calls, and a line per request. The
+  numbers come from the provider; when it reports none they are estimated from the text.
+- Tool callers: each tool is called as a tool of the turn, from inside `run_script`, or both, set
+  per tool in Options → AI agent under the default. The default replaces the script-mode switch:
+  **Auto** keeps tools on the turn while their schemas stay small and moves them into the script
+  API once they would cost more than it, and a host can override the app-wide choice. An existing
+  script-mode setting is read as a default of its own, so nothing changes on upgrade.
+- A script's tool calls now run several at a time (up to eight), on commands of their own, so a
+  program that fires a batch at once really does. Prompts a call has to ask for stay in one queue.
 - Ask once or for the whole session: the card that asks about a script running past its default
   20 seconds now offers **Always allow this session** beside **Allow once** and **Deny**, so a chat
   that keeps running long builds stops asking. The answer lasts until the session ends, and the

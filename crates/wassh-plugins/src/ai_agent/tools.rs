@@ -41,6 +41,7 @@ use super::protocol::{
 };
 
 use super::agent::shell_quote;
+use super::callers::Callers;
 use super::permissions::Permissions;
 use super::scopes::{Loaded, scope_of};
 use super::script;
@@ -955,62 +956,69 @@ pub fn plan_safe(name: &str) -> bool {
     is_read_only(name) || name == TOOL_RUN_SCRIPT
 }
 
-/// Every tool schema this conversation sends.
+/// The script API, one line per tool a script may call.
 ///
-/// Tools of scopes that are not loaded are left out on purpose — that is what keeps the
-/// prompt from carrying the whole toolset whether or not it is needed. `plan` narrows it
-/// further to what only reads; `script` replaces the scopes' schemas with `run_script` alone,
-/// whose API the system prompt spells out a line per tool instead of a schema.
-pub fn specs(
+/// A line is all the prompt needs: the argument names and types, what each argument is for,
+/// and what the tool is for. That is a fraction of what the same tools' schemas cost, and it
+/// is why a request can carry the whole toolset in its script API.
+pub fn catalog(
     permissions: &Permissions,
     loaded: &Loaded,
     subagents: bool,
     plan: bool,
-    script: bool,
-) -> Vec<Value> {
-    if script {
-        return available(permissions, loaded, subagents, plan)
-            .filter(|spec| spec.name == TOOL_RUN_SCRIPT)
-            .map(|spec| spec.schema())
-            .collect();
-    }
-    let mut specs: Vec<Value> = SCOPE_TOOLS.iter().map(|spec| spec.schema()).collect();
-    specs.extend(available(permissions, loaded, subagents, plan).map(|spec| spec.schema()));
-    // Tools a pane offers are listed as they are: their calls run commands, which the
-    // approval rules already gate.
-    for scope in loaded.scopes() {
-        let Some(pane) = scope.pane else {
-            continue;
-        };
-        specs.extend(
-            crate::plugin::tools_of(pane)
-                .iter()
-                .filter(|tool| permissions.offers(tool.name))
-                .filter(|tool| !plan || tool.read_only)
-                .map(PluginTool::schema),
-        );
-    }
-    specs
+    callers: &Callers,
+) -> String {
+    offered(permissions, loaded, subagents, plan, callers).catalog
 }
 
-/// The script API, one line per tool a script may call.
-///
-/// A line is all the prompt needs: the argument names and types, and what the tool is for.
-/// That is a fraction of what the same tools' schemas cost, and it is why script mode can
-/// carry the whole toolset in a request.
-pub fn catalog(permissions: &Permissions, loaded: &Loaded, subagents: bool, plan: bool) -> String {
-    let mut lines: Vec<String> = available(permissions, loaded, subagents, plan)
+/// What one request carries: schemas for the tools of the turn, lines for the script API.
+pub struct Offered {
+    /// Schemas of the tools the turn may call.
+    pub specs: Vec<Value>,
+    /// The script API, empty when no tool is called from a script.
+    pub catalog: String,
+}
+
+/// Build both halves of a request from one caller policy.
+pub fn offered(
+    permissions: &Permissions,
+    loaded: &Loaded,
+    subagents: bool,
+    plan: bool,
+    callers: &Callers,
+) -> Offered {
+    // The policy decides each tool on its own or by the chat's default.
+    let mut specs = Vec::new();
+    let mut lines = Vec::new();
+    let mut offer = |name: &str, schema: Value, line: String, specs: &mut Vec<Value>| {
+        let caller = callers.caller(name);
+        if caller.direct() {
+            specs.push(schema);
+        }
+        if caller.script() {
+            lines.push(line);
+        }
+    };
+    for spec in SCOPE_TOOLS
+        .iter()
+        .chain(available(permissions, loaded, subagents, plan))
         .filter(|spec| spec.name != TOOL_RUN_SCRIPT)
-        .map(|spec| {
-            let (properties, required) = parameters(spec.name);
+    {
+        let (properties, required) = parameters(spec.name);
+        offer(
+            spec.name,
+            spec.schema(),
             format!(
                 "- {}({}) — {}",
                 spec.name,
                 signature(&properties, &required),
                 first_sentence(spec.description)
-            )
-        })
-        .collect();
+            ),
+            &mut specs,
+        );
+    }
+    // Tools a pane offers are listed as they are: their calls run commands, which the
+    // approval rules already gate.
     for scope in loaded.scopes() {
         let Some(pane) = scope.pane else {
             continue;
@@ -1019,18 +1027,36 @@ pub fn catalog(permissions: &Permissions, loaded: &Loaded, subagents: bool, plan
             if !permissions.offers(tool.name) || (plan && !tool.read_only) {
                 continue;
             }
-            lines.push(format!(
-                "- {}({}) — {}",
+            offer(
                 tool.name,
-                signature(&tool.parameters["properties"], &tool.parameters["required"]),
-                first_sentence(tool.description)
-            ));
+                tool.schema(),
+                format!(
+                    "- {}({}) — {}",
+                    tool.name,
+                    signature(&tool.parameters["properties"], &tool.parameters["required"]),
+                    first_sentence(tool.description)
+                ),
+                &mut specs,
+            );
         }
     }
-    lines.join("\n")
+    let catalog = lines.join("\n");
+    // `run_script` is the way in, never something a script itself calls. It keeps the place
+    // the tools of the turn would give it: after the scope tools, before the rest.
+    if !catalog.is_empty()
+        && let Some(runner) = TOOL_SPECS.iter().find(|spec| spec.name == TOOL_RUN_SCRIPT)
+    {
+        specs.insert(SCOPE_TOOLS.len().min(specs.len()), runner.schema());
+    }
+    Offered { specs, catalog }
 }
 
-/// A tool's arguments as `name: type` pairs, `?` marking the optional ones.
+/// A tool's arguments as `name: type` pairs, `?` marking the optional ones, each followed by
+/// what the parameter is for.
+///
+/// The description carries what a signature cannot: defaults, caps and the values an argument
+/// takes. A script is written blind, so a dropped description is a call the model has to
+/// guess at — and a guess costs a whole round.
 fn signature(properties: &Value, required: &Value) -> String {
     let Some(map) = properties.as_object() else {
         return String::new();
@@ -1042,14 +1068,24 @@ fn signature(properties: &Value, required: &Value) -> String {
     map.iter()
         .map(|(key, schema)| {
             let ty = type_label(schema);
-            if required.contains(&key.as_str()) {
+            let name = if required.contains(&key.as_str()) {
                 format!("{key}: {ty}")
             } else {
                 format!("{key}?: {ty}")
+            };
+            match schema["description"].as_str().map(one_line) {
+                Some(note) if !note.is_empty() => format!("{name} — {note}"),
+                _ => name,
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A description on one line, without its closing period.
+fn one_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.trim_end_matches('.').to_owned()
 }
 
 /// The type a schema declares, spelled the way a catalog line reads best.
@@ -2421,6 +2457,7 @@ pub fn keys_sequence(keys: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_agent::callers::CallerMode;
     use crate::ai_agent::permissions::{
         GROUP_KNOWLEDGE_BASE, GROUP_LOCAL_FS, GROUP_REMOTE_FS, GROUP_TERMINAL, GROUP_WEB_ACCESS,
         Permission, group_key, method_key,
@@ -2484,9 +2521,39 @@ mod tests {
             .collect()
     }
 
+    /// The schemas a request carries when every tool is called the same way.
+    fn specs(
+        permissions: &Permissions,
+        loaded: &Loaded,
+        subagents: bool,
+        plan: bool,
+        script: bool,
+    ) -> Vec<Value> {
+        let mode = if script {
+            CallerMode::Script
+        } else {
+            CallerMode::Direct
+        };
+        offered(
+            permissions,
+            loaded,
+            subagents,
+            plan,
+            &Callers::every(mode),
+        )
+        .specs
+    }
+
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), true, false, false);
+        let schemas = offered(
+            &everything_allowed(),
+            &everything_loaded(),
+            true,
+            false,
+            &Callers::every(CallerMode::Both),
+        )
+        .specs;
         assert_eq!(
             schemas.len(),
             TOOL_SPECS.len() + crate::plugin::tools().count() + SCOPE_TOOLS.len()
@@ -2525,7 +2592,14 @@ mod tests {
 
     #[test]
     fn a_fresh_conversation_carries_the_scope_tools_and_the_root_only() {
-        let schemas = specs(&everything_allowed(), &Loaded::new(), true, false, false);
+        let schemas = offered(
+            &everything_allowed(),
+            &Loaded::new(),
+            true,
+            false,
+            &Callers::every(CallerMode::Both),
+        )
+        .specs;
         assert_eq!(
             names(&schemas),
             [
@@ -2566,18 +2640,37 @@ mod tests {
 
     #[test]
     fn the_catalog_carries_one_line_per_tool_a_script_may_call() {
-        let listed = catalog(&everything_allowed(), &everything_loaded(), true, false);
+        let scripted = Callers::every(CallerMode::Script);
+        let listed = catalog(&everything_allowed(), &everything_loaded(), true, false, &scripted);
         assert!(
-            listed.contains("- run_command(command: string, host?: string)"),
+            listed.contains("- run_command(command: string — "),
             "{listed}"
         );
+        assert!(listed.contains("host?: string — "), "{listed}");
         assert!(listed.contains("- dev_grep_search("), "{listed}");
         assert!(listed.contains("- docker_containers()"), "{listed}");
         assert!(!listed.contains("- run_script("), "{listed}");
         // Plan mode leaves out what changes something.
-        let planned = catalog(&everything_allowed(), &everything_loaded(), true, true);
+        let planned =
+            catalog(&everything_allowed(), &everything_loaded(), true, true, &scripted);
         assert!(!planned.contains("- remote_fs_write_file("), "{planned}");
         assert!(planned.contains("- dev_grep_search("), "{planned}");
+    }
+
+    #[test]
+    fn a_catalog_line_keeps_what_a_parameter_is_for() {
+        // A script is written blind, so the defaults and values a signature cannot carry
+        // have to stay in the line.
+        let scripted = Callers::every(CallerMode::Script);
+        let listed = catalog(&everything_allowed(), &everything_loaded(), true, false, &scripted);
+        assert!(
+            listed.contains("maxChars?: number — How much text to return (default 32000"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("encoding?: string — text (default) or base64"),
+            "{listed}"
+        );
     }
 
     #[test]
