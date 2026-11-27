@@ -41,6 +41,7 @@ use super::protocol::{
 
 use super::agent::shell_quote;
 use super::permissions::Permissions;
+use super::sandbox::{self, Confinement};
 use super::scopes::{self, Loaded, SCOPES, scope_of};
 use super::script;
 use crate::plugin::PluginTool;
@@ -2343,6 +2344,17 @@ fn local_grep(args: &Value) -> ToolResult {
 
 /// Run `local_fs_run_command` on this machine, killing it at the timeout.
 pub fn run_local_command(args: &Value) -> ToolResult {
+    run_local_command_in(args, None)
+}
+
+/// The same, with what the command may write confined to `paths` when the kernel can enforce
+/// it. Call it on the thread that runs the command: a ruleset holds the thread it is applied
+/// on and everything that thread starts.
+pub fn run_confined_local_command(args: &Value, paths: &[PathBuf]) -> ToolResult {
+    run_local_command_in(args, Some(paths))
+}
+
+fn run_local_command_in(args: &Value, confine: Option<&[PathBuf]>) -> ToolResult {
     let command = args["command"]
         .as_str()
         .map(str::trim)
@@ -2354,6 +2366,7 @@ pub fn run_local_command(args: &Value) -> ToolResult {
         .as_u64()
         .unwrap_or(DEV_COMMAND_TIMEOUT_DEFAULT_MS)
         .clamp(DEV_COMMAND_TIMEOUT_MIN_MS, MAX_DEV_COMMAND_TIMEOUT_MS);
+    let confinement = confine.map(sandbox::confine);
     let mut child = shell_command(&command)
         .current_dir(&cwd)
         .stdin(Stdio::null())
@@ -2390,6 +2403,9 @@ pub fn run_local_command(args: &Value) -> ToolResult {
     }
     if body.trim().is_empty() {
         body = "(no output)".to_owned();
+    }
+    if let Some(Confinement::None(why)) = confinement {
+        body.push_str(&format!("\n[not confined: {why}]"));
     }
     let code = status
         .code()

@@ -4,6 +4,14 @@
 
 ### Added
 
+- A command the chat runs on this computer is confined to the working tree. Being allowed to
+  run used to mean being allowed to write anywhere, so an approved `cargo build` could still
+  empty `~/.config`; on Linux the kernel now holds the command to the working tree, the chat's
+  scratch directory and the temporary directories, and a write anywhere else fails with EACCES
+  where the command and the model can see it. Reads stay open — the policy already refuses the
+  secrets — because a build reads `/usr`, `/etc` and its whole dependency tree. Where the
+  kernel has no Landlock the result says the command ran unconfined instead of claiming a
+  guarantee it cannot keep.
 - **Usage** also says which tools the chat actually called, how many of the schemas it
   carried were never called, and lists the busiest tools, so a chat's tool cost can be read
   rather than guessed at.

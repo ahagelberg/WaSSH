@@ -13,6 +13,7 @@ mod protocol;
 mod providers;
 mod rag;
 mod rules;
+mod sandbox;
 mod scopes;
 mod script;
 mod settings_ui;

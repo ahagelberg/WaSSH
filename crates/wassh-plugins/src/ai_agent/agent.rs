@@ -36,6 +36,7 @@ use super::protocol::{
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
 use super::rules::{ApprovalScope, RuleDecision, approval_scopes};
+use super::sandbox;
 use super::scopes::{self, Loaded};
 use super::script::{self, ScriptEvent, ScriptReply};
 use super::tools::{self, ToolResult};
@@ -3903,7 +3904,12 @@ task needs to load it, or call it from inside run_script with `await tools.{name
             }
             TOOL_LOCAL_RUN => {
                 let arguments = arguments.clone();
-                self.spawn_worker(call, turn, move || tools::run_local_command(&arguments));
+                let roots = vec![self.cwd.clone(), self.scratch.clone()];
+                self.spawn_worker(call, turn, move || {
+                    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+                    let paths = sandbox::writable(&roots);
+                    tools::run_confined_local_command(&arguments, &paths)
+                });
             }
             TOOL_WEB_FETCH => {
                 let url = arguments["url"].as_str().unwrap_or_default().to_owned();
