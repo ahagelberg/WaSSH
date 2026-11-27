@@ -959,6 +959,12 @@ pub const TOOL_IDLE_TURNS: u64 = 4;
 
 /// The token budget of the judge's answer, which is one word.
 const JUDGE_MAX_TOKENS: u32 = 8;
+
+/// What the model is told when a run wrote files and nothing checked them.
+const VERIFICATION_NOTICE: &str = "Nothing checked what you just changed: files were written \
+     and no build, test or linter ran. Run the check this project uses now — `cargo check`, \
+     `npm test`, a linter — or say plainly why none applies, and only then call the work done.";
+
 /// Most tools one search loads: the schemas they cost are the trade for finding them.
 const SEARCH_RESULTS: usize = 6;
 
@@ -995,6 +1001,12 @@ pub struct Agent {
     pub judge_config: Option<judge::Config>,
     /// What the judge has answered this session, by [`judge::key`].
     judged: BTreeMap<String, bool>,
+    /// Whether this run wrote a file, and whether anything has checked it since.
+    wrote: bool,
+    /// Whether this run ran a build, a test or a linter.
+    checked: bool,
+    /// Whether this run was already asked to check what it wrote.
+    asked_to_check: bool,
     /// Set once the user let scripts run past their default budget for the rest of the
     /// session, so a longer run is not asked about again.
     pub allow_long_scripts: bool,
@@ -1240,6 +1252,9 @@ impl Agent {
             return false;
         }
         self.error = None;
+        self.wrote = false;
+        self.checked = false;
+        self.asked_to_check = false;
         // A new task step is the moment to let go of what the last ones stopped using.
         self.user_turns += 1;
         self.release_idle_tools();
@@ -2752,6 +2767,18 @@ maxChars (cap {}) if the rest matters.]",
                 self.queue = completion.tool_calls.into_iter().collect();
                 if let Some(next) = self.queue.pop_front() {
                     self.begin_tool(next, session);
+                    return;
+                }
+                // The run ended: work that nothing looked at gets one question about it, so
+                // "done" is either checked or explained.
+                if self.needs_check() {
+                    self.asked_to_check = true;
+                    self.turns.push(Turn::Notice(VERIFICATION_NOTICE.to_owned()));
+                    self.history.push(ApiMessage::User {
+                        content: VERIFICATION_NOTICE.to_owned(),
+                        images: Vec::new(),
+                    });
+                    self.needs_reply = true;
                 }
             }
         }
@@ -3042,19 +3069,23 @@ released again once the conversation stops using them.",
         }
     }
 
-    /// What to do with the paths `call` names, when it names any.
-    fn path_verdict(&self, call: &ApiToolCall) -> Option<Verdict> {
+    /// What to do with the paths `call` names, when it names any. Notes that the run wrote
+    /// something, so a run that changes files owes the next check an answer.
+    fn path_verdict(&mut self, call: &ApiToolCall) -> Option<Verdict> {
         let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        let touched = policy::tool_paths(&call.name, &arguments);
+        self.wrote |= touched.iter().any(|(_, touch, _)| *touch == policy::Touch::Write);
         let root = tools::local_root();
         let home = root.to_string_lossy().into_owned();
         let policy = self.policy(&home);
         let mut worst: Option<Verdict> = None;
-        for (path, touch, base) in policy::tool_paths(&call.name, &arguments) {
+        for (path, touch, base) in touched {
+            let writes = touch == policy::Touch::Write;
             let base = match base {
                 policy::Base::Host => self.cwd.as_str(),
                 policy::Base::ThisComputer => "",
             };
-            let verdict = policy.path(path, base, touch == policy::Touch::Write);
+            let verdict = policy.path(path, base, writes);
             match verdict.decision {
                 RuleDecision::Deny => return Some(verdict),
                 RuleDecision::Ask => worst = Some(verdict),
@@ -3087,6 +3118,11 @@ released again once the conversation stops using them.",
             };
         }
         verdict
+    }
+
+    /// Whether this run wrote files that nothing has checked, and has not been asked yet.
+    fn needs_check(&self) -> bool {
+        self.wrote && !self.checked && !self.asked_to_check
     }
 
     /// The cache key of `action` for this conversation.
@@ -3437,6 +3473,9 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                     .as_str()
                     .filter(|password| !password.is_empty())
                     .map(str::to_owned);
+                if policy::is_check(&command) {
+                    self.checked = true;
+                }
                 match self.command_verdict(&command) {
                     Verdict {
                         decision: RuleDecision::Allow,
@@ -8529,6 +8568,64 @@ mod tests {
             name: TOOL_RUN_COMMAND.to_owned(),
             arguments: String::new(),
         }, 0));
+    }
+
+    #[test]
+    fn a_run_that_wrote_files_and_checked_nothing_is_asked_to_check() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        let mut fake = FakeSession::default();
+        when_offered(&mut agent, TOOL_REMOTE_WRITE);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_REMOTE_WRITE.to_owned(),
+                arguments: r#"{"path":"/srv/app/x.txt","content":"x"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(agent.wrote, "the write was not noted");
+        agent.turns.push(Turn::Assistant {
+            text: "done".to_owned(),
+            stopped: false,
+        });
+        agent.finish_reply(
+            agent.turns.len() - 1,
+            Ok(Completion {
+                text: "done".to_owned(),
+                ..Completion::default()
+            }),
+            &mut session,
+        );
+        assert!(agent.asked_to_check, "the run was not asked to check");
+        assert!(agent.needs_reply, "no reply was asked for");
+        assert!(
+            matches!(agent.turns.last(), Some(Turn::Notice(text)) if text.contains("Nothing checked")),
+            "{:?}",
+            agent.turns.last()
+        );
+        assert!(matches!(
+            agent.history.last(),
+            Some(ApiMessage::User { content, .. }) if content.contains("Nothing checked")
+        ));
+    }
+
+    #[test]
+    fn a_run_that_checked_its_work_is_not_asked() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        agent.wrote = true;
+        agent.checked = true;
+        assert!(!agent.needs_check());
+        // Asked once is enough, whatever the answer was.
+        agent.checked = false;
+        agent.asked_to_check = true;
+        assert!(!agent.needs_check());
+        // A run that wrote nothing owes nothing.
+        agent.asked_to_check = false;
+        agent.wrote = false;
+        assert!(!agent.needs_check());
     }
 
     #[test]

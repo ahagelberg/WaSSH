@@ -4,6 +4,11 @@
 
 ### Added
 
+- A run that writes files and checks nothing is asked to check them. "Done" used to be
+  accepted as long as the model said it: a chat could edit five files, never build them, and
+  stop. When a run has written through a file tool and no build, test or linter ran in it, the
+  agent adds one notice and asks for the check — or for a plain reason none applies — once per
+  run, so a run that changed nothing is never asked and a run cannot loop on it.
 - A command no rule covers is put to the chat's own model before the user, so the common case
   of "nothing matches this pattern" stops costing an interruption. **Let the model vet uncommon
   commands** on the host turns it on; the model is told the command, the host and the directory

@@ -411,6 +411,56 @@ fn expand(path: &str, home: &str) -> String {
     }
 }
 
+/// Commands that check work rather than change it, as the harness recognises them.
+const CHECK_BINS: &[&str] = &[
+    "rustc", "tsc", "eslint", "pytest", "jest", "vitest", "mocha", "mypy", "pyright", "make",
+    "cmake", "ctest", "ninja", "mvn", "gradle", "xcodebuild", "biome", "ruff", "deno", "just",
+];
+
+/// Tools whose second word names the job, and the jobs that check.
+const CHECK_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("cargo", &["check", "build", "test", "clippy", "nextest"]),
+    ("go", &["build", "test", "vet"]),
+    ("npm", &["test", "ci", "lint", "run"]),
+    ("pnpm", &["test", "lint", "build", "run"]),
+    ("yarn", &["test", "lint", "build", "run"]),
+    ("bun", &["test", "build", "run"]),
+    ("dotnet", &["build", "test"]),
+    ("python", &["-m"]),
+    ("python3", &["-m"]),
+    ("swift", &["build", "test"]),
+];
+
+/// Wrappers that name the real command in an argument: `npx tsc`, `python3 -m pytest`.
+const RUNNERS: &[&str] = &["npx", "python", "python3", "uv", "poetry", "pnpm", "yarn", "bun"];
+
+/// Whether `command` runs a build, a test or a linter, so something looked at the work.
+pub fn is_check(command: &str) -> bool {
+    let Ok(segments) = parse(command) else {
+        return false;
+    };
+    segments.iter().any(|segment| {
+        let Some(first) = segment.words.first() else {
+            return false;
+        };
+        let binary = first.rsplit('/').next().unwrap_or(first);
+        if CHECK_BINS.contains(&binary) {
+            return true;
+        }
+        if let Some((_, jobs)) = CHECK_SUBCOMMANDS.iter().find(|(name, _)| *name == binary)
+            && segment.words[1..]
+                .iter()
+                .any(|word| jobs.contains(&word.as_str()))
+        {
+            return true;
+        }
+        RUNNERS.contains(&binary)
+            && segment.words[1..]
+                .iter()
+                .any(|word| CHECK_BINS.contains(&word.rsplit('/').next().unwrap_or(word)))
+    })
+}
+
 /// Whether a segment is a command that cannot change anything.
 fn is_safe(segment: &Segment) -> bool {
     if segment.redirect {
@@ -801,6 +851,31 @@ mod tests {
             p.command("git status && curl example.com").decision,
             RuleDecision::Ask
         );
+    }
+
+    #[test]
+    fn a_check_is_told_apart_from_a_change() {
+        for command in [
+            "cargo check -p wassh-plugins",
+            "cargo test --lib && cargo clippy",
+            "npm test",
+            "python3 -m pytest -q",
+            "make -j2",
+            "go vet ./...",
+            "npx tsc --noEmit",
+        ] {
+            assert!(is_check(command), "{command}");
+        }
+        for command in [
+            "cargo fmt",
+            "echo cargo test",
+            "rm -rf target",
+            "git status",
+            "npm install",
+            "",
+        ] {
+            assert!(!is_check(command), "{command}");
+        }
     }
 
     #[test]
