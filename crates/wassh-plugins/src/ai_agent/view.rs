@@ -1561,7 +1561,9 @@ the commands. Callable now:",
         let Some(spawn) = self.agent.take_spawn_request() else {
             return;
         };
-        let index = self.agent.begin_subagent(&spawn.title, &spawn.prompt);
+        let index = self
+            .agent
+            .begin_subagent(&spawn.title, &spawn.prompt, &spawn.tools);
         match self.request_for(Some(index), settings, host, environment) {
             Some(request) => self
                 .agent
@@ -3016,7 +3018,7 @@ the commands. Callable now:",
         let prompt = MAP_TASK
             .replace("{root}", &root)
             .replace("{files}", &super::map::MAX_MAPPED_FILES.to_string());
-        let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt);
+        let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt, &[]);
         match self.request_for(Some(index), settings, host, environment) {
             Some(request) => {
                 if let Some(sub) = self.agent.subagents.get_mut(index) {
@@ -9648,7 +9650,7 @@ mod tests {
             1,
             "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
         );
-        let index = plugin.agent.begin_subagent("map the project", "map it");
+        let index = plugin.agent.begin_subagent("map the project", "map it", &[]);
         plugin.agent.subagents[index]
             .agent
             .turns
@@ -9687,7 +9689,7 @@ mod tests {
         plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_SCAN], 0);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let index = plugin.agent.begin_subagent("map the project", "map it");
+        let index = plugin.agent.begin_subagent("map the project", "map it", &[]);
         {
             let sub = &mut plugin.agent.subagents[index];
             sub.agent.turns.push(Turn::Tool {
@@ -9880,7 +9882,7 @@ mod tests {
             1,
             "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
         );
-        let index = plugin.agent.begin_subagent("map the project", "map it");
+        let index = plugin.agent.begin_subagent("map the project", "map it", &[]);
         plugin.agent.subagents[index]
             .agent
             .turns
@@ -9929,7 +9931,7 @@ mod tests {
             1,
             "10 5 /srv/app/main.rs\n__wassh_symbols__\n",
         );
-        let index = plugin.agent.begin_subagent("map the project", "map it");
+        let index = plugin.agent.begin_subagent("map the project", "map it", &[]);
         plugin.agent.subagents[index]
             .agent
             .turns
@@ -10114,7 +10116,6 @@ mod tests {
 
     #[test]
     fn the_map_scope_popup_clears_the_map() {
-        let mut plugin_with_chat = ();
         let mut settings = serde_json::Map::new();
         settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
         let mut plugin = AiAgent::default();
@@ -10266,7 +10267,6 @@ mod tests {
 
     #[test]
     fn the_tools_button_opens_the_loaded_tools_and_dropping_one_keeps_the_menu_open() {
-        let mut plugin_with_chat = ();
         let mut plugin = AiAgent::default();
         plugin.view = ChatView::Chat;
         plugin
@@ -10876,7 +10876,7 @@ mod tests {
         });
         let index = plugin
             .agent
-            .begin_subagent("check the logs", "Find the failing unit.");
+            .begin_subagent("check the logs", "Find the failing unit.", &[]);
         plugin.agent.subagents[index]
             .agent
             .turns
@@ -10979,7 +10979,7 @@ mod tests {
     fn stop_takes_the_main_run_first_and_the_subagents_second() {
         let (mut plugin, _worker) = busy_pane();
         assert_eq!(plugin.action_state(false), ActionState::StopMain);
-        let index = plugin.agent.begin_subagent("check", "do it");
+        let index = plugin.agent.begin_subagent("check", "do it", &[]);
         // A stream still open keeps the sub-agent working after the main run stops.
         let (_sender, events) = std::sync::mpsc::channel();
         plugin.agent.subagents[index]
@@ -11013,7 +11013,7 @@ mod tests {
         });
         let index = plugin
             .agent
-            .begin_subagent("check the logs", "Find the failing unit.");
+            .begin_subagent("check the logs", "Find the failing unit.", &[]);
         plugin.agent.subagents[index]
             .agent
             .turns
@@ -11044,7 +11044,7 @@ mod tests {
             text: "delegate".to_owned(),
             meta: UserMeta::default(),
         });
-        let index = plugin.agent.begin_subagent("check", "do it");
+        let index = plugin.agent.begin_subagent("check", "do it", &[]);
         let (_sender, events) = std::sync::mpsc::channel();
         plugin.agent.subagents[index]
             .agent
@@ -11065,7 +11065,7 @@ mod tests {
     #[test]
     fn the_header_counts_the_subagents_of_the_open_chat() {
         let (mut plugin, _worker) = busy_pane();
-        let index = plugin.agent.begin_subagent("check", "do it");
+        let index = plugin.agent.begin_subagent("check", "do it", &[]);
         let (_sender, events) = std::sync::mpsc::channel();
         plugin.agent.subagents[index]
             .agent

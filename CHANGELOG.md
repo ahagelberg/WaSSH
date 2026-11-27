@@ -4,6 +4,8 @@
 
 ### Added
 
+- A sub-agent can be given just the tools its task needs and stops after twelve rounds, so a
+  delegated search cannot spend the chat's budget on a hunt nobody asked for.
 - The few tools with parameters that are easy to get wrong show a real call as an example,
   and the standing guidance repeats itself less.
 - A read that stops early says where it stopped and takes an offset to continue, so a large

@@ -725,6 +725,8 @@ pub struct SpawnRequest {
     pub title: String,
     /// Task it is given.
     pub prompt: String,
+    /// Tools the task needs, by name; empty means the conversation's own loaded set.
+    pub tools: Vec<&'static str>,
 }
 
 /// Characters one request spends, by what carries them.
@@ -927,6 +929,11 @@ const CLEARED_MIN_CHARS: usize = 400;
 /// Clearing rewrites messages the provider has already cached, so it waits until the saving is
 /// worth more than the cache it costs.
 pub const TRANSCRIPT_CLEAR_SHARE: usize = 25;
+/// Rounds a sub-agent may take before it is stopped and reports what it has.
+///
+/// A delegated task is a bounded piece of work; a sub-agent that keeps hunting after a
+/// dozen rounds is spending the parent's budget without being asked to.
+pub const MAX_SUBAGENT_TURNS: usize = 12;
 /// User turns a loaded tool may go unused before it is released.
 pub const TOOL_IDLE_TURNS: u64 = 4;
 /// Most tools one search loads: the schemas they cost are the trade for finding them.
@@ -1323,6 +1330,21 @@ impl Agent {
         let mut progressed = false;
         for index in 0..self.subagents.len() {
             if !self.subagents[index].running() {
+                continue;
+            }
+            // A delegated task is bounded: past its rounds the sub-agent reports what it has
+            // rather than spending the conversation's budget on a hunt nobody asked for.
+            if self.subagents[index].agent.assistant_turns() >= MAX_SUBAGENT_TURNS
+                && self.subagents[index].agent.phase.is_none()
+            {
+                let agent = &mut self.subagents[index].agent;
+                agent.error = Some(format!(
+                    "The sub-agent used its {MAX_SUBAGENT_TURNS} rounds without finishing."
+                ));
+                agent.needs_reply = false;
+                agent.stop();
+                self.finish_subagent(index);
+                progressed = true;
                 continue;
             }
             if self.subagents[index].agent.poll(session) {
@@ -3974,11 +3996,22 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                     .filter(|title| !title.is_empty())
                     .map(str::to_owned)
                     .unwrap_or_else(|| subagent_title(&prompt));
+                // A task that says what it needs gets exactly that, so a search sub-agent is
+                // not handed the chat's whole loadout.
+                let tools: Vec<&'static str> = arguments["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|name| name.as_str())
+                    .filter_map(tools::static_name)
+                    .filter(|name| self.offers_tool(name))
+                    .collect();
                 self.spawn_request = Some(SpawnRequest {
                     call,
                     turn,
                     title,
                     prompt,
+                    tools,
                 });
             }
             TOOL_WAIT_SUBAGENT => {
@@ -4059,11 +4092,15 @@ task needs to load it, or call it from inside run_script with `await tools.{name
     ///
     /// It starts with this conversation's working directory, scopes, permissions and rules;
     /// the rules are re-read every frame, so later answers here reach it too.
-    pub fn begin_subagent(&mut self, title: &str, prompt: &str) -> usize {
+    pub fn begin_subagent(&mut self, title: &str, prompt: &str, tools: &[&'static str]) -> usize {
         self.next_subagent += 1;
         let id = format!("{SUBAGENT_ID_PREFIX}-{}", self.next_subagent);
         let mut agent = self.child_agent();
         agent.subagent = true;
+        if !tools.is_empty() {
+            agent.loaded = Loaded::new();
+            agent.loaded.load(tools.iter().copied(), 0);
+        }
         agent.keys = CommandKeys::subagent(&id);
         agent.push_user(prompt, UserMeta::default());
         self.subagents.push(Subagent {
@@ -5091,6 +5128,14 @@ task needs to load it, or call it from inside run_script with `await tools.{name
         chars
     }
 
+    /// Rounds the model has answered in this conversation.
+    fn assistant_turns(&self) -> usize {
+        self.history
+            .iter()
+            .filter(|message| matches!(message, ApiMessage::Assistant { .. }))
+            .count()
+    }
+
     /// Characters the request about to be sent spends, by what carries them.
     ///
     /// Kept until the answer arrives: the transcript grows while the request is out, and the
@@ -5997,7 +6042,7 @@ mod tests {
     #[test]
     fn a_subagent_writes_its_temporary_files_beside_its_parent() {
         let mut agent = Agent::new();
-        let index = agent.begin_subagent("check the log", "look at it");
+        let index = agent.begin_subagent("check the log", "look at it", &[]);
         let child = &agent.subagents[index].agent;
         assert_eq!(child.scratch, agent.scratch);
     }
@@ -6764,7 +6809,7 @@ mod tests {
                 ..
             })
         ));
-        let index = agent.begin_subagent("fetch logs", "read the logs");
+        let index = agent.begin_subagent("fetch logs", "read the logs", &[]);
         assert!(
             agent.subagents[index].agent.allow_long_scripts,
             "a sub-agent of this session asks again"
@@ -6958,6 +7003,60 @@ mod tests {
         assert!(failed);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].output.contains(PLAN_READ_ONLY), "{}", calls[0].output);
+    }
+
+    #[test]
+    fn a_spawn_can_narrow_the_subagents_toolset() {
+        let mut agent = Agent::new();
+        agent.permissions = Permissions::from_settings(&serde_json::Map::from_iter([(
+            super::super::permissions::group_key(super::super::permissions::GROUP_REMOTE_FS),
+            Value::Bool(true),
+        )]));
+        let mut session: Option<&mut dyn SessionAccess> = None;
+        agent.begin_tool(
+            ApiToolCall {
+                id: "spawn".to_owned(),
+                name: TOOL_SPAWN_SUBAGENT.to_owned(),
+                arguments: serde_json::json!({
+                    "title": "search",
+                    "prompt": "find the TODO markers",
+                    "tools": [TOOL_DEV_GREP, "not_a_tool"]
+                })
+                .to_string(),
+            },
+            &mut session,
+        );
+        let spawn = agent.take_spawn_request().expect("a spawn");
+        assert_eq!(spawn.tools, [TOOL_DEV_GREP]);
+        let index = agent.begin_subagent(&spawn.title, &spawn.prompt, &spawn.tools);
+        let child = &agent.subagents[index].agent;
+        assert!(child.loaded.holds(TOOL_DEV_GREP));
+        assert!(!child.loaded.holds(TOOL_DEV_VIEW), "the set is narrowed, not added to");
+    }
+
+    #[test]
+    fn a_subagent_is_stopped_at_its_round_budget() {
+        let mut agent = Agent::new();
+        let index = agent.begin_subagent("dig", "dig", &[]);
+        for _ in 0..MAX_SUBAGENT_TURNS {
+            agent.subagents[index]
+                .agent
+                .history
+                .push(ApiMessage::Assistant {
+                    content: "looking".to_owned(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                });
+        }
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        assert!(agent.poll(&mut session));
+        assert!(agent.subagents[index].end.is_some(), "it kept running");
+        assert!(
+            agent.turns.iter().any(|turn| matches!(turn, Turn::Notice(_) | Turn::Error(_))),
+            "{:?}",
+            agent.turns
+        );
     }
 
     #[test]
@@ -7780,7 +7879,7 @@ mod tests {
         );
 
         // And a sub-agent works under the same restriction.
-        let index = agent.begin_subagent("look", "read main.rs");
+        let index = agent.begin_subagent("look", "read main.rs", &[]);
         assert!(agent.subagents[index].agent.plan);
         assert!(!agent.subagents[index].agent.offers_tool(TOOL_DEV_EDIT));
     }
@@ -8893,7 +8992,7 @@ Working directory is now /srv/app.
         // The agent cannot build a provider request, so it hands the pane the spawn.
         let spawn = agent.take_spawn_request().expect("a spawn");
         assert_eq!(spawn.title, "check the logs");
-        let index = agent.begin_subagent(&spawn.title, &spawn.prompt);
+        let index = agent.begin_subagent(&spawn.title, &spawn.prompt, &[]);
         let sub = &agent.subagents[index];
         assert!(sub.agent.subagent, "it must not spawn anything of its own");
         assert!(
@@ -8915,7 +9014,7 @@ Working directory is now /srv/app.
     fn spawning_stops_at_the_limit_and_a_subagent_cannot_spawn() {
         let mut agent = Agent::new();
         agent.max_subagents = 1;
-        let first = agent.begin_subagent("one", "first task");
+        let first = agent.begin_subagent("one", "first task", &[]);
         // A stream still open keeps the first one running.
         let (_sender, events) = std::sync::mpsc::channel();
         agent.subagents[first].agent.turns.push(Turn::Assistant {
@@ -8946,7 +9045,7 @@ Working directory is now /srv/app.
     #[test]
     fn waiting_for_a_subagent_answers_with_its_result() {
         let mut agent = Agent::new();
-        let index = agent.begin_subagent("check the logs", "Find the failing unit.");
+        let index = agent.begin_subagent("check the logs", "Find the failing unit.", &[]);
         agent.subagents[index].agent.turns.push(Turn::Assistant {
             text: "api.service is failing".to_owned(),
             stopped: false,
@@ -8980,7 +9079,7 @@ Working directory is now /srv/app.
     #[test]
     fn a_finished_subagent_lands_in_the_transcript_and_the_history() {
         let mut agent = Agent::new();
-        let index = agent.begin_subagent("check the logs", "Find the failing unit.");
+        let index = agent.begin_subagent("check the logs", "Find the failing unit.", &[]);
         let (sender, events) = std::sync::mpsc::channel();
         agent.subagents[index].agent.turns.push(Turn::Assistant {
             text: String::new(),
@@ -9016,7 +9115,7 @@ Working directory is now /srv/app.
     #[test]
     fn a_running_subagent_follows_the_permissions_the_parent_gains() {
         let mut agent = Agent::new();
-        let index = agent.begin_subagent("check", "do it");
+        let index = agent.begin_subagent("check", "do it", &[]);
         // A stream still open keeps it running across the poll.
         let (_sender, events) = std::sync::mpsc::channel();
         agent.subagents[index].agent.turns.push(Turn::Assistant {
