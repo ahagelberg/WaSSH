@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use super::permissions::{Permission, Permissions};
 use super::policy::{self, Policy, Verdict};
+use super::judge;
 use super::map::{EnvMap, SystemFacts};
 use crate::plugin::{RemoteHost, RemoteHosts, RemoteState};
 use super::protocol::{
@@ -33,7 +34,9 @@ use super::protocol::{
     TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
     TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH, TOOL_SEARCH_TOOLS,
 };
-use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
+use super::providers::{
+    CompletionRequest, EmbedConfig, StreamEvent, complete, complete_blocking, embeddings,
+};
 use super::rag;
 use super::rules::{ApprovalScope, RuleDecision, approval_scopes};
 use super::sandbox;
@@ -271,6 +274,17 @@ pub enum Phase {
         scopes: Vec<ApprovalScope>,
         /// Why the policy asked, in one sentence.
         reason: String,
+    },
+    /// A command no rule covers waits for the judge's answer.
+    Judging {
+        /// The call it belongs to.
+        call: ApiToolCall,
+        /// Its transcript line.
+        turn: usize,
+        /// The cache key of what is being judged.
+        key: String,
+        /// The answer, once the worker has one.
+        events: Receiver<bool>,
     },
     /// A capability whose permission is "ask" waits for the user.
     Allowing {
@@ -942,6 +956,9 @@ pub const COMPACTED_SECTIONS_KEPT: usize = 4;
 pub const MAX_SUBAGENT_TURNS: usize = 12;
 /// User turns a loaded tool may go unused before it is released.
 pub const TOOL_IDLE_TURNS: u64 = 4;
+
+/// The token budget of the judge's answer, which is one word.
+const JUDGE_MAX_TOKENS: u32 = 8;
 /// Most tools one search loads: the schemas they cost are the trade for finding them.
 const SEARCH_RESULTS: usize = 6;
 
@@ -972,6 +989,12 @@ pub struct Agent {
     pub session_deny: Vec<String>,
     /// Set once the user allowed every prompt for the rest of this session.
     pub allow_all: bool,
+    /// Whether a command no rule covers is put to the model before the user.
+    pub judge_mode: judge::Mode,
+    /// The model to ask, as the pane knows it; `None` before the first request.
+    pub judge_config: Option<judge::Config>,
+    /// What the judge has answered this session, by [`judge::key`].
+    judged: BTreeMap<String, bool>,
     /// Set once the user let scripts run past their default budget for the rest of the
     /// session, so a longer run is not asked about again.
     pub allow_long_scripts: bool,
@@ -1104,7 +1127,9 @@ impl Agent {
     pub fn busy(&self) -> bool {
         matches!(
             self.phase,
-            Some(Phase::Streaming { .. } | Phase::Running { .. } | Phase::Remote { .. })
+            Some(
+                Phase::Streaming { .. } | Phase::Running { .. } | Phase::Remote { .. } | Phase::Judging { .. }
+            )
         )
     }
 
@@ -1396,6 +1421,12 @@ impl Agent {
             if agent.allow_long_scripts != self.allow_long_scripts {
                 agent.allow_long_scripts = self.allow_long_scripts;
             }
+            if agent.judge_mode != self.judge_mode {
+                agent.judge_mode = self.judge_mode;
+            }
+            if agent.judge_config.is_none() {
+                agent.judge_config = self.judge_config.clone();
+            }
             if agent.permissions != self.permissions {
                 agent.permissions = self.permissions.clone();
             }
@@ -1535,6 +1566,16 @@ impl Agent {
 
     /// Take in whatever this conversation's own worker thread or tool produced.
     fn poll_own(&mut self, session: Session<'_, '_>) -> bool {
+        if let Some(allowed) = self.judging_result() {
+            let Some(Phase::Judging { call, turn, key, .. }) = self.phase.take() else {
+                return false;
+            };
+            self.judged.insert(key, allowed);
+            // The call is dispatched again: what the judge allowed now reads as allowed by
+            // the policy, and what it refused falls through to the card.
+            self.dispatch(call, turn, session);
+            return true;
+        }
         let mut progressed = false;
         match &self.phase {
             Some(Phase::Streaming { turn, .. }) => {
@@ -3031,6 +3072,14 @@ released again once the conversation stops using them.",
         let root = tools::local_root();
         let home = root.to_string_lossy().into_owned();
         let verdict = self.policy(&home).command(command);
+        if verdict.decision == RuleDecision::Ask
+            && self.judged.get(&self.judge_key(command)) == Some(&true)
+        {
+            return Verdict {
+                decision: RuleDecision::Allow,
+                reason: "A judge read this command and allowed it.".to_owned(),
+            };
+        }
         if self.allow_all && verdict.decision == RuleDecision::Ask {
             return Verdict {
                 decision: RuleDecision::Allow,
@@ -3038,6 +3087,79 @@ released again once the conversation stops using them.",
             };
         }
         verdict
+    }
+
+    /// The cache key of `action` for this conversation.
+    fn judge_key(&self, action: &str) -> String {
+        judge::key(
+            action,
+            &self.cwd,
+            self.active_host.as_deref().unwrap_or_default(),
+        )
+    }
+
+    /// Put `action` to the judge, when this host has one switched on and it has not already
+    /// answered about it. Returns whether it is now being asked.
+    ///
+    /// The judge is told the action and where it would run — never the conversation, never a
+    /// tool result — so nothing a host printed can argue for it, and a refusal or a failure of
+    /// any kind leaves the question where it was: in front of the user.
+    fn start_judge(&mut self, action: &str, call: &ApiToolCall, turn: usize) -> bool {
+        if self.judge_mode != judge::Mode::Ask {
+            return false;
+        }
+        let key = self.judge_key(action);
+        if self.judged.contains_key(&key) {
+            return false;
+        }
+        let Some(config) = self.judge_config.clone().filter(judge::Config::ready) else {
+            return false;
+        };
+        let text = judge::action_text(
+            action,
+            &self.cwd,
+            self.active_host.as_deref().unwrap_or_default(),
+        );
+        let request = CompletionRequest {
+            base_url: config.base_url,
+            api_key: config.api_key,
+            protocol: config.protocol,
+            model: config.model,
+            system: judge::instructions().to_owned(),
+            current: String::new(),
+            messages: vec![ApiMessage::User {
+                content: text,
+                images: Vec::new(),
+            }],
+            tools: Vec::new(),
+            max_tokens: JUDGE_MAX_TOKENS,
+        };
+        let (sender, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let allowed = complete_blocking(&request)
+                .is_ok_and(|completion| judge::allows(&completion.text));
+            let _ = sender.send(allowed);
+        });
+        self.phase = Some(Phase::Judging {
+            call: call.clone(),
+            turn,
+            key,
+            events,
+        });
+        true
+    }
+
+    /// The judge's answer, once it has one. A thread that died without answering counts as a
+    /// refusal, so a broken judge can only ever add a question.
+    fn judging_result(&self) -> Option<bool> {
+        let Some(Phase::Judging { events, .. }) = &self.phase else {
+            return None;
+        };
+        match events.try_recv() {
+            Ok(allowed) => Some(allowed),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(false),
+        }
     }
 
     /// Run one call the permissions already allowed, on the host it names.
@@ -3328,12 +3450,14 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                         decision: RuleDecision::Ask,
                         reason,
                     } => {
-                        self.phase = Some(Phase::Approving {
-                            scopes: approval_scopes(&command),
-                            call,
-                            command,
-                            reason,
-                        });
+                        if !self.start_judge(&command, &call, turn) {
+                            self.phase = Some(Phase::Approving {
+                                scopes: approval_scopes(&command),
+                                call,
+                                command,
+                                reason,
+                            });
+                        }
                     }
                 }
             }
@@ -3367,12 +3491,14 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                         decision: RuleDecision::Ask,
                         reason,
                     } => {
-                        self.phase = Some(Phase::Approving {
-                            scopes: approval_scopes(&command),
-                            call,
-                            command,
-                            reason,
-                        });
+                        if !self.start_judge(&command, &call, turn) {
+                            self.phase = Some(Phase::Approving {
+                                scopes: approval_scopes(&command),
+                                call,
+                                command,
+                                reason,
+                            });
+                        }
                     }
                 }
             }
@@ -3523,12 +3649,14 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                 decision: RuleDecision::Ask,
                 reason,
             } => {
-                self.phase = Some(Phase::Approving {
-                    scopes: approval_scopes(&command),
-                    call,
-                    command,
-                    reason,
-                });
+                if !self.start_judge(&command, &call, turn) {
+                    self.phase = Some(Phase::Approving {
+                        scopes: approval_scopes(&command),
+                        call,
+                        command,
+                        reason,
+                    });
+                }
             }
         }
     }
@@ -4967,6 +5095,7 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                 }
             }
             Phase::Running { call, turn, .. }
+            | Phase::Judging { call, turn, .. }
             | Phase::Allowing { call, turn, .. }
             | Phase::Extending { call, turn, .. }
             | Phase::Connect { call, turn, .. }
@@ -8336,6 +8465,70 @@ mod tests {
             Some(Turn::Tool { output, .. }) => output.clone(),
             other => panic!("expected a tool turn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_uncommon_command_is_put_to_the_judge_before_the_user() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        agent.judge_mode = judge::Mode::Ask;
+        // A judge that cannot answer must fall back to the card, never to an allow.
+        agent.judge_config = Some(judge::Config {
+            base_url: "http://127.0.0.1:1".to_owned(),
+            api_key: String::new(),
+            protocol: crate::ai_agent::Protocol::Openai,
+            model: "test".to_owned(),
+        });
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"systemctl restart nginx"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(
+            matches!(agent.phase, Some(Phase::Judging { .. })),
+            "the judge was not asked"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !agent.approving() && std::time::Instant::now() < deadline {
+            agent.poll(&mut session);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(agent.approving(), "a judge that failed must ask the user");
+    }
+
+    #[test]
+    fn only_a_judged_allow_keeps_the_card_away() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        agent.judge_mode = judge::Mode::Ask;
+        assert_eq!(
+            agent.command_verdict("systemctl restart nginx").decision,
+            RuleDecision::Ask,
+            "an unjudged command asks"
+        );
+        let allowed = agent.judge_key("systemctl restart nginx");
+        agent.judged.insert(allowed, true);
+        assert_eq!(
+            agent.command_verdict("systemctl restart nginx").decision,
+            RuleDecision::Allow
+        );
+        // A refusal leaves the question where it was, and is not asked again.
+        let refused = agent.judge_key("systemctl stop nginx");
+        agent.judged.insert(refused, false);
+        assert_eq!(
+            agent.command_verdict("systemctl stop nginx").decision,
+            RuleDecision::Ask
+        );
+        assert!(!agent.start_judge("systemctl stop nginx", &ApiToolCall {
+            id: "c1".to_owned(),
+            name: TOOL_RUN_COMMAND.to_owned(),
+            arguments: String::new(),
+        }, 0));
     }
 
     #[test]

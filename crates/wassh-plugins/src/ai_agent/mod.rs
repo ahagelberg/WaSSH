@@ -5,6 +5,7 @@
 //! `permissions.ts`, and the pane mirrors the reference view.
 
 mod agent;
+mod judge;
 pub(crate) mod map;
 pub(crate) mod markdown;
 mod permissions;

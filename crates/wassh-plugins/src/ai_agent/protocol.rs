@@ -22,6 +22,8 @@ pub const SETTING_HOST_PROMPT: &str = "hostPrompt";
 pub const SETTING_HOST_ALLOW_RULES: &str = "allowRules";
 /// Setting key: this host's deny patterns.
 pub const SETTING_HOST_DENY_RULES: &str = "denyRules";
+/// Setting key: whether a command no rule covers is put to the model before the user.
+pub const SETTING_HOST_JUDGE: &str = "judgeCommands";
 /// Setting key: the local knowledge-base folder.
 pub const SETTING_RAG_FOLDER: &str = "ragFolder";
 /// Setting key: the provider used for embeddings.

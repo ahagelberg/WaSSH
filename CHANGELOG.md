@@ -4,6 +4,13 @@
 
 ### Added
 
+- A command no rule covers is put to the chat's own model before the user, so the common case
+  of "nothing matches this pattern" stops costing an interruption. **Let the model vet uncommon
+  commands** on the host turns it on; the model is told the command, the host and the directory
+  — never the conversation, never a tool result, never the files — so nothing a host printed can
+  argue for it. Only the single word `allow` keeps the card away; a refusal, a hedge, a timeout
+  or a failure all leave the question in front of the user, and an answer is remembered for the
+  rest of the session so the same command is not judged twice. Off by default.
 - A command the chat runs on this computer is confined to the working tree. Being allowed to
   run used to mean being allowed to write anywhere, so an approved `cargo build` could still
   empty `~/.config`; on Linux the kernel now holds the command to the working tree, the chat's

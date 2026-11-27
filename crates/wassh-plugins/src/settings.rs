@@ -631,6 +631,15 @@ const AI_AGENT_HOST: &[SettingsField] = &[
         &[],
         "Command patterns for this host that are always blocked. Deny always wins over allow.",
     ),
+    boolean(
+        "judgeCommands",
+        "Let the model vet uncommon commands",
+        false,
+        "A command no allow rule covers is put to the chat's own model before you are asked \
+         about it. It sees the command, the host and the directory — nothing of the \
+         conversation — and only a plain \"allow\" keeps the card away; anything else, including \
+         a failure, still asks you. Off by default.",
+    ),
     AI_AGENT_TERMINAL_GROUP,
     AI_AGENT_REMOTE_FS_GROUP,
     AI_AGENT_LOCAL_FS_GROUP,

@@ -26,13 +26,14 @@ use super::agent::{
 use super::markdown::{Block, Ink};
 use super::agent::HostCard;
 use crate::plugin::RemoteHost;
+use super::judge;
 use super::permissions::{GROUP_KEY_PREFIX, METHOD_KEY_PREFIX, Permissions, setting_key};
 use super::protocol::{
     CONVERSATIONS_PER_HOST_MAX, DATA_VERSION, DEFAULT_CHAT_TITLE, DEFAULT_MAX_SUBAGENTS,
     ImagePart, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CHARS, MAX_ATTACHMENTS, MAX_IMAGE_BYTES,
     MAX_IMAGES, Protocol, ProviderConfig, SAFE_RULES, SETTING_AUTO_COMPACT,
     SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
-    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
+    SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_JUDGE, SETTING_HOST_PROMPT,
     SETTING_HOST_RAG_FOLDER, SETTING_REACH_ALLOW, SETTING_REACH_DENY, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
     SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY,
     SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS, image_media_type,
@@ -67,6 +68,7 @@ const DERIVED_SETTINGS: &[&str] = &[
     SETTING_MAX_SUBAGENTS,
     SETTING_REACH_ALLOW,
     SETTING_REACH_DENY,
+    SETTING_HOST_JUDGE,
 ];
 /// Tokens a reply may use.
 const MAX_TOKENS: u32 = 4096;
@@ -976,6 +978,12 @@ fn build_request(
     // Kept so compaction measures the scopes this conversation really carries.
     agent.prompt_chars = tools::prompt_chars(&offered.specs, &text);
     agent.note_request(&text, &offered.specs);
+    agent.judge_config = Some(judge::Config {
+        base_url: provider.base_url.clone(),
+        api_key: api_key.clone(),
+        protocol: provider.protocol,
+        model: model.to_owned(),
+    });
     CompletionRequest {
         base_url: provider.base_url.clone(),
         api_key,
@@ -1437,6 +1445,15 @@ the commands. Callable now:",
             setting_rules(settings, SETTING_HOST_ALLOW_RULES).unwrap_or_default();
         self.agent.host_deny = setting_rules(settings, SETTING_HOST_DENY_RULES).unwrap_or_default();
         self.agent.permissions = Permissions::from_settings(settings);
+        self.agent.judge_mode = if settings
+            .get(SETTING_HOST_JUDGE)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            judge::Mode::Ask
+        } else {
+            judge::Mode::Never
+        };
         self.agent.reach_allow = setting_rules(settings, SETTING_REACH_ALLOW).unwrap_or_default();
         self.agent.reach_deny = setting_rules(settings, SETTING_REACH_DENY).unwrap_or_default();
         self.agent.max_subagents = settings
