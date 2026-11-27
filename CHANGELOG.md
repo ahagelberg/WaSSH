@@ -4,6 +4,10 @@
 
 ### Added
 
+- The standing part of an AI chat's prompt is sent as its own cacheable block, and only what
+  changes as the chat works — the directory, the loaded tools, the map — follows it. A long
+  chat pays once for the instructions instead of on every round.
+
 - Prompt caching on Anthropic-compatible providers: the system prompt and the toolset carry a
   cache breakpoint, and the newest message carries one more, so every round of a run reads the
   prefix the round before it already paid for. OpenAI-compatible endpoints cache on their own.

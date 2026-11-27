@@ -89,6 +89,28 @@ const COMPACTED_HEADING: &str = "Earlier conversation, compacted:";
 const MAP_HEADING: &str = "Environment map (query it with env_find, env_search and env_outline; \
 refresh or extend it with env_scan):";
 
+/// A system prompt in two parts: the standing instructions, and the state the chat is in.
+///
+/// A provider caches a prompt prefix, so the part that changes as the chat works is kept out
+/// of `stable`: a new working directory, a loaded scope or a newer map then costs the cache
+/// only what follows it, not the whole prompt.
+pub struct Prompt {
+    /// What does not change while the chat runs.
+    pub stable: String,
+    /// Directory, plan mode, loaded scopes, the script API, the map and compacted history.
+    pub current: String,
+}
+
+impl Prompt {
+    /// Both parts in the order they are sent.
+    pub fn text(&self) -> String {
+        if self.current.is_empty() {
+            return self.stable.clone();
+        }
+        format!("{}\n\n{}", self.stable, self.current)
+    }
+}
+
 /// What the mapping sub-agent is asked, with the root and the file budget filled in.
 const MAP_TASK: &str = "\
 Map the project rooted at {root} for the other chats on this host.
@@ -961,15 +983,17 @@ fn build_request(
         agent.plan,
         scripts,
     );
+    let text = system.text();
     // Kept so compaction measures the scopes this conversation really carries.
-    agent.prompt_chars = tools::prompt_chars(&offered.specs, &system);
-    agent.note_request(&system, &offered.specs);
+    agent.prompt_chars = tools::prompt_chars(&offered.specs, &text);
+    agent.note_request(&text, &offered.specs);
     CompletionRequest {
         base_url: provider.base_url.clone(),
         api_key,
         protocol: provider.protocol,
         model: model.to_owned(),
-        system,
+        system: system.stable,
+        current: system.current,
         messages: agent.history.clone(),
         tools: offered.specs,
         max_tokens: MAX_TOKENS,
@@ -1109,37 +1133,29 @@ impl AiAgent {
 
     /// The system prompt: what the agent is connected to, the tools this session really
     /// offers, and how to choose between them.
+    ///
+    /// Split in two because a provider caches a prompt prefix: the standing instructions come
+    /// first and stay byte-identical while the chat runs, and everything that changes as it
+    /// works — directory, loaded tools, catalogue, map — comes after them.
     fn system_prompt(
         agent: &Agent,
         settings: &serde_json::Map<String, Value>,
         host: &str,
         environment: &str,
-    ) -> String {
-        let mut lines = Vec::new();
+    ) -> Prompt {
+        let mut stable = Vec::new();
         if agent.subagent {
-            lines.push(
+            stable.push(
                 "You are a sub-agent that another agent delegated one task to. Work that task \
 through to an answer, then reply with a concise summary of what you found or did and stop. \
 You cannot ask the main conversation to do work for you and you cannot start sub-agents."
                     .to_owned(),
             );
         }
-        lines.extend([
+        stable.extend([
             format!(
                 "You are an AI development agent connected to the active WaSSH session \"{host}\"."
             ),
-            format!("Environment: {environment}."),
-            format!("Current working directory: {}", agent.cwd),
-        ]);
-        if agent.plan {
-            lines.push(
-                "This chat is in Plan mode: every tool offered here only reads. Investigate \
-as far as the question needs, then answer with what you would change, where, and why — you \
-cannot change anything yourself, and the user switches to Agent mode to carry the plan out."
-                    .to_owned(),
-            );
-        }
-        lines.extend([
             String::new(),
             // Tools arrive by scope: sending every schema on every turn would spend the
             // prompt on tools nobody asked for.
@@ -1148,29 +1164,64 @@ another scope with load_scope and drop one with unload_scope. Loading the scope 
 needs is the normal first step: the shell is the fallback, not the first choice. A scope \
 that shows no tools of its own is a step on the way: loading it opens the scopes it nests."
                 .to_owned(),
-            String::new(),
-            "Loaded scopes:".to_owned(),
         ]);
+        stable.push(String::new());
+        stable.push("Guidelines:".to_owned());
+        stable.extend(Self::tool_guidance(agent));
+        stable.extend([
+            "- After each command or tool call you see its actual result. Never invent output."
+                .to_owned(),
+            "- Ask before doing anything destructive or ambiguous.".to_owned(),
+            "- When the task is complete, reply with a concise plain-text summary.".to_owned(),
+        ]);
+        let global = setting_text(settings, SETTING_GLOBAL_PROMPT);
+        let host_text = setting_text(settings, SETTING_HOST_PROMPT);
+        if !global.is_empty() || !host_text.is_empty() {
+            stable.push(String::new());
+            stable.push("Additional prompt instructions and context:".to_owned());
+            stable.push(String::new());
+            if !global.is_empty() {
+                stable.push(format!("[Global prompt]\n{global}"));
+            }
+            if !host_text.is_empty() {
+                stable.push(format!("[Host prompt]\n{host_text}"));
+            }
+        }
+
+        // The state the chat is in now: what changes as it works, kept after the cached part.
+        let mut current = Vec::new();
+        current.push(format!("Environment: {environment}."));
+        current.push(format!("Current working directory: {}", agent.cwd));
+        if agent.plan {
+            current.push(
+                "This chat is in Plan mode: every tool offered here only reads. Investigate \
+as far as the question needs, then answer with what you would change, where, and why — you \
+cannot change anything yourself, and the user switches to Agent mode to carry the plan out."
+                    .to_owned(),
+            );
+        }
+        current.push(String::new());
+        current.push("Loaded scopes:".to_owned());
         // Only what the request actually sends: naming a tool this host may not call just
         // invites the model to try it and fall back to the shell.
         for scope in agent.scopes.scopes() {
             let names = Self::scope_tools(agent, scope);
             if !names.is_empty() {
-                lines.push(format!("- {}: {}", scope.id, names.join(", ")));
+                current.push(format!("- {}: {}", scope.id, names.join(", ")));
             }
         }
         let loadable = scopes::visible(&agent.scopes, &agent.permissions);
         if !loadable.is_empty() {
-            lines.push(String::new());
-            lines.push("Scopes to load, by id:".to_owned());
+            current.push(String::new());
+            current.push("Scopes to load, by id:".to_owned());
             for scope in loadable {
-                lines.push(format!("- {}: {}", scope.id, scope.summary));
+                current.push(format!("- {}: {}", scope.id, scope.summary));
             }
         }
         // How the tools are called. A chat sends schemas or a catalogue, never both, and it
         // moves to the catalogue when the model asks or the conversation grows, so the model
         // is told where that point is and can plan its work around it.
-        lines.push(String::new());
+        current.push(String::new());
         if agent.scripts() {
             let catalog = tools::catalog(
                 &agent.permissions,
@@ -1178,7 +1229,7 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 !agent.subagent,
                 agent.plan,
             );
-            lines.push(format!(
+            current.push(format!(
                 "Call tools from a script. `run_script` runs a JavaScript program in a \
 sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
 (`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
@@ -1202,15 +1253,15 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
                 super::script::MAX_EXEC_MS / 1_000,
                 super::script::MAX_TIMEOUT_MS / 1_000
             ));
-            lines.push(catalog);
-            lines.push(format!(
+            current.push(catalog);
+            current.push(format!(
                 "This chat calls its tools this way until `set_script_mode` with on: false \
 brings their schemas back; a chat also switches on its own once its conversation passes {}% \
 of the model's context window.",
                 super::agent::SCRIPT_MODE_CONTEXT_SHARE
             ));
         } else {
-            lines.push(format!(
+            current.push(format!(
                 "Call your tools on the turn, one call per request. When a step would take \
 several calls whose results only you read, call `set_script_mode` with on: true first: the \
 next request carries one catalogue line per tool instead of a schema each and you work \
@@ -1223,43 +1274,35 @@ with on: false brings the tools back to the turn.",
         // The map's digest: the tree this conversation already knows, so its turns go on
         // the work rather than on finding the files again.
         if agent.scopes.contains(ENV_SCOPE) && !agent.map.is_empty() {
-            lines.push(String::new());
-            lines.push(MAP_HEADING.to_owned());
-            lines.push(agent.map.overview());
+            current.push(String::new());
+            current.push(MAP_HEADING.to_owned());
+            current.push(agent.map.overview());
         }
         if agent.scopes.contains(ENV_SCOPE) && !agent.system.is_empty() {
-            lines.push(String::new());
-            lines.push(SYSTEM_HEADING.to_owned());
-            lines.push(agent.system.summary());
-        }
-        lines.push(String::new());
-        lines.push("Guidelines:".to_owned());
-        lines.extend(Self::tool_guidance(agent));
-        lines.extend([
-            "- After each command or tool call you see its actual result. Never invent output."
-                .to_owned(),
-            "- Ask before doing anything destructive or ambiguous.".to_owned(),
-            "- When the task is complete, reply with a concise plain-text summary.".to_owned(),
-        ]);
-        let global = setting_text(settings, SETTING_GLOBAL_PROMPT);
-        let host_text = setting_text(settings, SETTING_HOST_PROMPT);
-        if !global.is_empty() || !host_text.is_empty() {
-            lines.push(String::new());
-            lines.push("Additional prompt instructions and context:".to_owned());
-            lines.push(String::new());
-            if !global.is_empty() {
-                lines.push(format!("[Global prompt]\n{global}"));
-            }
-            if !host_text.is_empty() {
-                lines.push(format!("[Host prompt]\n{host_text}"));
-            }
+            current.push(String::new());
+            current.push(SYSTEM_HEADING.to_owned());
+            current.push(agent.system.summary());
         }
         if let Some(summary) = &agent.compacted {
-            lines.push(String::new());
-            lines.push(COMPACTED_HEADING.to_owned());
-            lines.push(summary.clone());
+            current.push(String::new());
+            current.push(COMPACTED_HEADING.to_owned());
+            current.push(summary.clone());
         }
-        lines.join("\n")
+        Prompt {
+            stable: stable.join("\n"),
+            current: current.join("\n"),
+        }
+    }
+
+    /// The whole prompt as one string, for tests that read it.
+    #[cfg(test)]
+    fn prompt_text(
+        agent: &Agent,
+        settings: &serde_json::Map<String, Value>,
+        host: &str,
+        environment: &str,
+    ) -> String {
+        Self::system_prompt(agent, settings, host, environment).text()
     }
 
     /// The tools of `scope` this conversation can call, as the model names them.
@@ -1313,12 +1356,12 @@ with on: false brings the tools back to the turn.",
              read or changed."
                 .to_owned(),
             "- A tool you want but do not have is not an invitation to improvise in the shell. \
-             If it belongs to a scope listed above, load that scope with load_scope first."
+             If it belongs to a scope listed below, load that scope with load_scope first."
                 .to_owned(),
         ];
         if agent.offers_tool(super::protocol::TOOL_RUN_COMMAND) {
             lines.push(
-                "- Work relative to the current working directory written above. When the work \
+                "- Work relative to the working directory the state below names. When the work \
                  moves, move it once with set_working_directory and keep the cd out of the \
                  commands that follow."
                     .to_owned(),
@@ -1781,6 +1824,7 @@ with on: false brings the tools back to the turn.",
                 protocol: provider.protocol,
                 model,
                 system: CHAT_TITLE_SYSTEM_PROMPT.to_owned(),
+                current: String::new(),
                 messages: vec![super::protocol::ApiMessage::User {
                     content: prompt,
                     images: Vec::new(),
@@ -2189,6 +2233,7 @@ with on: false brings the tools back to the turn.",
                 protocol: provider.protocol,
                 model,
                 system: SUMMARY_SYSTEM_PROMPT.to_owned(),
+                current: String::new(),
                 messages: vec![super::protocol::ApiMessage::User {
                     content: transcript,
                     images: Vec::new(),
@@ -9271,7 +9316,7 @@ mod tests {
             .load(super::super::scopes::find("host").unwrap());
         // Not loaded but available: the rule is to load it before searching the tree.
         let prompt =
-            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+            AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(
             prompt.contains("are answered from the Graph scope ('env'), which is not loaded"),
             "{prompt}"
@@ -9282,7 +9327,7 @@ mod tests {
             .scopes
             .load(super::super::scopes::find("env").unwrap());
         let prompt =
-            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+            AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(
             prompt.contains("Start project questions in the environment map"),
             "{prompt}"
@@ -9294,12 +9339,28 @@ mod tests {
     }
 
     #[test]
+    fn the_working_directory_stays_out_of_the_cached_prompt() {
+        let mut plugin = AiAgent::default();
+        let settings = serde_json::Map::new();
+        let first = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        plugin.agent.cwd = "/srv/app".to_owned();
+        let second = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        assert_eq!(
+            first.stable, second.stable,
+            "the cached half changed with the working directory"
+        );
+        assert_ne!(first.current, second.current);
+        assert!(second.current.contains("/srv/app"), "{}", second.current);
+        assert!(!second.stable.contains("/srv/app"), "{}", second.stable);
+    }
+
+    #[test]
     fn script_mode_puts_the_tool_catalog_in_the_prompt() {
         let mut plugin = AiAgent::default();
         plugin.agent.script_mode = Some(true);
         plugin.agent.resolve_scripts(0);
         let prompt =
-            AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+            AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(prompt.contains("Call tools from a script."), "{prompt}");
         // The whole point of the mode: many tool calls per script, not one round per call.
         assert!(
@@ -9384,7 +9445,7 @@ mod tests {
             for id in load {
                 plugin.agent.scopes.load(super::scopes::find(id).unwrap());
             }
-            AiAgent::system_prompt(
+            AiAgent::prompt_text(
                 &plugin.agent,
                 &serde_json::Map::new(),
                 "dev",
@@ -10231,7 +10292,7 @@ mod tests {
             .agent
             .scopes
             .load(super::super::scopes::find("host").unwrap());
-        let without = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        let without = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(
             !without.contains(MAP_HEADING),
             "the map is not the conversation's until its scope is loaded: {without}"
@@ -10241,7 +10302,7 @@ mod tests {
             .agent
             .scopes
             .load(super::super::scopes::find("env").unwrap());
-        let with = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        let with = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(with.contains(MAP_HEADING), "{with}");
         assert!(with.contains("/srv/app (2 files"), "{with}");
         assert!(with.contains("src/  2"), "{with}");
@@ -10249,7 +10310,7 @@ mod tests {
 
         // An empty map says nothing rather than costing prompt room.
         plugin.agent.map.clear();
-        let empty = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        let empty = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(!empty.contains(MAP_HEADING), "{empty}");
         settings.clear();
     }
@@ -10266,7 +10327,7 @@ mod tests {
             .agent
             .scopes
             .load(super::super::scopes::find("env").unwrap());
-        let without = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        let without = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(
             !without.contains(SYSTEM_HEADING),
             "nothing scanned, nothing claimed: {without}"
@@ -10276,7 +10337,7 @@ mod tests {
             1,
             "__wassh_os__\nLinux 6.1\n__wassh_ports__\n:8080 nginx\n__wassh_units__\nnginx.service\n",
         );
-        let with = AiAgent::system_prompt(&plugin.agent, &settings, "dev", "a test shell");
+        let with = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(with.contains(SYSTEM_HEADING), "{with}");
         assert!(with.contains(":8080 nginx"), "{with}");
         assert!(with.contains("nginx.service"), "{with}");

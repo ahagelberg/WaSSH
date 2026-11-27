@@ -32,8 +32,14 @@ pub struct CompletionRequest {
     pub protocol: Protocol,
     /// Model name.
     pub model: String,
-    /// System prompt.
+    /// System prompt: the part that stays the same while the chat runs, and is the one the
+    /// provider's cache keeps.
     pub system: String,
+    /// The rest of the system prompt: the directory, loaded tools and map as they are now.
+    ///
+    /// Kept apart from `system` so a change here does not cost the provider's cache the
+    /// stable part, which is what a cached request is billed on.
+    pub current: String,
     /// Conversation so far.
     pub messages: Vec<ApiMessage>,
     /// Tools the model may call, as JSON schemas.
@@ -54,8 +60,16 @@ pub enum StreamEvent {
 }
 
 /// The request body for an OpenAI-compatible endpoint.
+/// The system prompt as one string, for providers that take it as one.
+fn system_text(request: &CompletionRequest) -> String {
+    if request.current.is_empty() {
+        return request.system.clone();
+    }
+    format!("{}\n\n{}", request.system, request.current)
+}
+
 pub fn openai_body(request: &CompletionRequest) -> Value {
-    let mut messages = vec![json!({ "role": "system", "content": request.system })];
+    let mut messages = vec![json!({ "role": "system", "content": system_text(request) })];
     for message in &request.messages {
         messages.push(match message {
             ApiMessage::User { content, images } => openai_user_message(content, images),
@@ -242,7 +256,9 @@ pub fn anthropic_body(request: &CompletionRequest) -> Value {
         "model": request.model,
         "max_tokens": request.max_tokens,
         // The system prompt and the toolset are the same every round of a run, so they are
-        // marked cacheable: a round pays for them once, not once per round.
+        // marked cacheable: a round pays for them once, not once per round. Only the stable
+        // part carries the breakpoint; the state that follows changes as the chat works and
+        // would take the cache with it.
         "system": [{
             "type": "text",
             "text": request.system,
@@ -251,6 +267,12 @@ pub fn anthropic_body(request: &CompletionRequest) -> Value {
         "messages": messages,
         "stream": true
     });
+    if !request.current.is_empty() {
+        body["system"]
+            .as_array_mut()
+            .expect("the system prompt is built as a list")
+            .push(json!({ "type": "text", "text": request.current }));
+    }
     if !request.tools.is_empty() {
         let mut tools: Vec<Value> = request
             .tools
@@ -847,6 +869,27 @@ pub fn embeddings(config: &EmbedConfig, texts: &[String]) -> Result<Vec<Vec<f32>
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_state_after_the_cached_prompt_is_sent_as_its_own_block() {
+        let mut request = request(Protocol::Anthropic);
+        request.current = "Current working directory: /srv/app".to_owned();
+        let body = anthropic_body(&request);
+        let system = body["system"].as_array().expect("the prompt is two blocks");
+        assert_eq!(system.len(), 2);
+        assert!(system[0]["cache_control"].is_object());
+        assert_eq!(system[1]["text"], request.current);
+        assert!(
+            system[1].get("cache_control").is_none(),
+            "the state that changes must not carry the breakpoint"
+        );
+
+        // A provider that takes one string gets both, the cached part first.
+        let body = openai_body(&request);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.starts_with("be brief"), "{system}");
+        assert!(system.ends_with("/srv/app"), "{system}");
+    }
+
     fn request(protocol: Protocol) -> CompletionRequest {
         CompletionRequest {
             base_url: "https://example.test/v1".to_owned(),
@@ -854,6 +897,7 @@ mod tests {
             protocol,
             model: "m".to_owned(),
             system: "be brief".to_owned(),
+            current: String::new(),
             messages: vec![
                 ApiMessage::User {
                     content: "hi".to_owned(),
