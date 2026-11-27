@@ -4,6 +4,8 @@
 
 ### Added
 
+- A read that stops early says where it stopped and takes an offset to continue, so a large
+  file arrives in pieces the model asks for instead of being cut off silently.
 - The standing part of an AI chat's prompt is sent as its own cacheable block, and only what
   changes as the chat works — the directory, the loaded tools, the map — follows it. A long
   chat pays once for the instructions instead of on every round.

@@ -2076,7 +2076,11 @@ impl Agent {
                     ReadThen::Return => {
                         let mut body = text;
                         if content.truncated {
-                            body.push_str("\n\n[Content truncated at the read limit]");
+                            body.push_str(&format!(
+                                "\n\n[Content cut at the read limit; read again with a larger \
+maxChars (cap {}) if the rest matters.]",
+                                tools::MAX_FILE_READ_CHARS
+                            ));
                         }
                         Ready::Settle(format!("read {path}"), body, false)
                     }

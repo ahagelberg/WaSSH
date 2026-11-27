@@ -48,7 +48,7 @@ use crate::plugin::PluginTool;
 /// Longest body a fetch may return.
 pub const MAX_FETCH_CHARS: usize = 32_000;
 /// Longest body a file read returns when the call does not say.
-pub const MAX_READ_CHARS_DEFAULT: usize = 32_000;
+pub const MAX_READ_CHARS_DEFAULT: usize = 16_000;
 /// Longest file a read tool returns.
 pub const MAX_FILE_READ_CHARS: usize = 256_000;
 /// Bytes a base64 read returns before it stops, so the encoded text stays inside a prompt.
@@ -591,7 +591,7 @@ more needs approval)."),
         TOOL_REMOTE_READ => (
             json!({
                 "path": string("File to read."),
-                "maxChars": number("How much text to return (default 32000, cap 256000)."),
+                "maxChars": number("How much text to return (default 16000, cap 256000)."),
                 "encoding": string("text (default) or base64 for binary files."),
                 "host": host()
             }),
@@ -600,7 +600,9 @@ more needs approval)."),
         TOOL_LOCAL_READ => (
             json!({
                 "path": string("File to read."),
-                "maxChars": number("How much text to return (default 32000, cap 256000).")
+                "maxChars": number("How much text to return (default 16000, cap 256000)."),
+                "offset": number("Characters to skip (default 0; a truncated read says where \
+to continue).")
             }),
             json!(["path"]),
         ),
@@ -1321,13 +1323,24 @@ pub fn local_path(path: &str) -> PathBuf {
 
 /// Trim a long body and say so.
 fn clamp(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
+    clamp_from(text, 0, limit)
+}
+
+/// `text` cut to `limit` characters from `offset`, and a line saying where the rest is.
+///
+/// The note is part of the result on purpose: a silent cut makes the model believe the file
+/// ended, and the read costs another round anyway.
+fn clamp_from(text: &str, offset: usize, limit: usize) -> String {
+    let total = text.chars().count();
+    let start = offset.min(total);
+    let kept: String = text.chars().skip(start).take(limit).collect();
+    if start + kept.chars().count() >= total {
+        return kept;
     }
-    let kept: String = text.chars().take(limit).collect();
     format!(
-        "{kept}\n\n[Content truncated at {limit} characters of {}]",
-        text.chars().count()
+        "{kept}\n\n[Characters {start}..{} of {total}; read on with offset={}.]",
+        start + limit,
+        start + limit
     )
 }
 
@@ -1348,13 +1361,13 @@ pub fn join_path(dir: &str, name: &str) -> String {
 }
 
 /// Read a text file on this machine, refusing anything that looks binary.
-fn read_text_file(path: &Path, limit: usize) -> ToolResult {
+fn read_text_file(path: &Path, offset: usize, limit: usize) -> ToolResult {
     let bytes =
         std::fs::read(path).map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
     if bytes.iter().take(4096).any(|byte| *byte == 0) {
         return Err(format!("{} looks like a binary file.", path.display()));
     }
-    Ok(clamp(&String::from_utf8_lossy(&bytes), limit))
+    Ok(clamp_from(&String::from_utf8_lossy(&bytes), offset, limit))
 }
 
 /// Write a text file on this machine, creating parent directories.
@@ -1570,7 +1583,8 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
                 .as_u64()
                 .map_or(MAX_READ_CHARS_DEFAULT, |value| value as usize)
                 .clamp(1_000, MAX_FILE_READ_CHARS);
-            read_text_file(&path, limit)
+            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+            read_text_file(&path, offset, limit)
         }
         TOOL_LOCAL_WRITE => {
             let path = local_path(&text_argument("path").unwrap_or_default());
@@ -1582,7 +1596,7 @@ pub fn run_local(name: &str, args: &Value, now_ms: u64) -> ToolResult {
             let path = local_path(&text_argument("path").unwrap_or_default());
             let old = text_argument("oldText").unwrap_or_default();
             let new = text_argument("newText").unwrap_or_default();
-            let before = read_text_file(&path, MAX_FILE_READ_CHARS)?;
+            let before = read_text_file(&path, 0, MAX_FILE_READ_CHARS)?;
             let after = replace_once(&before, &old, &new)?;
             std::fs::write(&path, &after)
                 .map_err(|error| format!("Cannot write {}: {error}", path.display()))?;
@@ -1934,7 +1948,7 @@ fn local_multi_edit(args: &Value) -> ToolResult {
     if edits.is_empty() {
         return Err("edits must not be empty.".to_owned());
     }
-    let before = read_text_file(&path, MAX_FILE_READ_CHARS)?;
+    let before = read_text_file(&path, 0, MAX_FILE_READ_CHARS)?;
     let mut after = before.clone();
     for (index, edit) in edits.iter().enumerate() {
         let old = edit["oldText"].as_str().unwrap_or_default();
@@ -1976,7 +1990,7 @@ fn local_patch(args: &Value) -> ToolResult {
         .as_str()
         .filter(|patch| !patch.trim().is_empty())
         .ok_or_else(|| "patch is required.".to_owned())?;
-    let before = read_text_file(&path, MAX_FILE_READ_CHARS)?;
+    let before = read_text_file(&path, 0, MAX_FILE_READ_CHARS)?;
     let after = apply_unified_patch(&before, patch)?;
     if after == before {
         return Ok("The patch changed nothing.".to_owned());
@@ -2697,7 +2711,7 @@ mod tests {
         // have to stay in the line.
         let listed = catalog(&everything_allowed(), true, false);
         assert!(
-            listed.contains("maxChars?: number — How much text to return (default 32000"),
+            listed.contains("maxChars?: number — How much text to return (default 16000"),
             "{listed}"
         );
         assert!(
@@ -2789,6 +2803,16 @@ mod tests {
         let schemas = specs(&permissions, &everything_loaded(), true, false);
         assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
         assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
+    }
+
+    #[test]
+    fn a_truncated_read_says_where_to_continue() {
+        let first = clamp_from("abcdefghij", 0, 4);
+        assert!(first.starts_with("abcd"), "{first}");
+        assert!(first.contains("read on with offset=4"), "{first}");
+        assert_eq!(clamp_from("abcdefghij", 4, 100), "efghij");
+        // An offset past the end is an empty read, not a panic.
+        assert_eq!(clamp_from("abc", 99, 10), "");
     }
 
     #[test]
