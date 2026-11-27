@@ -13,11 +13,10 @@
   totals, what the input carried (system prompt, tool definitions, your prompts, earlier answers,
   tool results), what the answer spent on text and on tool calls, and a line per request. The
   numbers come from the provider; when it reports none they are estimated from the text.
-- Tool callers: each tool is called as a tool of the turn, from inside `run_script`, or both, set
-  per tool in Options → AI agent under the default. The default replaces the script-mode switch:
-  **Auto** keeps tools on the turn while their schemas stay small and moves them into the script
-  API once they would cost more than it, and a host can override the app-wide choice. An existing
-  script-mode setting is read as a default of its own, so nothing changes on upgrade.
+- The agent decides how it calls its tools. It either makes one call per request, or writes a
+  small program that makes several and returns only what the task needs. A chat moves to the
+  program on its own once it passes 40% of the model's context window, and the agent can switch
+  either way. The per-tool switches in Options are gone.
 - A script's tool calls now run several at a time (up to eight), on commands of their own, so a
   program that fires a batch at once really does. Prompts a call has to ask for stay in one queue.
 - Mount a folder from a saved host as a local drive: pick the host, the folder and a drive letter

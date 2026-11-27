@@ -23,7 +23,6 @@ use super::agent::{
     history_from_json, history_to_json, subagents_from_json, subagents_to_json, turns_from_json,
     turns_to_json,
 };
-use super::callers::{CallerMode, Callers};
 use super::markdown::{Block, Ink};
 use super::agent::HostCard;
 use crate::plugin::RemoteHost;
@@ -34,8 +33,8 @@ use super::protocol::{
     MAX_IMAGES, Protocol, ProviderConfig, SAFE_RULES, SETTING_AUTO_COMPACT,
     SETTING_DEFAULT_ALLOW_RULES, SETTING_DEFAULT_DENY_RULES, SETTING_GLOBAL_PROMPT,
     SETTING_HOST_ALLOW_RULES, SETTING_HOST_DENY_RULES, SETTING_HOST_PROMPT,
-    SETTING_HOST_RAG_FOLDER, SETTING_HOST_SCRIPT_MODE, SETTING_REACH_ALLOW, SETTING_REACH_DENY, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
-    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_SCRIPT_MODE, SETTING_WEB_SEARCH_KEY,
+    SETTING_HOST_RAG_FOLDER, SETTING_REACH_ALLOW, SETTING_REACH_DENY, SETTING_MAX_SUBAGENTS, SETTING_MODEL_CONTEXTS, SETTING_RAG_FOLDER,
+    SETTING_RAG_MODEL, SETTING_RAG_PROVIDER, SETTING_WEB_SEARCH_KEY,
     SETTING_WEB_SEARCH_PROVIDER, TITLE_MAX_CHARS, image_media_type,
 };
 use super::providers::{CompletionRequest, EmbedConfig, complete_blocking, provider_models};
@@ -70,8 +69,6 @@ const DERIVED_SETTINGS: &[&str] = &[
     SETTING_HOST_RAG_FOLDER,
     SETTING_WEB_SEARCH_PROVIDER,
     SETTING_MAX_SUBAGENTS,
-    SETTING_SCRIPT_MODE,
-    SETTING_HOST_SCRIPT_MODE,
     SETTING_REACH_ALLOW,
     SETTING_REACH_DENY,
 ];
@@ -955,13 +952,14 @@ fn build_request(
     environment: &str,
 ) -> CompletionRequest {
     agent.repair_history();
+    let scripts = agent.resolve_scripts(context_window(settings, model));
     let system = AiAgent::system_prompt(agent, settings, host, environment);
     let offered = tools::offered(
         &agent.permissions,
         &agent.scopes,
         !agent.subagent,
         agent.plan,
-        &agent.callers,
+        scripts,
     );
     // Kept so compaction measures the scopes this conversation really carries.
     agent.prompt_chars = tools::prompt_chars(&offered.specs, &system);
@@ -1169,17 +1167,17 @@ that shows no tools of its own is a step on the way: loading it opens the scopes
                 lines.push(format!("- {}: {}", scope.id, scope.summary));
             }
         }
-        // The tools called from scripts are spelled out here, a line each instead of a schema
-        // each, so a request can offer the whole toolset without carrying it.
-        let catalog = tools::catalog(
-            &agent.permissions,
-            &agent.scopes,
-            !agent.subagent,
-            agent.plan,
-            &agent.callers,
-        );
-        if !catalog.is_empty() {
-            lines.push(String::new());
+        // How the tools are called. A chat sends schemas or a catalogue, never both, and it
+        // moves to the catalogue when the model asks or the conversation grows, so the model
+        // is told where that point is and can plan its work around it.
+        lines.push(String::new());
+        if agent.scripts() {
+            let catalog = tools::catalog(
+                &agent.permissions,
+                &agent.scopes,
+                !agent.subagent,
+                agent.plan,
+            );
             lines.push(format!(
                 "Call tools from a script. `run_script` runs a JavaScript program in a \
 sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
@@ -1195,9 +1193,8 @@ and the decisions in the script rather than back through the conversation: filte
 compare and branch on results there. Spend real effort on shrinking what you return: filter \
 down to the lines that answer the question, sort and de-duplicate them, and compact, count or \
 summarise the rest instead of dumping raw output — that result is all the model sees, so keep \
-it as small as the answer allows. The tools listed below are called from a script, never as \
-tools of the turn; anything not listed there is a tool of the turn. The working directory is \
-shared by every call a script makes and stays after it, so move it once with `await \
+it as small as the answer allows. The working directory is shared by every call a script \
+makes and stays after it, so move it once with `await \
 tools.set_working_directory({{ path }})` and keep the cd out of the commands. Callable now:",
                 super::script::MAX_EXEC_MS / 1_000,
                 super::script::MAX_CALLS,
@@ -1206,6 +1203,22 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
                 super::script::MAX_TIMEOUT_MS / 1_000
             ));
             lines.push(catalog);
+            lines.push(format!(
+                "This chat calls its tools this way until `set_script_mode` with on: false \
+brings their schemas back; a chat also switches on its own once its conversation passes {}% \
+of the model's context window.",
+                super::agent::SCRIPT_MODE_CONTEXT_SHARE
+            ));
+        } else {
+            lines.push(format!(
+                "Call your tools on the turn, one call per request. When a step would take \
+several calls whose results only you read, call `set_script_mode` with on: true first: the \
+next request carries one catalogue line per tool instead of a schema each and you work \
+through `run_script`, which saves most of what the tools cost. A chat switches to that on its \
+own once its conversation passes {}% of the model's context window, and `set_script_mode` \
+with on: false brings the tools back to the turn.",
+                super::agent::SCRIPT_MODE_CONTEXT_SHARE
+            ));
         }
         // The map's digest: the tree this conversation already knows, so its turns go on
         // the work rather than on finding the files again.
@@ -1255,7 +1268,11 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
         if let Some(pane) = scope.pane {
             names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
         }
-        names.retain(|name| agent.offers_tool(name));
+        // The ways into the script API are tools of the turn only in that mode; naming them
+        // in a chat that calls its tools on the turn invites a call that is not offered.
+        names.retain(|name| {
+            agent.offers_tool(name) && (agent.scripts() || !tools::is_script_driver(name))
+        });
         names
     }
 
@@ -1450,7 +1467,6 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
         self.agent.permissions = Permissions::from_settings(settings);
         self.agent.reach_allow = setting_rules(settings, SETTING_REACH_ALLOW).unwrap_or_default();
         self.agent.reach_deny = setting_rules(settings, SETTING_REACH_DENY).unwrap_or_default();
-        self.agent.callers = Callers::from_settings(settings, Some(settings));
         self.agent.max_subagents = settings
             .get(SETTING_MAX_SUBAGENTS)
             .and_then(Value::as_u64)
@@ -3032,7 +3048,7 @@ tools.set_working_directory({{ path }})` and keep the cd out of the commands. Ca
         let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt);
         // The pass is a numbered procedure of direct calls, so it runs with the tools of its
         // scopes rather than whatever the chat sends.
-        self.agent.subagents[index].agent.callers = Callers::every(CallerMode::Direct);
+        self.agent.subagents[index].agent.script_mode = Some(false);
         match self.request_for(Some(index), settings, host, environment) {
             Some(request) => {
                 if let Some(sub) = self.agent.subagents.get_mut(index) {
@@ -9280,7 +9296,8 @@ mod tests {
     #[test]
     fn script_mode_puts_the_tool_catalog_in_the_prompt() {
         let mut plugin = AiAgent::default();
-        plugin.agent.callers = Callers::every(CallerMode::Script);
+        plugin.agent.script_mode = Some(true);
+        plugin.agent.resolve_scripts(0);
         let prompt =
             AiAgent::system_prompt(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(prompt.contains("Call tools from a script."), "{prompt}");
@@ -9337,10 +9354,17 @@ mod tests {
             prompt.contains("- run_command(command: string"),
             "{prompt}"
         );
-        // The guidance names tools the way a chat without scripts does: say that a script
-        // calls them, or the model calls one of them as a tool of the turn and is refused.
+        // The guidance says how the chat works in this mode and how it goes back.
         assert!(
-            prompt.contains("The tools listed below are called from a script"),
+            prompt.contains("This chat calls its tools this way until `set_script_mode`"),
+            "{prompt}"
+        );
+        // The point where the chat moves on its own is named, so the model can plan around it.
+        assert!(
+            prompt.contains(&format!(
+                "{}% of the model's context window",
+                super::super::agent::SCRIPT_MODE_CONTEXT_SHARE
+            )),
             "{prompt}"
         );
         // The root's tools are the only ones loaded, so nothing of a scope shows up.
@@ -9375,7 +9399,7 @@ mod tests {
         assert!(
             both.contains(
                 "- core: run_command, set_working_directory, hosts_list, run_command_background, \
-                 run_script, script_result, run_sudo, ask_user, spawn_subagent, wait_subagent, \
+                 set_script_mode, run_sudo, ask_user, spawn_subagent, wait_subagent, \
                  get_current_time"
             ),
             "{both}"
@@ -9736,7 +9760,8 @@ mod tests {
         .into_iter()
         .collect();
         let mut plugin = AiAgent::default();
-        plugin.agent.callers = Callers::every(CallerMode::Script);
+        plugin.agent.script_mode = Some(true);
+        plugin.agent.resolve_scripts(0);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         plugin.agent.map = super::super::map::EnvMap::parse(
@@ -9754,11 +9779,7 @@ mod tests {
         // The task is a numbered procedure — look at the map, read the files, answer with
         // one object — so the pass keeps the tools of its scopes rather than the chat's paths.
         assert!(
-            plugin.agent.subagents[run.subagent]
-                .agent
-                .callers
-                .caller("run_command")
-                .direct(),
+            !plugin.agent.subagents[run.subagent].agent.scripts(),
             "the mapping agent was left calling its tools from scripts"
         );
         assert!(

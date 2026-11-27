@@ -40,16 +40,6 @@ pub const SETTING_MODEL_CONTEXTS: &str = "modelContexts";
 pub const SETTING_AUTO_COMPACT: &str = "autoCompact";
 /// Setting key: how many sub-agents may run at the same time.
 pub const SETTING_MAX_SUBAGENTS: &str = "maxSubagents";
-/// Setting key: how a tool is called when the chat has no explicit choice for it.
-pub const SETTING_TOOL_CALLER_DEFAULT: &str = "toolCallerDefault";
-/// Setting key: this host's default caller, which wins over the app-wide one.
-pub const SETTING_HOST_TOOL_CALLER_DEFAULT: &str = "hostToolCallerDefault";
-/// Setting key: the caller chosen per tool, as `{ tool: "direct" | "script" | "both" }`.
-pub const SETTING_TOOL_CALLERS: &str = "toolCallers";
-/// Setting key: the retired switch, read only to migrate an existing install.
-pub const SETTING_SCRIPT_MODE: &str = "scriptMode";
-/// Setting key: the retired per-host switch, read only to migrate.
-pub const SETTING_HOST_SCRIPT_MODE: &str = "hostScriptMode";
 /// Setting key: saved hosts this conversation may reach without asking.
 pub const SETTING_REACH_ALLOW: &str = "agentReachAllow";
 /// Setting key: saved hosts this conversation may never reach.
@@ -191,6 +181,8 @@ pub const TOOL_SYSTEM_MEMORY: &str = "system_memory_report";
 pub const TOOL_LOAD_SCOPE: &str = "load_scope";
 /// Tool: take a scope's tools back out.
 pub const TOOL_UNLOAD_SCOPE: &str = "unload_scope";
+/// Tool: call the loaded tools from inside `run_script` instead of as tools of the turn.
+pub const TOOL_SET_SCRIPT_MODE: &str = "set_script_mode";
 
 /// Prefix that marks a rule list entry as a regular expression.
 pub const RULE_REGEX_PREFIX: &str = "regex:";

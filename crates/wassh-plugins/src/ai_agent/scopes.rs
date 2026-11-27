@@ -28,6 +28,7 @@ use super::protocol::{
     TOOL_SYSTEM_MEMORY,
     TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
     TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
+    TOOL_SET_SCRIPT_MODE,
 };
 use crate::{PluginId, plugin};
 
@@ -57,7 +58,8 @@ pub const SCOPES: &[Scope] = &[
         summary: "Run shell commands on the connected host (also as root) and set the directory \
 they work in, reach another saved host the same way, run a JavaScript program that calls the \
 other tools itself, ask the user a question, read the clock, and delegate work to a background \
-sub-agent.",
+sub-agent. set_script_mode decides whether the tools are called from one of those programs \
+instead of as tools of the turn.",
         tools: &[
             TOOL_RUN_COMMAND,
             TOOL_CHANGE_DIR,
@@ -65,6 +67,7 @@ sub-agent.",
             TOOL_RUN_COMMAND_BACKGROUND,
             TOOL_RUN_SCRIPT,
             TOOL_SCRIPT_RESULT,
+            TOOL_SET_SCRIPT_MODE,
             TOOL_RUN_SUDO,
             TOOL_ASK_USER,
             TOOL_SPAWN_SUBAGENT,

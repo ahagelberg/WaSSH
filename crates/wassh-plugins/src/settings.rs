@@ -303,42 +303,6 @@ const AI_AGENT_SEARCH_PROVIDERS: &[SelectOption] = &[
     },
 ];
 
-/// What a chat does with a tool it has no explicit choice for.
-const TOOL_CALLER_MODES: &[SelectOption] = &[
-    SelectOption {
-        value: "direct",
-        label: "Tool of the turn",
-    },
-    SelectOption {
-        value: "script",
-        label: "From a script",
-    },
-    SelectOption {
-        value: "both",
-        label: "Both ways",
-    },
-];
-
-/// The same choice for one host, where an empty value inherits the app-wide one.
-const TOOL_CALLER_HOST_MODES: &[SelectOption] = &[
-    SelectOption {
-        value: "",
-        label: "Inherit the app-wide choice",
-    },
-    SelectOption {
-        value: "direct",
-        label: "Tool of the turn",
-    },
-    SelectOption {
-        value: "script",
-        label: "From a script",
-    },
-    SelectOption {
-        value: "both",
-        label: "Both ways",
-    },
-];
-
 const AI_AGENT_KNOWLEDGE_CHILDREN: &[SettingsField] = &[    directory(
         "ragFolder",
         "Folder",
@@ -603,19 +567,6 @@ you ask them to.",
         "How many sub-agents may run in the background at once. A spawn beyond this is refused \
 and the model is told to wait for one to finish.",
     ),
-    SettingsField {
-        key: "toolCallerDefault",
-        label: "How tools are called",
-        kind: FieldKind::Select,
-        default: FieldDefault::Text("direct"),
-        description: "What a tool does when this chat has no choice for it. Both offers each tool \
-both ways, which is the largest request. Single tools are set in Tool callers.",
-        secret: false,
-        options: TOOL_CALLER_MODES,
-        children: &[],
-        item_schema: &[],
-        item_label: "",
-    },
     group(
         "globalKnowledgeGroup",
         "Global knowledge",
@@ -668,19 +619,6 @@ const AI_AGENT_HOST: &[SettingsField] = &[
         "",
         "Additional local folder of documents indexed just for this host, combined with the global knowledge folder.",
     ),
-    SettingsField {
-        key: "hostToolCallerDefault",
-        label: "How this host's tools are called",
-        kind: FieldKind::Select,
-        default: FieldDefault::Text(""),
-        description: "Wins over the app-wide choice for this host's chats. Leave it on Inherit \
-to use the app-wide one.",
-        secret: false,
-        options: TOOL_CALLER_HOST_MODES,
-        children: &[],
-        item_schema: &[],
-        item_label: "",
-    },
     string_list(
         "allowRules",
         "Allow rules",
@@ -1141,10 +1079,7 @@ pub fn apply_to(
 /// claiming none were set up.
 fn list_owned_app_keys(id: PluginId) -> &'static [&'static str] {
     match id {
-        PluginId::AiAgent => &[
-            crate::ai_agent::PROVIDERS_KEY,
-            crate::ai_agent::SETTING_TOOL_CALLERS,
-        ],
+        PluginId::AiAgent => &[crate::ai_agent::PROVIDERS_KEY],
         _ => &[],
     }
 }
@@ -1450,7 +1385,6 @@ mod tests {
                 "Model context windows",
                 "Compact long chats automatically",
                 "Sub-agents at a time",
-                "How tools are called",
                 "Global knowledge",
                 "Hosts the agent may reach",
                 "Hosts the agent may never reach",

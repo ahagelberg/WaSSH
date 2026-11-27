@@ -15,7 +15,6 @@ use serde_json::{Value, json};
 use super::permissions::{Permission, Permissions};
 use super::map::{EnvMap, SystemFacts};
 use crate::plugin::{RemoteHost, RemoteHosts, RemoteState};
-use super::callers::{Caller, CallerMode, Callers};
 use super::protocol::{
     ApiMessage, ApiToolCall, Completion, DEFAULT_MAX_SUBAGENTS, ImagePart,
     MAX_SUBAGENT_RESULT_CHARS, Usage, TOOL_ASK_USER, TOOL_CHANGE_DIR, TOOL_CURRENT_TIME, TOOL_DEV_CREATE, TOOL_DEV_DIFF, TOOL_DEV_EDIT, TOOL_DEV_FIND,
@@ -29,7 +28,7 @@ use super::protocol::{
     TOOL_REMOTE_MOVE, TOOL_REMOTE_PATCH, TOOL_REMOTE_READ, TOOL_REMOTE_STAT, TOOL_REMOTE_WRITE,
     TOOL_REMOTE_ZIP_EXTRACT, TOOL_REMOTE_ZIP_LIST, TOOL_REMOTE_ZIP_READ, TOOL_RUN_COMMAND,
     TOOL_HOSTS_LIST, TOOL_RUN_COMMAND_BACKGROUND, TOOL_RUN_SCRIPT, TOOL_RUN_SUDO,
-    TOOL_SCRIPT_RESULT, TOOL_SPAWN_SUBAGENT,
+    TOOL_SCRIPT_RESULT, TOOL_SET_SCRIPT_MODE, TOOL_SPAWN_SUBAGENT,
     TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
     TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
     TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
@@ -109,12 +108,12 @@ pub const DENIED_BY_USER: &str = "Action denied by user.";
 /// Said when a Plan-mode chat is asked to change something.
 pub const PLAN_READ_ONLY: &str = "This chat is in Plan mode, which only reads. Switch it to Agent \
 mode to change anything.";
-/// Said when a chat calls from the turn a tool it calls from scripts.
-pub const SCRIPT_TOOL_ONLY: &str = "This chat calls this tool from a script, so it is not a tool \
-of the turn.";
-/// Said when a script calls a tool the chat keeps on the direct path.
-pub const DIRECT_TOOL_ONLY: &str = "This tool is called as a tool of the turn, not from inside a \
+/// Said when a chat that calls its tools on the turn is asked for a script.
+pub const SCRIPT_TOOL_ONLY: &str = "This chat calls its tools on the turn, not from inside a \
 script.";
+/// Said when a chat that calls its tools from scripts is called on the turn.
+pub const DIRECT_TOOL_ONLY: &str = "This chat calls its tools from inside run_script, not as \
+tools of the turn.";
 /// Question shown when `ask_user` carried none.
 const QUESTION_FALLBACK: &str = "The agent needs your input.";
 /// Answer given to a tool call the user stopped before it ran.
@@ -938,6 +937,9 @@ const STUB_KEEP_CHARS: usize = 200;
 const STUB_TRIGGER_CHARS: usize = 24_000;
 /// User turns a loaded scope may go unused before it is released.
 const SCOPE_IDLE_TURNS: u64 = 4;
+/// Share of the model's context window (%) past which a chat moves to the script API on its
+/// own: the schemas it saves are worth more than the round each script costs.
+pub const SCRIPT_MODE_CONTEXT_SHARE: usize = 40;
 
 /// One conversation's state.
 #[derive(Default)]
@@ -1039,8 +1041,11 @@ pub struct Agent {
     pub background: Vec<BackgroundScript>,
     /// Counter behind the background script ids.
     next_background: usize,
-    /// Whether the tools are offered as a script API instead of one schema per tool.
-    pub callers: Callers,
+    /// How the model chose to call its tools: `Some(true)` from inside `run_script`,
+    /// `Some(false)` as tools of the turn, `None` left to the size of the conversation.
+    pub script_mode: Option<bool>,
+    /// Whether the request being sent carries the script API.
+    scripts: bool,
     /// Characters the request being sent spends, by what carries them.
     request_parts: Option<UsageParts>,
     /// Every request this conversation was billed for.
@@ -1185,6 +1190,8 @@ impl Agent {
         self.background.clear();
         self.next_background = 0;
         self.next_subagent = 0;
+        self.script_mode = None;
+        self.scripts = false;
         self.user_turns = 0;
         self.scope_use.clear();
     }
@@ -1722,7 +1729,7 @@ impl Agent {
             name: call.name,
             arguments: call.arguments,
         };
-        if self.caller(&inner.name) == Caller::Direct {
+        if !self.scripts {
             self.park_script_call(&inner, call.id);
             let label = self
                 .script
@@ -1730,7 +1737,7 @@ impl Agent {
                 .and_then(|run| run.calls.last())
                 .map(|row| row.label.clone())
                 .unwrap_or_default();
-            self.answer_script(&inner, label, DIRECT_TOOL_ONLY.to_owned(), true);
+            self.answer_script(&inner, label, SCRIPT_TOOL_ONLY.to_owned(), true);
             return;
         }
         if self.can_run_beside(&inner, session) {
@@ -3097,19 +3104,21 @@ at most."
             );
             return;
         }
-        // A tool the chat calls from scripts is not offered to the turn, so a call that
+        // A chat working through scripts is not offered the tools of the turn, so a call that
         // arrives here is one the model recalled: name the way in. The calls a script makes
         // are let through — they are what the sandbox asked for.
-        if name != TOOL_RUN_SCRIPT
+        if self.scripts
+            && !tools::is_scope_tool(&name)
+            && name != TOOL_RUN_SCRIPT
+            && name != TOOL_SCRIPT_RESULT
             && !self.waiting_on(&call)
-            && self.caller(&name) == Caller::Script
         {
             let label = call_label(&call);
             self.settle(
                 call,
                 turn,
                 label,
-                format!("{SCRIPT_TOOL_ONLY} Call run_script with a program that awaits `tools.{name}(...)`."),
+                format!("{DIRECT_TOOL_ONLY} Call run_script with a program that awaits `tools.{name}(...)`."),
                 true,
                 session,
             );
@@ -3249,6 +3258,23 @@ at most."
                 };
                 let label = call_label(&call);
                 self.settle(call, turn, label, output, failed, session);
+            }
+            TOOL_SET_SCRIPT_MODE => {
+                let on = arguments["on"].as_bool().unwrap_or(!self.scripts);
+                self.script_mode = Some(on);
+                self.scripts = on;
+                let output = if on {
+                    "This chat now calls its tools from inside run_script; the next request \
+carries the script API instead of the tool schemas. Call set_script_mode with on: false to \
+bring the tools back to the turn."
+                        .to_owned()
+                } else {
+                    "This chat now calls its tools on the turn; the next request carries their \
+schemas again. Call set_script_mode with on: true to work through run_script instead."
+                        .to_owned()
+                };
+                let label = call_label(&call);
+                self.settle(call, turn, label, output, false, session);
             }
             TOOL_UNLOAD_SCOPE => {
                 let asked = arguments["scope"].as_str().unwrap_or_default().to_owned();
@@ -4133,7 +4159,6 @@ at most."
         agent.allow_all = self.allow_all;
         agent.allow_long_scripts = self.allow_long_scripts;
         agent.plan = self.plan;
-        agent.callers = self.callers.clone();
         agent.tools = self.tools.clone();
         agent.max_subagents = self.max_subagents;
         agent
@@ -4291,7 +4316,6 @@ at most."
         // A script gets no model of its own and starts no sub-agents of its own. Its calls
         // are made by the program it runs, so its own turn has nothing to call.
         agent.subagent = true;
-        agent.callers = Callers::every(CallerMode::Direct);
         agent.keys = CommandKeys::subagent(&format!("bg-{id}"));
         let call = ApiToolCall {
             id: format!("bg-{id}"),
@@ -5176,9 +5200,22 @@ at most."
         chars
     }
 
-    /// How `name` is called: the request builder and the gate resolve one answer.
-    pub fn caller(&self, name: &str) -> Caller {
-        self.callers.caller(name)
+    /// Whether the request in flight carries the script API.
+    pub fn scripts(&self) -> bool {
+        self.scripts
+    }
+
+    /// Decide how the request about to be sent calls its tools, and remember it.
+    ///
+    /// The model's own choice wins. With none, the chat moves to scripts once the
+    /// conversation has grown past [`SCRIPT_MODE_CONTEXT_SHARE`] of the model's window, where
+    /// the schemas it saves are worth more than the round each script costs.
+    pub fn resolve_scripts(&mut self, window_tokens: usize) -> bool {
+        let limit = window_tokens * CHARS_PER_TOKEN * SCRIPT_MODE_CONTEXT_SHARE;
+        let used = (self.history_chars() + self.prompt_chars) * 100;
+        let scripts = self.script_mode.unwrap_or(used > limit);
+        self.scripts = scripts;
+        scripts
     }
 
     /// Characters the request about to be sent spends, by what carries them.
@@ -6513,10 +6550,16 @@ mod tests {
         panic!("the background script never finished");
     }
 
+    /// Put a chat in script mode the way the request builder does.
+    fn script_mode(agent: &mut Agent) {
+        agent.script_mode = Some(true);
+        agent.scripts = true;
+    }
+
     /// Start a script the way the model does.
     fn start_script(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
         // A chat that runs a script is one whose tools the script may call.
-        agent.callers = Callers::every(CallerMode::Both);
+        script_mode(agent);
         {
             let mut session: Option<&mut dyn SessionAccess> = Some(&mut *fake);
             agent.begin_tool(
@@ -6580,7 +6623,7 @@ mod tests {
     #[test]
     fn a_script_call_that_hangs_times_out() {
         let mut agent = Agent::new();
-        agent.callers = Callers::every(CallerMode::Both);
+        script_mode(&mut agent);
         agent
             .scopes
             .load(scopes::find("host-files").expect("the file scope"));
@@ -7035,7 +7078,7 @@ mod tests {
     #[test]
     fn plan_mode_offers_run_script_and_refuses_what_it_would_change() {
         let mut agent = Agent::new();
-        agent.callers = Callers::every(CallerMode::Both);
+        script_mode(&mut agent);
         agent.plan = true;
         assert!(agent.offers_tool(TOOL_RUN_SCRIPT));
         when_offered(&mut agent, TOOL_REMOTE_WRITE);
@@ -7182,9 +7225,9 @@ mod tests {
     }
 
     #[test]
-    fn a_script_only_tool_is_refused_on_the_turn() {
+    fn a_tool_is_refused_on_the_turn_in_script_mode() {
         let mut agent = Agent::new();
-        agent.callers = Callers::every(CallerMode::Script);
+        script_mode(&mut agent);
         agent.now_ms = 1_700_000_000_000;
         let mut fake = FakeSession::default();
         let output = run_tool(&mut agent, &mut fake, TOOL_CURRENT_TIME, "{}");
@@ -7196,7 +7239,7 @@ mod tests {
 
         // The same tool runs when the script asks for it.
         let mut scripted = Agent::new();
-        scripted.callers = Callers::every(CallerMode::Script);
+        script_mode(&mut scripted);
         let mut fake = FakeSession::default();
         start_script(
             &mut scripted,
@@ -7207,6 +7250,71 @@ mod tests {
             scripted.turns.last(),
             Some(Turn::Script { failed: false, .. })
         ));
+    }
+
+    #[test]
+    fn the_model_switches_between_the_turn_and_scripts() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        let output = run_tool(&mut agent, &mut fake, TOOL_SET_SCRIPT_MODE, r#"{"on":true}"#);
+        assert!(output.contains("run_script"), "{output}");
+        assert!(agent.scripts());
+        assert_eq!(agent.script_mode, Some(true));
+
+        let output = run_tool(&mut agent, &mut fake, TOOL_SET_SCRIPT_MODE, r#"{"on":false}"#);
+        assert!(output.contains("on the turn"), "{output}");
+        assert!(!agent.scripts());
+        assert_eq!(agent.script_mode, Some(false));
+    }
+
+    #[test]
+    fn a_chat_switches_to_scripts_once_its_conversation_is_long_enough() {
+        let mut agent = Agent::new();
+        // A window of 1,000 tokens holds 4,000 characters, so the share is reached at 1,600.
+        agent.history.push(ApiMessage::User {
+            content: "x".repeat(1_500),
+            images: Vec::new(),
+        });
+        assert!(!agent.resolve_scripts(1_000), "1,500 characters is below the share");
+        agent.history.push(ApiMessage::User {
+            content: "x".repeat(200),
+            images: Vec::new(),
+        });
+        assert!(agent.resolve_scripts(1_000), "1,700 characters is past the share");
+
+        // The model's own choice wins either way.
+        agent.script_mode = Some(false);
+        assert!(!agent.resolve_scripts(1_000));
+        agent.script_mode = Some(true);
+        assert!(agent.resolve_scripts(1_000));
+    }
+
+    #[test]
+    fn a_script_call_is_refused_while_the_chat_calls_its_tools_on_the_turn() {
+        let mut agent = Agent::new();
+        let mut fake = FakeSession::default();
+        // Start the script without the helper, so the chat stays on the turn.
+        {
+            let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+            agent.begin_tool(
+                ApiToolCall {
+                    id: "c1".to_owned(),
+                    name: TOOL_RUN_SCRIPT.to_owned(),
+                    arguments: serde_json::json!({
+                        "code": "await tools.get_current_time({});"
+                    })
+                    .to_string(),
+                },
+                &mut session,
+            );
+        }
+        drive_script(&mut agent, &mut fake);
+        let Some(Turn::Script { failed, calls, .. }) = agent.turns.last() else {
+            panic!("expected a script turn, got {:?}", agent.turns.last());
+        };
+        assert!(failed);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].output.contains("on the turn"), "{}", calls[0].output);
     }
 
     #[test]
@@ -7976,7 +8084,8 @@ mod tests {
         assert!(output.contains("already"), "{output}");
         let (failed, output) = ask(&mut agent, TOOL_LOAD_SCOPE, "host-files");
         assert!(!failed, "{output}");
-        assert!(output.contains("12 tools"), "{output}");
+        let tools = scopes::find("host-files").expect("the file scope").tools.len();
+        assert!(output.contains(&format!("{tools} tools")), "{output}");
         assert!(agent.offers_tool(TOOL_DEV_VIEW));
 
         // Unloading takes the tools back out; the root stays whatever is asked.

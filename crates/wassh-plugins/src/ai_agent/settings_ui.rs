@@ -16,7 +16,7 @@ use wassh_ui::widgets::{
 
 use super::protocol::{
     CUSTOM_PROVIDER_PREFIX, PROVIDER_CUSTOM, PROVIDER_TYPES, ProviderConfig, ProviderType,
-    Protocol, SETTING_TOOL_CALLERS,
+    Protocol,
 };
 use super::providers::provider_models;
 use wassh_ui::to_color32;
@@ -27,8 +27,6 @@ use crate::PluginId;
 pub const PROVIDERS_KEY: &str = "providers";
 /// Key earlier builds kept the plain-text API keys under, kept for the migration.
 pub const API_KEYS_KEY: &str = "apiKeys";
-/// Width of a tool's name in the caller list.
-const CALLER_NAME_WIDTH: f32 = 210.0;
 /// Prefix of the vault field one provider's key is filed under.
 const SECRET_PREFIX: &str = "provider.";
 /// Text shown in place of a stored key.
@@ -564,94 +562,7 @@ impl crate::settings::SettingsEditor for ProviderEditor {
         secrets: &mut PluginSecretDrafts,
     ) {
         self.show(ui, palette, values, secrets);
-        show_callers(ui, palette, values);
     }
-}
-
-/// The caller of every tool a chat can carry.
-///
-/// A tool left on the default follows the chat's default; one set here keeps its choice
-/// whatever the default does. Grouped by the scope that brings the tool in, because a tool
-/// only exists in a chat that loaded its scope.
-fn show_callers(ui: &mut Ui, palette: &Palette, values: &mut Map<String, Value>) {
-    const CHOICES: [(&str, &str); 4] = [
-        ("", "Default"),
-        ("direct", "Tool of the turn"),
-        ("script", "From a script"),
-        ("both", "Both"),
-    ];
-    let mut stored = values
-        .get(SETTING_TOOL_CALLERS)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    ui.add_space(10.0);
-    ui.label(
-        egui::RichText::new("Tool callers")
-            .strong()
-            .color(to_color32(palette.text)),
-    );
-    ui.label(
-        egui::RichText::new(
-            "How each tool is called. A tool left on Default follows the chat's default; one set \
-here keeps its choice whatever the default does. A tool called from a script is offered as a \
-line of the script API instead of a schema, and the model reaches it from inside `run_script`.",
-        )
-        .small()
-        .color(to_color32(palette.text_muted)),
-    );
-    for scope in super::scopes::SCOPES {
-        let mut names: Vec<&str> = scope.tools.to_vec();
-        if let Some(pane) = scope.pane {
-            names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
-        }
-        if names.is_empty() {
-            continue;
-        }
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(format!("{} — {}", scope.id, scope.summary))
-                .small()
-                .color(to_color32(palette.text_muted)),
-        );
-        for name in names {
-            let mut chosen = stored
-                .get(name)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let shown = CHOICES
-                .iter()
-                .find(|(value, _)| *value == chosen)
-                .map_or("Default", |(_, label)| *label);
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    egui::Vec2::new(CALLER_NAME_WIDTH, ui.spacing().interact_size.y),
-                    egui::Label::new(egui::RichText::new(name).small()),
-                );
-                egui::ComboBox::from_id_salt(("caller", scope.id, name))
-                    .selected_text(egui::RichText::new(shown).small())
-                    .show_ui(ui, |ui| {
-                        for (value, label) in CHOICES {
-                            if ui.selectable_label(chosen == value, label).clicked() {
-                                chosen = value.to_owned();
-                            }
-                        }
-                    });
-            });
-            match chosen.as_str() {
-                "" => {
-                    stored.remove(name);
-                }
-                other => {
-                    if stored.get(name).and_then(Value::as_str) != Some(other) {
-                        stored.insert(name.to_owned(), Value::from(other));
-                    }
-                }
-            }
-        }
-    }
-    values.insert(SETTING_TOOL_CALLERS.to_owned(), Value::Object(stored));
 }
 
 /// Record a key typed into the dialog, or a request to forget the stored one.
