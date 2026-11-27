@@ -951,7 +951,7 @@ fn build_request(
     host: &str,
     environment: &str,
 ) -> CompletionRequest {
-    agent.repair_history();
+    agent.repair_history(context_window(settings, model));
     let scripts = agent.resolve_scripts(context_window(settings, model));
     let system = AiAgent::system_prompt(agent, settings, host, environment);
     let offered = tools::offered(

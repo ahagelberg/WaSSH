@@ -926,15 +926,14 @@ pub const CHARS_PER_TOKEN: usize = 4;
 pub const USAGE_CALLS_KEPT: usize = 1_000;
 /// Assistant turns whose tool results the history keeps in full.
 const KEPT_TOOL_TURNS: usize = 2;
-/// A result shorter than this is left whole: its stub would be as long as the result.
-const STUB_MIN_CHARS: usize = 400;
-/// Characters of an old result that are kept, so the model still sees what it said.
-const STUB_KEEP_CHARS: usize = 200;
-/// History size below which nothing is cut down.
+/// A result shorter than this is left whole: its placeholder would be as long as the result.
+const CLEARED_MIN_CHARS: usize = 400;
+/// Share of the model's context window (%) past which results the chat has worked through are
+/// cleared from the provider history.
 ///
-/// Cutting rewrites messages the provider has already cached, so it is done once the saving
-/// is worth more than the cache it costs.
-const STUB_TRIGGER_CHARS: usize = 24_000;
+/// Clearing rewrites messages the provider has already cached, so it waits until the saving is
+/// worth more than the cache it costs.
+pub const TRANSCRIPT_CLEAR_SHARE: usize = 25;
 /// User turns a loaded scope may go unused before it is released.
 const SCOPE_IDLE_TURNS: u64 = 4;
 /// Share of the model's context window (%) past which a chat moves to the script API on its
@@ -5058,7 +5057,7 @@ schemas again. Call set_script_mode with on: true to work through run_script ins
     /// the user stopped the run, the session died, the model asked and nothing ran — makes
     /// the whole conversation a 400 until it is gone. The assistant's text stays, so
     /// nothing the model already said is lost; a turn with nothing left in it goes.
-    pub fn repair_history(&mut self) {
+    pub fn repair_history(&mut self, window_tokens: usize) {
         let answered: std::collections::HashSet<String> = self
             .history
             .iter()
@@ -5078,18 +5077,20 @@ schemas again. Call set_script_mode with on: true to work through run_script ins
             }
             _ => true,
         });
-        self.trim_used_results();
+        self.trim_used_results(window_tokens);
     }
 
-    /// Cut down results the conversation has already worked through.
+    /// Clear the results the conversation has already worked through.
     ///
-    /// A tool result is needed while the model is acting on it; an answer two turns old is
-    /// usually just prompt weight. The head of each old result stays, so what the model saw
-    /// is still readable, and the transcript keeps every character for the reader. Only
-    /// turns already behind the newest [`KEPT_TOOL_TURNS`] are cut, and only once the
-    /// history is big enough that the saving beats the cache the rewrite costs.
-    fn trim_used_results(&mut self) {
-        if self.history.iter().map(message_chars).sum::<usize>() <= STUB_TRIGGER_CHARS {
+    /// A result is needed while the model is acting on it; an answer two turns old is prompt
+    /// weight. The result is replaced by a line naming the call and what it answered, so the
+    /// model still knows a call happened and what it was, and the transcript keeps every
+    /// character for the reader. Only turns already behind the newest [`KEPT_TOOL_TURNS`] are
+    /// cleared, and only once the history has grown past [`TRANSCRIPT_CLEAR_SHARE`] of the
+    /// model's window, where the saving beats the cache the rewrite costs.
+    fn trim_used_results(&mut self, window_tokens: usize) {
+        let budget = window_tokens * CHARS_PER_TOKEN * TRANSCRIPT_CLEAR_SHARE;
+        if self.history.iter().map(message_chars).sum::<usize>() * 100 <= budget {
             return;
         }
         let mut assistant_seen = 0;
@@ -5128,14 +5129,12 @@ schemas again. Call set_script_mode with on: true to work through run_script ins
                 continue;
             };
             let chars = content.chars().count();
-            if chars <= STUB_MIN_CHARS {
+            if chars <= CLEARED_MIN_CHARS {
                 continue;
             }
             let name = names.get(tool_call_id).map_or("The tool", String::as_str);
-            let head: String = content.chars().take(STUB_KEEP_CHARS).collect();
             *content = format!(
-                "{head}\n…[{name} answered {chars} characters; the rest is kept in the \
-                 transcript]"
+                "[{name} answered {chars} characters here; the result is kept in the transcript]"
             );
             cut = true;
         }
@@ -6080,6 +6079,10 @@ mod tests {
 
     /// Polls a running script may take before the test calls it stuck.
     const SCRIPT_POLL_STEPS: usize = 10_000;
+    /// A model window large enough that no worked-through result is ever cleared.
+    const WIDE_WINDOW: usize = 1_000_000;
+    /// A window small enough that a worked-through result is cleared.
+    const SMALL_WINDOW: usize = 1_000;
 
     #[test]
     fn a_command_points_its_temporary_files_at_the_scratch_directory() {
@@ -6298,7 +6301,7 @@ mod tests {
             },
         ];
         assert!(agent.can_resume(), "the model owes an answer to this run");
-        agent.repair_history();
+        agent.repair_history(WIDE_WINDOW);
         // The answered call and its result stay; the one that never came back goes.
         assert_eq!(agent.history.len(), 3, "{:?}", agent.history);
         match &agent.history[1] {
@@ -6315,7 +6318,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: vec![call("c")],
         });
-        agent.repair_history();
+        agent.repair_history(WIDE_WINDOW);
         assert_eq!(agent.history.len(), 3, "{:?}", agent.history);
 
         // Text the model already wrote survives.
@@ -6324,7 +6327,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: vec![call("d")],
         });
-        agent.repair_history();
+        agent.repair_history(WIDE_WINDOW);
         assert_eq!(agent.history.len(), 4, "{:?}", agent.history);
         assert!(matches!(
             agent.history.last(),
@@ -6555,7 +6558,6 @@ mod tests {
         agent.script_mode = Some(true);
         agent.scripts = true;
     }
-
     /// Start a script the way the model does.
     fn start_script(agent: &mut Agent, fake: &mut FakeSession, code: &str) {
         // A chat that runs a script is one whose tools the script may call.
@@ -7173,7 +7175,7 @@ mod tests {
             output: big.clone(),
             failed: false,
         });
-        agent.repair_history();
+        agent.repair_history(SMALL_WINDOW);
         let result = |index: usize| match &agent.history[index] {
             ApiMessage::Tool { content, .. } => content.clone(),
             other => panic!("expected a tool result, got {other:?}"),
@@ -7214,7 +7216,7 @@ mod tests {
                 content: "y".repeat(600),
             });
         }
-        agent.repair_history();
+        agent.repair_history(WIDE_WINDOW);
         // Rewriting a message the provider already cached costs more than the stub saves.
         assert!(
             agent

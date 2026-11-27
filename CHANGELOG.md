@@ -36,10 +36,10 @@
   note says so; the model sees it among the scopes it can load. Before this, a scope loaded
   once stayed in every request for the rest of the chat.
 - Results the chat has already worked through no longer weigh on every later request. Once the
-  provider history grows past a budget, results older than the last two answered turns are cut
-  down to their head plus a note saying what they were and how long they were; the transcript
+  conversation passes a quarter of the model's context window, results older than the last two
+  answered turns are replaced by a line naming the call and how much it answered; the transcript
   keeps them whole, so nothing the user reads is lost. A short chat keeps its results as they
-  came, because rewriting a cached message costs more than the cut saves.
+  came, because rewriting a cached message costs more than the clearing saves.
 - Keep every pane working when a session comes back. Whatever a pane had asked the old connection
   for belonged to a channel that went away with it: the app now fails the commands and file
   requests it was still carrying and forgets its forwards and the login directory, so a pane
