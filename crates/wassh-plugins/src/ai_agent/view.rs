@@ -1285,13 +1285,8 @@ the commands. Callable now:",
                 .collect()
         };
         let mut lines = vec![
-            "- Reach for a tool before a shell command wherever one fits: tools cannot hang on \
-             a pager, they answer with structured output, and the user sees exactly what was \
-             read or changed."
-                .to_owned(),
-            "- A tool you want but do not have is not an invitation to improvise in the shell. \
-             Call search_tools with what the task needs to load it, or call it from inside \
-             run_script."
+            "- A tool you want but do not have is not an invitation to improvise in the shell: \
+             call search_tools with what the task needs, or call it from inside run_script."
                 .to_owned(),
         ];
         if agent.offers_tool(super::protocol::TOOL_RUN_COMMAND) {

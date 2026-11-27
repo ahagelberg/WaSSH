@@ -4,6 +4,8 @@
 
 ### Added
 
+- The few tools with parameters that are easy to get wrong show a real call as an example,
+  and the standing guidance repeats itself less.
 - A read that stops early says where it stopped and takes an offset to continue, so a large
   file arrives in pieces the model asks for instead of being cut off silently.
 - The standing part of an AI chat's prompt is sent as its own cacheable block, and only what

@@ -441,11 +441,37 @@ impl ToolSpec {
                 "required": required
             })
         };
-        json!({
+        let mut schema = json!({
             "name": self.name,
             "description": self.description,
             "parameters": parameters
-        })
+        });
+        if let Some(examples) = input_examples(self.name) {
+            schema["input_examples"] = examples;
+        }
+        schema
+    }
+}
+
+/// Calls that show how a tool's parameters go together, for the few that are easy to get
+/// wrong. A schema says what is valid; an example says what is meant.
+fn input_examples(name: &str) -> Option<Value> {
+    match name {
+        TOOL_RUN_SCRIPT => Some(json!([{
+            "code": "const hits = await tools.dev_grep_search({ pattern: 'TODO', path: '/srv/app' });\nreturn hits.text.split('\\n').filter(Boolean).length;"
+        }])),
+        TOOL_LOCAL_REPLACE => Some(json!([{
+            "pattern": "\\bold_name\\b",
+            "replacement": "new_name",
+            "path": "/srv/app/src",
+            "glob": "*.rs",
+            "dryRun": false
+        }])),
+        TOOL_LOCAL_PATCH => Some(json!([{
+            "path": "/srv/app/src/main.rs",
+            "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n"
+        }])),
+        _ => None,
     }
 }
 
@@ -2803,6 +2829,21 @@ mod tests {
         let schemas = specs(&permissions, &everything_loaded(), true, false);
         assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
         assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
+    }
+
+    #[test]
+    fn a_tool_that_is_easy_to_call_wrong_carries_an_example() {
+        let schema = |name: &str| {
+            TOOL_SPECS
+                .iter()
+                .find(|spec| spec.name == name)
+                .expect("a tool")
+                .schema()
+        };
+        assert!(schema(TOOL_RUN_SCRIPT)["input_examples"].is_array());
+        assert!(schema(TOOL_LOCAL_REPLACE)["input_examples"].is_array());
+        // A tool with one obvious argument needs no example, and examples cost tokens.
+        assert!(schema(TOOL_RUN_COMMAND).get("input_examples").is_none());
     }
 
     #[test]
