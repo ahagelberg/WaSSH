@@ -9,7 +9,6 @@
 //! Only Windows can mount in this build; everywhere else the same interface answers that
 //! mounting needs a platform it does not have.
 
-#[cfg(windows)]
 pub use imp::Mounts;
 
 /// Everything a mount needs, on a platform that has a filesystem driver.
@@ -603,8 +602,8 @@ mod imp {
     }
 
     impl RemoteMounts for Mounts {
-        fn mounts(&self) -> &[MountedDrive] {
-            &[]
+        fn mounts(&self) -> Vec<MountedDrive> {
+            Vec::new()
         }
 
         fn hosts(&self) -> &[RemoteHost] {
@@ -631,8 +630,8 @@ mod imp {
 
         fn install_driver(&mut self) {}
 
-        fn remembered(&self) -> &[RememberedMount] {
-            &[]
+        fn remembered(&self) -> Vec<RememberedMount> {
+            Vec::new()
         }
 
         fn remount(&mut self, _key: &str) {}

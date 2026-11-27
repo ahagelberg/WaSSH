@@ -17,7 +17,6 @@ egui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 wassh-core = { path = "../wassh-core" }
-wassh-mount = { path = "../wassh-mount" }
 wassh-plugins = { path = "../wassh-plugins" }
 wassh-serial = { path = "../wassh-serial" }
 wassh-store = { path = "../wassh-store" }
@@ -27,6 +26,10 @@ wassh-telnet = { path = "../wassh-telnet" }
 wassh-term = { path = "../wassh-term" }
 wassh-ui = { path = "../wassh-ui" }
 winit = { workspace = true }
+
+# Mounting a remote folder needs a filesystem driver, which only Windows has.
+[target.'cfg(windows)'.dependencies]
+wassh-mount = { path = "../wassh-mount" }
 
 # Compiles `res/WaSSH.ico` into the executable's resource table; Windows reads the
 # taskbar and Explorer icon from there, not from the running window.
