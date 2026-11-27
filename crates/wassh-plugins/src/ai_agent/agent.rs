@@ -929,6 +929,8 @@ const CLEARED_MIN_CHARS: usize = 400;
 /// Clearing rewrites messages the provider has already cached, so it waits until the saving is
 /// worth more than the cache it costs.
 pub const TRANSCRIPT_CLEAR_SHARE: usize = 25;
+/// Compaction summaries the prompt keeps; the oldest whole section goes when a newer arrives.
+pub const COMPACTED_SECTIONS_KEPT: usize = 4;
 /// Rounds a sub-agent may take before it is stopped and reports what it has.
 ///
 /// A delegated task is a bounded piece of work; a sub-agent that keeps hunting after a
@@ -1001,11 +1003,13 @@ pub struct Agent {
     /// The conversation's size in characters, with the length and last-message size it was
     /// counted at; see [`Agent::history_chars`].
     history_count: Option<(usize, usize, usize)>,
-    /// Summary of the part of the conversation that was compacted away.
+    /// Summaries of the parts of the conversation that were compacted away, oldest first.
     ///
-    /// It travels in the system prompt rather than the history, so the transcript and the
-    /// history keep one user turn per user message.
-    pub compacted: Option<String>,
+    /// A compaction appends its own summary and never rewrites an older one: rewriting is
+    /// where a summary loses the detail a later question needed. They travel in the system
+    /// prompt rather than the history, so the transcript and the history keep one user turn
+    /// per user message.
+    pub compacted: Vec<String>,
     /// The environment map of the host, which outlives the conversation.
     pub map: EnvMap,
     /// How the host is set up: its ports and services, which also outlive the conversation.
@@ -1162,7 +1166,7 @@ impl Agent {
         self.error = None;
         self.queue.clear();
         self.needs_reply = false;
-        self.compacted = None;
+        self.compacted.clear();
         self.loaded = Loaded::new();
         self.plan = false;
         self.script = None;
@@ -5290,7 +5294,10 @@ task needs to load it, or call it from inside run_script with `await tools.{name
             .map_or(self.turns.len(), |(index, _)| index);
         self.history.drain(..cut);
         self.turns.drain(..turns);
-        self.compacted = Some(summary.to_owned());
+        self.compacted.push(summary.to_owned());
+        if self.compacted.len() > COMPACTED_SECTIONS_KEPT {
+            self.compacted.remove(0);
+        }
         turns
     }
 }
@@ -5857,7 +5864,15 @@ pub fn subagents_from_json(value: Option<&Value>) -> Vec<Subagent> {
             agent.subagent = true;
             agent.keys = CommandKeys::subagent(id);
             agent.cwd = row["cwd"].as_str().unwrap_or("/").to_owned();
-            agent.compacted = row["compacted"].as_str().map(str::to_owned);
+            agent.compacted = match &row["compacted"] {
+                Value::Array(sections) => sections
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                Value::String(section) => vec![section.clone()],
+                _ => Vec::new(),
+            };
             agent.loaded = Loaded::from_json(row.get("loaded"));
             agent.usage = UsageLog::from_json(row.get("usage"));
             if let Some(turns) = row["turns"].as_array() {
@@ -7421,7 +7436,7 @@ mod tests {
         assert!(agent.folded_text(cut).contains("question 0"));
 
         assert_eq!(agent.fold(cut, "Goal: nothing yet"), 4);
-        assert_eq!(agent.compacted.as_deref(), Some("Goal: nothing yet"));
+        assert_eq!(agent.compacted, ["Goal: nothing yet"]);
         assert_eq!(
             agent.history.first(),
             Some(&ApiMessage::User {
@@ -7486,11 +7501,52 @@ mod tests {
     }
 
     #[test]
+    fn a_second_compaction_appends_a_section_instead_of_rewriting_the_first() {
+        let mut agent = Agent::new();
+        for step in 0..8 {
+            agent.history.push(ApiMessage::User {
+                content: format!("q{step}"),
+                images: Vec::new(),
+            });
+        }
+        let cut = agent.compact_split(2).expect("a split");
+        agent.fold(cut, "first");
+        for step in 0..4 {
+            agent.history.push(ApiMessage::User {
+                content: format!("more {step}"),
+                images: Vec::new(),
+            });
+        }
+        let cut = agent.compact_split(2).expect("a split");
+        agent.fold(cut, "second");
+        assert_eq!(
+            agent.compacted,
+            ["first", "second"],
+            "the older summary is kept, not rewritten into the newer one"
+        );
+
+        // Only the oldest whole section goes when the list is full.
+        for step in 0..COMPACTED_SECTIONS_KEPT {
+            for more in 0..4 {
+                agent.history.push(ApiMessage::User {
+                    content: format!("later {step} {more}"),
+                    images: Vec::new(),
+                });
+            }
+            if let Some(cut) = agent.compact_split(2) {
+                agent.fold(cut, &format!("section {step}"));
+            }
+        }
+        assert_eq!(agent.compacted.len(), COMPACTED_SECTIONS_KEPT);
+        assert!(!agent.compacted.iter().any(|section| section == "first"));
+    }
+
+    #[test]
     fn a_clear_drops_the_compacted_summary() {
         let mut agent = Agent::new();
-        agent.compacted = Some("older context".to_owned());
+        agent.compacted = vec!["older context".to_owned()];
         agent.clear();
-        assert_eq!(agent.compacted, None);
+        assert!(agent.compacted.is_empty());
     }
 
     #[test]
@@ -7538,8 +7594,8 @@ mod tests {
         assert_eq!(agent.rewind_to(index).as_deref(), Some("question 3"));
         assert!(agent.history.is_empty(), "the question is being rewritten");
         assert_eq!(
-            agent.compacted.as_deref(),
-            Some("Goal: earlier questions"),
+            agent.compacted,
+            ["Goal: earlier questions"],
             "what was compacted away is still the work behind the chat"
         );
     }

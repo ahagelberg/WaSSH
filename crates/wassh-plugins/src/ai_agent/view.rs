@@ -500,8 +500,8 @@ pub struct StoredChat {
     pub model: String,
     /// Provider id it used.
     pub provider: String,
-    /// Summary of the part of it that was compacted away.
-    pub compacted: Option<String>,
+    /// Summaries of the parts of it that were compacted away, oldest first.
+    pub compacted: Vec<String>,
     /// Scopes it carried tools from.
     pub loaded: Loaded,
     /// Whether it was a Plan-mode chat, which only reads.
@@ -1019,7 +1019,7 @@ impl AiAgent {
             cwd: std::mem::take(&mut self.agent.cwd),
             model: self.model.clone(),
             provider,
-            compacted: self.agent.compacted.take(),
+            compacted: std::mem::take(&mut self.agent.compacted),
             loaded: std::mem::take(&mut self.agent.loaded),
             plan: self.agent.plan,
             usage: std::mem::take(&mut self.agent.usage),
@@ -1235,10 +1235,10 @@ the commands. Callable now:",
             current.push(SYSTEM_HEADING.to_owned());
             current.push(agent.system.summary());
         }
-        if let Some(summary) = &agent.compacted {
+        if !agent.compacted.is_empty() {
             current.push(String::new());
             current.push(COMPACTED_HEADING.to_owned());
-            current.push(summary.clone());
+            current.push(agent.compacted.join("\n\n"));
         }
         Prompt {
             stable: stable.join("\n"),
@@ -2062,11 +2062,15 @@ the commands. Callable now:",
         if let Some(history) = stored.get("history").and_then(Value::as_array) {
             self.agent.history = history_from_json(history);
         }
-        self.agent.compacted = stored
-            .get("compacted")
-            .and_then(Value::as_str)
-            .filter(|summary| !summary.is_empty())
-            .map(str::to_owned);
+        self.agent.compacted = match &stored["compacted"] {
+            Value::Array(sections) => sections
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            Value::String(section) => vec![section.clone()],
+            _ => Vec::new(),
+        };
         self.agent.loaded = Loaded::from_json(stored.get("loaded"));
         self.agent.plan = stored["planMode"].as_bool().unwrap_or(false);
         self.agent.usage = UsageLog::from_json(stored.get("usage"));
@@ -2106,10 +2110,15 @@ the commands. Callable now:",
                             .as_array()
                             .map(|history| history_from_json(history))
                             .unwrap_or_default(),
-                        compacted: chat["compacted"]
-                            .as_str()
-                            .filter(|summary| !summary.is_empty())
-                            .map(str::to_owned),
+                        compacted: match &chat["compacted"] {
+                            Value::Array(sections) => sections
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect(),
+                            Value::String(section) => vec![section.clone()],
+                            _ => Vec::new(),
+                        },
                         loaded: Loaded::from_json(chat.get("loaded")),
                         plan: chat["planMode"].as_bool().unwrap_or(false),
                         usage: UsageLog::from_json(chat.get("usage")),
@@ -6678,15 +6687,15 @@ mod tests {
         let ctx = egui::Context::default();
         for _ in 0..50 {
             frame(&mut plugin, &mut settings, &ctx, Vec::new());
-            if plugin.agent.compacted.is_some() {
+            if !plugin.agent.compacted.is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         assert_eq!(
-            plugin.agent.compacted.as_deref(),
-            Some("Goal: ship the daemon"),
+            plugin.agent.compacted,
+            ["Goal: ship the daemon"],
             "the summary never came back: error {:?}, pending {}, history {}",
             plugin.error,
             plugin.summary.is_some(),
@@ -6837,7 +6846,7 @@ mod tests {
             frame(&mut plugin, &mut settings, &ctx, Vec::new());
         }
 
-        assert_eq!(plugin.agent.compacted, None, "the chat is kept whole");
+        assert!(plugin.agent.compacted.is_empty(), "the chat is kept whole");
         assert_eq!(plugin.agent.history.len(), 10);
         assert!(plugin.summary.is_none(), "nothing was sent to summarise");
         assert!(

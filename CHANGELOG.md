@@ -46,6 +46,9 @@
   turns with no call from a scope, it and anything it nests go back to the loadable list and a
   note says so; the model sees it among the scopes it can load. Before this, a scope loaded
   once stayed in every request for the rest of the chat.
+- A chat that is compacted twice keeps both summaries: each compaction adds a section instead of
+  rewriting the one before it, so detail a later question needs is not summarised away, and the
+  oldest whole section is dropped only when the fourth arrives.
 - Results the chat has already worked through no longer weigh on every later request. Once the
   conversation passes a quarter of the model's context window, results older than the last two
   answered turns are replaced by a line naming the call and how much it answered; the transcript
