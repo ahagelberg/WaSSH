@@ -13,6 +13,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::permissions::{Permission, Permissions};
+use super::policy::{self, Policy, Verdict};
 use super::map::{EnvMap, SystemFacts};
 use crate::plugin::{RemoteHost, RemoteHosts, RemoteState};
 use super::protocol::{
@@ -34,9 +35,7 @@ use super::protocol::{
 };
 use super::providers::{CompletionRequest, EmbedConfig, StreamEvent, complete, embeddings};
 use super::rag;
-use super::rules::{
-    ApprovalScope, RuleDecision, approval_scopes, decide_command,
-};
+use super::rules::{ApprovalScope, RuleDecision, approval_scopes};
 use super::scopes::{self, Loaded};
 use super::script::{self, ScriptEvent, ScriptReply};
 use super::tools::{self, ToolResult};
@@ -269,6 +268,8 @@ pub enum Phase {
         command: String,
         /// "Always allow/deny" choices offered.
         scopes: Vec<ApprovalScope>,
+        /// Why the policy asked, in one sentence.
+        reason: String,
     },
     /// A capability whose permission is "ask" waits for the user.
     Allowing {
@@ -278,6 +279,8 @@ pub enum Phase {
         turn: usize,
         /// What it wants to do, shown on the card.
         label: String,
+        /// Why this call needs the user, when the policy rather than the tool asked.
+        reason: String,
     },
     /// A script asked to run longer than the default, and waits for the user.
     Extending {
@@ -2744,6 +2747,28 @@ maxChars (cap {}) if the rest matters.]",
             self.settle(call, turn, label, PLAN_READ_ONLY.to_owned(), true, session);
             return;
         }
+        // Where the file goes is checked before whether the tool may run: a write into
+        // `~/.ssh` is refused whatever the capability says, and a write outside the working
+        // directory is put in front of the user with the reason it needs them.
+        if let Some(verdict) = self.path_verdict(&call) {
+            let label = call_label(&call);
+            match verdict.decision {
+                RuleDecision::Deny => {
+                    self.settle(call, turn, label, verdict.reason, true, session);
+                    return;
+                }
+                RuleDecision::Ask if !self.allow_all => {
+                    self.phase = Some(Phase::Allowing {
+                        call,
+                        turn,
+                        label,
+                        reason: verdict.reason,
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
         match self.permission(&call.name) {
             Permission::Allow => {}
             Permission::Deny => {
@@ -2761,6 +2786,7 @@ maxChars (cap {}) if the rest matters.]",
             Permission::Ask => {
                 self.phase = Some(Phase::Allowing {
                     label: call_label(&call),
+                    reason: format!("{} is switched off for this chat.", call.name),
                     call,
                     turn,
                 });
@@ -2773,7 +2799,13 @@ maxChars (cap {}) if the rest matters.]",
     /// Answer a capability's permission prompt. "Always" answers are written
     /// to the settings by the pane before calling this.
     pub fn answer_permission(&mut self, allow: bool, session: Session<'_, '_>) {
-        let Some(Phase::Allowing { call, turn, label }) = self.phase.take() else {
+        let Some(Phase::Allowing {
+            call,
+            turn,
+            label,
+            ..
+        }) = self.phase.take()
+        else {
             return;
         };
         if allow {
@@ -2953,22 +2985,58 @@ released again once the conversation stops using them.",
     }
 
 
-    /// Session-wide allow answers Ask decisions but leaves command Deny rules intact.
-    fn command_decision(&self, command: &str) -> RuleDecision {
-        let decision = decide_command(
-            command,
-            Some(&self.host_allow),
-            Some(&self.host_deny),
-            Some(&self.app_allow),
-            Some(&self.app_deny),
-            &self.session_allow,
-            &self.session_deny,
-        );
-        if self.allow_all && decision == RuleDecision::Ask {
-            RuleDecision::Allow
-        } else {
-            decision
+    /// The policy this conversation applies, with this computer's home spelled out.
+    fn policy<'a>(&'a self, home: &'a str) -> Policy<'a> {
+        Policy {
+            cwd: &self.cwd,
+            home,
+            scratch: &self.scratch,
+            host_allow: &self.host_allow,
+            host_deny: &self.host_deny,
+            app_allow: &self.app_allow,
+            app_deny: &self.app_deny,
+            session_allow: &self.session_allow,
+            session_deny: &self.session_deny,
         }
+    }
+
+    /// What to do with the paths `call` names, when it names any.
+    fn path_verdict(&self, call: &ApiToolCall) -> Option<Verdict> {
+        let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        let root = tools::local_root();
+        let home = root.to_string_lossy().into_owned();
+        let policy = self.policy(&home);
+        let mut worst: Option<Verdict> = None;
+        for (path, touch, base) in policy::tool_paths(&call.name, &arguments) {
+            let base = match base {
+                policy::Base::Host => self.cwd.as_str(),
+                policy::Base::ThisComputer => "",
+            };
+            let verdict = policy.path(path, base, touch == policy::Touch::Write);
+            match verdict.decision {
+                RuleDecision::Deny => return Some(verdict),
+                RuleDecision::Ask => worst = Some(verdict),
+                RuleDecision::Allow => {}
+            }
+        }
+        worst
+    }
+
+    /// What to do with `command`, and why.
+    ///
+    /// Session-wide allow answers an ask but leaves a deny — a rule's or a protected path's —
+    /// intact, because "allow everything" is a statement about prompts, not about `~/.ssh`.
+    fn command_verdict(&self, command: &str) -> Verdict {
+        let root = tools::local_root();
+        let home = root.to_string_lossy().into_owned();
+        let verdict = self.policy(&home).command(command);
+        if self.allow_all && verdict.decision == RuleDecision::Ask {
+            return Verdict {
+                decision: RuleDecision::Allow,
+                reason: "You allowed everything this session.".to_owned(),
+            };
+        }
+        verdict
     }
 
     /// Run one call the permissions already allowed, on the host it names.
@@ -3242,25 +3310,28 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                     );
                     return;
                 };
-                let decision = self.command_decision(&command);
                 let sudo_stdin = arguments["sudoStdin"]
                     .as_str()
                     .filter(|password| !password.is_empty())
                     .map(str::to_owned);
-                match decision {
-                    RuleDecision::Allow => {
-                        self.exec_command(call, command, sudo_stdin, turn, session)
-                    }
-                    RuleDecision::Deny => {
-                        let reason =
-                            format!("Running `{command}` is not allowed by the permission rules.");
-                        self.settle(call, turn, format!("$ {command}"), reason, true, session);
-                    }
-                    RuleDecision::Ask => {
+                match self.command_verdict(&command) {
+                    Verdict {
+                        decision: RuleDecision::Allow,
+                        ..
+                    } => self.exec_command(call, command, sudo_stdin, turn, session),
+                    Verdict {
+                        decision: RuleDecision::Deny,
+                        reason,
+                    } => self.settle(call, turn, format!("$ {command}"), reason, true, session),
+                    Verdict {
+                        decision: RuleDecision::Ask,
+                        reason,
+                    } => {
                         self.phase = Some(Phase::Approving {
                             scopes: approval_scopes(&command),
                             call,
                             command,
+                            reason,
                         });
                     }
                 }
@@ -3282,20 +3353,24 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                     );
                     return;
                 };
-                match self.command_decision(&command) {
-                    RuleDecision::Allow => {
-                        self.exec_background_command(call, command, turn, session)
-                    }
-                    RuleDecision::Deny => {
-                        let reason =
-                            format!("Running `{command}` is not allowed by the permission rules.");
-                        self.settle(call, turn, format!("$ {command}"), reason, true, session);
-                    }
-                    RuleDecision::Ask => {
+                match self.command_verdict(&command) {
+                    Verdict {
+                        decision: RuleDecision::Allow,
+                        ..
+                    } => self.exec_background_command(call, command, turn, session),
+                    Verdict {
+                        decision: RuleDecision::Deny,
+                        reason,
+                    } => self.settle(call, turn, format!("$ {command}"), reason, true, session),
+                    Verdict {
+                        decision: RuleDecision::Ask,
+                        reason,
+                    } => {
                         self.phase = Some(Phase::Approving {
                             scopes: approval_scopes(&command),
                             call,
                             command,
+                            reason,
                         });
                     }
                 }
@@ -3319,12 +3394,10 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                 };
                 // The password prompt is the approval: it names the command and only the
                 // user can answer it. Rules that refuse a command still refuse it here.
-                let decision = self.command_decision(&command);
-                if decision == RuleDecision::Deny {
-                    let reason =
-                        format!("Running `{command}` is not allowed by the permission rules.");
+                let verdict = self.command_verdict(&command);
+                if verdict.decision == RuleDecision::Deny {
                     let label = call_label(&call);
-                    self.settle(call, turn, label, reason, true, session);
+                    self.settle(call, turn, label, verdict.reason, true, session);
                     return;
                 }
                 let reason = arguments["reason"]
@@ -3436,17 +3509,24 @@ task needs to load it, or call it from inside run_script with `await tools.{name
                 return;
             }
         };
-        match self.command_decision(&command) {
-            RuleDecision::Allow => self.exec_command(call, command, None, turn, session),
-            RuleDecision::Deny => {
-                let reason = format!("Running `{command}` is not allowed by the permission rules.");
-                self.settle(call, turn, format!("$ {command}"), reason, true, session);
-            }
-            RuleDecision::Ask => {
+        match self.command_verdict(&command) {
+            Verdict {
+                decision: RuleDecision::Allow,
+                ..
+            } => self.exec_command(call, command, None, turn, session),
+            Verdict {
+                decision: RuleDecision::Deny,
+                reason,
+            } => self.settle(call, turn, format!("$ {command}"), reason, true, session),
+            Verdict {
+                decision: RuleDecision::Ask,
+                reason,
+            } => {
                 self.phase = Some(Phase::Approving {
                     scopes: approval_scopes(&command),
                     call,
                     command,
+                    reason,
                 });
             }
         }
@@ -4729,6 +4809,7 @@ task needs to load it, or call it from inside run_script with `await tools.{name
             call,
             command,
             scopes,
+            ..
         }) = self.phase.take()
         else {
             return;
@@ -7874,7 +7955,7 @@ mod tests {
         assert!(!agent.approving(), "a denied command prompted instead of refusing");
         assert!(matches!(
             agent.history.last(),
-            Some(ApiMessage::Tool { content, .. }) if content.contains("not allowed by the permission rules")
+            Some(ApiMessage::Tool { content, .. }) if content.contains("Your rules refuse this command")
         ));
 
         let mut fake = FakeSession::default();
@@ -8252,6 +8333,79 @@ mod tests {
     }
 
     #[test]
+    fn a_write_into_a_secret_directory_is_refused_even_after_allow_everything() {
+        let mut agent = Agent::new();
+        agent.allow_all = true;
+        let mut fake = FakeSession::default();
+        when_offered(&mut agent, TOOL_LOCAL_WRITE);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_LOCAL_WRITE.to_owned(),
+                arguments: r#"{"path":"~/.ssh/authorized_keys","content":"x"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(!agent.approving(), "a secret path prompted instead of refusing");
+        assert!(fake.writes.is_empty(), "the file was written anyway");
+        assert!(
+            matches!(
+                agent.history.last(),
+                Some(ApiMessage::Tool { content, .. }) if content.contains("holds credentials")
+            ),
+            "{:?}",
+            agent.history.last()
+        );
+    }
+
+    #[test]
+    fn a_write_outside_the_working_tree_says_where_it_is() {
+        let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
+        let mut fake = FakeSession::default();
+        when_offered(&mut agent, TOOL_REMOTE_WRITE);
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_REMOTE_WRITE.to_owned(),
+                arguments: r#"{"path":"/srv/other/x.txt","content":"x"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        assert!(fake.writes.is_empty(), "the file was written without asking");
+        let Some(Phase::Allowing { reason, .. }) = &agent.phase else {
+            panic!("the write did not wait for the user");
+        };
+        assert!(reason.contains("/srv/other/x.txt"), "{reason}");
+        assert!(reason.contains("outside the working directory"), "{reason}");
+    }
+
+    #[test]
+    fn a_command_a_glob_covered_still_asks_when_it_does_more() {
+        let mut agent = Agent::new();
+        // Inside the tree, so the line is judged on what it does and not on where it writes.
+        agent.cwd = "/srv/app".to_owned();
+        agent.app_allow = vec!["git status*".to_owned()];
+        let mut fake = FakeSession::default();
+        let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
+        agent.begin_tool(
+            ApiToolCall {
+                id: "c1".to_owned(),
+                name: TOOL_RUN_COMMAND.to_owned(),
+                arguments: r#"{"command":"git status && rm -rf /srv/app/target"}"#.to_owned(),
+            },
+            &mut session,
+        );
+        let Some(Phase::Approving { command, reason, .. }) = &agent.phase else {
+            panic!("the line did not wait for the user");
+        };
+        assert_eq!(command, "git status && rm -rf /srv/app/target");
+        assert!(reason.contains("rule covers"), "{reason}");
+    }
+
+    #[test]
     fn a_graph_tool_on_an_empty_map_asks_for_a_scan_and_a_pass() {
         let mut agent = Agent::new();
         let mut fake = FakeSession::default();
@@ -8596,6 +8750,7 @@ Working directory is now /srv/app.
     #[test]
     fn a_patch_file_is_read_then_applied_to_the_target() {
         let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
         when_offered(&mut agent, TOOL_REMOTE_PATCH);
         let mut fake = FakeSession::default();
         fake.contents
@@ -8643,11 +8798,12 @@ Working directory is now /srv/app.
     #[test]
     fn a_remote_edit_writes_owned_bytes_and_reports_the_diff() {
         let mut agent = Agent::new();
+        agent.cwd = "/srv/app".to_owned();
         when_offered(&mut agent, TOOL_REMOTE_EDIT);
         let mut fake = FakeSession::default();
         // The edit resolves `translated.txt` against the working directory.
         fake.contents
-            .insert("/translated.txt".to_owned(), "one\ntwo\n".to_owned());
+            .insert("/srv/app/translated.txt".to_owned(), "one\ntwo\n".to_owned());
         let mut session: Option<&mut dyn SessionAccess> = Some(&mut fake);
         agent.begin_tool(
             ApiToolCall {
@@ -8662,7 +8818,7 @@ Working directory is now /srv/app.
         let write = fake.writes.last().cloned();
         assert_eq!(
             write.as_ref().map(|(path, _)| path.as_str()),
-            Some("/translated.txt")
+            Some("/srv/app/translated.txt")
         );
         assert!(
             write

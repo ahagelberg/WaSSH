@@ -8,6 +8,7 @@ mod agent;
 pub(crate) mod map;
 pub(crate) mod markdown;
 mod permissions;
+mod policy;
 mod protocol;
 mod providers;
 mod rag;

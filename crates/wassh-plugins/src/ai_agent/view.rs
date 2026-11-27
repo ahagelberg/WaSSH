@@ -4381,10 +4381,10 @@ enum PromptTarget {
 /// borrows itself mutably.
 #[derive(Default)]
 struct Prompts {
-    /// Approval card: the command and the scopes on offer.
-    approval: Option<(String, Vec<ApprovalScope>)>,
-    /// Capability card: the label, and the tool it belongs to when it has a setting.
-    allowing: Option<(String, Option<String>)>,
+    /// Approval card: the command, the scopes on offer, and why it asked.
+    approval: Option<(String, Vec<ApprovalScope>, String)>,
+    /// Capability card: the label, the tool it belongs to, and why it asked.
+    allowing: Option<(String, Option<String>, String)>,
     /// Extension card: the seconds a script asked to run for.
     extending: Option<u64>,
     /// Question card: the call id and the questions.
@@ -4401,14 +4401,20 @@ impl Prompts {
         Self {
             approval: match &agent.phase {
                 Some(Phase::Approving {
-                    command, scopes, ..
-                }) => Some((command.clone(), scopes.clone())),
+                    command,
+                    scopes,
+                    reason,
+                    ..
+                }) => Some((command.clone(), scopes.clone(), reason.clone())),
                 _ => None,
             },
             allowing: match &agent.phase {
-                Some(Phase::Allowing { call, label, .. }) => {
-                    Some((label.clone(), Some(call.name.clone())))
-                }
+                Some(Phase::Allowing {
+                    call,
+                    label,
+                    reason,
+                    ..
+                }) => Some((label.clone(), Some(call.name.clone()), reason.clone())),
                 _ => None,
             },
             extending: match &agent.phase {
@@ -4555,7 +4561,7 @@ impl AiAgent {
         }
 
         // The approval card: the command the model wants to run, and how far to allow it.
-        if let Some((command, scopes)) = &prompts.approval {
+        if let Some((command, scopes, reason)) = &prompts.approval {
             let mut chosen: Option<(bool, Option<usize>)> = None;
             let mut everything = false;
             prompt_card(
@@ -4570,6 +4576,13 @@ impl AiAgent {
                             .color(to_color32(palette.text)),
                     );
                     prompt_command(ui, palette, command);
+                    if !reason.is_empty() {
+                        ui.label(
+                            egui::RichText::new(reason)
+                                .size(11.0)
+                                .color(to_color32(palette.text_muted)),
+                        );
+                    }
                 },
                 |ui| {
                     prompt_action_row(ui, "approval", |ui| {
@@ -4684,7 +4697,7 @@ script normally stops after {} seconds of JavaScript.",
         }
 
         // The capability card: a tool whose permission is "ask".
-        if let Some((label, _)) = &prompts.allowing {
+        if let Some((label, _, reason)) = &prompts.allowing {
             prompt_card(
                 ui,
                 palette,
@@ -4697,6 +4710,13 @@ script normally stops after {} seconds of JavaScript.",
                             .color(to_color32(palette.text)),
                     );
                     prompt_command(ui, palette, label);
+                    if !reason.is_empty() {
+                        ui.label(
+                            egui::RichText::new(reason)
+                                .size(11.0)
+                                .color(to_color32(palette.text_muted)),
+                        );
+                    }
                 },
                 |ui| {
                     prompt_action_row(ui, "permission-now", |ui| {
@@ -6097,7 +6117,7 @@ impl Plugin for AiAgent {
                 .allow_everything(&mut session);
         } else if let Some((allow, always)) = prompts.permission {
             if always
-                && let Some((_, Some(tool))) = &pending.allowing
+                && let Some((_, Some(tool), _)) = &pending.allowing
                 && let Some(key) = setting_key(tool)
             {
                 context.set_text(&key, if allow { "allow" } else { "deny" });
@@ -7227,6 +7247,7 @@ mod tests {
             },
             label: "terminal_write".to_owned(),
             turn: 0,
+            reason: "test".to_owned(),
         });
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
@@ -7325,6 +7346,7 @@ mod tests {
             },
             command: "systemctl restart nginx".to_owned(),
             scopes: super::super::rules::approval_scopes("systemctl restart nginx"),
+            reason: "test".to_owned(),
         });
         assert!(
             !plugin.ticking(),
@@ -7599,6 +7621,7 @@ mod tests {
             },
             command: "systemctl restart nginx".to_owned(),
             scopes: super::super::rules::approval_scopes("systemctl restart nginx"),
+            reason: "test".to_owned(),
         });
         let mut settings = serde_json::Map::new();
         let painted = draw(&mut plugin, &mut settings);
@@ -7630,6 +7653,7 @@ mod tests {
             },
             label: "terminal_write".to_owned(),
             turn: 0,
+            reason: "test".to_owned(),
         });
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -7653,6 +7677,7 @@ mod tests {
             },
             command: "systemctl restart nginx".to_owned(),
             scopes: super::super::rules::approval_scopes("systemctl restart nginx"),
+            reason: "test".to_owned(),
         });
         let approval_rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         assert_actions_share_row(&approval_rows, &["Allow", "Deny"]);
@@ -7725,6 +7750,7 @@ mod tests {
             },
             command: script.clone(),
             scopes: scopes.clone(),
+            reason: "test".to_owned(),
         });
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
@@ -11139,6 +11165,7 @@ mod tests {
             },
             turn: 1,
             label: "type rm".to_owned(),
+            reason: "test".to_owned(),
         });
         plugin.caption_for = None;
         draw(&mut plugin, &mut settings);

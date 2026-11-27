@@ -44,6 +44,15 @@
 
 ### Fixed
 
+- What a command may do is decided from what it does, not from how it is spelled. A saved
+  pattern like `git status*` used to cover `git status && rm -rf /`, because the whole line was
+  compared as text; each command of a line is now read on its own and matched on its own, its
+  paths are resolved, and a command substitution, a heredoc or an interpreter whose arguments
+  decide at run time asks instead of being trusted. A command that only reads runs; a write
+  outside the working directory asks; a write into a system directory is refused; and nothing —
+  no rule, no "allow everything this session" — opens `~/.ssh`, `~/.aws`, `~/.kube`, a `.env`
+  file or a private key. The same zones judge the file tools before they run, and each card that
+  asks now says why it asked.
 - Loaded scopes are released again once the conversation stops using them. After four user
   turns with no call from a scope, it and anything it nests go back to the loadable list and a
   note says so; the model sees it among the scopes it can load. Before this, a scope loaded
