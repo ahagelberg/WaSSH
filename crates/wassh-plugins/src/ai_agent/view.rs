@@ -52,10 +52,6 @@ const CONVERSATION_KEY: &str = "conversation";
 const MAP_KEY: &str = "envMap";
 /// Key the host's ports and services are stored under.
 const SYSTEM_KEY: &str = "envSystem";
-/// The scope that holds the environment map.
-const ENV_SCOPE: &str = "env";
-/// User-facing name for the environment-map scope.
-const GRAPH_SCOPE_LABEL: &str = "Graph";
 /// Settings [`AiAgent::apply_settings`] derives the agent's rules and tools from, besides
 /// the per-group and per-tool permission keys it reads through [`Permissions`].
 const DERIVED_SETTINGS: &[&str] = &[
@@ -289,20 +285,20 @@ const MIN_ANSWER_WIDTH: f32 = 80.0;
 const PROMPT_COMMAND_MAX_CHARS: usize = 400;
 /// Characters of a command kept in an "always allow" button's label.
 const SCOPE_LABEL_MAX_CHARS: usize = 56;
-/// What a loaded scope's tag says when hovered.
-const SCOPE_CHIP_HINT: &str = "Scope loaded. Click for its options";
-/// Caption of the row of loaded scopes over the composer.
-const SCOPE_LABEL: &str = "Loaded scopes:";
-/// Type size of a loaded scope's tag and of its caption.
-const SCOPE_TAG_TEXT_SIZE: f32 = 10.0;
-/// Height of a loaded scope's tag.
-const SCOPE_TAG_HEIGHT: f32 = 16.0;
-/// Side padding inside a loaded scope's tag.
-const SCOPE_TAG_PADDING: f32 = 6.0;
-/// Width of the popup a tag opens.
-const SCOPE_POPUP_WIDTH: f32 = 260.0;
+/// Caption of the button that opens the list of loaded tools.
+const TOOLS_LABEL: &str = "Tools";
+/// Tooltip of the tools button.
+const TOOLS_HINT: &str = "Tools this chat keeps on the turn. Everything else the host allows is \
+callable from inside run_script.";
+/// Heading of the loaded-tools popup.
+const TOOLS_TITLE: &str = "Loaded tools";
+/// What the loaded-tools popup says when the root's own tools are all there is.
+const TOOLS_EMPTY: &str = "Nothing beyond the root's own tools. The model searches for the rest; \
+a tool it loads shows up here until the conversation stops using it.";
+/// Width of the loaded-tools popup.
+const TOOLS_POPUP_WIDTH: f32 = 280.0;
 /// Padding inside that popup.
-const SCOPE_POPUP_PADDING: i8 = 10;
+const TOOLS_POPUP_PADDING: i8 = 10;
 /// Gap between the popup's lines.
 const SCOPE_POPUP_GAP: f32 = 6.0;
 /// Padding inside a prompt card.
@@ -507,7 +503,7 @@ pub struct StoredChat {
     /// Summary of the part of it that was compacted away.
     pub compacted: Option<String>,
     /// Scopes it carried tools from.
-    pub scopes: Loaded,
+    pub loaded: Loaded,
     /// Whether it was a Plan-mode chat, which only reads.
     pub plan: bool,
     /// Every request it was billed for.
@@ -773,7 +769,7 @@ pub struct AiAgent {
     /// Tool card whose copy button confirmed: which card, which button, and when.
     copied: Option<(usize, CopyTarget, u64)>,
     /// The scope popup a tag click opened, if any.
-    scope_popup: Option<ScopePopup>,
+    tools_popup: Option<ToolsPopup>,
     /// Map revision the host's plugin data holds, so a change is written once.
     map_saved: u64,
     /// System-facts revision the host's plugin data holds.
@@ -806,12 +802,10 @@ struct MapRun {
     attempts: u8,
 }
 
-/// The popup a click on a loaded scope's tag opens.
-struct ScopePopup {
-    /// Scope it belongs to.
-    id: &'static str,
-    /// The tag it came from, so it sits under that tag and a press on it does not close the
-    /// popup it just opened.
+/// The popup the tools button opens.
+struct ToolsPopup {
+    /// The button it came from, so it sits under it and a press on it does not close the popup
+    /// it just opened.
     anchor: egui::Rect,
 }
 
@@ -878,7 +872,7 @@ impl Default for AiAgent {
             applied: None,
             applied_web_key: None,
             copied: None,
-            scope_popup: None,
+            tools_popup: None,
             expanded_chats: std::collections::BTreeSet::new(),
             map_saved: 0,
             system_saved: 0,
@@ -974,15 +968,8 @@ fn build_request(
     environment: &str,
 ) -> CompletionRequest {
     agent.repair_history(context_window(settings, model));
-    let scripts = agent.resolve_scripts(context_window(settings, model));
     let system = AiAgent::system_prompt(agent, settings, host, environment);
-    let offered = tools::offered(
-        &agent.permissions,
-        &agent.scopes,
-        !agent.subagent,
-        agent.plan,
-        scripts,
-    );
+    let offered = tools::offered(&agent.permissions, &agent.loaded, !agent.subagent, agent.plan);
     let text = system.text();
     // Kept so compaction measures the scopes this conversation really carries.
     agent.prompt_chars = tools::prompt_chars(&offered.specs, &text);
@@ -1033,7 +1020,7 @@ impl AiAgent {
             model: self.model.clone(),
             provider,
             compacted: self.agent.compacted.take(),
-            scopes: std::mem::take(&mut self.agent.scopes),
+            loaded: std::mem::take(&mut self.agent.loaded),
             plan: self.agent.plan,
             usage: std::mem::take(&mut self.agent.usage),
         }
@@ -1099,7 +1086,7 @@ impl AiAgent {
         self.agent.adopt_subagents(chat.subagents);
         self.agent.cwd = chat.cwd;
         self.agent.compacted = chat.compacted;
-        self.agent.scopes = chat.scopes;
+        self.agent.loaded = chat.loaded;
         self.agent.plan = chat.plan;
         self.agent.usage = chat.usage;
         self.created = chat.created;
@@ -1157,12 +1144,14 @@ You cannot ask the main conversation to do work for you and you cannot start sub
                 "You are an AI development agent connected to the active WaSSH session \"{host}\"."
             ),
             String::new(),
-            // Tools arrive by scope: sending every schema on every turn would spend the
-            // prompt on tools nobody asked for.
-            "Tools come in scopes, and only a loaded scope's tools can be called. Bring in \
-another scope with load_scope and drop one with unload_scope. Loading the scope a task \
-needs is the normal first step: the shell is the fallback, not the first choice. A scope \
-that shows no tools of its own is a step on the way: loading it opens the scopes it nests."
+            // Schemas cost the prompt on every round, so only the tools a task needs are sent
+            // as tools of the turn; everything else the host allows is one line in the script
+            // API. Searching is the normal first step: the shell is the fallback, not the
+            // first choice.
+            "Every tool this host allows is callable from inside `run_script`, one line each in \
+the script API. The few a task needs on the turn are loaded with `search_tools`, which sends \
+their schemas from the next request on; a tool the conversation stops using is released \
+again by itself. Search before improvising in the shell."
                 .to_owned(),
         ]);
         stable.push(String::new());
@@ -1201,84 +1190,47 @@ cannot change anything yourself, and the user switches to Agent mode to carry th
             );
         }
         current.push(String::new());
-        current.push("Loaded scopes:".to_owned());
-        // Only what the request actually sends: naming a tool this host may not call just
-        // invites the model to try it and fall back to the shell.
-        for scope in agent.scopes.scopes() {
-            let names = Self::scope_tools(agent, scope);
-            if !names.is_empty() {
-                current.push(format!("- {}: {}", scope.id, names.join(", ")));
-            }
-        }
-        let loadable = scopes::visible(&agent.scopes, &agent.permissions);
-        if !loadable.is_empty() {
-            current.push(String::new());
-            current.push("Scopes to load, by id:".to_owned());
-            for scope in loadable {
-                current.push(format!("- {}: {}", scope.id, scope.summary));
-            }
-        }
-        // How the tools are called. A chat sends schemas or a catalogue, never both, and it
-        // moves to the catalogue when the model asks or the conversation grows, so the model
-        // is told where that point is and can plan its work around it.
-        current.push(String::new());
-        if agent.scripts() {
-            let catalog = tools::catalog(
-                &agent.permissions,
-                &agent.scopes,
-                !agent.subagent,
-                agent.plan,
-            );
-            current.push(format!(
-                "Call tools from a script. `run_script` runs a JavaScript program in a \
-sandbox: `await tools.<name>(args)` runs a tool and resolves to its JSON result \
-(`{{ ok: true, text }}`), and a failed call throws. A script gets {} seconds of JavaScript \
-— time spent waiting on a tool does not count — and up to {} tool calls; one call that has \
-not answered within {} seconds fails with a timeout. Pass `timeoutSeconds` to ask for a \
-longer run than {} seconds, up to {}; the user is asked to approve it. Pass `background: true` \
-to run it beside the conversation and collect it later with `script_result {{ id }}`. Run \
-multiple tool calls in one go when it makes sense: put every call a step needs in a single \
-script, batch independent calls together and chain the ones that depend on each other, instead \
-of spending a round per call, because each round re-sends the whole prompt. Do the processing \
-and the decisions in the script rather than back through the conversation: filter, join, \
-compare and branch on results there. Spend real effort on shrinking what you return: filter \
-down to the lines that answer the question, sort and de-duplicate them, and compact, count or \
-summarise the rest instead of dumping raw output — that result is all the model sees, so keep \
-it as small as the answer allows. The working directory is shared by every call a script \
-makes and stays after it, so move it once with `await \
-tools.set_working_directory({{ path }})` and keep the cd out of the commands. Callable now:",
-                super::script::MAX_EXEC_MS / 1_000,
-                super::script::MAX_CALLS,
-                super::script::MAX_CALL_MS / 1_000,
-                super::script::MAX_EXEC_MS / 1_000,
-                super::script::MAX_TIMEOUT_MS / 1_000
-            ));
-            current.push(catalog);
-            current.push(format!(
-                "This chat calls its tools this way until `set_script_mode` with on: false \
-brings their schemas back; a chat also switches on its own once its conversation passes {}% \
-of the model's context window.",
-                super::agent::SCRIPT_MODE_CONTEXT_SHARE
-            ));
+        let loaded: Vec<&str> = agent.loaded.names().collect();
+        if loaded.is_empty() {
+            current.push("No tool is loaded beyond the root's own.".to_owned());
         } else {
-            current.push(format!(
-                "Call your tools on the turn, one call per request. When a step would take \
-several calls whose results only you read, call `set_script_mode` with on: true first: the \
-next request carries one catalogue line per tool instead of a schema each and you work \
-through `run_script`, which saves most of what the tools cost. A chat switches to that on its \
-own once its conversation passes {}% of the model's context window, and `set_script_mode` \
-with on: false brings the tools back to the turn.",
-                super::agent::SCRIPT_MODE_CONTEXT_SHARE
-            ));
+            current.push(format!("Loaded tools: {}.", loaded.join(", ")));
         }
+        current.push(String::new());
+        let catalog = tools::catalog(&agent.permissions, !agent.subagent, agent.plan);
+        current.push(format!(
+            "Call tools from a script. `run_script` runs a JavaScript program in a sandbox: \
+`await tools.<name>(args)` runs a tool and resolves to its JSON result (`{{ ok: true, text }}`), \
+and a failed call throws. A script gets {} seconds of JavaScript — time spent waiting on a \
+tool does not count — and up to {} tool calls; one call that has not answered within {} \
+seconds fails with a timeout. Pass `timeoutSeconds` to ask for a longer run than {} seconds, \
+up to {}; the user is asked to approve it. Pass `background: true` to run it beside the \
+conversation and collect it later with `script_result {{ id }}`. Run multiple tool calls in one \
+go when it makes sense: put every call a step needs in a single script, batch independent \
+calls together and chain the ones that depend on each other, instead of spending a round per \
+call, because each round re-sends the whole prompt. Do the processing and the decisions in \
+the script rather than back through the conversation: filter, join, compare and branch on \
+results there. Spend real effort on shrinking what you return: filter down to the lines that \
+answer the question, sort and de-duplicate them, and compact, count or summarise the rest \
+instead of dumping raw output — that result is all the model sees, so keep it as small as the \
+answer allows. The working directory is shared by every call a script makes and stays after \
+it, so move it once with `await tools.set_working_directory({{ path }})` and keep the cd out of \
+the commands. Callable now:",
+            super::script::MAX_EXEC_MS / 1_000,
+            super::script::MAX_CALLS,
+            super::script::MAX_CALL_MS / 1_000,
+            super::script::MAX_EXEC_MS / 1_000,
+            super::script::MAX_TIMEOUT_MS / 1_000
+        ));
+        current.push(catalog);
         // The map's digest: the tree this conversation already knows, so its turns go on
         // the work rather than on finding the files again.
-        if agent.scopes.contains(ENV_SCOPE) && !agent.map.is_empty() {
+        if !agent.map.is_empty() {
             current.push(String::new());
             current.push(MAP_HEADING.to_owned());
             current.push(agent.map.overview());
         }
-        if agent.scopes.contains(ENV_SCOPE) && !agent.system.is_empty() {
+        if !agent.system.is_empty() {
             current.push(String::new());
             current.push(SYSTEM_HEADING.to_owned());
             current.push(agent.system.summary());
@@ -1305,36 +1257,18 @@ with on: false brings the tools back to the turn.",
         Self::system_prompt(agent, settings, host, environment).text()
     }
 
-    /// The tools of `scope` this conversation can call, as the model names them.
-    fn scope_tools(agent: &Agent, scope: &scopes::Scope) -> Vec<&'static str> {
-        let mut names = scope.tools.to_vec();
-        if let Some(pane) = scope.pane {
-            names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
-        }
-        // The ways into the script API are tools of the turn only in that mode; naming them
-        // in a chat that calls its tools on the turn invites a call that is not offered.
-        names.retain(|name| {
-            agent.offers_tool(name) && (agent.scripts() || !tools::is_script_driver(name))
-        });
-        names
-    }
-
-    /// The scope this conversation would load to get at the host's files, and the file tools
-    /// it holds.
+    /// The tools that read and change files on the connected host, when the host allows any.
     ///
     /// Naming them while they are not loaded is what stops the agent from reading, searching
-    /// and editing files with `cat`, `grep` and `sed` instead of loading the scope.
-    fn host_file_scope(agent: &Agent) -> Option<(&'static str, String)> {
-        let scope = scopes::visible(&agent.scopes, &agent.permissions)
+    /// and editing files with `cat`, `grep` and `sed` instead of searching for the tools.
+    fn host_file_tools(agent: &Agent) -> Option<String> {
+        let names: Vec<&str> = scopes::find("host-files")
             .into_iter()
-            .find(|scope| scope.tools.iter().any(|name| is_host_file_tool(name)))?;
-        let names: Vec<&str> = scope
-            .tools
-            .iter()
+            .flat_map(|scope| scope.tools.iter())
             .copied()
-            .filter(|name| is_host_file_tool(name))
+            .filter(|name| is_host_file_tool(name) && agent.offers_tool(name))
             .collect();
-        Some((scope.id, names.join(", ")))
+        (!names.is_empty()).then(|| names.join(", "))
     }
 
     /// How to choose between this session's tools, named as they are offered here.
@@ -1356,7 +1290,8 @@ with on: false brings the tools back to the turn.",
              read or changed."
                 .to_owned(),
             "- A tool you want but do not have is not an invitation to improvise in the shell. \
-             If it belongs to a scope listed below, load that scope with load_scope first."
+             Call search_tools with what the task needs to load it, or call it from inside \
+             run_script."
                 .to_owned(),
         ];
         if agent.offers_tool(super::protocol::TOOL_RUN_COMMAND) {
@@ -1376,20 +1311,17 @@ with on: false brings the tools back to the turn.",
                  they cannot hang on a pager, and they show the user what changed.",
                 host_files.join(", ")
             ));
-        } else if let Some((scope, names)) = Self::host_file_scope(agent) {
+        } else if let Some(names) = Self::host_file_tools(agent) {
             lines.push(format!(
-                "- Files on the connected host are read, searched and changed with {names}, \
-                 which the '{scope}' scope holds. Load that scope before touching a file there; \
-                 do not use cat, head, tail, ls, find, grep/rg, sed, awk or shell redirection \
-                 in its place."
+                "- Files on the connected host are read, searched and changed with {names}. \
+                 search_tools with \"host file\" loads them; do not use cat, head, tail, ls, \
+                 find, grep/rg, sed, awk or shell redirection in their place."
             ));
         }
         // The map answers project questions without touching the host, so it leads: loaded it
         // is the rule, visible it is the scope to load before searching the tree by hand.
-        let env_available = scopes::visible(&agent.scopes, &agent.permissions)
-            .iter()
-            .any(|scope| scope.id == ENV_SCOPE);
-        if agent.offers_tool(super::protocol::TOOL_ENV_FIND) {
+        let env_available = agent.offers_tool(super::protocol::TOOL_ENV_SCAN);
+        if agent.loaded.holds(super::protocol::TOOL_ENV_FIND) {
             lines.push(
                 "- Start project questions in the environment map: where something lives, what \
                  calls it, which files make up an area, how the tree fits together. env_search \
@@ -1405,9 +1337,9 @@ with on: false brings the tools back to the turn.",
         } else if env_available {
             lines.push(
                 "- Project questions — where something lives, what calls it, which files make up \
-                 an area — are answered from the Graph scope ('env'), which is not loaded: load \
-                 it first and use its env_search, env_find and env_outline instead of searching \
-                 the tree by hand. Load it together with the host's file tools when the work is \
+                 an area — are answered from the environment map: search_tools with \"environment \
+                 map\" loads env_search, env_find and env_outline, which answer without touching \
+                 the host. Load them together with the host's file tools when the work is \
                  development."
                     .to_owned(),
             );
@@ -2138,7 +2070,7 @@ with on: false brings the tools back to the turn.",
             .and_then(Value::as_str)
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
-        self.agent.scopes = Loaded::from_json(stored.get("scopes"));
+        self.agent.loaded = Loaded::from_json(stored.get("loaded"));
         self.agent.plan = stored["planMode"].as_bool().unwrap_or(false);
         self.agent.usage = UsageLog::from_json(stored.get("usage"));
         self.agent
@@ -2181,7 +2113,7 @@ with on: false brings the tools back to the turn.",
                             .as_str()
                             .filter(|summary| !summary.is_empty())
                             .map(str::to_owned),
-                        scopes: Loaded::from_json(chat.get("scopes")),
+                        loaded: Loaded::from_json(chat.get("loaded")),
                         plan: chat["planMode"].as_bool().unwrap_or(false),
                         usage: UsageLog::from_json(chat.get("usage")),
                         subagents: subagents_from_json(chat.get("subagents")),
@@ -2853,25 +2785,26 @@ with on: false brings the tools back to the turn.",
         self.send_message(text, UserMeta::default(), Vec::new(), settings, host, environment);
     }
 
-    /// Draw the popup a tag opened: what the scope is, the tools it carries, and the way to
-    /// turn it off.
-    fn scope_popover(&mut self, ui: &mut Ui, palette: &Palette) {
-        let Some(popup) = self.scope_popup.as_ref() else {
-            return;
-        };
-        let Some(scope) = scopes::find(popup.id) else {
-            self.scope_popup = None;
+    /// Draw the popup the tools button opened: what this chat keeps on the turn, and the
+    /// environment map when the host allows it.
+    fn tools_popover(&mut self, ui: &mut Ui, palette: &Palette) {
+        let Some(popup) = self.tools_popup.as_ref() else {
             return;
         };
         let anchor = popup.anchor;
-        let loaded = self.agent.scopes.contains(scope.id);
-        let tools = self.scope_tool_names(scope);
-        let mut turn_off = false;
+        let loaded: Vec<(&'static str, String)> = self
+            .agent
+            .loaded
+            .names()
+            .map(|name| (name, tools::describe(name).unwrap_or_default()))
+            .collect();
+        let env = self.agent.offers_tool(super::protocol::TOOL_ENV_SCAN);
+        let mut dropped: Option<&'static str> = None;
         let mut scan = false;
         let mut deep = false;
         let mut clear = false;
         let mut more = false;
-        let area = egui::Area::new(egui::Id::unique(("ai-scope-popup", scope.id)))
+        let area = egui::Area::new(egui::Id::unique("ai-tools-popup"))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor.left_bottom() + egui::Vec2::new(0.0, SCOPE_POPUP_GAP))
             .show(ui.ctx(), |ui| {
@@ -2879,55 +2812,57 @@ with on: false brings the tools back to the turn.",
                     .fill(to_color32(palette.bg_panel))
                     .stroke(egui::Stroke::new(1.0, to_color32(palette.border)))
                     .corner_radius(egui::CornerRadius::same(RADIUS as u8))
-                    .inner_margin(egui::Margin::same(SCOPE_POPUP_PADDING))
+                    .inner_margin(egui::Margin::same(TOOLS_POPUP_PADDING))
                     .show(ui, |ui| {
-                        ui.set_width(SCOPE_POPUP_WIDTH);
+                        ui.set_width(TOOLS_POPUP_WIDTH);
                         ui.spacing_mut().item_spacing.y = SCOPE_POPUP_GAP;
                         ui.label(
-                            egui::RichText::new(if scope.id == ENV_SCOPE {
-                                GRAPH_SCOPE_LABEL
-                            } else {
-                                scope.id
-                            })
+                            egui::RichText::new(TOOLS_TITLE)
                                 .size(12.0)
                                 .strong()
                                 .color(to_color32(palette.text)),
                         );
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(scope.summary)
-                                    .size(11.0)
-                                    .color(to_color32(palette.text_muted)),
-                            )
-                            .wrap(),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!(
-                                    "{} {}",
-                                    if loaded {
-                                        "Loaded, carrying"
-                                    } else {
-                                        "Not loaded. Would carry"
-                                    },
-                                    tools.len()
-                                ))
-                                .size(10.0)
-                                .color(to_color32(palette.text_muted)),
-                            )
-                            .wrap(),
-                        );
-                        if !tools.is_empty() {
+                        if loaded.is_empty() {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(tools.join(", "))
+                                    egui::RichText::new(TOOLS_EMPTY)
                                         .size(10.0)
-                                        .color(to_color32(palette.accent)),
+                                        .color(to_color32(palette.text_muted)),
                                 )
                                 .wrap(),
                             );
                         }
-                        if scope.id == ENV_SCOPE {
+                        for (name, description) in &loaded {
+                            ui.horizontal(|ui| {
+                                if Button::new("Drop")
+                                    .compact()
+                                    .ghost()
+                                    .show(ui, palette)
+                                    .clicked()
+                                {
+                                    dropped = Some(*name);
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(*name)
+                                            .size(10.0)
+                                            .color(to_color32(palette.accent)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                            if !description.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(description)
+                                            .size(10.0)
+                                            .color(to_color32(palette.text_muted)),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        }
+                        if env {
                             ui.separator();
                             ui.add(
                                 egui::Label::new(
@@ -2976,14 +2911,10 @@ with on: false brings the tools back to the turn.",
                                     .clicked();
                             });
                         }
-                        if loaded {
-                            ui.separator();
-                            turn_off = Button::new("Turn off").compact().show(ui, palette).clicked();
-                        }
                     });
             });
-        if turn_off {
-            let _ = self.agent.unload_scope(scope.id);
+        if let Some(name) = dropped {
+            self.agent.loaded.release_tool(name);
         }
         if clear {
             self.agent.map.clear();
@@ -3012,8 +2943,8 @@ with on: false brings the tools back to the turn.",
                 .flatten()
                 .is_some_and(|pos| !rect.contains(pos) && !anchor.contains(pos))
         });
-        if turn_off || clear || escape || pressed_outside {
-            self.scope_popup = None;
+        if clear || escape || pressed_outside {
+            self.tools_popup = None;
         }
     }
 
@@ -3091,9 +3022,6 @@ with on: false brings the tools back to the turn.",
             .replace("{root}", &root)
             .replace("{files}", &super::map::MAX_MAPPED_FILES.to_string());
         let index = self.agent.begin_subagent(MAP_SUBAGENT_TITLE, &prompt);
-        // The pass is a numbered procedure of direct calls, so it runs with the tools of its
-        // scopes rather than whatever the chat sends.
-        self.agent.subagents[index].agent.script_mode = Some(false);
         match self.request_for(Some(index), settings, host, environment) {
             Some(request) => {
                 if let Some(sub) = self.agent.subagents.get_mut(index) {
@@ -3238,16 +3166,6 @@ with on: false brings the tools back to the turn.",
         lines
     }
 
-    /// The tools `scope` holds that this host may call, loaded or not.
-    fn scope_tool_names(&self, scope: &scopes::Scope) -> Vec<&'static str> {
-        let mut names = scope.tools.to_vec();
-        if let Some(pane) = scope.pane {
-            names.extend(crate::plugin::tools_of(pane).iter().map(|tool| tool.name));
-        }
-        names.retain(|name| self.agent.permissions.offers(name));
-        names
-    }
-
     /// Draw the list of earlier chats, newest first, and open the one the user picks.
     fn chat_list(&mut self, ui: &mut Ui, palette: &wassh_core::Palette, muted: egui::Color32) {
         if self.chats.is_empty() {
@@ -3387,50 +3305,6 @@ fn back_button(ui: &mut Ui, palette: &Palette) -> bool {
 /// One loaded scope, as a small quiet tag beside the composer.
 ///
 /// Neutral rather than accent-filled: a loaded scope is context the conversation carries,
-/// not a button, so only hovering gives it a surface.
-fn scope_tag(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
-    let font = egui::FontId::proportional(SCOPE_TAG_TEXT_SIZE);
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), to_color32(palette.text))
-        .size()
-        .x;
-    let (rect, response) = ui.allocate_exact_size(
-        egui::Vec2::new(text_width + SCOPE_TAG_PADDING * 2.0, SCOPE_TAG_HEIGHT),
-        egui::Sense::click(),
-    );
-    let hovered = response.hovered();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, RADIUS, to_color32(palette.bg_panel_2));
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    ui.painter().rect_stroke(
-        rect,
-        RADIUS,
-        egui::Stroke::new(
-            1.0,
-            to_color32(if hovered {
-                palette.text_muted
-            } else {
-                palette.border
-            }),
-        ),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        font,
-        to_color32(if hovered {
-            palette.text
-        } else {
-            palette.text_muted
-        }),
-    );
-    response
-}
 
 /// One sub-agent card under its chat: name, state and how much it has written.
 ///
@@ -4363,9 +4237,7 @@ fn tool_badge(name: &str, palette: &Palette) -> (&'static str, wassh_core::Rgba)
         super::protocol::TOOL_RAG_SEARCH => ("RAG", rgb(0xc084fc)),
         other if other.starts_with("system_") => ("System", rgb(0x2dd4bf)),
         other if other.starts_with("terminal_") => ("Your terminal", rgb(0xf472b6)),
-        super::protocol::TOOL_LOAD_SCOPE | super::protocol::TOOL_UNLOAD_SCOPE => {
-            ("Scope", palette.text_muted)
-        }
+        super::protocol::TOOL_SEARCH_TOOLS => ("Search", palette.text_muted),
         _ => ("Tool", palette.text_muted),
     }
 }
@@ -5537,7 +5409,7 @@ script normally stops after {} seconds of JavaScript.",
                     "history": history_to_json(&chat.history),
                     "subagents": subagents_to_json(&chat.subagents),
                     "compacted": chat.compacted,
-                    "scopes": chat.scopes.to_json(),
+                    "loaded": chat.loaded.to_json(),
                     "planMode": chat.plan,
                     "usage": chat.usage.to_json()
                 })
@@ -5556,7 +5428,7 @@ script normally stops after {} seconds of JavaScript.",
                 "history": history_to_json(&self.agent.history),
                 "subagents": subagents_to_json(&self.agent.subagents),
                 "compacted": self.agent.compacted,
-                "scopes": self.agent.scopes.to_json(),
+                "loaded": self.agent.loaded.to_json(),
                 "planMode": self.agent.plan,
                 "usage": self.agent.usage.to_json(),
                 "chats": chats
@@ -5620,6 +5492,7 @@ impl Plugin for AiAgent {
         let mut back = false;
         let mut new_chat = false;
         let mut usage = false;
+        let mut tools_button: Option<egui::Response> = None;
         egui::containers::Sides::new()
             .height(BACK_BUTTON_SIZE)
             .shrink_left()
@@ -5691,6 +5564,13 @@ impl Plugin for AiAgent {
                             .show(ui, palette)
                             .clicked();
                     if matches!(self.view, ChatView::Chat) {
+                        tools_button = Some(
+                            Button::new(TOOLS_LABEL)
+                                .compact()
+                                .ghost()
+                                .show(ui, palette)
+                                .on_hover_text(TOOLS_HINT),
+                        );
                         usage = Button::new(USAGE_LABEL)
                             .compact()
                             .ghost()
@@ -5705,6 +5585,9 @@ impl Plugin for AiAgent {
         }
         if usage {
             self.view = ChatView::Stats(None);
+        }
+        if let Some(tools) = tools_button.filter(|button| button.clicked()) {
+            self.tools_popup = Some(ToolsPopup { anchor: tools.rect });
         }
         if back {
             match self.view {
@@ -5873,37 +5756,6 @@ impl Plugin for AiAgent {
                         self.draft = self.queued.remove(index).text;
                     } else if let Some(index) = drop {
                         self.queued.remove(index);
-                    }
-                }
-
-                // Scopes this conversation carries; a click drops one and the room its tools
-                // took goes with it.
-                let loaded: Vec<&'static str> = self
-                    .agent
-                    .scopes
-                    .ids()
-                    .iter()
-                    .copied()
-                    .filter(|id| *id != scopes::ROOT)
-                    .collect();
-                if !loaded.is_empty() {
-                    let mut opened = None;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new(SCOPE_LABEL)
-                                .size(SCOPE_TAG_TEXT_SIZE)
-                                .color(muted),
-                        );
-                        for id in loaded {
-                            let label = if id == ENV_SCOPE { GRAPH_SCOPE_LABEL } else { id };
-                            let tag = scope_tag(ui, palette, label).on_hover_text(SCOPE_CHIP_HINT);
-                            if tag.clicked() {
-                                opened = Some((id, tag.rect));
-                            }
-                        }
-                    });
-                    if let Some((id, anchor)) = opened {
-                        self.scope_popup = Some(ScopePopup { id, anchor });
                     }
                 }
 
@@ -6181,7 +6033,7 @@ impl Plugin for AiAgent {
         }
 
         // A popup the tags opened sits over the pane, so a press anywhere else closes it.
-        self.scope_popover(ui, palette);
+        self.tools_popover(ui, palette);
 
         if let Some((allow, remember, everything)) = prompts.approval {
             if everything {
@@ -9307,25 +9159,17 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_sends_project_questions_to_the_graph_scope() {
+    fn the_prompt_points_project_questions_at_the_environment_map() {
         let mut plugin = AiAgent::default();
-        // The host scope is what makes the Graph one reachable, and its summary names the map.
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("host").unwrap());
-        // Not loaded but available: the rule is to load it before searching the tree.
+        // Not loaded: the rule is to search for the map's tools before searching the tree.
         let prompt =
             AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(
-            prompt.contains("are answered from the Graph scope ('env'), which is not loaded"),
+            prompt.contains("are answered from the environment map"),
             "{prompt}"
         );
         // Loaded: the map tools themselves are the first stop, and grepping is the fallback.
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("env").unwrap());
+        plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_FIND], 0);
         let prompt =
             AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(
@@ -9355,14 +9199,12 @@ mod tests {
     }
 
     #[test]
-    fn script_mode_puts_the_tool_catalog_in_the_prompt() {
+    fn the_prompt_carries_the_script_api_and_the_loaded_tools() {
         let mut plugin = AiAgent::default();
-        plugin.agent.script_mode = Some(true);
-        plugin.agent.resolve_scripts(0);
         let prompt =
             AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(prompt.contains("Call tools from a script."), "{prompt}");
-        // The whole point of the mode: many tool calls per script, not one round per call.
+        // The whole point of the catalogue: many tool calls per script, not one round per call.
         assert!(
             prompt.contains("Run multiple tool calls in one go when it makes sense"),
             "{prompt}"
@@ -9399,111 +9241,55 @@ mod tests {
             "{prompt}"
         );
         // A longer run is offered, but only with the user's approval.
+        assert!(prompt.contains("Pass `timeoutSeconds`"), "{prompt}");
+        assert!(prompt.contains("the user is asked to approve it"), "{prompt}");
+        assert!(prompt.contains("each round re-sends the whole prompt"), "{prompt}");
+        assert!(prompt.contains("- run_command(command: string"), "{prompt}");
+
+        // Nothing is loaded beyond the root: the prompt says so and names no schema tool.
         assert!(
-            prompt.contains("Pass `timeoutSeconds`"),
+            prompt.contains("No tool is loaded beyond the root's own."),
             "{prompt}"
         );
+        plugin.agent.loaded.load([super::super::protocol::TOOL_DEV_GREP], 0);
+        let prompt =
+            AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(
-            prompt.contains("the user is asked to approve it"),
+            prompt.contains(&format!("Loaded tools: {}", super::super::protocol::TOOL_DEV_GREP)),
             "{prompt}"
         );
-        assert!(
-            prompt.contains("each round re-sends the whole prompt"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("- run_command(command: string"),
-            "{prompt}"
-        );
-        // The guidance says how the chat works in this mode and how it goes back.
-        assert!(
-            prompt.contains("This chat calls its tools this way until `set_script_mode`"),
-            "{prompt}"
-        );
-        // The point where the chat moves on its own is named, so the model can plan around it.
-        assert!(
-            prompt.contains(&format!(
-                "{}% of the model's context window",
-                super::super::agent::SCRIPT_MODE_CONTEXT_SHARE
-            )),
-            "{prompt}"
-        );
-        // The root's tools are the only ones loaded, so nothing of a scope shows up.
-        assert!(!prompt.contains("- dev_grep_search("), "{prompt}");
     }
 
     #[test]
-    fn the_prompt_names_the_loaded_scopes_and_what_can_be_loaded_next() {
+    fn the_prompt_names_the_loaded_tools_and_keeps_the_rest_in_the_catalogue() {
         use super::super::permissions::{GROUP_LOCAL_FS, GROUP_REMOTE_FS, Permissions, group_key};
-        let prompt_for = |groups: Vec<&str>, load: &[&str]| {
-            let settings: serde_json::Map<String, Value> = groups
-                .into_iter()
-                .map(|group| (group_key(group), json!(true)))
-                .collect();
-            let mut plugin = AiAgent::default();
-            plugin.agent.permissions = Permissions::from_settings(&settings);
-            for id in load {
-                plugin.agent.scopes.load(super::scopes::find(id).unwrap());
-            }
-            AiAgent::prompt_text(
-                &plugin.agent,
-                &serde_json::Map::new(),
-                "dev",
-                "a test shell",
-            )
-        };
-
-        // Nothing loaded beyond the root: the prompt offers the next stops and names no
-        // tool of a scope that is not loaded.
-        let both = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &[]);
-        assert!(both.contains("Environment: a test shell."), "{both}");
+        let settings: serde_json::Map<String, Value> = [GROUP_REMOTE_FS, GROUP_LOCAL_FS]
+            .into_iter()
+            .map(|group| (group_key(group), json!(true)))
+            .collect();
+        let mut plugin = AiAgent::default();
+        plugin.agent.permissions = Permissions::from_settings(&settings);
+        let prompt =
+            AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
+        assert!(prompt.contains("Environment: a test shell."), "{prompt}");
+        // The root's own tools are always tools of the turn.
+        assert!(prompt.contains("run_command"), "{prompt}");
+        // Everything else is a catalogue line, so the prompt names it as one.
+        assert!(prompt.contains("- remote_fs_read_file("), "{prompt}");
+        assert!(prompt.contains("- local_fs_grep_search("), "{prompt}");
         assert!(
-            both.contains(
-                "- core: run_command, set_working_directory, hosts_list, run_command_background, \
-                 set_script_mode, run_sudo, ask_user, spawn_subagent, wait_subagent, \
-                 get_current_time"
-            ),
-            "{both}"
-        );
-        assert!(both.contains("- host: "), "{both}");
-        assert!(both.contains("- local: "), "{both}");
-        assert!(!both.contains("remote_fs_read_file"), "{both}");
-        assert!(!both.contains("local_fs_grep_search"), "{both}");
-
-        // Loading a scope names its tools and the guidance for them.
-        let loaded = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &["host", "host-files"]);
-        assert!(
-            loaded.contains("- host-files: remote_fs_read_file"),
-            "{loaded}"
-        );
-        assert!(loaded.contains("dev_grep_search"), "{loaded}");
-        assert!(loaded.contains("Files on the connected host:"), "{loaded}");
-        assert!(
-            loaded.contains("sed, awk or shell redirection"),
-            "{loaded}"
+            prompt.contains("No tool is loaded beyond the root's own."),
+            "{prompt}"
         );
 
-        // One stop earlier: the file tools are not loaded, so the prompt names the scope
-        // that holds them instead of leaving the agent to guess with the shell.
-        let one_step = prompt_for(vec![GROUP_REMOTE_FS, GROUP_LOCAL_FS], &["host"]);
+        // Loading names them as tools of the turn.
+        plugin.agent.loaded.load([super::super::protocol::TOOL_REMOTE_READ], 0);
+        let prompt =
+            AiAgent::prompt_text(&plugin.agent, &serde_json::Map::new(), "dev", "a test shell");
         assert!(
-            one_step.contains("which the 'host-files' scope holds"),
-            "{one_step}"
+            prompt.contains(&format!("Loaded tools: {}", super::super::protocol::TOOL_REMOTE_READ)),
+            "{prompt}"
         );
-        assert!(one_step.contains("dev_view_file"), "{one_step}");
-        assert!(!one_step.contains("Files on the connected host:"), "{one_step}");
-
-        // A capability the host may not use never shows up, not even as a scope.
-        let local_only = prompt_for(vec![GROUP_LOCAL_FS], &[]);
-        assert!(local_only.contains("- local: "), "{local_only}");
-        assert!(!local_only.contains("- host-files: "), "{local_only}");
-        assert!(!local_only.contains("dev_view_file"), "{local_only}");
-
-        // A host with nothing switched on keeps the commands and loses the file scopes.
-        let bare = prompt_for(Vec::new(), &[]);
-        assert!(bare.contains("- core: run_command"), "{bare}");
-        assert!(!bare.contains("- local: "), "{bare}");
-        assert!(!bare.contains("local_fs_read_file"), "{bare}");
     }
 
     #[test]
@@ -9821,8 +9607,7 @@ mod tests {
         .into_iter()
         .collect();
         let mut plugin = AiAgent::default();
-        plugin.agent.script_mode = Some(true);
-        plugin.agent.resolve_scripts(0);
+        plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_OVERVIEW], 0);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         plugin.agent.map = super::super::map::EnvMap::parse(
@@ -9837,11 +9622,13 @@ mod tests {
             .map_deep
             .as_ref()
             .unwrap_or_else(|| panic!("the mapping pass did not start: {:?}", plugin.error));
-        // The task is a numbered procedure — look at the map, read the files, answer with
-        // one object — so the pass keeps the tools of its scopes rather than the chat's paths.
+        // The pass starts with the tools this chat has loaded, so it can use the map directly.
         assert!(
-            !plugin.agent.subagents[run.subagent].agent.scripts(),
-            "the mapping agent was left calling its tools from scripts"
+            plugin.agent.subagents[run.subagent]
+                .agent
+                .loaded
+                .holds(super::super::protocol::TOOL_ENV_OVERVIEW),
+            "the mapping agent did not inherit the chat's loaded tools"
         );
         assert!(
             plugin.agent.subagents[run.subagent]
@@ -9901,14 +9688,8 @@ mod tests {
         let mut settings = serde_json::Map::new();
         settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
         let mut plugin = AiAgent::default();
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("host").unwrap());
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("env").unwrap());
+        plugin.view = ChatView::Chat;
+        plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_SCAN], 0);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let index = plugin.agent.begin_subagent("map the project", "map it");
@@ -9941,9 +9722,9 @@ mod tests {
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let tag = rows
             .iter()
-            .find(|(_, _, text)| text == GRAPH_SCOPE_LABEL)
+            .find(|(_, _, text)| text == TOOLS_LABEL)
             .cloned()
-            .expect("the Graph scope has a tag");
+            .expect("the Tools button is in the header");
         frame(&mut plugin, &mut settings, &ctx, click(tag));
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         assert!(
@@ -10061,22 +9842,16 @@ mod tests {
         let mut settings = serde_json::Map::new();
         settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
         let mut plugin = AiAgent::default();
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("host").unwrap());
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("env").unwrap());
+        plugin.view = ChatView::Chat;
+        plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_SCAN], 0);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let tag = rows
             .iter()
-            .find(|(_, _, text)| text == GRAPH_SCOPE_LABEL)
+            .find(|(_, _, text)| text == TOOLS_LABEL)
             .cloned()
-            .expect("the Graph scope has a tag");
+            .expect("the Tools button is in the header");
         frame(&mut plugin, &mut settings, &ctx, click(tag));
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let scan = rows
@@ -10284,28 +10059,14 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_carries_the_map_once_its_scope_is_loaded() {
+    fn the_prompt_carries_the_map_once_it_has_one() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
         plugin.agent.map = a_scanned_map();
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("host").unwrap());
-        let without = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
-        assert!(
-            !without.contains(MAP_HEADING),
-            "the map is not the conversation's until its scope is loaded: {without}"
-        );
-
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("env").unwrap());
+        plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_FIND], 0);
         let with = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(with.contains(MAP_HEADING), "{with}");
         assert!(with.contains("/srv/app (2 files"), "{with}");
-        assert!(with.contains("src/  2"), "{with}");
         assert!(with.contains("env_search ranks files"), "{with}");
 
         // An empty map says nothing rather than costing prompt room.
@@ -10319,14 +10080,7 @@ mod tests {
     fn the_prompt_carries_the_host_setup_once_it_has_been_scanned() {
         let mut plugin = AiAgent::default();
         let mut settings = serde_json::Map::new();
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("host").unwrap());
-        plugin
-            .agent
-            .scopes
-            .load(super::super::scopes::find("env").unwrap());
+        plugin.agent.loaded.load([super::super::protocol::TOOL_ENV_SCAN], 0);
         let without = AiAgent::prompt_text(&plugin.agent, &settings, "dev", "a test shell");
         assert!(
             !without.contains(SYSTEM_HEADING),
@@ -10365,22 +10119,26 @@ mod tests {
 
     #[test]
     fn the_map_scope_popup_clears_the_map() {
+        let mut plugin_with_chat = ();
         let mut settings = serde_json::Map::new();
         settings.insert(MAP_KEY.to_owned(), a_scanned_map().to_json());
         let mut plugin = AiAgent::default();
-        plugin.agent.scopes.load(super::super::scopes::find("host").unwrap());
-        plugin.agent.scopes.load(super::super::scopes::find("env").unwrap());
+        plugin.view = ChatView::Chat;
+        plugin
+            .agent
+            .loaded
+            .load([super::super::protocol::TOOL_ENV_SCAN], 0);
         let ctx = egui::Context::default();
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let tag = rows
             .iter()
-            .find(|(_, _, text)| text == GRAPH_SCOPE_LABEL)
+            .find(|(_, _, text)| text == TOOLS_LABEL)
             .cloned()
-            .expect("the Graph scope has a tag");
+            .expect("the Tools button is in the header");
         assert!(
-            rows.iter().any(|(_, _, text)| text == "host"),
-            "the host scope stays visible alongside Graph: {rows:?}"
+            rows.iter().any(|(_, _, text)| text == TOOLS_LABEL),
+            "the header keeps the tools button: {rows:?}"
         );
         frame(&mut plugin, &mut settings, &ctx, click(tag));
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
@@ -10396,7 +10154,7 @@ mod tests {
         frame(&mut plugin, &mut settings, &ctx, click(clear));
         assert!(plugin.agent.map.is_empty(), "Clear did not empty the map");
         assert!(
-            plugin.agent.scopes.contains(ENV_SCOPE),
+            plugin.agent.loaded.holds(super::super::protocol::TOOL_ENV_SCAN),
             "clearing is not unloading"
         );
     }
@@ -10497,58 +10255,67 @@ mod tests {
                 "model": "llama3.1",
                 "turns": [],
                 "history": [],
-                "scopes": [scopes::ROOT, "web", "not-a-scope"]
+                "loaded": ["local_fs_grep_search", "not-a-tool"]
             }),
         );
         let mut plugin = AiAgent::default();
         draw(&mut plugin, &mut settings);
-        assert!(plugin.agent.scopes.contains("web"));
-        assert!(!plugin.agent.scopes.contains("not-a-scope"));
-        assert!(plugin.agent.scopes.contains(scopes::ROOT));
-        // Written back in graph order, with the unknown id dropped.
-        assert_eq!(settings[CONVERSATION_KEY]["scopes"], json!([scopes::ROOT, "web"]));
+        assert!(plugin.agent.loaded.holds("local_fs_grep_search"));
+        assert!(!plugin.agent.loaded.holds("not-a-tool"));
+        // Written back by name, with the unknown one dropped.
+        assert_eq!(
+            settings[CONVERSATION_KEY]["loaded"],
+            json!(["local_fs_grep_search"])
+        );
     }
 
     #[test]
-    fn a_scope_tag_opens_its_popup_and_turning_off_drops_it() {
+    fn the_tools_button_opens_the_loaded_tools_and_dropping_one_keeps_the_menu_open() {
+        let mut plugin_with_chat = ();
         let mut plugin = AiAgent::default();
-        plugin.agent.scopes.load(super::scopes::find("host").unwrap());
+        plugin.view = ChatView::Chat;
+        plugin
+            .agent
+            .loaded
+            .load([super::super::protocol::TOOL_DEV_GREP], 0);
         let mut settings = serde_json::Map::new();
         let ctx = egui::Context::default();
         // The composer panel settles its height on the first frame.
         frame(&mut plugin, &mut settings, &ctx, Vec::new());
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
         assert!(
-            rows.iter().any(|(_, _, text)| text == SCOPE_LABEL),
+            rows.iter().any(|(_, _, text)| text == TOOLS_LABEL),
             "{rows:?}"
         );
-        let tag = rows
+        let button = rows
             .iter()
-            .find(|(_, _, text)| text == "host")
+            .find(|(_, _, text)| text == TOOLS_LABEL)
             .cloned()
-            .unwrap_or_else(|| panic!("no tag for the loaded scope: {rows:?}"));
-        frame(&mut plugin, &mut settings, &ctx, click(tag));
+            .unwrap_or_else(|| panic!("no tools button in the header: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(button));
         assert!(
-            plugin.agent.scopes.contains("host"),
-            "clicking a tag asks, it does not unload"
+            plugin.agent.loaded.holds(super::super::protocol::TOOL_DEV_GREP),
+            "opening the list must not unload anything"
         );
 
-        // The popup says what the scope is and offers to turn it off.
+        // The popup names the loaded tool and offers to drop it.
         let rows = frame(&mut plugin, &mut settings, &ctx, Vec::new());
-        let scope = super::scopes::find("host").unwrap();
         assert!(
-            rows.iter().any(|(_, _, text)| text == scope.summary),
-            "the popup does not describe the scope: {rows:?}"
+            rows.iter()
+                .any(|(_, _, text)| text == super::super::protocol::TOOL_DEV_GREP),
+            "the popup does not name the loaded tool: {rows:?}"
         );
-        let turn_off = rows
+        let drop = rows
             .iter()
-            .find(|(_, _, text)| text == "Turn off")
+            .find(|(_, _, text)| text == "Drop")
             .cloned()
-            .unwrap_or_else(|| panic!("the popup offers no Turn off: {rows:?}"));
-        frame(&mut plugin, &mut settings, &ctx, click(turn_off));
-        assert!(!plugin.agent.scopes.contains("host"), "Turn off did nothing");
-        assert!(plugin.agent.scopes.contains(scopes::ROOT));
-        assert!(plugin.scope_popup.is_none(), "the popup closed with the action");
+            .unwrap_or_else(|| panic!("the popup offers no Drop: {rows:?}"));
+        frame(&mut plugin, &mut settings, &ctx, click(drop));
+        assert!(
+            !plugin.agent.loaded.holds(super::super::protocol::TOOL_DEV_GREP),
+            "Drop did nothing"
+        );
+        assert!(plugin.tools_popup.is_some(), "the popup closes only on a press outside");
     }
 
     #[test]

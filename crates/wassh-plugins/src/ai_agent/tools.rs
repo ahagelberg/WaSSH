@@ -27,7 +27,6 @@ use super::protocol::{
     TOOL_HOSTS_LIST,
     TOOL_ENV_OVERVIEW, TOOL_ENV_SCAN, TOOL_ENV_SEARCH, TOOL_ENV_SYSTEM, TOOL_GIT_BRANCHES,
     TOOL_GIT_CHECKOUT, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_LOG, TOOL_GIT_STATUS,
-    TOOL_LOAD_SCOPE,
     TOOL_LOCAL_DELETE, TOOL_LOCAL_EDIT, TOOL_LOCAL_GREP, TOOL_LOCAL_LIST, TOOL_LOCAL_MOVE,
     TOOL_LOCAL_MULTI_EDIT, TOOL_LOCAL_PATCH, TOOL_LOCAL_READ, TOOL_LOCAL_REPLACE, TOOL_LOCAL_RUN,
     TOOL_LOCAL_WRITE, TOOL_RAG_SEARCH, TOOL_REMOTE_DELETE, TOOL_REMOTE_EDIT, TOOL_REMOTE_LIST,
@@ -37,13 +36,12 @@ use super::protocol::{
     TOOL_SPAWN_SUBAGENT,
     TOOL_SYSTEM_DISK, TOOL_SYSTEM_MEMORY, TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES,
     TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ, TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE,
-    TOOL_UNLOAD_SCOPE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
-    TOOL_SET_SCRIPT_MODE,
+    TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH, TOOL_SEARCH_TOOLS,
 };
 
 use super::agent::shell_quote;
 use super::permissions::Permissions;
-use super::scopes::{Loaded, scope_of};
+use super::scopes::{self, Loaded, SCOPES, scope_of};
 use super::script;
 use crate::plugin::PluginTool;
 
@@ -453,24 +451,12 @@ impl ToolSpec {
 
 /// The tools that move along the scope graph. They are sent in every request: without them
 /// the model could never reach anything a scope holds.
-pub const SCOPE_TOOLS: &[ToolSpec] = &[
-    ToolSpec {
-        name: TOOL_LOAD_SCOPE,
-        description: "Load a scope so its tools can be called. Ask for one of the scopes listed \
-as available; its tools are offered from the next turn on.",
-    },
-    ToolSpec {
-        name: TOOL_UNLOAD_SCOPE,
-        description: "Drop a loaded scope and everything inside it, freeing the room its tools \
-took in this conversation.",
-    },
-    ToolSpec {
-        name: TOOL_SET_SCRIPT_MODE,
-        description: "Call the loaded tools from inside `run_script` instead of as tools of the \
-turn, or switch back. Script mode carries one catalogue line per tool instead of a schema \
-each, which is most of what a long chat spends on tools.",
-    },
-];
+pub const SCOPE_TOOLS: &[ToolSpec] = &[ToolSpec {
+    name: TOOL_SEARCH_TOOLS,
+    description: "Search the tools this host allows for what a task needs, and load the best \
+matches as tools of the turn. Everything a script may call is already listed; search is how a \
+tool gets its own schema.",
+}];
 
 /// Whether `name` is one of the scope tools.
 pub fn is_scope_tool(name: &str) -> bool {
@@ -742,14 +728,10 @@ more needs approval)."),
             json!(["path", "oldText", "newText"]),
         ),
         TOOL_CURRENT_TIME => (json!({}), json!([])),
-        TOOL_LOAD_SCOPE | TOOL_UNLOAD_SCOPE => (
-            json!({ "scope": string("Id of the scope, exactly as the scope index lists it.") }),
-            json!(["scope"]),
-        ),
-        TOOL_SET_SCRIPT_MODE => (
-            json!({ "on": boolean("true calls the tools from inside run_script; false offers \
-them as tools of the turn again.") }),
-            json!(["on"]),
+        TOOL_SEARCH_TOOLS => (
+            json!({ "query": string("What the work needs, in a few words: \"host file search\", \
+\"docker containers\", \"terminal\".") }),
+            json!(["query"]),
         ),
         TOOL_RAG_SEARCH => (
             json!({
@@ -944,18 +926,17 @@ them as tools of the turn again.") }),
     }
 }
 
-/// The tools this conversation may use: the loaded scopes' tools the host permits, minus the
-/// sub-agent drivers when this conversation is itself a sub-agent.
+/// The tools this host may use, minus the sub-agent drivers when this conversation is itself
+/// a sub-agent.
 pub fn available(
     permissions: &Permissions,
-    loaded: &Loaded,
     subagents: bool,
     plan: bool,
 ) -> impl Iterator<Item = &'static ToolSpec> {
     TOOL_SPECS
         .iter()
         .filter(move |spec| subagents || !is_subagent_tool(spec.name))
-        .filter(move |spec| loaded.holds(spec.name) && permissions.offers(spec.name))
+        .filter(move |spec| permissions.offers(spec.name))
         .filter(move |spec| !plan || plan_safe(spec.name))
 }
 
@@ -970,79 +951,73 @@ pub fn plan_safe(name: &str) -> bool {
 /// The script API, one line per tool a script may call.
 ///
 /// A line is all the prompt needs: the argument names and types, what each argument is for,
-/// and what the tool is for. That is a fraction of what the same tools' schemas cost, and it
-/// is why a chat that works through scripts can carry tools it would not send as schemas.
-pub fn catalog(
-    permissions: &Permissions,
-    loaded: &Loaded,
-    subagents: bool,
-    plan: bool,
-) -> String {
-    offered(permissions, loaded, subagents, plan, true).catalog
+/// and what the tool is for. That is a fraction of what a schema costs, which is why every
+/// tool the host allows can be offered to a script while only the loaded ones are offered to
+/// the turn.
+pub fn catalog(permissions: &Permissions, subagents: bool, plan: bool) -> String {
+    offered(permissions, &Loaded::new(), subagents, plan).catalog
 }
 
-/// The tools that are how a chat works through the script API: the way in, and the way back
-/// to what a background script answered. They are tools of the turn in either mode.
-pub(crate) fn is_script_driver(name: &str) -> bool {
-    matches!(name, TOOL_RUN_SCRIPT | TOOL_SCRIPT_RESULT)
+/// Whether `name` is a tool of the root scope, which is always a tool of the turn.
+pub fn is_root_tool(name: &str) -> bool {
+    scopes::find(scopes::ROOT).is_some_and(|scope| scope.tools.contains(&name))
+}
+
+/// The root scope's specs, in the order the scope lists them.
+fn root_specs() -> impl Iterator<Item = &'static ToolSpec> {
+    scopes::find(scopes::ROOT)
+        .into_iter()
+        .flat_map(|scope| scope.tools.iter())
+        .filter_map(|name| TOOL_SPECS.iter().find(|spec| spec.name == *name))
 }
 
 /// What one request carries: schemas for the tools of the turn, lines for the script API.
 pub struct Offered {
     /// Schemas of the tools the turn may call.
     pub specs: Vec<Value>,
-    /// The script API, empty while the chat calls its tools on the turn.
+    /// The script API, a line per tool a script may call.
     pub catalog: String,
 }
 
 /// Build both halves of a request.
 ///
-/// A chat calls its tools one way or the other, never both: a schema costs far more than a
-/// catalogue line, so offering the same tool both ways would pay twice for it. In script mode
-/// the turn keeps the ways in — `run_script`, `script_result` and the scope tools — and the
-/// catalogue carries the tools themselves; otherwise every loaded tool comes as its own
-/// schema and the script API stays empty until the chat switches.
+/// The root's tools are always schemas: they are the way in and the everyday commands. Every
+/// other tool the host allows is a catalogue line, callable from `run_script`, and the loaded
+/// ones are sent as schemas too because the chat asked for them on the turn. A tool is loaded
+/// by `search_tools` or by being called, and released once the conversation stops using it.
 pub fn offered(
     permissions: &Permissions,
     loaded: &Loaded,
     subagents: bool,
     plan: bool,
-    scripts: bool,
 ) -> Offered {
     let mut specs: Vec<Value> = SCOPE_TOOLS.iter().map(|spec| spec.schema()).collect();
+    specs.extend(
+        root_specs()
+            .filter(|spec| permissions.offers(spec.name))
+            .filter(|spec| !plan || plan_safe(spec.name))
+            .filter(|spec| subagents || !is_subagent_tool(spec.name))
+            .map(|spec| spec.schema()),
+    );
     let mut lines = Vec::new();
-    if scripts {
-        specs.extend(
-            TOOL_SPECS
-                .iter()
-                .filter(|spec| is_script_driver(spec.name))
-                .map(|spec| spec.schema()),
-        );
-    }
-    let mut offer = |schema: Value, line: String| {
-        if scripts {
-            lines.push(line);
-        } else {
-            specs.push(schema);
-        }
-    };
-    for spec in available(permissions, loaded, subagents, plan)
-        .filter(|spec| !is_script_driver(spec.name))
-    {
-        let (properties, required) = parameters(spec.name);
-        offer(
-            spec.schema(),
-            format!(
+    for spec in available(permissions, subagents, plan) {
+        // The way in is never something a script calls.
+        if spec.name != TOOL_RUN_SCRIPT {
+            let (properties, required) = parameters(spec.name);
+            lines.push(format!(
                 "- {}({}) — {}",
                 spec.name,
                 signature(&properties, &required),
                 first_sentence(spec.description)
-            ),
-        );
+            ));
+        }
+        if loaded.holds(spec.name) && !is_root_tool(spec.name) {
+            specs.push(spec.schema());
+        }
     }
     // Tools a pane offers are listed as they are: their calls run commands, which the
     // approval rules already gate.
-    for scope in loaded.scopes() {
+    for scope in SCOPES.iter().filter(|scope| scope.pane.is_some()) {
         let Some(pane) = scope.pane else {
             continue;
         };
@@ -1050,21 +1025,92 @@ pub fn offered(
             if !permissions.offers(tool.name) || (plan && !tool.read_only) {
                 continue;
             }
-            offer(
-                tool.schema(),
-                format!(
-                    "- {}({}) — {}",
-                    tool.name,
-                    signature(&tool.parameters["properties"], &tool.parameters["required"]),
-                    first_sentence(tool.description)
-                ),
-            );
+            lines.push(format!(
+                "- {}({}) — {}",
+                tool.name,
+                signature(&tool.parameters["properties"], &tool.parameters["required"]),
+                first_sentence(tool.description)
+            ));
+            if loaded.holds(tool.name) {
+                specs.push(tool.schema());
+            }
         }
     }
     Offered {
         specs,
         catalog: lines.join("\n"),
     }
+}
+
+/// What `name` is for, one line, for the pane that lists the loaded tools.
+pub fn describe(name: &str) -> Option<String> {
+    if let Some(spec) = TOOL_SPECS
+        .iter()
+        .chain(SCOPE_TOOLS)
+        .find(|spec| spec.name == name)
+    {
+        return Some(one_line(first_sentence(spec.description)));
+    }
+    plugin_tool(name).map(|tool| one_line(first_sentence(tool.description)))
+}
+
+/// Every tool name this build knows, as a `'static` borrow of the registry entry.
+pub fn static_name(name: &str) -> Option<&'static str> {
+    TOOL_SPECS
+        .iter()
+        .chain(SCOPE_TOOLS)
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.name)
+        .or_else(|| plugin_tool(name).map(|tool| tool.name))
+}
+
+/// The tools a query matches, best first: `(name, scope summary, description)`.
+///
+/// Searched by word over the name, the group the tool lives in and its description, so
+/// "search files on the host" finds the file tools and not the web search.
+pub fn search(
+    permissions: &Permissions,
+    subagents: bool,
+    plan: bool,
+    query: &str,
+) -> Vec<(&'static str, &'static str, &'static str)> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut found: Vec<(u32, &'static str, &'static str, &'static str)> = Vec::new();
+    let mut consider = |name: &'static str, description: &'static str| {
+        let summary = scope_of(name).map_or("", |scope| scope.summary);
+        let score = words.iter().fold(0, |total, word| {
+            let lowered = name.to_lowercase();
+            total
+                + if lowered.contains(word.as_str()) { 3 } else { 0 }
+                + if summary.to_lowercase().contains(word.as_str()) { 2 } else { 0 }
+                + if description.to_lowercase().contains(word.as_str()) { 1 } else { 0 }
+        });
+        if score > 0 {
+            found.push((score, name, summary, description));
+        }
+    };
+    for spec in available(permissions, subagents, plan) {
+        consider(spec.name, spec.description);
+    }
+    for scope in SCOPES {
+        let Some(pane) = scope.pane else {
+            continue;
+        };
+        for tool in crate::plugin::tools_of(pane) {
+            if permissions.offers(tool.name) && !(plan && !tool.read_only) {
+                consider(tool.name, tool.description);
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    found
+        .into_iter()
+        .map(|(_, name, summary, description)| (name, summary, description))
+        .collect()
 }
 
 /// A tool's arguments as `name: type` pairs, `?` marking the optional ones, each followed by
@@ -1099,7 +1145,7 @@ fn signature(properties: &Value, required: &Value) -> String {
 }
 
 /// A description on one line, without its closing period.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     flat.trim_end_matches('.').to_owned()
 }
@@ -1122,7 +1168,7 @@ fn type_label(schema: &Value) -> String {
 }
 
 /// The first sentence of a description, which is all a catalog line needs.
-fn first_sentence(text: &str) -> &str {
+pub(crate) fn first_sentence(text: &str) -> &str {
     match text.find(". ") {
         Some(end) => &text[..=end],
         None => text,
@@ -1149,11 +1195,6 @@ pub fn is_tool(name: &str) -> bool {
         || plugin_tool(name).is_some()
 }
 
-/// The scope a tool is reached through, for telling the model how to get at one it does not
-/// have yet.
-pub fn scope_for(name: &str) -> Option<&'static str> {
-    scope_of(name).map(|scope| scope.id)
-}
 
 /// Whether a tool needs the connected session.
 ///
@@ -1248,9 +1289,7 @@ pub fn is_read_only(name: &str) -> bool {
             | TOOL_SYSTEM_DISK
             | TOOL_SYSTEM_MEMORY
             | TOOL_ASK_USER
-            | TOOL_LOAD_SCOPE
-            | TOOL_UNLOAD_SCOPE
-            | TOOL_SET_SCRIPT_MODE
+            | TOOL_SEARCH_TOOLS
             | TOOL_CHANGE_DIR
             | TOOL_HOSTS_LIST
             | TOOL_SPAWN_SUBAGENT
@@ -2506,12 +2545,14 @@ mod tests {
         assert!(kept.contains(&format!("export TMPDIR='{dir}'")), "{kept}");
     }
 
-    /// Every scope loaded, so every tool is in the payload.
+    /// Every tool the host can load, loaded.
     fn everything_loaded() -> Loaded {
         let mut loaded = Loaded::new();
-        for scope in super::super::scopes::SCOPES {
-            loaded.load(scope);
-        }
+        let names = TOOL_SPECS
+            .iter()
+            .map(|spec| spec.name)
+            .chain(crate::plugin::tools().map(|tool| tool.name));
+        loaded.load(names, 0);
         loaded
     }
 
@@ -2537,23 +2578,17 @@ mod tests {
             .collect()
     }
 
-    /// The schemas a request carries in one mode.
-    fn specs(
-        permissions: &Permissions,
-        loaded: &Loaded,
-        subagents: bool,
-        plan: bool,
-        scripts: bool,
-    ) -> Vec<Value> {
-        offered(permissions, loaded, subagents, plan, scripts).specs
+    /// The schemas a request carries.
+    fn specs(permissions: &Permissions, loaded: &Loaded, subagents: bool, plan: bool) -> Vec<Value> {
+        offered(permissions, loaded, subagents, plan).specs
     }
 
     #[test]
     fn every_reference_tool_has_a_schema() {
-        let schemas = offered(&everything_allowed(), &everything_loaded(), true, false, false).specs;
+        let schemas = offered(&everything_allowed(), &everything_loaded(), true, false).specs;
         assert_eq!(
             schemas.len(),
-            TOOL_SPECS.len() - 2 + crate::plugin::tools().count() + SCOPE_TOOLS.len()
+            TOOL_SPECS.len() + crate::plugin::tools().count() + SCOPE_TOOLS.len()
         );
         // The tools a pane offers are listed alongside the agent's own.
         let docker = schemas
@@ -2564,16 +2599,20 @@ mod tests {
         assert!(is_tool("docker_containers"));
         assert!(needs_session("docker_containers"));
         let names = names(&schemas);
-        assert!(names.contains(&"run_command"));
-        assert!(names.contains(&"run_sudo"));
-        assert!(names.contains(&"dev_grep_search"));
-        assert!(names.contains(&"local_fs_grep_search"));
-        assert!(names.contains(&"local_fs_run_command"));
-        assert!(names.contains(&"local_fs_apply_patch"));
-        assert!(names.contains(&"local_fs_replace_in_files"));
-        assert!(names.contains(&"terminal_send_keys"));
-        assert!(names.contains(&"system_memory_report"));
-        assert!(names.contains(&"rag_search"));
+        for kept in [
+            "run_command",
+            "run_sudo",
+            "dev_grep_search",
+            "local_fs_grep_search",
+            "local_fs_run_command",
+            "local_fs_apply_patch",
+            "local_fs_replace_in_files",
+            "terminal_send_keys",
+            "system_memory_report",
+            "rag_search",
+        ] {
+            assert!(names.contains(&kept), "{kept}");
+        }
         let ask_user = schemas
             .iter()
             .find(|schema| schema["name"] == TOOL_ASK_USER)
@@ -2588,18 +2627,18 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_conversation_carries_the_scope_tools_and_the_root_only() {
-        let schemas = offered(&everything_allowed(), &Loaded::new(), true, false, false).specs;
+    fn a_fresh_conversation_carries_the_way_in_and_the_root_only() {
+        let offered = offered(&everything_allowed(), &Loaded::new(), true, false);
         assert_eq!(
-            names(&schemas),
+            names(&offered.specs),
             [
-                TOOL_LOAD_SCOPE,
-                TOOL_UNLOAD_SCOPE,
-                TOOL_SET_SCRIPT_MODE,
+                TOOL_SEARCH_TOOLS,
                 TOOL_RUN_COMMAND,
                 TOOL_CHANGE_DIR,
                 TOOL_HOSTS_LIST,
                 TOOL_RUN_COMMAND_BACKGROUND,
+                TOOL_RUN_SCRIPT,
+                TOOL_SCRIPT_RESULT,
                 TOOL_RUN_SUDO,
                 TOOL_ASK_USER,
                 TOOL_SPAWN_SUBAGENT,
@@ -2607,49 +2646,37 @@ mod tests {
                 TOOL_CURRENT_TIME,
             ]
         );
+        // Everything else is one catalogue line, so it is still callable from a script.
+        assert!(offered.catalog.contains("- dev_grep_search("), "{}", offered.catalog);
+        assert!(!offered.catalog.contains("- run_script("), "{}", offered.catalog);
+    }
+
+    #[test]
+    fn a_loaded_tool_gets_a_schema_and_stays_in_the_catalogue() {
+        let mut loaded = Loaded::new();
+        loaded.load([TOOL_DEV_VIEW], 0);
+        let offered = offered(&everything_allowed(), &loaded, true, false);
+        let names = names(&offered.specs);
+        assert!(names.contains(&TOOL_DEV_VIEW));
+        assert!(!names.contains(&TOOL_LOCAL_READ), "an unloaded tool stays a line");
+        assert!(offered.catalog.contains("- local_fs_read_file("), "{}", offered.catalog);
+        // A defined call a script makes reaches a loaded tool as well.
+        assert!(offered.catalog.contains(&format!("- {TOOL_DEV_VIEW}(")));
     }
 
     #[test]
     fn a_subagent_is_not_offered_the_tools_that_drive_subagents() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), false, false, false);
-        let names = names(&schemas);
+        let offered = offered(&everything_allowed(), &everything_loaded(), false, false);
+        let names = names(&offered.specs);
         assert!(!names.contains(&TOOL_SPAWN_SUBAGENT));
         assert!(!names.contains(&TOOL_WAIT_SUBAGENT));
-        assert!(names.contains(&TOOL_RUN_COMMAND));
-    }
-
-    #[test]
-    fn script_mode_keeps_the_way_in_and_carries_the_rest_as_lines() {
-        let offered = offered(&everything_allowed(), &everything_loaded(), true, false, true);
-        assert_eq!(
-            names(&offered.specs),
-            [
-                TOOL_LOAD_SCOPE,
-                TOOL_UNLOAD_SCOPE,
-                TOOL_SET_SCRIPT_MODE,
-                TOOL_RUN_SCRIPT,
-                TOOL_SCRIPT_RESULT,
-            ]
-        );
-        assert!(offered.catalog.contains(&format!("- {TOOL_RUN_COMMAND}(")));
-        // Plan mode keeps the way in: the calls it makes are checked one by one.
-        let planned = specs(&everything_allowed(), &everything_loaded(), true, true, true);
-        assert_eq!(names(&planned), names(&offered.specs));
-    }
-
-    #[test]
-    fn a_conversation_that_calls_its_tools_on_the_turn_has_no_script_api() {
-        let offered = offered(&everything_allowed(), &everything_loaded(), true, false, false);
-        assert!(offered.catalog.is_empty());
-        let names = names(&offered.specs);
-        assert!(!names.contains(&TOOL_RUN_SCRIPT));
-        assert!(!names.contains(&TOOL_SCRIPT_RESULT));
+        assert!(!offered.catalog.contains(&format!("- {TOOL_SPAWN_SUBAGENT}(")));
         assert!(names.contains(&TOOL_RUN_COMMAND));
     }
 
     #[test]
     fn the_catalog_carries_one_line_per_tool_a_script_may_call() {
-        let listed = catalog(&everything_allowed(), &everything_loaded(), true, false);
+        let listed = catalog(&everything_allowed(), true, false);
         assert!(
             listed.contains("- run_command(command: string — "),
             "{listed}"
@@ -2659,7 +2686,7 @@ mod tests {
         assert!(listed.contains("- docker_containers()"), "{listed}");
         assert!(!listed.contains("- run_script("), "{listed}");
         // Plan mode leaves out what changes something.
-        let planned = catalog(&everything_allowed(), &everything_loaded(), true, true);
+        let planned = catalog(&everything_allowed(), true, true);
         assert!(!planned.contains("- remote_fs_write_file("), "{planned}");
         assert!(planned.contains("- dev_grep_search("), "{planned}");
     }
@@ -2668,7 +2695,7 @@ mod tests {
     fn a_catalog_line_keeps_what_a_parameter_is_for() {
         // A script is written blind, so the defaults and values a signature cannot carry
         // have to stay in the line.
-        let listed = catalog(&everything_allowed(), &everything_loaded(), true, false);
+        let listed = catalog(&everything_allowed(), true, false);
         assert!(
             listed.contains("maxChars?: number — How much text to return (default 32000"),
             "{listed}"
@@ -2680,33 +2707,35 @@ mod tests {
     }
 
     #[test]
-    fn loading_a_scope_is_what_puts_its_schemas_in_the_request() {
-        let permissions = everything_allowed();
-        let mut loaded = Loaded::new();
-        loaded.load(super::super::scopes::find("host-files").unwrap());
-        let schemas = specs(&permissions, &loaded, true, false, false);
-        assert!(names(&schemas).contains(&TOOL_DEV_VIEW));
-        assert!(!names(&schemas).contains(&TOOL_LOCAL_READ));
-        loaded.load(super::super::scopes::find("docker").unwrap());
-        assert!(names(&specs(&permissions, &loaded, true, false, false)).contains(&"docker_containers"));
-    }
-
-    #[test]
-    fn the_root_request_costs_a_fraction_of_the_loadouts() {
-        let permissions = everything_allowed();
-        let base = specs(&permissions, &Loaded::new(), true, false, false);
-        let all = specs(&permissions, &everything_loaded(), true, false, false);
-        let base = prompt_chars(&base, "");
-        let all = prompt_chars(&all, "");
+    fn a_search_ranks_the_tools_a_task_needs_first() {
+        let found = search(&everything_allowed(), true, false, "search files on the host");
+        let names: Vec<&str> = found.iter().map(|(name, _, _)| *name).collect();
         assert!(
-            base * 5 < all,
-            "the base request is {base} chars of {all}, which is not a saving worth the hop"
+            names.iter().any(|name| name.starts_with("dev_grep") || name.starts_with("dev_find")),
+            "{names:?}"
+        );
+        // The host's file tools come before the web search, which shares the word "search".
+        let host_file = names.iter().position(|name| name.starts_with("dev_"));
+        let web = names.iter().position(|name| *name == TOOL_WEB_SEARCH);
+        assert!(host_file < web, "{names:?}");
+
+        // A word no tool carries finds nothing, and a tool the host may not use is never found.
+        assert!(search(&everything_allowed(), true, false, "zzzz").is_empty());
+        let denied = search(
+            &Permissions::from_settings(&serde_json::Map::new()),
+            true,
+            false,
+            "fetch a web page",
+        );
+        assert!(
+            !denied.iter().any(|(name, _, _)| *name == TOOL_WEB_FETCH),
+            "a denied tool was offered: {denied:?}"
         );
     }
 
     #[test]
     fn plan_mode_sends_only_the_tools_that_read() {
-        let schemas = specs(&everything_allowed(), &everything_loaded(), true, true, false);
+        let schemas = specs(&everything_allowed(), &everything_loaded(), true, true);
         let names = names(&schemas);
         for kept in [
             TOOL_DEV_VIEW,
@@ -2718,7 +2747,7 @@ mod tests {
             TOOL_SYSTEM_OVERVIEW,
             TOOL_ENV_FIND,
             TOOL_ASK_USER,
-            TOOL_LOAD_SCOPE,
+            TOOL_SEARCH_TOOLS,
             TOOL_CHANGE_DIR,
             "docker_containers",
         ] {
@@ -2757,7 +2786,7 @@ mod tests {
         ]));
         assert_eq!(permissions.decision(TOOL_TERMINAL_KEYS), Permission::Ask);
         assert_eq!(permissions.decision(TOOL_TERMINAL_WRITE), Permission::Deny);
-        let schemas = specs(&permissions, &everything_loaded(), true, false, false);
+        let schemas = specs(&permissions, &everything_loaded(), true, false);
         assert!(names(&schemas).contains(&TOOL_TERMINAL_KEYS));
         assert!(!names(&schemas).contains(&TOOL_TERMINAL_WRITE));
     }

@@ -1,14 +1,13 @@
-//! The graph of tool scopes the model navigates.
+//! The index of tools, grouped by the kind of work they do.
 //!
-//! Sending every tool schema in every request costs the prompt a few thousand tokens before
-//! the user has typed anything. Instead the tools are grouped into scopes, and only the
-//! scopes loaded for this conversation have their schemas sent. The root scope is always
-//! loaded; from there the model follows the graph with `load_scope`.
-//!
-//! A scope is *visible* while one of the scopes around it is loaded: a child of a loaded
-//! scope is visible, and so is a scope one of its `related` edges points at. Only `children`
-//! edges nest, so unloading a scope takes its whole subtree with it; a `related` edge only
-//! widens what may be loaded next and never loads anything by itself.
+//! Every tool a host allows is callable from inside `run_script`, one line each in the script
+//! API, so the prompt never has to carry every schema. The tools the chat wants on the turn
+//! are *loaded*, and only those are sent as schemas: `search_tools` loads the few a task
+//! needs, and a tool the conversation stops using is released again after a few turns. The
+//! groups here are what the search matches against and what tells the model which kinds of
+//! work exist at all.
+
+use std::collections::BTreeMap;
 
 use super::permissions::Permissions;
 use super::protocol::{
@@ -28,38 +27,32 @@ use super::protocol::{
     TOOL_SYSTEM_MEMORY,
     TOOL_SYSTEM_OVERVIEW, TOOL_SYSTEM_PROCESSES, TOOL_TERMINAL_KEYS, TOOL_TERMINAL_READ,
     TOOL_TERMINAL_WAIT, TOOL_TERMINAL_WRITE, TOOL_WAIT_SUBAGENT, TOOL_WEB_FETCH, TOOL_WEB_SEARCH,
-    TOOL_SET_SCRIPT_MODE,
 };
 use crate::{PluginId, plugin};
 
-/// The scope that is always loaded: the commands themselves and the user prompt.
+/// The scope whose tools are always tools of the turn: the commands and the prompt.
 pub const ROOT: &str = "core";
 
-/// One node of the tool graph.
+/// One kind of work the index knows.
 pub struct Scope {
-    /// Id the model passes to `load_scope`.
+    /// Id, and the word a search matches on.
     pub id: &'static str,
-    /// One line shown in the index while the scope is not loaded.
+    /// One line shown in a search that matched nothing.
     pub summary: &'static str,
     /// Tools of this crate's own, by the names the model calls.
     pub tools: &'static [&'static str],
     /// A pane whose tools this scope offers instead of (or as well as) named ones.
     pub pane: Option<PluginId>,
-    /// Scopes this one nests.
-    pub children: &'static [&'static str],
-    /// Scopes worth offering alongside this one; visibility only, nothing loads.
-    pub related: &'static [&'static str],
 }
 
-/// Every scope, parents before children.
+/// Every kind of work, the root first.
 pub const SCOPES: &[Scope] = &[
     Scope {
         id: ROOT,
         summary: "Run shell commands on the connected host (also as root) and set the directory \
 they work in, reach another saved host the same way, run a JavaScript program that calls the \
 other tools itself, ask the user a question, read the clock, and delegate work to a background \
-sub-agent. set_script_mode decides whether the tools are called from one of those programs \
-instead of as tools of the turn.",
+sub-agent.",
         tools: &[
             TOOL_RUN_COMMAND,
             TOOL_CHANGE_DIR,
@@ -67,7 +60,6 @@ instead of as tools of the turn.",
             TOOL_RUN_COMMAND_BACKGROUND,
             TOOL_RUN_SCRIPT,
             TOOL_SCRIPT_RESULT,
-            TOOL_SET_SCRIPT_MODE,
             TOOL_RUN_SUDO,
             TOOL_ASK_USER,
             TOOL_SPAWN_SUBAGENT,
@@ -75,18 +67,6 @@ instead of as tools of the turn.",
             TOOL_CURRENT_TIME,
         ],
         pane: None,
-        children: &["host", "local", "web", "knowledge", "docker"],
-        related: &[],
-    },
-    Scope {
-        id: "host",
-        summary: "Work with the connected host: the environment map of its files, the files \
-themselves (dev_view, dev_edit, dev_create, dev_list, dev_grep, dev_find, dev_diff), its \
-system statistics, the live terminal.",
-        tools: &[],
-        pane: None,
-        children: &["env", "host-files", "host-system", "host-terminal"],
-        related: &["local", "docker"],
     },
     Scope {
         id: "env",
@@ -104,8 +84,6 @@ dev_grep_search or dev_find_files for \"where is X\".",
             TOOL_ENV_SYSTEM,
         ],
         pane: None,
-        children: &[],
-        related: &["host-files", "host-system"],
     },
     Scope {
         id: "host-files",
@@ -141,8 +119,6 @@ instead of cat, grep, ls, find or sed.",
             TOOL_DEV_DIFF,
         ],
         pane: None,
-        children: &[],
-        related: &["host-terminal", "env"],
     },
     Scope {
         id: "host-system",
@@ -154,8 +130,6 @@ instead of cat, grep, ls, find or sed.",
             TOOL_SYSTEM_MEMORY,
         ],
         pane: None,
-        children: &[],
-        related: &["docker"],
     },
     Scope {
         id: "host-terminal",
@@ -167,8 +141,6 @@ instead of cat, grep, ls, find or sed.",
             TOOL_TERMINAL_WAIT,
         ],
         pane: None,
-        children: &[],
-        related: &["host-files"],
     },
     Scope {
         id: "local",
@@ -187,32 +159,24 @@ instead of cat, grep, ls, find or sed.",
             TOOL_LOCAL_RUN,
         ],
         pane: None,
-        children: &[],
-        related: &["host-files"],
     },
     Scope {
         id: "web",
         summary: "Fetch pages and search the web.",
         tools: &[TOOL_WEB_FETCH, TOOL_WEB_SEARCH],
         pane: None,
-        children: &[],
-        related: &[],
     },
     Scope {
         id: "knowledge",
         summary: "Search the configured knowledge-base folders.",
         tools: &[TOOL_RAG_SEARCH],
         pane: None,
-        children: &[],
-        related: &[],
     },
     Scope {
         id: "docker",
         summary: "Inspect containers, images, volumes and networks through the docker CLI.",
         tools: &[],
         pane: Some(PluginId::DockerManager),
-        children: &[],
-        related: &["host-system"],
     },
 ];
 
@@ -241,136 +205,99 @@ fn tools_of(scope: &'static Scope) -> Vec<&'static str> {
 }
 
 /// Whether the host may use any tool of this scope.
-///
-/// A scope holding no tools of its own is available while one of its children is, so a
-/// container never shows up as an empty stop with every branch switched off.
-pub fn available(scope: &'static Scope, permissions: &Permissions) -> bool {
+pub fn scope_available(scope: &'static Scope, permissions: &Permissions) -> bool {
     tools_of(scope)
         .iter()
         .any(|name| permissions.offers(name))
-        || scope
-            .children
-            .iter()
-            .filter_map(|id| find(id))
-            .any(|child| available(child, permissions))
 }
 
-/// The scopes the model may load next.
-///
-/// Everything a loaded scope nests or is related to, minus what is loaded already, in graph
-/// order and only what the host may actually use.
-pub fn visible(loaded: &Loaded, permissions: &Permissions) -> Vec<&'static Scope> {
-    let mut reachable: Vec<&'static str> = Vec::new();
-    for scope in loaded.scopes() {
-        for id in scope.children.iter().chain(scope.related).copied() {
-            if !loaded.contains(id) && !reachable.contains(&id) {
-                reachable.push(id);
-            }
-        }
-    }
+/// The kinds of work the index knows that this host can do, for a search that matched nothing.
+pub fn summaries(permissions: &Permissions) -> Vec<(&'static str, &'static str)> {
     SCOPES
         .iter()
-        .filter(|scope| reachable.contains(&scope.id) && available(scope, permissions))
+        .filter(|scope| scope.id != ROOT && scope_available(scope, permissions))
+        .map(|scope| (scope.id, scope.summary))
         .collect()
 }
 
-/// The scopes loaded for one conversation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The tools loaded for one conversation: the ones offered as tools of the turn.
+///
+/// Everything else the host allows is still callable from `run_script`, so a tool is loaded
+/// only when the chat wants it on the turn, and it is released once the conversation has not
+/// used it for [`crate::ai_agent::agent::TOOL_IDLE_TURNS`] turns.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Loaded {
-    /// Loaded ids, kept in graph order so the prompt and the request never reorder.
-    ids: Vec<&'static str>,
-}
-
-impl Default for Loaded {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Loaded tool names, with the user turn each was last used in. Sorted by name, so the
+    /// request never reorders between rounds.
+    tools: BTreeMap<&'static str, u64>,
 }
 
 impl Loaded {
-    /// The set a conversation starts with: the root scope alone.
+    /// A conversation that has loaded nothing yet.
     pub fn new() -> Self {
-        Self { ids: vec![ROOT] }
+        Self::default()
     }
 
-    /// The loaded scopes in graph order.
-    pub fn scopes(&self) -> impl Iterator<Item = &'static Scope> {
-        SCOPES
-            .iter()
-            .filter(|scope| self.contains(scope.id))
+    /// The loaded tools, in the order the request lists them.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.tools.keys().copied()
     }
 
-    /// The ids of everything loaded.
-    pub fn ids(&self) -> &[&'static str] {
-        &self.ids
-    }
-
-    /// Whether `id` is loaded.
-    pub fn contains(&self, id: &str) -> bool {
-        self.ids.contains(&id)
-    }
-
-    /// Whether `tool` comes from a loaded scope.
+    /// Whether `tool` is loaded, and so offered as a tool of the turn.
     pub fn holds(&self, tool: &str) -> bool {
-        scope_of(tool).is_some_and(|scope| self.contains(scope.id))
+        self.tools.contains_key(tool)
     }
 
-    /// Load a scope. Answers whether it was not loaded already.
-    pub fn load(&mut self, scope: &'static Scope) -> bool {
-        if self.contains(scope.id) {
-            return false;
+    /// How many tools are loaded.
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Load `tools`, remembering the turn that wanted them.
+    pub fn load(&mut self, tools: impl IntoIterator<Item = &'static str>, turn: u64) {
+        for tool in tools {
+            self.tools.insert(tool, turn);
         }
-        self.ids.push(scope.id);
-        self.ids.sort_by_key(|id| {
-            SCOPES
-                .iter()
-                .position(|scope| scope.id == *id)
-                .unwrap_or(SCOPES.len())
-        });
-        true
     }
 
-    /// Unload `id` and everything it nests.
-    ///
-    /// The root stays loaded whatever the model asks: the conversation needs the commands
-    /// and the user prompt.
-    pub fn unload(&mut self, id: &str) -> Vec<&'static str> {
-        if id == ROOT {
-            return Vec::new();
-        }
-        let mut removed = Vec::new();
-        self.remove(id, &mut removed);
-        self.ids.retain(|loaded| !removed.contains(loaded));
-        removed
+    /// Note that `tool` was used in `turn`, so it stays loaded.
+    pub fn touch(&mut self, tool: &'static str, turn: u64) {
+        self.tools.insert(tool, turn);
     }
 
-    /// The stored ids. Unknown ones (a scope from an older build) are dropped on the way in.
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::Value::from(self.ids.clone())
+    /// Drop one tool, so it goes back to being callable from a script alone.
+    pub fn release_tool(&mut self, tool: &str) -> bool {
+        self.tools.remove(tool).is_some()
     }
 
-    /// Read a stored set back, which always holds the root.
-    pub fn from_json(value: Option<&serde_json::Value>) -> Self {
-        let mut loaded = Self::new();
-        for id in value.and_then(serde_json::Value::as_array).into_iter().flatten() {
-            if let Some(scope) = id.as_str().and_then(find) {
-                loaded.load(scope);
+    /// Release what the conversation has not used for `idle` turns.
+    pub fn release(&mut self, turn: u64, idle: u64) -> Vec<&'static str> {
+        let mut released = Vec::new();
+        self.tools.retain(|tool, used| {
+            let keep = turn.saturating_sub(*used) < idle;
+            if !keep {
+                released.push(*tool);
             }
+            keep
+        });
+        released
+    }
+
+    /// The stored names.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::Value::from(self.tools.keys().copied().collect::<Vec<_>>())
+    }
+
+    /// Read a stored set back. Names this build does not know are dropped on the way in.
+    pub fn from_json(value: Option<&serde_json::Value>) -> Self {
+        let mut loaded = Self::default();
+        for name in value.and_then(serde_json::Value::as_array).into_iter().flatten() {
+            let Some(name) = name.as_str().and_then(super::tools::static_name) else {
+                continue;
+            };
+            loaded.tools.insert(name, 0);
         }
         loaded
-    }
-
-    fn remove(&self, id: &str, removed: &mut Vec<&'static str>) {
-        let Some(scope) = find(id) else {
-            return;
-        };
-        if !self.contains(scope.id) || removed.contains(&scope.id) {
-            return;
-        }
-        removed.push(scope.id);
-        for child in scope.children {
-            self.remove(child, removed);
-        }
     }
 }
 
@@ -394,10 +321,6 @@ mod tests {
         }))
     }
 
-    fn ids(scopes: &[&'static Scope]) -> Vec<&'static str> {
-        scopes.iter().map(|scope| scope.id).collect()
-    }
-
     #[test]
     fn every_tool_belongs_to_exactly_one_scope() {
         let names = super::super::tools::TOOL_SPECS
@@ -414,103 +337,58 @@ mod tests {
     }
 
     #[test]
-    fn the_root_is_the_only_scope_a_conversation_starts_with() {
+    fn a_conversation_starts_with_nothing_loaded() {
         let loaded = Loaded::new();
-        assert!(loaded.contains(ROOT));
-        assert_eq!(loaded.ids(), [ROOT]);
-        assert!(loaded.holds(TOOL_RUN_COMMAND));
-        assert!(!loaded.holds(TOOL_REMOTE_READ));
+        assert_eq!(loaded.len(), 0);
+        assert!(!loaded.holds(TOOL_DEV_VIEW));
         assert!(!loaded.holds("docker_containers"));
     }
 
     #[test]
-    fn the_root_offers_the_next_stops_but_not_their_tools() {
-        let permissions = everything_on();
-        let loaded = Loaded::new();
-        assert_eq!(
-            ids(&visible(&loaded, &permissions)),
-            ["host", "local", "web", "knowledge", "docker"]
-        );
-    }
-
-    #[test]
-    fn loading_a_container_scope_reveals_its_children_and_nothing_else() {
-        let permissions = everything_on();
+    fn a_tool_stays_loaded_until_it_goes_unused() {
         let mut loaded = Loaded::new();
-        loaded.load(find("host").unwrap());
-        let shown = ids(&visible(&loaded, &permissions));
-        assert_eq!(
-            shown,
-            [
-                "env",
-                "host-files",
-                "host-system",
-                "host-terminal",
-                "local",
-                "web",
-                "knowledge",
-                "docker",
-            ]
-        );
-        assert!(!loaded.holds(TOOL_DEV_VIEW));
-        loaded.load(find("host-files").unwrap());
+        loaded.load([TOOL_DEV_VIEW, TOOL_DEV_GREP], 1);
         assert!(loaded.holds(TOOL_DEV_VIEW));
+        assert_eq!(loaded.names().collect::<Vec<_>>(), [TOOL_DEV_GREP, TOOL_DEV_VIEW]);
+
+        // One turn later it is still worth its schema.
+        assert!(loaded.release(2, 2).is_empty());
+        assert!(loaded.holds(TOOL_DEV_VIEW));
+        // A call in the third turn keeps the one that was used; the other goes.
+        loaded.touch(TOOL_DEV_GREP, 3);
+        let released = loaded.release(4, 2);
+        assert_eq!(released, [TOOL_DEV_VIEW]);
+        assert!(loaded.holds(TOOL_DEV_GREP));
     }
 
     #[test]
-    fn a_related_scope_can_be_loaded_without_its_parent() {
-        let permissions = everything_on();
+    fn loaded_tools_survive_a_round_trip_through_json() {
         let mut loaded = Loaded::new();
-        // `host-files` is only reachable through `host`, which is not loaded yet.
-        assert!(!ids(&visible(&loaded, &permissions)).contains(&"host-files"));
-        loaded.load(find("local").unwrap());
-        // `local` is related to `host-files`, which makes it loadable on its own.
-        assert!(ids(&visible(&loaded, &permissions)).contains(&"host-files"));
+        loaded.load([TOOL_DEV_VIEW, TOOL_DEV_GREP], 4);
+        let stored = loaded.to_json();
+        let read = Loaded::from_json(Some(&stored));
+        assert_eq!(read.names().collect::<Vec<_>>(), loaded.names().collect::<Vec<_>>());
+        // A name this build does not know is dropped rather than kept as a broken entry.
+        let stale = json!(["host-files", TOOL_DEV_VIEW]);
+        assert_eq!(Loaded::from_json(Some(&stale)).len(), 1);
     }
 
     #[test]
-    fn unloading_takes_the_loaded_subtree_and_leaves_the_root() {
-        let mut loaded = Loaded::new();
-        loaded.load(find("host").unwrap());
-        loaded.load(find("host-files").unwrap());
-        loaded.load(find("web").unwrap());
-        assert_eq!(loaded.unload("host"), ["host", "host-files"]);
-        assert!(loaded.contains(ROOT));
-        assert!(loaded.contains("web"));
-        assert!(loaded.unload(ROOT).is_empty());
-        assert!(loaded.contains(ROOT));
-    }
+    fn the_index_names_what_the_host_can_do() {
+        let shown = summaries(&everything_on());
+        let ids: Vec<&str> = shown.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&"host-files"));
+        assert!(ids.contains(&"docker"));
+        assert!(!ids.contains(&ROOT));
 
-    #[test]
-    fn a_scope_whose_group_is_off_is_invisible() {
-        let permissions = permissions(json!({}));
-        let mut loaded = Loaded::new();
-        loaded.load(find("host").unwrap());
-        let shown = ids(&visible(&loaded, &permissions));
-        // Only the ungated system scope survives inside `host`.
-        assert!(shown.contains(&"host-system"));
-        assert!(!shown.contains(&"host-files"));
-        assert!(!shown.contains(&"host-terminal"));
-        assert!(!available(find("web").unwrap(), &permissions));
-    }
-
-    #[test]
-    fn a_container_stays_available_while_one_of_its_children_is() {
-        let permissions = permissions(json!({ group_key(GROUP_TERMINAL): true }));
-        // remote-fs is off but the system probes are ungated, so the container is reachable.
-        assert!(available(find("host").unwrap(), &permissions));
-        assert!(!available(find("web").unwrap(), &permissions));
-    }
-
-    #[test]
-    fn loaded_scopes_survive_a_round_trip_and_drop_unknown_ids() {
-        let mut loaded = Loaded::new();
-        loaded.load(find("host").unwrap());
-        loaded.load(find("web").unwrap());
-        let stored = json!([ROOT, "web", "host", "not-a-scope"]);
-        let restored = Loaded::from_json(Some(&stored));
-        assert_eq!(restored, loaded);
-        assert_eq!(restored.ids(), [ROOT, "host", "web"]);
-        assert_eq!(Loaded::from_json(None), Loaded::new());
+        // A host with the families switched off offers no tool of theirs; the map tools and
+        // the pane tools are not gated and stay.
+        let off: Vec<&str> = summaries(&permissions(json!({})))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!off.contains(&"host-files"));
+        assert!(!off.contains(&"web"));
+        assert!(!off.contains(&"terminal"));
     }
 }

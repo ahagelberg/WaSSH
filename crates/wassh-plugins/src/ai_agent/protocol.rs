@@ -177,12 +177,8 @@ pub const TOOL_SYSTEM_PROCESSES: &str = "system_process_list";
 pub const TOOL_SYSTEM_DISK: &str = "system_disk_usage";
 /// Tool: the memory report.
 pub const TOOL_SYSTEM_MEMORY: &str = "system_memory_report";
-/// Tool: bring a scope's tools into the conversation.
-pub const TOOL_LOAD_SCOPE: &str = "load_scope";
-/// Tool: take a scope's tools back out.
-pub const TOOL_UNLOAD_SCOPE: &str = "unload_scope";
-/// Tool: call the loaded tools from inside `run_script` instead of as tools of the turn.
-pub const TOOL_SET_SCRIPT_MODE: &str = "set_script_mode";
+/// Tool: search the tools this host allows and load the few a task needs.
+pub const TOOL_SEARCH_TOOLS: &str = "search_tools";
 
 /// Prefix that marks a rule list entry as a regular expression.
 pub const RULE_REGEX_PREFIX: &str = "regex:";
@@ -205,7 +201,7 @@ pub const OPENAI_MODELS_PATH: &str = "/models";
 pub const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 
 /// Version of the plugin's stored data.
-pub const DATA_VERSION: u32 = 4;
+pub const DATA_VERSION: u32 = 5;
 /// Title a fresh chat gets.
 pub const DEFAULT_CHAT_TITLE: &str = "New chat";
 /// Chats kept per host.

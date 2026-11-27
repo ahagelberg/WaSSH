@@ -17,10 +17,11 @@
   totals, what the input carried (system prompt, tool definitions, your prompts, earlier answers,
   tool results), what the answer spent on text and on tool calls, and a line per request. The
   numbers come from the provider; when it reports none they are estimated from the text.
-- The agent decides how it calls its tools. It either makes one call per request, or writes a
-  small program that makes several and returns only what the task needs. A chat moves to the
-  program on its own once it passes 40% of the model's context window, and the agent can switch
-  either way. The per-tool switches in Options are gone.
+- The agent loads the tools a task needs instead of carrying every schema. `search_tools` finds
+  them by what the work is ("host file", "docker", "terminal"); the few it loads are sent as
+  tools of the turn, and a tool the chat stops using is released again after four turns.
+  Everything else the host allows stays callable from inside `run_script`. **Tools** on the chat
+  header lists what is loaded, drops one on request, and holds the environment map's controls.
 - A script's tool calls now run several at a time (up to eight), on commands of their own, so a
   program that fires a batch at once really does. Prompts a call has to ask for stay in one queue.
 - Mount a folder from a saved host as a local drive: pick the host, the folder and a drive letter
