@@ -178,6 +178,8 @@ const USAGE_LABEL: &str = "Usage";
 /// Tooltip of the usage button.
 const USAGE_HINT: &str = "What this chat's requests have cost: totals, what they carried, and \
 one line per request.";
+/// Tools the usage view lists by call count.
+const USAGE_TOOL_ROWS: usize = 6;
 /// Heading of the usage view.
 const USAGE_TITLE: &str = "Token usage";
 /// What the usage view says before the first answer arrives.
@@ -5291,6 +5293,42 @@ script normally stops after {} seconds of JavaScript.",
                     share_row(ui, palette, muted, label, value, totals.input, colour);
                 }
                 share_row(ui, palette, muted, "Answer text", totals.text, totals.output, palette.text);
+                if chat.is_none() && !self.agent.offered_tools.is_empty() {
+                    ui.add_space(USAGE_ROW_GAP);
+                    ui.label(egui::RichText::new("Tools on the turn").size(FOOTER_TEXT_SIZE));
+                    let idle = self
+                        .agent
+                        .offered_tools
+                        .iter()
+                        .filter(|name| !self.agent.tools_used.contains_key(*name))
+                        .count();
+                    let calls: u32 = self.agent.tools_used.values().sum();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{idle} of {} schemas were never called; {calls} calls across {} \
+tools.",
+                                self.agent.offered_tools.len(),
+                                self.agent.tools_used.len()
+                            ))
+                            .size(FOOTER_TEXT_SIZE)
+                            .color(muted),
+                        )
+                        .wrap(),
+                    );
+                    let mut busiest: Vec<(&String, &u32)> = self.agent.tools_used.iter().collect();
+                    busiest.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                    for (name, count) in busiest.iter().take(USAGE_TOOL_ROWS) {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(*name).size(FOOTER_TEXT_SIZE));
+                            ui.label(
+                                egui::RichText::new(format!("{count}"))
+                                    .size(FOOTER_TEXT_SIZE)
+                                    .color(muted),
+                            );
+                        });
+                    }
+                }
                 share_row(
                     ui,
                     palette,

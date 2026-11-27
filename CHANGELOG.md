@@ -4,6 +4,9 @@
 
 ### Added
 
+- **Usage** also says which tools the chat actually called, how many of the schemas it
+  carried were never called, and lists the busiest tools, so a chat's tool cost can be read
+  rather than guessed at.
 - A sub-agent can be given just the tools its task needs and stops after twelve rounds, so a
   delegated search cannot spend the chat's budget on a hunt nobody asked for.
 - The few tools with parameters that are easy to get wrong show a real call as an example,
@@ -13,7 +16,6 @@
 - The standing part of an AI chat's prompt is sent as its own cacheable block, and only what
   changes as the chat works — the directory, the loaded tools, the map — follows it. A long
   chat pays once for the instructions instead of on every round.
-
 - Prompt caching on Anthropic-compatible providers: the system prompt and the toolset carry a
   cache breakpoint, and the newest message carries one more, so every round of a run reads the
   prefix the round before it already paid for. OpenAI-compatible endpoints cache on their own.

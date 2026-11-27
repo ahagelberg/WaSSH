@@ -1047,6 +1047,10 @@ pub struct Agent {
     request_parts: Option<UsageParts>,
     /// Every request this conversation was billed for.
     pub usage: UsageLog,
+    /// Calls made per tool in this conversation, by the name the model used.
+    pub tools_used: std::collections::BTreeMap<String, u32>,
+    /// The tool names the last request carried as schemas.
+    pub offered_tools: Vec<String>,
     /// User messages this conversation has taken, the clock scope release reads.
     user_turns: u64,
     /// The app's connections to other hosts, handed in by the pane every frame.
@@ -1168,6 +1172,8 @@ impl Agent {
         self.needs_reply = false;
         self.compacted.clear();
         self.loaded = Loaded::new();
+        self.tools_used.clear();
+        self.offered_tools.clear();
         self.plan = false;
         self.script = None;
         self.spawn_request = None;
@@ -2921,6 +2927,7 @@ released again once the conversation stops using them.",
 
     /// Note that `tool` ran, so it stays loaded.
     fn note_tool_use(&mut self, tool: &str) {
+        *self.tools_used.entry(tool.to_owned()).or_default() += 1;
         if tools::is_root_tool(tool) || tools::is_scope_tool(tool) {
             return;
         }
@@ -5145,6 +5152,10 @@ task needs to load it, or call it from inside run_script with `await tools.{name
     /// Kept until the answer arrives: the transcript grows while the request is out, and the
     /// parts have to describe what was sent rather than what is there when it comes back.
     pub fn note_request(&mut self, system: &str, tools: &[Value]) {
+        self.offered_tools = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect();
         let mut parts = UsageParts {
             system: system.chars().count(),
             tools: tools.iter().map(|tool| tool.to_string().chars().count()).sum(),
@@ -7018,6 +7029,27 @@ mod tests {
         assert!(failed);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].output.contains(PLAN_READ_ONLY), "{}", calls[0].output);
+    }
+
+    #[test]
+    fn the_usage_counts_calls_per_tool_and_what_the_request_carried() {
+        let mut agent = Agent::new();
+        agent.now_ms = 1_700_000_000_000;
+        let mut fake = FakeSession::default();
+        run_tool(&mut agent, &mut fake, TOOL_CURRENT_TIME, "{}");
+        run_tool(&mut agent, &mut fake, TOOL_CURRENT_TIME, "{}");
+        assert_eq!(agent.tools_used.get(TOOL_CURRENT_TIME), Some(&2));
+        assert_eq!(agent.tools_used.len(), 1);
+
+        let offered = tools::offered(&agent.permissions, &agent.loaded, true, false).specs;
+        agent.note_request("prompt", &offered);
+        assert!(agent.offered_tools.contains(&TOOL_CURRENT_TIME.to_owned()));
+        assert!(agent.offered_tools.contains(&TOOL_RUN_COMMAND.to_owned()));
+        assert!(!agent.offered_tools.contains(&TOOL_LOCAL_READ.to_owned()));
+
+        agent.clear();
+        assert!(agent.tools_used.is_empty());
+        assert!(agent.offered_tools.is_empty());
     }
 
     #[test]
