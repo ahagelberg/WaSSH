@@ -6288,6 +6288,7 @@ mod tests {
                 secrets,
                 secret_writes: Vec::new(),
                 remote: remote.clone(),
+                mounts: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             let shapes = std::mem::take(&mut output.shapes);
@@ -6354,6 +6355,7 @@ mod tests {
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
             remote: None,
+            mounts: None,
         };
         let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
         let commands = std::mem::take(&mut output.platform_output.commands);
@@ -7247,6 +7249,7 @@ mod tests {
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
             remote: None,
+            mounts: None,
         }
     }
 
@@ -7721,6 +7724,7 @@ mod tests {
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
             remote: None,
+            mounts: None,
         };
         let mut texts = Vec::new();
         let mut cards = Vec::new();
@@ -7960,6 +7964,7 @@ mod tests {
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
                 remote: None,
+                mounts: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| plugin.show(ui, &mut context));
             title = None;
@@ -8669,6 +8674,7 @@ mod tests {
                 status: SessionStatus::Connected, settings: &mut settings, scope: "host-1".to_owned(),
                 session: None, events: &[], pending_input: Vec::new(), repaint_after: None,
                 secrets: &EMPTY_SECRETS, secret_writes: Vec::new(), remote: None,
+                mounts: None,
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -8917,6 +8923,7 @@ mod tests {
                 secrets: &EMPTY_SECRETS,
                 secret_writes: Vec::new(),
                 remote: None,
+                mounts: None,
             };
             let mut output = ctx.run_ui(input, |ui| plugin.show(ui, &mut context));
             let shapes = std::mem::take(&mut output.shapes);

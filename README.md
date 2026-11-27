@@ -9,6 +9,7 @@ Native WaSSH desktop client, built as a single self-contained Cargo workspace.
 | `wassh-core` | Domain model: app constants, palette/theme, session status + backoff, dock layout |
 | `wassh-store` | Config persistence (settings, hosts, tabs, known hosts, plugin data) |
 | `wassh-ssh` | SSH transport: auth, jump chains, channels, tunnels, X11, SFTP |
+| `wassh-mount` | Remote folders as local drives: a filesystem core and the WinFsp backend |
 | `wassh-term` | Terminal emulation glue (alacritty_terminal), input encoding, selection/search |
 | `wassh-term-render` | Glyph atlas and cell mesh generation |
 | `wassh-sys` | Native facts about this machine through the OS (Win32 on Windows, `/proc` on Linux): CPU, memory, disk, network, processes |
@@ -46,6 +47,10 @@ cargo run -p wassh
 - Long-running builds: `CARGO_BUILD_JOBS=8 taskset -c 0-9 cargo build` (this machine is
   limited to 10 cores and must not run parallel builds).
 - `wassh --spike` runs the terminal/SSH spike harness; `--widgets` shows the widget gallery.
+- Mounting a remote folder as a drive needs WinFsp on Windows
+  (`winget install WinFsp.WinFsp`). WaSSH loads `winfsp-x64.dll` at run time and is not
+  built against the WinFsp SDK. WinFsp — Windows File System Proxy, Copyright (C)
+  Bill Zissimopoulos, https://winfsp.dev — is used under its GPLv3 FLOSS exception.
 - `vendor/winit` is winit 0.30.13 with the Windows 11 mixed-DPI fix backported (see
   `vendor/winit/PATCHED.md`). Drop the directory and the `[patch.crates-io]` entry once
   eframe moves to a winit release that contains it.

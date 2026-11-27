@@ -1,6 +1,6 @@
 //! Built-in plugins.
 //!
-//! The eight plugins compile into the binary behind a Rust trait; there is no dynamic
+//! The nine plugins compile into the binary behind a Rust trait; there is no dynamic
 //! loading. Manifests carry the ids, names and toolbar labels used by settings and stored
 //! plugin data.
 
@@ -13,6 +13,7 @@ pub mod docker;
 pub mod files;
 pub mod macro_pad;
 pub mod monitor;
+pub mod mounts;
 pub mod mqtt;
 pub mod plugin;
 pub mod settings;
@@ -24,11 +25,12 @@ pub use docker::DockerManager;
 pub use files::{Files, SftpAccess, SftpEntry, SftpListing};
 pub use macro_pad::MacroPad;
 pub use monitor::{MonitorAccess, ServerMonitor, Snapshot};
+pub use mounts::MountsPane;
 pub use mqtt::MqttAnalyser;
 pub use command::TcpAccess;
 pub use plugin::{
-    HeaderButton, Plugin, PluginContext, RemoteHost, RemoteHosts, RemoteState, SessionAccess,
-    TerminalAccess, create,
+    DriverState, HeaderButton, MountState, MountedDrive, Plugin, PluginContext, RemoteHost,
+    RemoteHosts, RemoteMounts, RemoteState, RememberedMount, SessionAccess, TerminalAccess, create,
 };
 pub use settings::{FieldKind, SettingsField};
 
@@ -47,10 +49,11 @@ pub enum PluginId {
     MacroPad,
     ConnectionLogger,
     Scratchpad,
+    Mounts,
 }
 
 impl PluginId {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AiAgent,
         Self::Sftp,
         Self::ServerMonitor,
@@ -59,12 +62,13 @@ impl PluginId {
         Self::MacroPad,
         Self::ConnectionLogger,
         Self::Scratchpad,
+        Self::Mounts,
     ];
 
     /// The order the original app registers its plugins in
     /// (`BUILTIN_PLUGIN_DEFINITIONS`), which is the order of the plugin list in
     /// Options, the plugin sections, the toolbar and the Plugins menu.
-    pub const UI_ORDER: [Self; 8] = [
+    pub const UI_ORDER: [Self; 9] = [
         Self::ServerMonitor,
         Self::Scratchpad,
         Self::MacroPad,
@@ -73,6 +77,7 @@ impl PluginId {
         Self::AiAgent,
         Self::ConnectionLogger,
         Self::DockerManager,
+        Self::Mounts,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -85,6 +90,7 @@ impl PluginId {
             Self::MacroPad => "macro-pad",
             Self::ConnectionLogger => "connection-logger",
             Self::Scratchpad => "scratchpad",
+            Self::Mounts => "mounts",
         }
     }
 
@@ -114,6 +120,7 @@ impl PluginId {
             Self::MacroPad => "macropad",
             Self::ConnectionLogger => "connectionlogger",
             Self::Scratchpad => "scratchpad",
+            Self::Mounts => "mounts",
         }
     }
 
@@ -139,6 +146,10 @@ impl PluginId {
                 "Logs connection and disconnection events to analyse network stability."
             }
             Self::Scratchpad => "Notes shared across sessions of the same host.",
+            Self::Mounts => {
+                "Mount a folder from a saved host as a drive letter or a directory, through \
+                 WaSSH's own SSH connection."
+            }
         }
     }
 
@@ -152,6 +163,7 @@ impl PluginId {
             Self::MacroPad => ("Macro pad", "Macros", "Macros"),
             Self::ConnectionLogger => ("Connection logger", "Conn Log", "Connection Log"),
             Self::Scratchpad => ("Scratchpad", "Scratch", "Scratchpad"),
+            Self::Mounts => ("Mounts", "Mounts", "Mounts"),
         };
         PluginManifest {
             id: self,
@@ -207,15 +219,15 @@ mod tests {
     #[test]
     fn every_plugin_has_a_unique_id_and_name() {
         let manifests: Vec<_> = PluginId::ALL.into_iter().map(PluginId::manifest).collect();
-        assert_eq!(manifests.len(), 8);
+        assert_eq!(manifests.len(), 9);
         let mut ids: Vec<_> = manifests.iter().map(|m| m.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.len(), 9);
         let mut names: Vec<_> = manifests.iter().map(|m| m.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 9);
     }
 
     #[test]
@@ -223,6 +235,7 @@ mod tests {
         assert_eq!(PluginId::AiAgent.as_str(), "ai-agent");
         assert_eq!(PluginId::MqttAnalyser.as_str(), "mqtt-analyser");
         assert_eq!(PluginId::ConnectionLogger.as_str(), "connection-logger");
+        assert_eq!(PluginId::Mounts.as_str(), "mounts");
     }
 
     #[test]

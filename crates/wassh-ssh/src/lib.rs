@@ -16,6 +16,7 @@ pub mod known_hosts;
 pub mod remote_session;
 pub mod session;
 pub mod sftp;
+pub mod sftp_client;
 pub mod tunnels;
 pub mod x11;
 
@@ -29,6 +30,10 @@ pub use session::{
 pub use sftp::{
     SFTP_STOPPED, SftpEntry, SftpOutcome, SftpProgress, SftpProgressPhase, SftpRequest, SftpStop,
     format_size,
+};
+pub use sftp_client::{
+    CHUNK as SFTP_CHUNK, OpenOptions as SftpOpenOptions, RemoteAttrs, SftpClient, SftpClientError,
+    SftpResult as SftpClientResult,
 };
 pub use tunnels::{RemoteForwards, TunnelRequest, remote_forwards};
 pub use x11::X11Config;

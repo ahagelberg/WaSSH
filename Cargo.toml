@@ -6,6 +6,7 @@ members = [
     "crates/wassh-store",
     "crates/wassh-ssh",
     "crates/wassh-mqtt",
+    "crates/wassh-mount",
     "crates/wassh-telnet",
     "crates/wassh-serial",
     "crates/wassh-term",

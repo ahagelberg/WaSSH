@@ -51,6 +51,11 @@ pub struct PluginContext<'a> {
     /// resolves credentials, host keys and jump hosts the same way a tab does. It is
     /// shared so a pane can keep it past the frame it was handed in.
     pub remote: Option<Rc<RefCell<dyn RemoteHosts>>>,
+    /// Remote folders mounted as local drives, when the host offers them.
+    ///
+    /// Mounts outlive a tab and are shared by every pane, so this is the app's list, not
+    /// the pane's.
+    pub mounts: Option<Rc<RefCell<dyn RemoteMounts>>>,
 }
 
 impl PluginContext<'_> {
@@ -275,9 +280,132 @@ pub trait RemoteHosts {
     fn close(&mut self, handle: &str);
 }
 
+/// Where one mounted folder stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MountState {
+    /// Never mounted.
+    #[default]
+    Idle,
+    /// Connecting and starting the filesystem.
+    Mounting,
+    /// The host needs a password no vault holds; answer with [`RemoteMounts::supply_password`].
+    NeedsPassword,
+    /// Mounted and answering.
+    Open,
+    /// The connection went away; the mount keeps trying.
+    Lost,
+    /// It could not be mounted, and this is why.
+    Failed(String),
+}
+
+impl MountState {
+    /// Whether a program can use the mount point right now.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Whether the mount is in the middle of connecting.
+    pub fn is_working(&self) -> bool {
+        matches!(self, Self::Mounting | Self::Lost)
+    }
+}
+
+/// One remote folder mounted as a local drive, as a pane shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MountedDrive {
+    /// Key the pane named the mount by; also how it asks for it to be unmounted.
+    pub key: String,
+    /// Drive letter (`X:`) or directory the folder is mounted at.
+    pub mount_point: String,
+    /// Saved host id the folder is on.
+    pub host_id: String,
+    /// The host's display name.
+    pub host_name: String,
+    /// Folder on the host that is served.
+    pub remote_path: String,
+    /// Where the mount stands.
+    pub state: MountState,
+    /// How often the mount has reconnected, so the pane can say it came back.
+    pub reconnects: u32,
+}
+
+/// Whether this machine can mount at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriverState {
+    /// Mounting is available.
+    Ready,
+    /// It is not, and this is why (the driver is missing, or the platform has none).
+    Missing(String),
+}
+
+impl DriverState {
+    /// Whether a mount can be attempted.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+/// A mount remembered from an earlier run, offered again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RememberedMount {
+    /// Key the entry is filed under.
+    pub key: String,
+    /// Saved host id the folder is on.
+    pub host_id: String,
+    /// The host's display name.
+    pub host_name: String,
+    /// Folder on the host that is served.
+    pub remote_path: String,
+    /// Where it was mounted; mounting uses it when the place is still free.
+    pub mount_point: String,
+    /// Why it cannot be mounted as it was, if it cannot.
+    pub problem: Option<String>,
+}
+
+/// Remote folders shown as local drives, and the driver that serves them.
+pub trait RemoteMounts {
+    /// Every mount, in the order they were made.
+    fn mounts(&self) -> Vec<MountedDrive>;
+
+    /// Every saved host, without secrets, for the pane's picker.
+    fn hosts(&self) -> &[RemoteHost];
+
+    /// Drive letters nothing is using, in the order a picker shows them.
+    fn free_drives(&self) -> Vec<String>;
+
+    /// Whether this machine can mount.
+    fn driver(&self) -> DriverState;
+
+    /// Mount `remote_path` of `host_id` at `mount_point` (`X:` or a directory), under `key`.
+    fn mount(&mut self, key: &str, host_id: &str, remote_path: &str, mount_point: &str);
+
+    /// Drop the mount under `key`.
+    fn unmount(&mut self, key: &str);
+
+    /// Ask for the mount under `key` to connect again now.
+    fn retry(&mut self, key: &str);
+
+    /// Hand over a password the user typed for a host that has none in the vault.
+    fn supply_password(&mut self, key: &str, password: &str);
+
+    /// Show the mount's folder in a file window.
+    fn reveal(&mut self, mount_point: &str);
+
+    /// Install the driver this platform needs, after the user agreed to it.
+    fn install_driver(&mut self);
+
+    /// Mounts remembered from an earlier run that are not mounted now.
+    fn remembered(&self) -> Vec<RememberedMount>;
+
+    /// Mount a remembered entry again, as it was saved.
+    fn remount(&mut self, key: &str);
+
+    /// Stop offering a remembered entry.
+    fn forget(&mut self, key: &str);
+}
+
 /// A built-in plugin view.
-pub trait Plugin {
-    /// Manifest describing this plugin's id, labels and default placement.
+pub trait Plugin {    /// Manifest describing this plugin's id, labels and default placement.
     fn manifest(&self) -> PluginManifest;
 
     /// Draw the pane. The host draws the frame, title bar and close button.
@@ -436,6 +564,7 @@ pub fn create(id: PluginId) -> Box<dyn Plugin> {
         PluginId::DockerManager => Box::new(crate::docker::DockerManager::default()),
         PluginId::MqttAnalyser => Box::new(crate::mqtt::MqttAnalyser::default()),
         PluginId::Scratchpad => Box::new(Scratchpad::default()),
+        PluginId::Mounts => Box::new(crate::mounts::MountsPane::default()),
         PluginId::AiAgent => Box::new(crate::ai_agent::AiAgent::default()),
     }
 }
@@ -488,6 +617,7 @@ mod tests {
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
             remote: None,
+            mounts: None,
         };
         assert!(context.is_connected());
         context.set_text("text", "hello");
@@ -509,6 +639,7 @@ mod tests {
             secrets: &EMPTY_SECRETS,
             secret_writes: Vec::new(),
             remote: None,
+            mounts: None,
         };
         assert!(!context.is_connected());
         assert_eq!(context.text("text"), Some("hello"));

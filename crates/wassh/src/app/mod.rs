@@ -6,8 +6,10 @@
 
 pub mod dialogs;
 pub mod local_exec;
+pub mod mounts;
 pub mod local_files;
 pub mod quick_connect;
+pub mod reach;
 pub mod remote;
 pub mod session;
 pub mod wsl;
@@ -31,6 +33,7 @@ use wassh_store::Config;
 use wassh_term::TerminalSize;
 use wassh_ui::widgets::{Button, MenuItem, MenuState, ToastKind, Toasts};
 
+use self::mounts::Mounts;
 use self::remote::RemoteSessions;
 use self::dialogs::{
     Command, DialogAction, Dialogs, FindCommand, FindState, GroupEditState, HostSave, HostState,
@@ -191,6 +194,8 @@ pub struct Shell {
     known_hosts: Arc<KnownHosts>,
     /// Connections to other hosts, opened for a pane that asked for one.
     remote: Rc<RefCell<RemoteSessions>>,
+    /// Remote folders mounted as local drives, shared by every tab.
+    mounts: Rc<RefCell<Mounts>>,
     fullscreen: bool,
     fullscreen_request: Option<bool>,
     zoom: f32,
@@ -593,7 +598,12 @@ impl Shell {
             quick: QuickForm::default(),
             closed: Vec::new(),
             known_hosts: Arc::clone(&known_hosts),
-            remote: std::rc::Rc::new(std::cell::RefCell::new(RemoteSessions::new(known_hosts))),
+            remote: std::rc::Rc::new(std::cell::RefCell::new(RemoteSessions::new(
+                Arc::clone(&known_hosts),
+            ))),
+            mounts: std::rc::Rc::new(std::cell::RefCell::new(Mounts::new(Arc::clone(
+                &known_hosts,
+            )))),
             fullscreen: false,
             fullscreen_request: None,
             zoom: 0.0,
@@ -1715,6 +1725,9 @@ impl Shell {
         self.remote
             .borrow_mut()
             .sync(&self.hosts, &identities, self.secrets.as_ref());
+        self.mounts
+            .borrow_mut()
+            .sync(&self.hosts, &identities, self.secrets.as_ref());
     }
 
     fn delete_host(&mut self, id: &str) {
@@ -2093,6 +2106,7 @@ impl Shell {
         // A connection opened for a pane finishes its dialling, its commands and its file
         // requests outside any tab, so it is polled once here.
         self.remote.borrow_mut().poll();
+        self.mounts.borrow_mut().poll();
         // A pane works whether or not it is drawn: a tab whose status changed hands its
         // events on here, and a tab with a run in flight keeps moving.
         for index in changed {
@@ -2434,6 +2448,7 @@ impl Shell {
         let values = self.take_plugin_values(index);
         let store = self.config.as_ref();
         let remote: Rc<RefCell<dyn wassh_plugins::RemoteHosts>> = self.remote.clone();
+        let mounts: Rc<RefCell<dyn wassh_plugins::RemoteMounts>> = self.mounts.clone();
         let mut after = None;
         if let Some(session) = self.sessions.get_mut(index) {
             after = session.poll_plugins(
@@ -2441,6 +2456,7 @@ impl Shell {
                 &values,
                 &self.settings.enabled_plugins,
                 Some(remote),
+                Some(mounts),
             );
         }
         self.plugin_values = Some(values);
@@ -2881,6 +2897,7 @@ impl Shell {
                 store: self.config.as_ref(),
                 plugin_values: &plugin_values,
                 remote: Rc::clone(&self.remote),
+                mounts: Rc::clone(&self.mounts),
                 measured,
             };
             let actions = wassh_ui::dock_layout(
@@ -3781,6 +3798,8 @@ struct SessionPanes<'a> {
     plugin_values: &'a PluginValues,
     /// Connections to other hosts, for a pane that asks for one.
     remote: Rc<RefCell<RemoteSessions>>,
+    /// Remote folders mounted as drives, for the pane that shows them.
+    mounts: Rc<RefCell<Mounts>>,
     /// Emulator size measured for the space the docks left for the terminal.
     measured: TerminalSize,
 }
@@ -3804,6 +3823,7 @@ impl wassh_ui::DockContent for SessionPanes<'_> {
             self.store,
             self.plugin_values,
             Some(Rc::clone(&self.remote)),
+            Some(Rc::clone(&self.mounts)),
         );
     }
 

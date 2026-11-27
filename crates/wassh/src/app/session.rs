@@ -1651,6 +1651,7 @@ impl SessionEntry {
         store: Option<&wassh_store::Config>,
         values: &PluginValues,
         remote: Option<Rc<RefCell<super::remote::RemoteSessions>>>,
+        mounts: Option<Rc<RefCell<super::mounts::Mounts>>>,
     ) {
         let Some(id) = PluginId::parse(plugin_id) else {
             return;
@@ -1672,6 +1673,8 @@ impl SessionEntry {
         let secrets = values.secrets.get(id.as_str()).unwrap_or(&NO_SECRETS);
         let remote: Option<Rc<RefCell<dyn wassh_plugins::RemoteHosts>>> =
             remote.map(|remote| remote as Rc<RefCell<dyn wassh_plugins::RemoteHosts>>);
+        let mounts: Option<Rc<RefCell<dyn wassh_plugins::RemoteMounts>>> =
+            mounts.map(|mounts| mounts as Rc<RefCell<dyn wassh_plugins::RemoteMounts>>);
         let typed;
         let repaint_after;
         {
@@ -1689,6 +1692,7 @@ impl SessionEntry {
                 secrets,
                 secret_writes: Vec::new(),
                 remote: remote.clone(),
+                mounts: mounts.clone(),
             };
             pane.plugin.show(ui, &mut context);
             typed = std::mem::take(&mut context.pending_input);
@@ -1778,6 +1782,7 @@ impl SessionEntry {
         values: &PluginValues,
         enabled: &[String],
         remote: Option<Rc<RefCell<dyn wassh_plugins::RemoteHosts>>>,
+        mounts: Option<Rc<RefCell<dyn wassh_plugins::RemoteMounts>>>,
     ) -> Option<Duration> {
         let scope = self.plugin_scope();
         let events = std::sync::Arc::clone(&self.status_history);
@@ -1810,6 +1815,7 @@ impl SessionEntry {
                 secrets,
                 secret_writes: Vec::new(),
                 remote: remote.clone(),
+                mounts: mounts.clone(),
             };
             pane.plugin.poll(&mut context);
             let writes = std::mem::take(&mut context.secret_writes);
@@ -4140,7 +4146,7 @@ mod tests {
         );
 
         let enabled = vec![PluginId::ConnectionLogger.as_str().to_owned()];
-        let after = entry.poll_plugins(None, &PluginValues::default(), &enabled, None);
+        let after = entry.poll_plugins(None, &PluginValues::default(), &enabled, None, None);
         assert_eq!(polls.load(relaxed), 1, "the pane was not polled");
         assert!(
             had_session.load(relaxed),
@@ -4173,7 +4179,7 @@ mod tests {
         let enabled = vec![wassh_plugins::PluginId::ConnectionLogger
             .as_str()
             .to_owned()];
-        entry.poll_plugins(None, &PluginValues::default(), &enabled, None);
+        entry.poll_plugins(None, &PluginValues::default(), &enabled, None, None);
         let log = connection_log(&entry);
         assert_eq!(log.len(), 1, "the connect is in the log: {log:?}");
         assert_eq!(log[0]["kind"], serde_json::json!("connected"));
@@ -4186,7 +4192,7 @@ mod tests {
         );
 
         // The same history, offered again, writes nothing.
-        entry.poll_plugins(None, &PluginValues::default(), &enabled, None);
+        entry.poll_plugins(None, &PluginValues::default(), &enabled, None, None);
         assert!(entry.take_dirty_plugins().is_empty());
         assert_eq!(connection_log(&entry).len(), 1);
     }

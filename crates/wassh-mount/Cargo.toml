@@ -1,0 +1,20 @@
+[package]
+name = "wassh-mount"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Remote folders as local drives: a filesystem core and the WinFsp backend"
+
+[dependencies]
+wassh-ssh = { path = "../wassh-ssh" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+] }

@@ -16,6 +16,11 @@
   script-mode setting is read as a default of its own, so nothing changes on upgrade.
 - A script's tool calls now run several at a time (up to eight), on commands of their own, so a
   program that fires a batch at once really does. Prompts a call has to ask for stay in one queue.
+- Mount a folder from a saved host as a local drive: pick the host, the folder and a drive letter
+  or an empty directory, and it opens in Explorer like any other disk, through the same jump hosts
+  and credentials the session uses. A mount reconnects on its own while it stays mounted — per host
+  you can decide whether it gives up — and remembered mounts come back with **Remount**. Needs
+  WinFsp, which the pane offers to install; Windows only for now.
 - Ask once or for the whole session: the card that asks about a script running past its default
   20 seconds now offers **Always allow this session** beside **Allow once** and **Deny**, so a chat
   that keeps running long builds stops asking. The answer lasts until the session ends, and the

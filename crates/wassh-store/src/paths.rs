@@ -16,6 +16,7 @@ pub const HOSTS_FILE: &str = "hosts.json";
 pub const IDENTITIES_FILE: &str = "identities.json";
 pub const TABS_FILE: &str = "tabs.json";
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts.json";
+pub const MOUNTS_FILE: &str = "mounts.json";
 
 /// Settings document path inside the data directory.
 pub fn settings_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
@@ -36,6 +37,11 @@ pub fn tabs_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
 
 pub fn known_hosts_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
     data_dir.as_ref().join(KNOWN_HOSTS_FILE)
+}
+
+/// Remembered remote mounts.
+pub fn mounts_file(data_dir: impl AsRef<std::path::Path>) -> PathBuf {
+    data_dir.as_ref().join(MOUNTS_FILE)
 }
 
 /// `plugin-<id>.json`, or `plugin-<id>.<scope>.json` when a scope is supplied.

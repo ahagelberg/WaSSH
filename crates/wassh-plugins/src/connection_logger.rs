@@ -1775,6 +1775,7 @@ mod tests {
                     secrets: &secrets,
                     secret_writes: Vec::new(),
                     remote: None,
+                    mounts: None,
                 };
                 logger.show(ui, &mut context);
             });

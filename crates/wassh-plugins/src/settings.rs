@@ -830,6 +830,15 @@ const MQTT_MESSAGE_ITEM: &[SettingsField] = &[
     ),
 ];
 
+/// What a mount does when the connection under it keeps failing.
+const MOUNTS_HOST: &[SettingsField] = &[boolean(
+    "keepRetrying",
+    "Keep reconnecting",
+    true,
+    "Keep a mounted drive trying when its connection drops. Turned off, a drive gives up \
+     after five minutes and waits for Retry.",
+)];
+
 const MQTT_MODES: &[SelectOption] = &[
     SelectOption {
         value: "text",
@@ -1002,7 +1011,7 @@ pub fn app_schema(id: PluginId) -> &'static [SettingsField] {
         PluginId::MacroPad => MACRO_PAD_APP,
         PluginId::MqttAnalyser => MQTT_APP,
         // Files and Scratchpad are configured in their own panel.
-        PluginId::Sftp | PluginId::ServerMonitor | PluginId::Scratchpad => &[],
+        PluginId::Sftp | PluginId::ServerMonitor | PluginId::Scratchpad | PluginId::Mounts => &[],
     }
 }
 
@@ -1014,6 +1023,7 @@ pub fn host_schema(id: PluginId) -> &'static [SettingsField] {
         PluginId::MqttAnalyser => MQTT_HOST,
         PluginId::ServerMonitor => SERVER_MONITOR_HOST,
         PluginId::AiAgent => AI_AGENT_HOST,
+        PluginId::Mounts => MOUNTS_HOST,
         PluginId::Sftp | PluginId::MacroPad | PluginId::Scratchpad => &[],
     }
 }
@@ -1029,6 +1039,7 @@ pub fn app_heading(id: PluginId) -> &'static str {
         PluginId::AiAgent => "AI agent",
         PluginId::Sftp => "Files",
         PluginId::Scratchpad => "Scratchpad",
+        PluginId::Mounts => "Mounts",
     }
 }
 
@@ -1043,6 +1054,7 @@ pub fn host_heading(id: PluginId) -> &'static str {
         PluginId::Sftp => "Files",
         PluginId::MacroPad => "Macro pad",
         PluginId::Scratchpad => "Scratchpad",
+        PluginId::Mounts => "Mounts",
     }
 }
 
@@ -1335,7 +1347,8 @@ mod tests {
                 "server-monitor",
                 "docker-manager",
                 "mqtt-analyser",
-                "connection-logger"
+                "connection-logger",
+                "mounts"
             ]
         );
     }
@@ -1353,7 +1366,8 @@ mod tests {
                 "sftp",
                 "ai-agent",
                 "connection-logger",
-                "docker-manager"
+                "docker-manager",
+                "mounts"
             ]
         );
         // Same set as ALL, only reordered.

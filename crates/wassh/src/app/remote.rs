@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wassh_core::{
-    AuthMethod, ConnectionParams, HostProfile, HostsDocument, Identity, Platform, SessionStatus,
+    AuthMethod, ConnectionParams, HostsDocument, Identity, Platform, SessionStatus,
 };
 use wassh_plugins::{
     CommandAccess, CommandOutput, MonitorAccess, RemoteHost, RemoteHosts, RemoteState,
@@ -22,7 +22,8 @@ use wassh_ssh::{
     ExecJob, HostKeyPolicy, JumpHop, KnownHosts, SftpJob, SshAuth, SshEvent, SshOptions, SshSession,
 };
 
-use super::session::{Secrets, jump_chain, resolve_auth};
+use super::reach::{Inventory, Reach};
+use super::session::Secrets;
 
 /// How long a connection nobody used is kept before it is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -30,25 +31,6 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SIDE_COLS: u16 = 80;
 /// Rows, as above.
 const SIDE_ROWS: u16 = 24;
-/// Port an SSH connection uses when the profile leaves it unset.
-const DEFAULT_PORT: u16 = 22;
-
-/// What one saved host needs before it can be dialled.
-enum Reach {
-    /// Ready: parameters, the secrets they need, and the jump hosts in front of it.
-    Ready {
-        params: Box<ConnectionParams>,
-        secrets: Secrets,
-        jumps: Vec<JumpHop>,
-    },
-    /// The parameters need a password the vault does not hold.
-    NeedsPassword {
-        params: Box<ConnectionParams>,
-        jumps: Vec<JumpHop>,
-    },
-    /// It cannot be opened, and this is why.
-    Blocked(String),
-}
 
 /// One connection, as a pane handle left it.
 struct Side {
@@ -62,8 +44,7 @@ struct Side {
 /// Every connection opened for a pane, and what the app can offer it.
 pub struct RemoteSessions {
     /// The saved hosts, rebuilt on [`RemoteSessions::sync`].
-    hosts: Vec<RemoteHost>,
-    reach: HashMap<String, Reach>,
+    inventory: Inventory,
     sides: HashMap<String, Side>,
     known_hosts: Arc<KnownHosts>,
     idle: Duration,
@@ -73,8 +54,7 @@ impl RemoteSessions {
     /// A broker that checks host keys against `known_hosts`.
     pub fn new(known_hosts: Arc<KnownHosts>) -> Self {
         Self {
-            hosts: Vec::new(),
-            reach: HashMap::new(),
+            inventory: Inventory::new(),
             sides: HashMap::new(),
             known_hosts,
             idle: IDLE_TIMEOUT,
@@ -91,64 +71,12 @@ impl RemoteSessions {
         identities: &[Identity],
         vault: Option<&wassh_store::SecretsStore>,
     ) {
-        self.hosts.clear();
-        self.reach.clear();
-        for host in &hosts.hosts {
-            let (reach, problem) = self.classify(host, hosts, identities, vault);
-            self.reach.insert(host.id.clone(), reach);
-            self.hosts.push(RemoteHost {
-                id: host.id.clone(),
-                name: host.display_name().to_owned(),
-                address: address_of(host),
-                tags: host.tags.clone(),
-                problem,
-            });
-        }
+        self.inventory
+            .sync(hosts, identities, vault, &self.known_hosts);
         // A connection to a host that no longer exists has nothing left to reach.
+        let inventory = &self.inventory;
         self.sides
-            .retain(|_, side| self.reach.contains_key(&side.host_id));
-    }
-
-    /// What opening `host` would need, and what stands in the way when something does.
-    fn classify(
-        &self,
-        host: &HostProfile,
-        hosts: &HostsDocument,
-        identities: &[Identity],
-        vault: Option<&wassh_store::SecretsStore>,
-    ) -> (Reach, Option<String>) {
-        let (params, secrets) =
-            match resolve_auth(&host.connection, Some(&host.id), identities, vault) {
-                Ok(resolved) => resolved,
-                Err(reason) => return (Reach::Blocked(reason.clone()), Some(reason)),
-            };
-        let jumps = match jump_chain(hosts, &host.connection, identities, vault) {
-            Ok(jumps) => jumps,
-            Err(reason) => return (Reach::Blocked(reason.clone()), Some(reason)),
-        };
-        if self.known_hosts.get(&params.host, params.port).is_none() {
-            let reason = "its host key is not trusted yet — connect once from a terminal tab and \
-                          accept it"
-                .to_owned();
-            return (Reach::Blocked(reason.clone()), Some(reason));
-        }
-        if params.auth == AuthMethod::Password && secrets.password.is_empty() {
-            return (
-                Reach::NeedsPassword {
-                    params: Box::new(params),
-                    jumps,
-                },
-                Some("needs a password".to_owned()),
-            );
-        }
-        (
-            Reach::Ready {
-                params: Box::new(params),
-                secrets,
-                jumps,
-            },
-            None,
-        )
+            .retain(|_, side| inventory.contains(&side.host_id));
     }
 
     /// Poll every connection: transport events, running commands and file requests, and the
@@ -194,7 +122,7 @@ impl RemoteSessions {
 
     /// The connection itself: either a dialled session or the reason there is none.
     fn open(&self, host_id: &str, password: Option<String>) -> (RemoteState, Option<SideSession>) {
-        let Some(reach) = self.reach.get(host_id) else {
+        let Some(reach) = self.inventory.reach(host_id) else {
             return (
                 RemoteState::Failed(format!("'{host_id}' is not a saved host")),
                 None,
@@ -238,7 +166,7 @@ impl RemoteSessions {
 
 impl RemoteHosts for RemoteSessions {
     fn hosts(&self) -> &[RemoteHost] {
-        &self.hosts
+        self.inventory.hosts()
     }
 
     fn connect(&mut self, handle: &str, host_id: &str) {
@@ -313,18 +241,6 @@ fn next_state(event: &SshEvent, environment: &str) -> Option<RemoteState> {
         })),
         SshEvent::Error(error) => Some(RemoteState::Failed(error.clone())),
         _ => None,
-    }
-}
-
-/// `user@host:port`, as a person reads an address.
-fn address_of(host: &HostProfile) -> String {
-    let port = match host.connection.port {
-        0 => DEFAULT_PORT,
-        port => port,
-    };
-    match host.connection.username.trim() {
-        "" => format!("{}:{port}", host.connection.host),
-        user => format!("{user}@{}:{port}", host.connection.host),
     }
 }
 
@@ -786,7 +702,7 @@ impl MonitorAccess for SideSession {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wassh_core::ConnectionType;
+    use wassh_core::{ConnectionType, HostProfile};
 
     /// A document holding one SSH host that wants a password.
     fn hosts_with(host_id: &str) -> HostsDocument {

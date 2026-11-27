@@ -3967,6 +3967,10 @@ const CREDITS: &[(&str, &str)] = &[
     ("serial2 — serial ports", "BSD-2-Clause OR Apache-2.0"),
     ("tokio — asynchronous runtime", "MIT"),
     ("ureq — HTTP for the AI agent's providers", "MIT OR Apache-2.0"),
+    (
+        "WinFsp — Windows File System Proxy, Copyright (C) Bill Zissimopoulos (winfsp.dev) — remote drives",
+        "GPLv3 with a FLOSS exception",
+    ),
     ("winit — windowing and input", "Apache-2.0"),
 ];
 

@@ -85,6 +85,12 @@ pub struct SshOptions {
     /// Used for tmux/screen attach (`tmux new-session -A -s main`), and for any tab that
     /// should start in a specific program.
     pub command: Option<String>,
+    /// Whether to ask for a login shell at all.
+    ///
+    /// `false` leaves the session channel idle: no PTY, no shell, no remote command, so no
+    /// startup file runs on the host. A connection that only reads files or probes the host
+    /// asks for this.
+    pub shell: bool,
     /// Port forwards to establish once authenticated.
     pub tunnels: Vec<crate::tunnels::TunnelRequest>,
     /// Jump hosts to traverse before reaching the target, outermost first.
@@ -108,6 +114,7 @@ impl SshOptions {
             keepalive_max: 3,
             x11: None,
             command: None,
+            shell: true,
             tunnels: Vec::new(),
             jumps: Vec::new(),
             host_key_policy: HostKeyPolicy::AcceptAny,
@@ -170,6 +177,10 @@ enum SshCommand {
         host: String,
         port: u16,
         reply: std::sync::mpsc::Sender<Result<(String, u16), String>>,
+    },
+    /// Open a long-lived SFTP channel for a remote filesystem.
+    OpenSftpClient {
+        reply: std::sync::mpsc::Sender<Result<crate::sftp_client::SftpClient, String>>,
     },
 }
 
@@ -472,6 +483,18 @@ impl SshSession {
     pub fn disconnect(&mut self) {
         let _ = self.commands.send(SshCommand::Disconnect);
     }
+
+    /// Open a long-lived SFTP channel for a remote filesystem.
+    ///
+    /// The answer carries a client that blocks on each call, which is what a filesystem
+    /// driver needs; it stays usable until the session ends.
+    pub fn open_sftp_client(
+        &self,
+    ) -> std::sync::mpsc::Receiver<Result<crate::sftp_client::SftpClient, String>> {
+        let (reply, answer) = channel();
+        let _ = self.commands.send(SshCommand::OpenSftpClient { reply });
+        answer
+    }
     /// Drain pending events without blocking.
     pub fn events(&self) -> Vec<SshEvent> {
         self.events.try_iter().collect()
@@ -758,30 +781,32 @@ async fn connect_and_shell(
         .channel_open_session()
         .await
         .context("opening a session channel")?;
-    channel
-        .request_pty(
-            true,
-            &options.term,
-            u32::from(options.cols),
-            u32::from(options.rows),
-            0,
-            0,
-            &[],
-        )
-        .await
-        .context("requesting a PTY")?;
-    match &options.command {
-        Some(command) => {
-            channel
-                .exec(true, command.as_bytes())
-                .await
-                .context("requesting the remote command")?;
-        }
-        None => {
-            channel
-                .request_shell(true)
-                .await
-                .context("requesting a shell")?;
+    if options.shell {
+        channel
+            .request_pty(
+                true,
+                &options.term,
+                u32::from(options.cols),
+                u32::from(options.rows),
+                0,
+                0,
+                &[],
+            )
+            .await
+            .context("requesting a PTY")?;
+        match &options.command {
+            Some(command) => {
+                channel
+                    .exec(true, command.as_bytes())
+                    .await
+                    .context("requesting the remote command")?;
+            }
+            None => {
+                channel
+                    .request_shell(true)
+                    .await
+                    .context("requesting a shell")?;
+            }
         }
     }
 
@@ -857,6 +882,13 @@ async fn connect_and_shell(
                             )
                             .await
                             .map_err(|error| format!("{error:#}"));
+                            let _ = reply.send(answer);
+                        });
+                    }
+                    Some(SshCommand::OpenSftpClient { reply }) => {
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            let answer = crate::sftp_client::open(handle).await;
                             let _ = reply.send(answer);
                         });
                     }
